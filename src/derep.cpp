@@ -18,12 +18,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -48,6 +51,11 @@ extern "C" {
 }
 #endif
 
+// All file-local types are in an anonymous namespace to give their member
+// functions internal linkage and avoid ODR violations with sort.cpp (which
+// defines identically-named classes with different layouts).
+namespace {
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -65,6 +73,30 @@ struct IndexEntry {
 
     IndexEntry() : record_index(0), non_len(0), count(1) {}
     IndexEntry(uint64_t idx, uint32_t len) : record_index(idx), non_len(len), count(1) {}
+};
+
+struct SequenceFingerprint {
+    uint64_t hash;
+    uint32_t seq_len;
+
+    SequenceFingerprint() : hash(0), seq_len(0) {}
+    SequenceFingerprint(uint64_t h, size_t len) : hash(h) {
+        if (len > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("Sequence length exceeds supported fingerprint range");
+        }
+        seq_len = static_cast<uint32_t>(len);
+    }
+
+    bool operator==(const SequenceFingerprint& other) const {
+        return hash == other.hash && seq_len == other.seq_len;
+    }
+};
+
+struct SequenceFingerprintHash {
+    size_t operator()(const SequenceFingerprint& fp) const {
+        uint64_t mixed = fp.hash ^ (static_cast<uint64_t>(fp.seq_len) * 0x9e3779b97f4a7c15ULL);
+        return static_cast<size_t>(mixed ^ (mixed >> 32));
+    }
 };
 
 // ============================================================================
@@ -121,6 +153,21 @@ static inline uint64_t canonical_hash(const std::string& seq, bool use_revcomp) 
     std::string rc = revcomp(seq);
     uint64_t h2 = XXH3_64bits(rc.data(), rc.size());
     return std::min(h1, h2);
+}
+
+static std::string shell_escape_path(const std::string& path) {
+    std::string escaped;
+    escaped.reserve(path.size() + 2);
+    escaped.push_back('\'');
+    for (char c : path) {
+        if (c == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    escaped.push_back('\'');
+    return escaped;
 }
 
 // ============================================================================
@@ -240,7 +287,7 @@ public:
         : path_(path), use_pigz_(use_pigz), pipe_(nullptr), gzfp_(nullptr), record_count_(0) {
 
         if (use_pigz_) {
-            std::string cmd = "pigz -dc -p 4 " + path;
+            std::string cmd = "pigz -dc -p 4 -- " + shell_escape_path(path);
             pipe_ = popen(cmd.c_str(), "r");
             if (!pipe_) {
                 throw std::runtime_error("Cannot open pigz pipe: " + path);
@@ -257,7 +304,14 @@ public:
 
     ~FastqReader() {
         if (gzfp_) gzclose(gzfp_);
-        if (pipe_) pclose(pipe_);
+        if (pipe_) {
+            int rc = pclose(pipe_);
+            if (rc != 0) {
+                std::cerr << "Fatal: pclose failed for pigz reader pipe (" << path_
+                          << "), status " << rc << "\n";
+                std::terminate();
+            }
+        }
     }
 
     bool read(FastqRecord& rec) {
@@ -323,7 +377,7 @@ public:
         if (compress_) {
             // Try to use pigz for parallel compression first (popen -> write)
             // Match reader pattern: use 4 threads for pigz here as well
-            std::string pigz_cmd = "pigz -c -p 4 > \"" + path + "\" 2>/dev/null";
+            std::string pigz_cmd = "pigz -c -p 4 > " + shell_escape_path(path) + " 2>/dev/null";
             pigz_pipe_ = popen(pigz_cmd.c_str(), "w");
             if (pigz_pipe_) {
                 // Set a large buffer for pipe writes
@@ -345,7 +399,14 @@ public:
     }
 
     ~FastqWriter() {
-        if (pigz_pipe_) pclose(pigz_pipe_);
+        if (pigz_pipe_) {
+            int rc = pclose(pigz_pipe_);
+            if (rc != 0) {
+                std::cerr << "Fatal: pclose failed for pigz writer pipe (" << path_
+                          << "), status " << rc << "\n";
+                std::terminate();
+            }
+        }
         else if (gzfp_) gzclose(gzfp_);
     }
 
@@ -356,9 +417,11 @@ public:
                         rec.header.c_str(), rec.seq.c_str(),
                         rec.plus.c_str(), rec.qual.c_str());
             } else {
-                gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                         rec.header.c_str(), rec.seq.c_str(),
-                         rec.plus.c_str(), rec.qual.c_str());
+                if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
+                             rec.header.c_str(), rec.seq.c_str(),
+                             rec.plus.c_str(), rec.qual.c_str()) < 0) {
+                    throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
+                }
             }
         } else {
             plain_out_ << rec.header << '\n'
@@ -408,7 +471,7 @@ public:
             pass1_standard(ext_path, non_path);
         }
 
-        size_t index_mb = (index_.size() * sizeof(std::pair<uint64_t, IndexEntry>)) / (1024 * 1024);
+        size_t index_mb = (index_.size() * sizeof(std::pair<SequenceFingerprint, IndexEntry>)) / (1024 * 1024);
         log_info("Index size: " + std::to_string(index_mb) + " MB for " +
                 std::to_string(total_reads_) + " reads");
 
@@ -428,6 +491,33 @@ public:
     }
 
 private:
+    template <typename TExtReader, typename TNonReader>
+    bool read_paired_checked(TExtReader& ext_reader,
+                             TNonReader& non_reader,
+                             FastqRecord& ext_rec,
+                             FastqRecord& non_rec,
+                             uint64_t record_idx,
+                             const char* phase) {
+        bool ext_ok = ext_reader.read(ext_rec);
+        bool non_ok = non_reader.read(non_rec);
+
+        if (ext_ok != non_ok) {
+            throw std::runtime_error("Paired FASTQ files have different lengths in " +
+                                     std::string(phase) + " at record " + std::to_string(record_idx + 1));
+        }
+        if (!ext_ok) {
+            return false;
+        }
+
+        const std::string ext_id = trim_id(ext_rec.header);
+        const std::string non_id = trim_id(non_rec.header);
+        if (ext_id != non_id) {
+            log_warn("Paired FASTQ ID mismatch in " + std::string(phase) + " at record " +
+                     std::to_string(record_idx + 1) + ": ext=" + ext_id + ", non=" + non_id);
+        }
+        return true;
+    }
+
     void pass1_standard(const std::string& ext_path, const std::string& non_path) {
         FastqReader ext_reader(ext_path, use_pigz_);
         FastqReader non_reader(non_path, use_pigz_);
@@ -435,13 +525,14 @@ private:
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 
-        while (ext_reader.read(ext_rec) && non_reader.read(non_rec)) {
+        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass1")) {
             uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            SequenceFingerprint fp(h, ext_rec.seq.size());
 
-            auto it = index_.find(h);
+            auto it = index_.find(fp);
             if (it == index_.end()) {
                 // New cluster - store minimal info
-                index_.emplace(h, IndexEntry(record_idx, non_rec.seq.size()));
+                index_.emplace(fp, IndexEntry(record_idx, non_rec.seq.size()));
             } else {
                 // Existing cluster - update count and check if this is longer
                 it->second.count++;
@@ -476,12 +567,13 @@ private:
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 
-        while (ext_reader.read(ext_rec) && non_reader.read(non_rec)) {
+        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass1")) {
             uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            SequenceFingerprint fp(h, ext_rec.seq.size());
 
-            auto it = index_.find(h);
+            auto it = index_.find(fp);
             if (it == index_.end()) {
-                index_.emplace(h, IndexEntry(record_idx, non_rec.seq.size()));
+                index_.emplace(fp, IndexEntry(record_idx, non_rec.seq.size()));
             } else {
                 it->second.count++;
                 if (non_rec.seq.size() > it->second.non_len) {
@@ -530,7 +622,9 @@ private:
             cluster_gz = gzopen(cluster_path.c_str(), "wb6");
             if (cluster_gz) {
                 gzbuffer(cluster_gz, GZBUF_SIZE);
-                gzprintf(cluster_gz, "hash\text_len\text_count\tnon_len\tnon_count\n");
+                if (gzprintf(cluster_gz, "hash\text_len\text_count\tnon_len\tnon_count\n") < 0) {
+                    throw std::runtime_error("gzprintf failed while writing cluster header");
+                }
             }
         }
 
@@ -539,12 +633,12 @@ private:
         size_t written = 0;
 
         // Create set of record indices to write
-        ska::flat_hash_map<uint64_t, uint64_t> records_to_write;  // record_idx → hash
-        for (const auto& [hash, entry] : index_) {
-            records_to_write[entry.record_index] = hash;
+        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;  // record_idx → fingerprint
+        for (const auto& [fingerprint, entry] : index_) {
+            records_to_write[entry.record_index] = fingerprint;
         }
 
-        while (ext_reader.read(ext_rec) && non_reader.read(non_rec)) {
+        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass2")) {
             auto it = records_to_write.find(record_idx);
             if (it != records_to_write.end()) {
                 // This is a representative record - write it
@@ -552,11 +646,17 @@ private:
                 non_writer.write(non_rec);
 
                 if (cluster_gz) {
-                    uint64_t hash = it->second;
-                    const IndexEntry& entry = index_[hash];
-                    gzprintf(cluster_gz, "%016lx\t%lu\t%u\t%lu\t%u\n",
-                            hash, ext_rec.seq.size(), entry.count,
-                            non_rec.seq.size(), entry.count);
+                    const SequenceFingerprint& fingerprint = it->second;
+                    auto entry_it = index_.find(fingerprint);
+                    if (entry_it == index_.end()) {
+                        throw std::runtime_error("Internal error: missing fingerprint for cluster output");
+                    }
+                    const IndexEntry& entry = entry_it->second;
+                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%u\t%lu\t%u\n",
+                                 fingerprint.hash, ext_rec.seq.size(), entry.count,
+                                 non_rec.seq.size(), entry.count) < 0) {
+                        throw std::runtime_error("gzprintf failed while writing cluster record");
+                    }
                 }
 
                 written++;
@@ -598,7 +698,9 @@ private:
             cluster_gz = gzopen(cluster_path.c_str(), "wb6");
             if (cluster_gz) {
                 gzbuffer(cluster_gz, GZBUF_SIZE);
-                gzprintf(cluster_gz, "hash\text_len\text_count\tnon_len\tnon_count\n");
+                if (gzprintf(cluster_gz, "hash\text_len\text_count\tnon_len\tnon_count\n") < 0) {
+                    throw std::runtime_error("gzprintf failed while writing cluster header");
+                }
             }
         }
 
@@ -606,23 +708,29 @@ private:
         uint64_t record_idx = 0;
         size_t written = 0;
 
-        ska::flat_hash_map<uint64_t, uint64_t> records_to_write;
-        for (const auto& [hash, entry] : index_) {
-            records_to_write[entry.record_index] = hash;
+        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
+        for (const auto& [fingerprint, entry] : index_) {
+            records_to_write[entry.record_index] = fingerprint;
         }
 
-        while (ext_reader.read(ext_rec) && non_reader.read(non_rec)) {
+        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass2")) {
             auto it = records_to_write.find(record_idx);
             if (it != records_to_write.end()) {
                 ext_writer.write(ext_rec);
                 non_writer.write(non_rec);
 
                 if (cluster_gz) {
-                    uint64_t hash = it->second;
-                    const IndexEntry& entry = index_[hash];
-                    gzprintf(cluster_gz, "%016lx\t%lu\t%u\t%lu\t%u\n",
-                            hash, ext_rec.seq.size(), entry.count,
-                            non_rec.seq.size(), entry.count);
+                    const SequenceFingerprint& fingerprint = it->second;
+                    auto entry_it = index_.find(fingerprint);
+                    if (entry_it == index_.end()) {
+                        throw std::runtime_error("Internal error: missing fingerprint for cluster output");
+                    }
+                    const IndexEntry& entry = entry_it->second;
+                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%u\t%lu\t%u\n",
+                                 fingerprint.hash, ext_rec.seq.size(), entry.count,
+                                 non_rec.seq.size(), entry.count) < 0) {
+                        throw std::runtime_error("gzprintf failed while writing cluster record");
+                    }
                 }
 
                 written++;
@@ -668,9 +776,9 @@ private:
     bool use_pigz_;
     bool use_isal_;
 
-    // Minimal index: hash → (record_index, non_len, count)
-    // Only ~20 bytes per INPUT record (vs ~300 bytes for full records)
-    ska::flat_hash_map<uint64_t, IndexEntry> index_;
+    // Minimal index: (hash + ext_len) → (record_index, non_len, count)
+    // Secondary fingerprint (ext_len) helps detect hash collisions.
+    ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
 
     uint64_t total_reads_;
 };
@@ -678,6 +786,8 @@ private:
 // ============================================================================
 // Main
 // ============================================================================
+
+}  // namespace
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: fqdup " << prog << " [OPTIONS]\n"

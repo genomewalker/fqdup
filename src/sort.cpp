@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -45,6 +47,11 @@ extern "C" {
 }
 #endif
 
+// All file-local types are in an anonymous namespace to give their member
+// functions internal linkage and avoid ODR violations with derep.cpp (which
+// defines identically-named classes with different layouts).
+namespace {
+
 constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;  // 4MB for better I/O performance
 
 // Parse memory size string (e.g., "4G", "2048M")
@@ -69,6 +76,21 @@ static size_t parse_memory_size(const std::string& str) {
         }
     }
     return value;
+}
+
+static std::string shell_escape_path(const std::string& path) {
+    std::string escaped;
+    escaped.reserve(path.size() + 2);
+    escaped.push_back('\'');
+    for (char c : path) {
+        if (c == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    escaped.push_back('\'');
+    return escaped;
 }
 
 // String arena - single large allocation for all string data in a chunk
@@ -472,9 +494,11 @@ public:
     // Write FastqRecord (std::string - for merge phase)
     void write(const FastqRecord& rec) {
         if (compress_) {
-            gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                     rec.header.c_str(), rec.seq.c_str(),
-                     rec.plus.c_str(), rec.qual.c_str());
+            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
+                         rec.header.c_str(), rec.seq.c_str(),
+                         rec.plus.c_str(), rec.qual.c_str()) < 0) {
+                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
+            }
         } else {
             out_ << rec.header << '\n' << rec.seq << '\n'
                  << rec.plus << '\n' << rec.qual << '\n';
@@ -484,11 +508,13 @@ public:
     // Write FastqRecordArena (raw pointers - for chunk writing)
     void write(const FastqRecordArena& rec) {
         if (compress_) {
-            gzprintf(gzfp_, "%.*s\n%.*s\n%.*s\n%.*s\n",
-                     (int)rec.header_len, rec.header,
-                     (int)rec.seq_len, rec.seq,
-                     (int)rec.plus_len, rec.plus,
-                     (int)rec.qual_len, rec.qual);
+            if (gzprintf(gzfp_, "%.*s\n%.*s\n%.*s\n%.*s\n",
+                         (int)rec.header_len, rec.header,
+                         (int)rec.seq_len, rec.seq,
+                         (int)rec.plus_len, rec.plus,
+                         (int)rec.qual_len, rec.qual) < 0) {
+                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
+            }
         } else {
             out_.write(rec.header, rec.header_len) << '\n';
             out_.write(rec.seq, rec.seq_len) << '\n';
@@ -764,7 +790,7 @@ private:
 
         if (is_gzipped && input != "/dev/stdin" && input != "-") {
             // Try to use pigz with multiple threads for parallel decompression
-            std::string pigz_cmd = "pigz -dc -p " + std::to_string(threads_) + " \"" + input + "\" 2>/dev/null";
+            std::string pigz_cmd = "pigz -dc -p " + std::to_string(threads_) + " -- " + shell_escape_path(input) + " 2>/dev/null";
             pigz_pipe = popen(pigz_cmd.c_str(), "r");
         }
 
@@ -781,6 +807,17 @@ private:
         int num_writers = threads_ / 2;  // Use half threads for writing
         if (num_writers < 2) num_writers = 2;
         const size_t NUM_CHUNK_BUFFERS = num_writers + 2;
+
+        const size_t max_memory_bytes = max_memory_mb_ * 1024ULL * 1024ULL;
+        const size_t max_chunk_bytes = max_memory_bytes / (NUM_CHUNK_BUFFERS * 3ULL);
+        if (max_chunk_bytes == 0) {
+            throw std::runtime_error("Insufficient --max-memory for configured chunk buffers");
+        }
+        if (chunk_size_bytes_ > max_chunk_bytes) {
+            chunk_size_bytes_ = max_chunk_bytes;
+            log_info("Adjusted chunk size to " + std::to_string(chunk_size_bytes_ / (1024ULL * 1024ULL)) +
+                     " MB to stay within --max-memory preallocation budget");
+        }
 
         // Pre-allocate all chunk buffers with arenas
         std::vector<ChunkBuffer> chunk_pool;
@@ -801,6 +838,9 @@ private:
         std::condition_variable reader_cv;  // For backpressure
         std::atomic<bool> done_reading{false};
         std::atomic<int> active_writers{0};
+        std::atomic<bool> writer_failed{false};
+        std::exception_ptr writer_exception;
+        std::mutex writer_exception_mutex;
 
         size_t chunk_bytes = 0;
         size_t total_reads = 0;
@@ -829,8 +869,23 @@ private:
                 }
 
                 if (has_work) {
-                    // Sort and write the chunk from the buffer pool
-                    write_sorted_chunk(std::move(chunk_pool[buffer_idx]));
+                    try {
+                        // Sort and write the chunk from the buffer pool
+                        write_sorted_chunk(std::move(chunk_pool[buffer_idx]));
+                    } catch (...) {
+                        active_writers--;
+                        {
+                            std::lock_guard<std::mutex> lock(writer_exception_mutex);
+                            if (!writer_exception) {
+                                writer_exception = std::current_exception();
+                            }
+                        }
+                        writer_failed = true;
+                        done_reading = true;
+                        queue_cv.notify_all();
+                        reader_cv.notify_all();
+                        break;
+                    }
                     active_writers--;
 
                     // Return buffer to available pool
@@ -861,7 +916,7 @@ private:
         }
 
         FastqRecordArena rec;
-        while (reader->read(rec, chunk_pool[current_buffer_idx].arena)) {
+        while (!writer_failed.load() && reader->read(rec, chunk_pool[current_buffer_idx].arena)) {
             auto read_end = std::chrono::steady_clock::now();
             read_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(read_end - last_read_start).count();
 
@@ -880,7 +935,10 @@ private:
                     write_queue.push(current_buffer_idx);
 
                     // Wait for an available buffer (backpressure)
-                    reader_cv.wait(lock, [&]{ return !available_buffers.empty(); });
+                    reader_cv.wait(lock, [&]{ return !available_buffers.empty() || writer_failed.load(); });
+                    if (writer_failed.load()) {
+                        break;
+                    }
 
                     // Get next buffer from pool
                     current_buffer_idx = available_buffers.front();
@@ -889,6 +947,10 @@ private:
                 queue_cv.notify_one();
 
                 chunk_bytes = 0;
+            }
+
+            if (writer_failed.load()) {
+                break;
             }
 
             if ((total_reads % 1000000) == 0) {
@@ -916,14 +978,16 @@ private:
         }
 
         // Queue final chunk if it has data
-        if (!chunk_pool[current_buffer_idx].records.empty()) {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            write_queue.push(current_buffer_idx);
-            queue_cv.notify_one();
-        } else {
-            // Return unused buffer
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            available_buffers.push(current_buffer_idx);
+        if (!writer_failed.load()) {
+            if (!chunk_pool[current_buffer_idx].records.empty()) {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                write_queue.push(current_buffer_idx);
+                queue_cv.notify_one();
+            } else {
+                // Return unused buffer
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                available_buffers.push(current_buffer_idx);
+            }
         }
 
         // Wait for all writers to finish
@@ -931,6 +995,18 @@ private:
         queue_cv.notify_all();  // Wake all writers
         for (auto& t : writer_threads) {
             t.join();
+        }
+
+        // Close pigz pipe if used
+        if (pigz_pipe) {
+            int rc = pclose(pigz_pipe);
+            if (rc != 0) {
+                throw std::runtime_error("pclose failed for pigz reader pipe with status " + std::to_string(rc));
+            }
+        }
+
+        if (writer_exception) {
+            std::rethrow_exception(writer_exception);
         }
 
         std::cerr << "\r" << std::string(100, ' ') << "\r" << std::flush;
@@ -954,10 +1030,6 @@ private:
         log_info("Phase 1 complete: " + std::to_string(total_reads) + " reads, " +
                 std::to_string(chunks_created_) + " chunks");
 
-        // Close pigz pipe if used
-        if (pigz_pipe) {
-            pclose(pigz_pipe);
-        }
     }
 
     void write_sorted_chunk(ChunkBuffer&& chunk) {
@@ -1041,7 +1113,10 @@ private:
 
     void merge_chunks(const std::string& output) {
         if (sorted_files_.size() == 1) {
-            std::rename(sorted_files_[0].c_str(), output.c_str());
+            if (std::rename(sorted_files_[0].c_str(), output.c_str()) != 0) {
+                throw std::runtime_error("rename failed from " + sorted_files_[0] + " to " + output +
+                                         ": " + std::strerror(errno));
+            }
             sorted_files_.clear();
             return;
         }
@@ -1067,7 +1142,7 @@ private:
         };
 
         auto compare_entries = [&compare_records](const MergeEntry& a, const MergeEntry& b) -> bool {
-            return !compare_records(a.record, b.record);  // Inverted for min-heap
+            return compare_records(b.record, a.record);  // Inverted for min-heap
         };
 
         std::priority_queue<MergeEntry, std::vector<MergeEntry>, decltype(compare_entries)> pq(compare_entries);
@@ -1084,7 +1159,7 @@ private:
         FILE* pigz_pipe = nullptr;
         if (compress) {
             // Try to use pigz with multiple threads for faster compression
-            std::string pigz_cmd = "pigz -c -p " + std::to_string(threads_) + " > " + output + " 2>/dev/null";
+            std::string pigz_cmd = "pigz -c -p " + std::to_string(threads_) + " > " + shell_escape_path(output) + " 2>/dev/null";
             pigz_pipe = popen(pigz_cmd.c_str(), "w");
         }
 
@@ -1095,8 +1170,6 @@ private:
         }
 
         size_t merged = 0;
-        char buffer[8192];  // Line buffer for pigz pipe
-
         while (!pq.empty()) {
             MergeEntry e = pq.top();
             pq.pop();
@@ -1119,7 +1192,10 @@ private:
         }
 
         if (pigz_pipe) {
-            pclose(pigz_pipe);
+            int rc = pclose(pigz_pipe);
+            if (rc != 0) {
+                throw std::runtime_error("pclose failed for pigz writer pipe with status " + std::to_string(rc));
+            }
         }
 
         std::cerr << "\r" << std::string(100, ' ') << "\r" << std::flush;
@@ -1141,6 +1217,8 @@ private:
     size_t total_write_time_ms_{0};
     size_t total_bytes_written_{0};
 };
+
+}  // namespace
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: fqdup " << prog << " -i INPUT -o OUTPUT --max-memory SIZE [-p THREADS] [-t TMPDIR] [-N] [--fast]\n"
