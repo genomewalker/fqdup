@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -98,6 +99,136 @@ struct SequenceFingerprintHash {
         return static_cast<size_t>(mixed ^ (mixed >> 32));
     }
 };
+
+// ============================================================================
+// Ancient DNA Damage Model
+//
+// DART-style per-position deamination model:
+//   P_CT(p) = d_max_5 * exp(-lambda_5 * p) + background   [C→T at 5' terminus]
+//   P_GA(p) = d_max_3 * exp(-lambda_3 * p) + background   [G→A at 3' terminus]
+// where p is distance (0-indexed) from the relevant end.
+//
+// Two PCR-duplicate reads damaged independently have expected Hamming distance:
+//   E[k] = Σ_p [ 2*P_CT(p)*(1-P_CT(p)) + 2*P_GA(L-1-p)*(1-P_GA(L-1-p)) ]
+//          + 2 * L * pcr_error_rate
+//
+// We handle damage by masking positions whose damage probability exceeds
+// mask_threshold before hashing, so damaged and undamaged copies of the same
+// molecule map to the same fingerprint.
+// ============================================================================
+
+struct DamageProfile {
+    double d_max_5prime   = 0.0;   // Max C→T rate at 5' end
+    double d_max_3prime   = 0.0;   // Max G→A rate at 3' end
+    double lambda_5prime  = 0.5;   // Exponential decay, 5' end
+    double lambda_3prime  = 0.5;   // Exponential decay, 3' end
+    double background     = 0.02;  // Background deamination across all positions
+    double mask_threshold = 0.05;  // Mask when P(deamination) > this value
+    double pcr_error_rate = 0.0;   // n_cycles * phi (per bp per cycle)
+    bool   enabled        = false;
+
+    double p_ct(int p) const {
+        return d_max_5prime * std::exp(-lambda_5prime * p) + background;
+    }
+    double p_ga(int p) const {
+        return d_max_3prime * std::exp(-lambda_3prime * p) + background;
+    }
+
+    // Expected Hamming distance between two independently-damaged duplicate
+    // reads of length L (Poisson approximation, see header comment above).
+    double expected_mismatches(int L) const {
+        double e = 0.0;
+        for (int p = 0; p < L; ++p) {
+            double pct = p_ct(p);
+            double pga = p_ga(L - 1 - p);
+            e += 2.0 * pct * (1.0 - pct);
+            e += 2.0 * pga * (1.0 - pga);
+        }
+        e += 2.0 * L * pcr_error_rate;
+        return e;
+    }
+
+    // 99th-percentile mismatch tolerance under a Poisson approximation.
+    int mismatch_tolerance(int L) const {
+        double lam = expected_mismatches(L);
+        if (lam < 1e-9) return 0;
+        double cumP = 0.0, pois = std::exp(-lam);
+        int k = 0;
+        while (cumP + pois < 0.99 && k < 100) {
+            cumP += pois;
+            ++k;
+            pois *= lam / k;
+        }
+        return k;
+    }
+
+    void print_info(int typical_read_length) const {
+        log_info("--- Damage-Aware Deduplication ---");
+        log_info("  5'-end d_max:  " + std::to_string(d_max_5prime));
+        log_info("  3'-end d_max:  " + std::to_string(d_max_3prime));
+        log_info("  5'-end lambda: " + std::to_string(lambda_5prime));
+        log_info("  3'-end lambda: " + std::to_string(lambda_3prime));
+        log_info("  Background:    " + std::to_string(background));
+        log_info("  Mask threshold:" + std::to_string(mask_threshold));
+        if (pcr_error_rate > 0.0) {
+            log_info("  PCR error rate:" + std::to_string(pcr_error_rate) + " per bp");
+        }
+        if (typical_read_length > 0) {
+            double e   = expected_mismatches(typical_read_length);
+            int    tol = mismatch_tolerance(typical_read_length);
+            log_info("  Expected mismatches (L=" + std::to_string(typical_read_length) +
+                     "): " + std::to_string(e) +
+                     ", 99th-pct tolerance: " + std::to_string(tol));
+        }
+    }
+};
+
+// Mask damage-prone positions before hashing.
+// C and T at 5'-end positions with P_CT > threshold → sentinel 0x01.
+// G and A at 3'-end positions with P_GA > threshold → sentinel 0x02.
+// swap_ends=true is used for the reverse-complement strand: the 5' end of the
+// RC corresponds to the 3' end of the original molecule, so the 5' and 3'
+// damage rates are exchanged.
+static std::string apply_damage_mask(const std::string& seq,
+                                     const DamageProfile& prof,
+                                     bool swap_ends) {
+    std::string m = seq;
+    int L = static_cast<int>(seq.size());
+    for (int i = 0; i < L; ++i) {
+        char cu = static_cast<char>(
+            std::toupper(static_cast<unsigned char>(m[i])));
+
+        double rate5 = swap_ends ? prof.p_ga(i)         : prof.p_ct(i);
+        double rate3 = swap_ends ? prof.p_ct(L - 1 - i) : prof.p_ga(L - 1 - i);
+
+        if (rate5 > prof.mask_threshold && (cu == 'C' || cu == 'T')) {
+            m[i] = '\x01';
+        } else if (rate3 > prof.mask_threshold && (cu == 'G' || cu == 'A')) {
+            m[i] = '\x02';
+        }
+    }
+    return m;
+}
+
+// Forward declaration — defined in the Utilities section below.
+static inline std::string revcomp(const std::string& s);
+
+// Damage-aware canonical hash: mask terminal damage positions so that reads
+// from the same molecule that differ only by deamination hash identically.
+// For the reverse-complement strand the 5'/3' damage profiles are swapped
+// (the 5' end of the RC corresponds to the 3' overhang of the original).
+static uint64_t damage_canonical_hash(const std::string& seq,
+                                      const DamageProfile& prof,
+                                      bool use_revcomp) {
+    std::string masked = apply_damage_mask(seq, prof, /*swap_ends=*/false);
+    uint64_t h1 = XXH3_64bits(masked.data(), masked.size());
+    if (!use_revcomp) return h1;
+
+    std::string rc        = revcomp(seq);
+    std::string masked_rc = apply_damage_mask(rc, prof, /*swap_ends=*/true);
+    uint64_t h2 = XXH3_64bits(masked_rc.data(), masked_rc.size());
+    return std::min(h1, h2);
+}
 
 // ============================================================================
 // FASTQ Record
@@ -366,6 +497,120 @@ private:
 };
 
 // ============================================================================
+// Damage estimation (DART-inspired, needs FastqReader defined above)
+// ============================================================================
+
+// Scan the first n_reads records of a (possibly gzipped) FASTQ file,
+// accumulate per-position T/(C+T) and A/(A+G) frequencies, estimate a
+// background level from positions 20-30, then fit an exponential decay
+//   excess(p) = d_max * exp(-lambda * p)
+// via ordinary least squares on the log-linearised data.
+static DamageProfile estimate_damage(const std::string& path,
+                                     int    n_reads,
+                                     double mask_threshold) {
+    FastqReader reader(path, /*use_pigz=*/false);
+    FastqRecord rec;
+
+    constexpr int MAX_POS = 35;
+    double T_5[MAX_POS]  = {};  // T  count at position p from 5' end
+    double CT_5[MAX_POS] = {};  // C+T count at position p from 5' end
+    double A_3[MAX_POS]  = {};  // A  count at position p from 3' end
+    double AG_3[MAX_POS] = {};  // A+G count at position p from 3' end
+
+    int reads_scanned = 0;
+    int typical_len   = 0;
+
+    while (reads_scanned < n_reads && reader.read(rec)) {
+        int L = static_cast<int>(rec.seq.size());
+        if (L > typical_len) typical_len = L;
+
+        for (int p = 0; p < std::min(L, MAX_POS); ++p) {
+            char c5 = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(rec.seq[p])));
+            if      (c5 == 'T') { T_5[p]++;  CT_5[p]++; }
+            else if (c5 == 'C') {             CT_5[p]++; }
+
+            char c3 = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
+            if      (c3 == 'A') { A_3[p]++;  AG_3[p]++; }
+            else if (c3 == 'G') {             AG_3[p]++; }
+        }
+        reads_scanned++;
+    }
+
+    // Per-position frequencies (-1 when count is too low)
+    double freq_T[MAX_POS] = {};
+    double freq_A[MAX_POS] = {};
+    for (int p = 0; p < MAX_POS; ++p) {
+        freq_T[p] = (CT_5[p]  >= 10.0) ? T_5[p]  / CT_5[p]  : -1.0;
+        freq_A[p] = (AG_3[p] >= 10.0) ? A_3[p] / AG_3[p] : -1.0;
+    }
+
+    // Background: average of positions 20-30 (minimal damage zone)
+    double bg_sum = 0.0;
+    int    bg_n   = 0;
+    for (int p = 20; p < std::min(30, MAX_POS); ++p) {
+        if (freq_T[p] >= 0.0) { bg_sum += freq_T[p]; bg_n++; }
+        if (freq_A[p] >= 0.0) { bg_sum += freq_A[p]; bg_n++; }
+    }
+    double background = (bg_n > 0) ? bg_sum / bg_n : 0.02;
+    background = std::max(0.005, std::min(0.15, background));
+
+    // OLS fit: excess(p) ≈ d_max * exp(-lambda * p)
+    // → log(excess / d_max) = -lambda * p   (simple regression, slope = -lambda)
+    auto fit_exp = [&](const double* freq,
+                       double& d_max_out, double& lambda_out) {
+        d_max_out  = (freq[0] >= 0.0) ? std::max(0.0, freq[0] - background) : 0.0;
+        lambda_out = 0.5;
+        if (d_max_out < 0.01) return;
+
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        int n = 0;
+        for (int p = 0; p < std::min(20, MAX_POS); ++p) {
+            if (freq[p] < 0.0) continue;
+            double excess = freq[p] - background;
+            if (excess < 0.005) continue;
+            double y = std::log(excess / d_max_out);
+            sx += p; sy += y; sxx += p * p; sxy += p * y;
+            n++;
+        }
+        if (n < 2) return;
+        double denom = n * sxx - sx * sx;
+        if (std::abs(denom) < 1e-10) return;
+        double slope = (n * sxy - sx * sy) / denom;
+        lambda_out = std::max(0.05, std::min(10.0, -slope));
+    };
+
+    double d_max_5 = 0.0, lambda_5 = 0.5;
+    double d_max_3 = 0.0, lambda_3 = 0.5;
+    fit_exp(freq_T, d_max_5, lambda_5);
+    fit_exp(freq_A, d_max_3, lambda_3);
+
+    DamageProfile profile;
+    profile.d_max_5prime   = d_max_5;
+    profile.d_max_3prime   = d_max_3;
+    profile.lambda_5prime  = lambda_5;
+    profile.lambda_3prime  = lambda_3;
+    profile.background     = background;
+    profile.mask_threshold = mask_threshold;
+    profile.enabled        = (d_max_5 > 0.02 || d_max_3 > 0.02);
+
+    log_info("Pass 0: damage estimation from " +
+             std::to_string(reads_scanned) + " reads in " + path);
+    log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
+             " lambda=" + std::to_string(lambda_5));
+    log_info("  3'-end: d_max=" + std::to_string(d_max_3) +
+             " lambda=" + std::to_string(lambda_3));
+    log_info("  Background: " + std::to_string(background));
+    if (profile.enabled && typical_len > 0) {
+        profile.print_info(typical_len);
+    } else {
+        log_info("  Damage below threshold — standard exact hashing will be used");
+    }
+    return profile;
+}
+
+// ============================================================================
 // FASTQ Writer
 // ============================================================================
 
@@ -445,9 +690,10 @@ private:
 
 class DerepEngine {
 public:
-    DerepEngine(bool use_revcomp, bool write_clusters, bool use_pigz, bool use_isal)
+    DerepEngine(bool use_revcomp, bool write_clusters, bool use_pigz, bool use_isal,
+                const DamageProfile& profile = DamageProfile{})
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
-          use_pigz_(use_pigz), use_isal_(use_isal), total_reads_(0) {}
+          use_pigz_(use_pigz), use_isal_(use_isal), profile_(profile), total_reads_(0) {}
 
     void process(const std::string& ext_path,
                  const std::string& non_path,
@@ -518,6 +764,12 @@ private:
         return true;
     }
 
+    uint64_t compute_hash(const std::string& seq) const {
+        if (profile_.enabled)
+            return damage_canonical_hash(seq, profile_, use_revcomp_);
+        return canonical_hash(seq, use_revcomp_);
+    }
+
     void pass1_standard(const std::string& ext_path, const std::string& non_path) {
         FastqReader ext_reader(ext_path, use_pigz_);
         FastqReader non_reader(non_path, use_pigz_);
@@ -526,7 +778,7 @@ private:
         uint64_t record_idx = 0;
 
         while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass1")) {
-            uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            uint64_t h = compute_hash(ext_rec.seq);
             SequenceFingerprint fp(h, ext_rec.seq.size());
 
             auto it = index_.find(fp);
@@ -568,7 +820,7 @@ private:
         uint64_t record_idx = 0;
 
         while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass1")) {
-            uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            uint64_t h = compute_hash(ext_rec.seq);
             SequenceFingerprint fp(h, ext_rec.seq.size());
 
             auto it = index_.find(fp);
@@ -775,6 +1027,7 @@ private:
     bool write_clusters_;
     bool use_pigz_;
     bool use_isal_;
+    DamageProfile profile_;
 
     // Minimal index: (hash + ext_len) → (record_index, non_len, count)
     // Secondary fingerprint (ext_len) helps detect hash collisions.
@@ -806,6 +1059,20 @@ static void print_usage(const char* prog) {
               << "  --pigz      Use pigz for parallel decompression\n"
               << "  --isal      Use ISA-L for hardware-accelerated decompression (FASTEST!)\n"
               << "  -h, --help  Show this help\n"
+              << "\nAncient DNA damage-aware deduplication:\n"
+              << "  --damage-auto        Estimate damage parameters from input (Pass 0)\n"
+              << "  --damage-dmax  FLOAT Set d_max for both 5' and 3' ends manually\n"
+              << "  --damage-dmax5 FLOAT Set d_max for 5' end only\n"
+              << "  --damage-dmax3 FLOAT Set d_max for 3' end only\n"
+              << "  --damage-lambda FLOAT  Set lambda (decay) for both ends\n"
+              << "  --damage-lambda5 FLOAT Set lambda for 5' end only\n"
+              << "  --damage-lambda3 FLOAT Set lambda for 3' end only\n"
+              << "  --damage-bg FLOAT    Background deamination rate (default: 0.02)\n"
+              << "  --mask-threshold FLOAT  Mask positions with P(deamination) > T (default: 0.05)\n"
+              << "  --pcr-cycles INT     Number of PCR cycles (for error modeling)\n"
+              << "  --pcr-efficiency FLOAT  PCR efficiency per cycle, 0-1 (default: 1.0)\n"
+              << "  --pcr-error-rate FLOAT  Error rate in sub/base/doubling (default: 5.3e-7 = Q5/HiFi)\n"
+              << "                          Typical values: Q5=5.3e-7, Phusion=3.9e-6, Taq=1.5e-4\n"
               << "\nMemory usage:\n"
               << "  ~16 bytes per input read (NOT per unique cluster!)\n"
               << "  400M reads = ~6.4 GB RAM\n"
@@ -822,8 +1089,24 @@ int derep_main(int argc, char** argv) {
 
     std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path;
     bool use_revcomp = true;
-    bool use_pigz = false;
-    bool use_isal = false;
+    bool use_pigz    = false;
+    bool use_isal    = false;
+
+    // Damage model options
+    bool   damage_auto     = false;
+    double damage_dmax5    = -1.0;  // < 0 means "not set"
+    double damage_dmax3    = -1.0;
+    double damage_lambda5  = 0.5;
+    double damage_lambda3  = 0.5;
+    double damage_bg       = 0.02;
+    double mask_threshold  = 0.05;
+    int    pcr_cycles      = 0;
+    double pcr_efficiency  = 1.0;     // PCR amplification efficiency per cycle (0–1)
+    // Error rate in sub/base/doubling (Potapov & Ong 2017):
+    //   Q5/HiFi:  5.3e-7   Phusion/Pfu: 3.9e-6   KOD: 1.2e-5   Taq: 1.5e-4
+    // Thermocycling damage adds ~1.4e-6/base/cycle (97% C→T, any polymerase).
+    // Default: Q5-class HiFi polymerase — appropriate for well-controlled libraries.
+    double pcr_phi         = 5.3e-7;  // sub/base/doubling
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -847,6 +1130,30 @@ int derep_main(int argc, char** argv) {
             use_pigz = true;
         } else if (arg == "--isal") {
             use_isal = true;
+        } else if (arg == "--damage-auto") {
+            damage_auto = true;
+        } else if (arg == "--damage-dmax" && i + 1 < argc) {
+            damage_dmax5 = damage_dmax3 = std::stod(argv[++i]);
+        } else if (arg == "--damage-dmax5" && i + 1 < argc) {
+            damage_dmax5 = std::stod(argv[++i]);
+        } else if (arg == "--damage-dmax3" && i + 1 < argc) {
+            damage_dmax3 = std::stod(argv[++i]);
+        } else if (arg == "--damage-lambda" && i + 1 < argc) {
+            damage_lambda5 = damage_lambda3 = std::stod(argv[++i]);
+        } else if (arg == "--damage-lambda5" && i + 1 < argc) {
+            damage_lambda5 = std::stod(argv[++i]);
+        } else if (arg == "--damage-lambda3" && i + 1 < argc) {
+            damage_lambda3 = std::stod(argv[++i]);
+        } else if (arg == "--damage-bg" && i + 1 < argc) {
+            damage_bg = std::stod(argv[++i]);
+        } else if (arg == "--mask-threshold" && i + 1 < argc) {
+            mask_threshold = std::stod(argv[++i]);
+        } else if (arg == "--pcr-cycles" && i + 1 < argc) {
+            pcr_cycles = std::stoi(argv[++i]);
+        } else if (arg == "--pcr-efficiency" && i + 1 < argc) {
+            pcr_efficiency = std::stod(argv[++i]);
+        } else if (arg == "--pcr-error-rate" && i + 1 < argc) {
+            pcr_phi = std::stod(argv[++i]);
         }
     }
 
@@ -876,8 +1183,37 @@ int derep_main(int argc, char** argv) {
     }
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
 
+    // Build damage profile
+    // Effective doublings: D = n * log2(1+E)  (Potapov & Ong 2017, Eq. 6 framework)
+    // PCR error contribution per base (for two independent reads in a duplicate):
+    //   pcr_error_rate = 2 * phi * D  (factor 2: both reads accumulate errors)
+    // We store the per-base-per-read rate; expected_mismatches() multiplies by L and 2.
+    double D_eff = pcr_cycles * std::log2(1.0 + pcr_efficiency);
+    double pcr_total_rate = pcr_phi * D_eff;  // per base, single read
+
+    DamageProfile profile;
+    profile.mask_threshold = mask_threshold;
+    profile.pcr_error_rate = pcr_total_rate;
+
     try {
-        DerepEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal);
+        if (damage_auto) {
+            // Pass 0: estimate from the non-extended file (typically shorter reads,
+            // more representative of capture/library prep damage)
+            profile = estimate_damage(nonext_path, 100000, mask_threshold);
+            profile.pcr_error_rate = pcr_total_rate;
+        } else if (damage_dmax5 >= 0.0) {
+            // Manual specification
+            profile.d_max_5prime  = damage_dmax5;
+            profile.d_max_3prime  = (damage_dmax3 >= 0.0) ? damage_dmax3 : damage_dmax5;
+            profile.lambda_5prime = damage_lambda5;
+            profile.lambda_3prime = damage_lambda3;
+            profile.background    = damage_bg;
+            profile.pcr_error_rate = pcr_total_rate;
+            profile.enabled       = (damage_dmax5 > 0.0);
+            profile.print_info(/*typical_read_length=*/0);
+        }
+
+        DerepEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal, profile);
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
