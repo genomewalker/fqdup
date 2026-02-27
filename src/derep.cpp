@@ -80,12 +80,12 @@ struct ErrCorParams {
 
 struct IndexEntry {
     uint64_t record_index;  // Sequential record number
+    uint64_t count;         // Number of duplicates (uint64_t: handles >4 G dups cleanly)
     uint32_t non_len;       // Non-extended sequence length
-    uint32_t count;         // Number of duplicates
     uint32_t seq_id;        // Index into SeqArena (populated when --error-correct is on)
 
-    IndexEntry() : record_index(0), non_len(0), count(1), seq_id(0) {}
-    IndexEntry(uint64_t idx, uint32_t len) : record_index(idx), non_len(len), count(1), seq_id(0) {}
+    IndexEntry() : record_index(0), count(1), non_len(0), seq_id(0) {}
+    IndexEntry(uint64_t idx, uint32_t len) : record_index(idx), count(1), non_len(len), seq_id(0) {}
 };
 
 struct SequenceFingerprint {
@@ -135,6 +135,10 @@ struct SeqArena {
     uint32_t append(const std::string& seq) {
         if (seq.size() > 65535u)
             throw std::runtime_error("Sequence too long for arena (>65535 bp)");
+        if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
+        if (bases.size() + seq.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            throw std::runtime_error("SeqArena base array overflow (> 4 GB of sequence data)");
         uint32_t id = static_cast<uint32_t>(offsets.size());
         offsets.push_back(static_cast<uint32_t>(bases.size()));
         lengths.push_back(static_cast<uint16_t>(seq.size()));
@@ -170,6 +174,8 @@ struct PairIndex {
         if (bv.len == 0) {
             bv.first = id;
         } else {
+            if (pool.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+                throw std::runtime_error("PairIndex pool overflow (> 4 G spill nodes)");
             uint32_t node = static_cast<uint32_t>(pool.size());
             pool.push_back({id, bv.spill_head});
             bv.spill_head = node;
@@ -1101,13 +1107,15 @@ private:
     // A cluster C (count <= max_count) is absorbed into parent P (count >= ratio*C.count)
     // if their extended sequences differ by at most 1 substitution OUTSIDE the damage zone.
     void phase3_error_correct() {
+        if (arena_.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            throw std::runtime_error("Phase 3: arena size exceeds uint32_t range");
         const uint32_t N = static_cast<uint32_t>(arena_.size());
         if (N == 0) return;
 
         is_error_.assign(N, false);
 
         // Build seq_id → count lookup from index
-        std::vector<uint32_t> id_count(N, 0);
+        std::vector<uint64_t> id_count(N, 0);
         for (const auto& [fp, entry] : index_)
             id_count[entry.seq_id] = entry.count;
 
