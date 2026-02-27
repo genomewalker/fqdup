@@ -206,7 +206,9 @@ static inline uint64_t rotl64(uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
-// Order-independent pair key: tag ∈ {0,1,2} identifies which two parts are paired.
+// Pair key for two part-hashes (ha, hb), with a tag identifying which pair {0,1,2}
+// and the interior length.  NOT commutative — callers must pass (ha, hb) in the
+// same order for insert and query (convention: lower index first).
 static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
     return splitmix64(ha ^ rotl64(hb, 23)
                       ^ (static_cast<uint64_t>(tag) << 56)
