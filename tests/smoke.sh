@@ -42,14 +42,14 @@ TTTTTTTT
 +
 IIIIIIII
 @read_001
-AAAA
+AAAAAA
 +
-IIII
+IIIIII
 EOF
 
 # ---- fqdup sort ----
-"$FQDUP" sort -i non.fq -o non.sorted.fq --max-memory 1G -t .
-"$FQDUP" sort -i ext.fq -o ext.sorted.fq --max-memory 1G -t .
+"$FQDUP" sort -i non.fq -o non.sorted.fq --max-memory 1G -t . --fast
+"$FQDUP" sort -i ext.fq -o ext.sorted.fq --max-memory 1G -t . --fast
 
 if [[ ! -s non.sorted.fq ]]; then
     echo "FAIL: non.sorted.fq missing or empty"
