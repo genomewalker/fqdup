@@ -500,14 +500,20 @@ private:
 // Damage estimation (DART-inspired, needs FastqReader defined above)
 // ============================================================================
 
-// Scan the first n_reads records of a (possibly gzipped) FASTQ file,
+// Sample n_reads records uniformly from a (possibly gzipped) FASTQ file,
 // accumulate per-position T/(C+T) and A/(A+G) frequencies, estimate a
 // background level from positions 20-30, then fit an exponential decay
 //   excess(p) = d_max * exp(-lambda * p)
 // via ordinary least squares on the log-linearised data.
+//
+// Uses systematic stride sampling (every stride-th record) so that samples
+// are spread throughout the file rather than drawn from the beginning only.
+// This matters when the input is sorted — position-sorted reads would make
+// the first N records an unrepresentative subsample of one chromosome.
 static DamageProfile estimate_damage(const std::string& path,
                                      int    n_reads,
-                                     double mask_threshold) {
+                                     double mask_threshold,
+                                     int    stride = 1000) {
     FastqReader reader(path, /*use_pigz=*/false);
     FastqRecord rec;
 
@@ -517,25 +523,35 @@ static DamageProfile estimate_damage(const std::string& path,
     double A_3[MAX_POS]  = {};  // A  count at position p from 3' end
     double AG_3[MAX_POS] = {};  // A+G count at position p from 3' end
 
-    int reads_scanned = 0;
-    int typical_len   = 0;
+    int      reads_scanned = 0;
+    int      typical_len   = 0;
+    uint64_t record_pos    = 0;
 
-    while (reads_scanned < n_reads && reader.read(rec)) {
-        int L = static_cast<int>(rec.seq.size());
-        if (L > typical_len) typical_len = L;
+    // Read up to n_reads * stride total records so that n_reads samples
+    // are spread across the first (n_reads * stride) records of the file.
+    // For a 400 M-read file with defaults (n_reads=100k, stride=1000) this
+    // scans 100 M records — roughly the whole file for typical library sizes.
+    const uint64_t max_to_scan = static_cast<uint64_t>(n_reads) * stride;
 
-        for (int p = 0; p < std::min(L, MAX_POS); ++p) {
-            char c5 = static_cast<char>(
-                std::toupper(static_cast<unsigned char>(rec.seq[p])));
-            if      (c5 == 'T') { T_5[p]++;  CT_5[p]++; }
-            else if (c5 == 'C') {             CT_5[p]++; }
+    while (record_pos < max_to_scan && reader.read(rec)) {
+        if (record_pos % stride == 0) {
+            int L = static_cast<int>(rec.seq.size());
+            if (L > typical_len) typical_len = L;
 
-            char c3 = static_cast<char>(
-                std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
-            if      (c3 == 'A') { A_3[p]++;  AG_3[p]++; }
-            else if (c3 == 'G') {             AG_3[p]++; }
+            for (int p = 0; p < std::min(L, MAX_POS); ++p) {
+                char c5 = static_cast<char>(
+                    std::toupper(static_cast<unsigned char>(rec.seq[p])));
+                if      (c5 == 'T') { T_5[p]++;  CT_5[p]++; }
+                else if (c5 == 'C') {             CT_5[p]++; }
+
+                char c3 = static_cast<char>(
+                    std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
+                if      (c3 == 'A') { A_3[p]++;  AG_3[p]++; }
+                else if (c3 == 'G') {             AG_3[p]++; }
+            }
+            reads_scanned++;
         }
-        reads_scanned++;
+        record_pos++;
     }
 
     // Per-position frequencies (-1 when count is too low)
@@ -595,8 +611,10 @@ static DamageProfile estimate_damage(const std::string& path,
     profile.mask_threshold = mask_threshold;
     profile.enabled        = (d_max_5 > 0.02 || d_max_3 > 0.02);
 
-    log_info("Pass 0: damage estimation from " +
-             std::to_string(reads_scanned) + " reads in " + path);
+    log_info("Pass 0: damage estimation — sampled " +
+             std::to_string(reads_scanned) + " reads (every " +
+             std::to_string(stride) + "th) from " +
+             std::to_string(record_pos) + " scanned in " + path);
     log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
              " lambda=" + std::to_string(lambda_5));
     log_info("  3'-end: d_max=" + std::to_string(d_max_3) +
@@ -1061,6 +1079,9 @@ static void print_usage(const char* prog) {
               << "  -h, --help  Show this help\n"
               << "\nAncient DNA damage-aware deduplication:\n"
               << "  --damage-auto        Estimate damage parameters from input (Pass 0)\n"
+              << "  --damage-stride INT  Sampling stride for Pass 0 (default: 1000)\n"
+              << "                       Samples every N-th read to cover sorted files uniformly.\n"
+              << "                       Total records scanned = 100000 * stride.\n"
               << "  --damage-dmax  FLOAT Set d_max for both 5' and 3' ends manually\n"
               << "  --damage-dmax5 FLOAT Set d_max for 5' end only\n"
               << "  --damage-dmax3 FLOAT Set d_max for 3' end only\n"
@@ -1100,6 +1121,7 @@ int derep_main(int argc, char** argv) {
     double damage_lambda3  = 0.5;
     double damage_bg       = 0.02;
     double mask_threshold  = 0.05;
+    int    damage_stride   = 1000;  // sample every N-th read during damage estimation
     int    pcr_cycles      = 0;
     double pcr_efficiency  = 1.0;     // PCR amplification efficiency per cycle (0–1)
     // Error rate in sub/base/doubling (Potapov & Ong 2017):
@@ -1132,6 +1154,8 @@ int derep_main(int argc, char** argv) {
             use_isal = true;
         } else if (arg == "--damage-auto") {
             damage_auto = true;
+        } else if (arg == "--damage-stride" && i + 1 < argc) {
+            damage_stride = std::stoi(argv[++i]);
         } else if (arg == "--damage-dmax" && i + 1 < argc) {
             damage_dmax5 = damage_dmax3 = std::stod(argv[++i]);
         } else if (arg == "--damage-dmax5" && i + 1 < argc) {
@@ -1199,7 +1223,7 @@ int derep_main(int argc, char** argv) {
         if (damage_auto) {
             // Pass 0: estimate from the non-extended file (typically shorter reads,
             // more representative of capture/library prep damage)
-            profile = estimate_damage(nonext_path, 100000, mask_threshold);
+            profile = estimate_damage(nonext_path, 100000, mask_threshold, damage_stride);
             profile.pcr_error_rate = pcr_total_rate;
         } else if (damage_dmax5 >= 0.0) {
             // Manual specification
