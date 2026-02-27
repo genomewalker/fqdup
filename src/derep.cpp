@@ -206,10 +206,10 @@ static inline uint64_t rotl64(uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
-// Pair key for two part-hashes (ha, hb), with a tag identifying which pair {0,1,2}
-// and the interior length.  NOT commutative — callers must pass (ha, hb) in the
-// same order for insert and query (convention: lower index first).
+// Truly order-independent pair key: normalise (ha,hb) so min is always first,
+// then mix.  Safe to call as pair_key(h0,h1,...) or pair_key(h1,h0,...).
 static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
+    if (ha > hb) std::swap(ha, hb);
     return splitmix64(ha ^ rotl64(hb, 23)
                       ^ (static_cast<uint64_t>(tag) << 56)
                       ^ static_cast<uint64_t>(ilen));
@@ -1142,8 +1142,8 @@ private:
 
         // Phase 3b: for each child (count <= max_count), search for a parent
         // at interior Hamming distance <= 1 with count >= ratio × child count.
-        std::vector<uint32_t> seen_epoch(N, 0);
-        uint32_t epoch = 0;
+        std::vector<uint64_t> seen_epoch(N, 0);
+        uint64_t epoch = 0;
 
         for (uint32_t cid = 0; cid < N; ++cid) {
             if (id_count[cid] > errcor_.max_count) continue;
