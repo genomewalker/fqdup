@@ -42,6 +42,10 @@
 #include "flat_hash_map.hpp"
 #include <xxhash.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #ifdef __linux__
 #include <malloc.h>
 #endif
@@ -63,6 +67,13 @@ namespace {
 
 constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;  // 4MB
 
+struct ErrCorParams {
+    bool     enabled    = false;
+    double   ratio      = 50.0;   // parent must have count >= ratio × child count
+    uint32_t max_count  = 5;      // only query seqs with count <= max_count
+    uint32_t bucket_cap = 64;     // max pair-key bucket size (limits low-complexity bloat)
+};
+
 // ============================================================================
 // Minimal index entry - only 16 bytes per record!
 // ============================================================================
@@ -71,9 +82,10 @@ struct IndexEntry {
     uint64_t record_index;  // Sequential record number
     uint32_t non_len;       // Non-extended sequence length
     uint32_t count;         // Number of duplicates
+    uint32_t seq_id;        // Index into SeqArena (populated when --error-correct is on)
 
-    IndexEntry() : record_index(0), non_len(0), count(1) {}
-    IndexEntry(uint64_t idx, uint32_t len) : record_index(idx), non_len(len), count(1) {}
+    IndexEntry() : record_index(0), non_len(0), count(1), seq_id(0) {}
+    IndexEntry(uint64_t idx, uint32_t len) : record_index(idx), non_len(len), count(1), seq_id(0) {}
 };
 
 struct SequenceFingerprint {
@@ -99,6 +111,135 @@ struct SequenceFingerprintHash {
         return static_cast<size_t>(mixed ^ (mixed >> 32));
     }
 };
+
+// ============================================================================
+// Phase 3: PCR Error Correction — data structures
+//
+// Count-stratified 3-way pigeonhole neighbor finding for edit-distance-1
+// detection.  Reads with count ≤ max_count that have a neighbour with
+// count ≥ ratio × their own count are classified as PCR error duplicates
+// and removed from the output.
+//
+// 3-way pigeonhole principle:
+//   Split interior [k5, L-k3) into three parts p0, p1, p2.
+//   If Hamming(child, parent) == 1 inside the interior, at least two of the
+//   three parts match exactly.  We index all three (matched-pair) combinations
+//   so any 1-error variant is found by exactly one lookup.
+// ============================================================================
+
+struct SeqArena {
+    std::vector<uint8_t>  bases;
+    std::vector<uint32_t> offsets;
+    std::vector<uint16_t> lengths;
+
+    uint32_t append(const std::string& seq) {
+        if (seq.size() > 65535u)
+            throw std::runtime_error("Sequence too long for arena (>65535 bp)");
+        uint32_t id = static_cast<uint32_t>(offsets.size());
+        offsets.push_back(static_cast<uint32_t>(bases.size()));
+        lengths.push_back(static_cast<uint16_t>(seq.size()));
+        bases.insert(bases.end(),
+                     reinterpret_cast<const uint8_t*>(seq.data()),
+                     reinterpret_cast<const uint8_t*>(seq.data()) + seq.size());
+        return id;
+    }
+
+    const uint8_t* data(uint32_t id)   const { return bases.data() + offsets[id]; }
+    uint16_t       length(uint32_t id) const { return lengths[id]; }
+    size_t         size()              const { return offsets.size(); }
+};
+
+// Pair-key bucket: inline first entry + singly-linked overflow list.
+struct SpillNode { uint32_t id; uint32_t next; };
+
+struct BucketVal {
+    uint32_t first      = 0;
+    uint32_t spill_head = 0;
+    uint32_t len        = 0;
+};
+
+struct PairIndex {
+    ska::flat_hash_map<uint64_t, BucketVal> map;
+    std::vector<SpillNode> pool;
+
+    PairIndex() { pool.push_back({0, 0}); }  // index 0 = sentinel
+
+    void insert(uint64_t key, uint32_t id, uint32_t cap) {
+        auto& bv = map[key];
+        if (bv.len >= cap) return;
+        if (bv.len == 0) {
+            bv.first = id;
+        } else {
+            uint32_t node = static_cast<uint32_t>(pool.size());
+            pool.push_back({id, bv.spill_head});
+            bv.spill_head = node;
+        }
+        bv.len++;
+    }
+
+    template <typename F>
+    void query(uint64_t key, F&& fn) const {
+        auto it = map.find(key);
+        if (it == map.end() || it->second.len == 0) return;
+        fn(it->second.first);
+        uint32_t idx = it->second.spill_head;
+        while (idx != 0) { fn(pool[idx].id); idx = pool[idx].next; }
+    }
+};
+
+struct Split3 { int o0, l0, o1, l1, o2, l2; };
+
+static inline Split3 make_split3(int k5, int ilen) {
+    int s0 = ilen / 3;
+    int s1 = (ilen * 2) / 3 - s0;
+    int s2 = ilen - s0 - s1;
+    return { k5, s0, k5 + s0, s1, k5 + s0 + s1, s2 };
+}
+
+static inline uint64_t splitmix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint64_t rotl64(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+// Order-independent pair key: tag ∈ {0,1,2} identifies which two parts are paired.
+static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
+    return splitmix64(ha ^ rotl64(hb, 23)
+                      ^ (static_cast<uint64_t>(tag) << 56)
+                      ^ static_cast<uint64_t>(ilen));
+}
+
+// Returns true if Hamming distance between a[k5..k5+ilen) and b[k5..k5+ilen) <= 1.
+#ifdef __AVX2__
+static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
+                                  int k5, int ilen) {
+    a += k5; b += k5;
+    int mm = 0, i = 0;
+    for (; i + 32 <= ilen; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
+        int diff = ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
+        mm += __builtin_popcount(static_cast<unsigned>(diff));
+        if (mm > 1) return false;
+    }
+    for (; i < ilen; ++i)
+        if (a[i] != b[i] && ++mm > 1) return false;
+    return true;
+}
+#else
+static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
+                                  int k5, int ilen) {
+    a += k5; b += k5;
+    int mm = 0;
+    for (int i = 0; i < ilen; ++i)
+        if (a[i] != b[i] && ++mm > 1) return false;
+    return true;
+}
+#endif
 
 // ============================================================================
 // Ancient DNA Damage Model
@@ -230,6 +371,19 @@ static std::string apply_damage_mask(const std::string& seq,
         }
     }
     return m;
+}
+
+// Compute the number of 5' and 3' terminal positions to exclude from the
+// error-correction interior.  These are positions where the damage excess
+// exceeds mask_threshold — the same positions masked during hashing.
+// When damage is not enabled, k5 = k3 = 0 (full sequence is interior).
+static std::pair<int,int> damage_zone_bounds(int L, const DamageProfile& prof) {
+    if (!prof.enabled) return {0, 0};
+    int k5 = 0;
+    while (k5 < L && prof.dmg_5(k5) > prof.mask_threshold) k5++;
+    int k3 = 0;
+    while (k3 < L - k5 && prof.dmg_3(k3) > prof.mask_threshold) k3++;
+    return {k5, k3};
 }
 
 // Forward declaration — defined in the Utilities section below.
@@ -767,9 +921,11 @@ private:
 class DerepEngine {
 public:
     DerepEngine(bool use_revcomp, bool write_clusters, bool use_pigz, bool use_isal,
-                const DamageProfile& profile = DamageProfile{})
+                const DamageProfile& profile = DamageProfile{},
+                const ErrCorParams& errcor = ErrCorParams{})
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
-          use_pigz_(use_pigz), use_isal_(use_isal), profile_(profile), total_reads_(0) {}
+          use_pigz_(use_pigz), use_isal_(use_isal), profile_(profile),
+          errcor_(errcor), total_reads_(0), errcor_absorbed_(0) {}
 
     void process(const std::string& ext_path,
                  const std::string& non_path,
@@ -796,6 +952,11 @@ public:
         size_t index_mb = (index_.size() * sizeof(std::pair<SequenceFingerprint, IndexEntry>)) / (1024 * 1024);
         log_info("Index size: " + std::to_string(index_mb) + " MB for " +
                 std::to_string(total_reads_) + " reads");
+
+        if (errcor_.enabled) {
+            log_info("Phase 3: PCR error correction");
+            phase3_error_correct();
+        }
 
         log_info("Pass 2: Write unique records");
 
@@ -859,8 +1020,11 @@ private:
 
             auto it = index_.find(fp);
             if (it == index_.end()) {
-                // New cluster - store minimal info
-                index_.emplace(fp, IndexEntry(record_idx, non_rec.seq.size()));
+                // New cluster — store minimal info + optionally arena entry
+                IndexEntry entry(record_idx, non_rec.seq.size());
+                if (errcor_.enabled)
+                    entry.seq_id = arena_.append(ext_rec.seq);
+                index_.emplace(fp, entry);
             } else {
                 // Existing cluster - update count and check if this is longer
                 it->second.count++;
@@ -901,7 +1065,10 @@ private:
 
             auto it = index_.find(fp);
             if (it == index_.end()) {
-                index_.emplace(fp, IndexEntry(record_idx, non_rec.seq.size()));
+                IndexEntry entry(record_idx, non_rec.seq.size());
+                if (errcor_.enabled)
+                    entry.seq_id = arena_.append(ext_rec.seq);
+                index_.emplace(fp, entry);
             } else {
                 it->second.count++;
                 if (non_rec.seq.size() > it->second.non_len) {
@@ -927,6 +1094,102 @@ private:
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
     }
 #endif
+
+    // Phase 3: absorb PCR error duplicates.
+    // A cluster C (count <= max_count) is absorbed into parent P (count >= ratio*C.count)
+    // if their extended sequences differ by at most 1 substitution OUTSIDE the damage zone.
+    void phase3_error_correct() {
+        const uint32_t N = static_cast<uint32_t>(arena_.size());
+        if (N == 0) return;
+
+        is_error_.assign(N, false);
+
+        // Build seq_id → count lookup from index
+        std::vector<uint32_t> id_count(N, 0);
+        for (const auto& [fp, entry] : index_)
+            id_count[entry.seq_id] = entry.count;
+
+        // Phase 3a: index all parent sequences (count > max_count) by pair-keys
+        // Shard by interior_len — prevents cross-length false candidates.
+        struct LenShard { std::array<PairIndex, 3> pi; };
+        ska::flat_hash_map<int, LenShard> shards;
+        shards.reserve(64);
+
+        uint64_t n_parents = 0;
+        for (uint32_t id = 0; id < N; ++id) {
+            if (id_count[id] <= errcor_.max_count) continue;
+            int L = arena_.length(id);
+            auto [k5, k3] = damage_zone_bounds(L, profile_);
+            int ilen = std::max(0, L - k5 - k3);
+            if (ilen < 3) continue;
+
+            const uint8_t* seq = arena_.data(id);
+            Split3 sp = make_split3(k5, ilen);
+            uint64_t h0 = XXH3_64bits(seq + sp.o0, sp.l0);
+            uint64_t h1 = XXH3_64bits(seq + sp.o1, sp.l1);
+            uint64_t h2 = XXH3_64bits(seq + sp.o2, sp.l2);
+
+            auto& sh = shards[ilen];
+            sh.pi[0].insert(pair_key(h0, h1, 0, ilen), id, errcor_.bucket_cap);
+            sh.pi[1].insert(pair_key(h0, h2, 1, ilen), id, errcor_.bucket_cap);
+            sh.pi[2].insert(pair_key(h1, h2, 2, ilen), id, errcor_.bucket_cap);
+            n_parents++;
+        }
+        log_info("Phase 3: indexed " + std::to_string(n_parents) + " parent sequences (count>" +
+                 std::to_string(errcor_.max_count) + ")");
+
+        // Phase 3b: for each child (count <= max_count), search for a parent
+        // at interior Hamming distance <= 1 with count >= ratio × child count.
+        std::vector<uint32_t> seen_epoch(N, 0);
+        uint32_t epoch = 0;
+
+        for (uint32_t cid = 0; cid < N; ++cid) {
+            if (id_count[cid] > errcor_.max_count) continue;
+            if (is_error_[cid]) continue;
+
+            int L = arena_.length(cid);
+            auto [k5, k3] = damage_zone_bounds(L, profile_);
+            int ilen = std::max(0, L - k5 - k3);
+            if (ilen < 3) continue;
+
+            auto shard_it = shards.find(ilen);
+            if (shard_it == shards.end()) continue;
+
+            const uint8_t* child_seq = arena_.data(cid);
+            Split3 sp = make_split3(k5, ilen);
+            uint64_t h0 = XXH3_64bits(child_seq + sp.o0, sp.l0);
+            uint64_t h1 = XXH3_64bits(child_seq + sp.o1, sp.l1);
+            uint64_t h2 = XXH3_64bits(child_seq + sp.o2, sp.l2);
+
+            epoch++;
+            bool absorbed = false;
+
+            auto check = [&](uint32_t pid) {
+                if (absorbed) return;
+                if (seen_epoch[pid] == epoch) return;
+                seen_epoch[pid] = epoch;
+                if (is_error_[pid]) return;
+                if (arena_.length(pid) != static_cast<uint16_t>(L)) return;
+                if (static_cast<double>(id_count[pid]) < errcor_.ratio * id_count[cid]) return;
+                if (interior_hamming_le1(arena_.data(pid), child_seq, k5, ilen))
+                    absorbed = true;
+            };
+
+            auto& sh = shard_it->second;
+            sh.pi[0].query(pair_key(h0, h1, 0, ilen), check);
+            if (!absorbed) sh.pi[1].query(pair_key(h0, h2, 1, ilen), check);
+            if (!absorbed) sh.pi[2].query(pair_key(h1, h2, 2, ilen), check);
+
+            if (absorbed) {
+                is_error_[cid] = true;
+                errcor_absorbed_++;
+            }
+        }
+
+        log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
+                 " PCR error sequences (ratio=" + std::to_string(errcor_.ratio) +
+                 ", max-count=" + std::to_string(errcor_.max_count) + ")");
+    }
 
     void pass2_standard(const std::string& ext_path,
                        const std::string& non_path,
@@ -960,11 +1223,13 @@ private:
         uint64_t record_idx = 0;
         size_t written = 0;
 
-        // Create set of record indices to write
-        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;  // record_idx → fingerprint
+        // Build set of record indices to write, skipping absorbed PCR error sequences.
+        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
         for (const auto& [fingerprint, entry] : index_) {
+            if (!is_error_.empty() && is_error_[entry.seq_id]) continue;
             records_to_write[entry.record_index] = fingerprint;
         }
+        const size_t n_to_write = records_to_write.size();
 
         while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass2")) {
             auto it = records_to_write.find(record_idx);
@@ -989,7 +1254,7 @@ private:
 
                 written++;
                 if ((written % 100000) == 0) {
-                    std::cerr << "\r[Pass 2] " << written << " / " << index_.size()
+                    std::cerr << "\r[Pass 2] " << written << " / " << n_to_write
                              << " unique records written" << std::flush;
                 }
             }
@@ -1038,8 +1303,10 @@ private:
 
         ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
         for (const auto& [fingerprint, entry] : index_) {
+            if (!is_error_.empty() && is_error_[entry.seq_id]) continue;
             records_to_write[entry.record_index] = fingerprint;
         }
+        const size_t n_to_write = records_to_write.size();
 
         while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec, record_idx, "pass2")) {
             auto it = records_to_write.find(record_idx);
@@ -1063,7 +1330,7 @@ private:
 
                 written++;
                 if ((written % 100000) == 0) {
-                    std::cerr << "\r[Pass 2] " << written << " / " << index_.size()
+                    std::cerr << "\r[Pass 2] " << written << " / " << n_to_write
                              << " unique records written" << std::flush;
                 }
             }
@@ -1081,11 +1348,21 @@ private:
     void print_stats() const {
         log_info("=== Final Statistics ===");
         log_info("Total reads processed: " + std::to_string(total_reads_));
-        log_info("Unique clusters: " + std::to_string(index_.size()));
+        log_info("Unique clusters (dedup): " + std::to_string(index_.size()));
 
         if (total_reads_ > 0) {
             double dup_rate = 100.0 * (1.0 - (double)index_.size() / total_reads_);
             log_info("Deduplication rate: " + std::to_string(dup_rate) + "%");
+        }
+
+        if (errcor_.enabled) {
+            size_t output = index_.size() - errcor_absorbed_;
+            log_info("PCR error sequences removed: " + std::to_string(errcor_absorbed_));
+            log_info("Output sequences: " + std::to_string(output));
+            if (index_.size() > 0) {
+                double ecr = 100.0 * errcor_absorbed_ / index_.size();
+                log_info("Error correction rate: " + std::to_string(ecr) + "%");
+            }
         }
 
 #ifdef __linux__
@@ -1104,12 +1381,17 @@ private:
     bool use_pigz_;
     bool use_isal_;
     DamageProfile profile_;
+    ErrCorParams  errcor_;
 
-    // Minimal index: (hash + ext_len) → (record_index, non_len, count)
-    // Secondary fingerprint (ext_len) helps detect hash collisions.
+    // Minimal index: (hash + ext_len) → (record_index, non_len, count, seq_id)
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
 
+    // Phase 3: error correction state (populated only when errcor_.enabled)
+    SeqArena          arena_;
+    std::vector<bool> is_error_;
+
     uint64_t total_reads_;
+    uint64_t errcor_absorbed_;
 };
 
 // ============================================================================
@@ -1135,6 +1417,15 @@ static void print_usage(const char* prog) {
               << "  --pigz      Use pigz for parallel decompression\n"
               << "  --isal      Use ISA-L for hardware-accelerated decompression (FASTEST!)\n"
               << "  -h, --help  Show this help\n"
+              << "\nPCR error correction (Phase 3 — damage-aware):\n"
+              << "  --error-correct      Enable PCR error duplicate removal after dedup\n"
+              << "                       Absorbs low-count clusters that differ from a high-count\n"
+              << "                       parent by exactly 1 interior substitution.\n"
+              << "                       Terminal (damage-zone) positions are never used to absorb.\n"
+              << "  --errcor-ratio FLOAT  Min count ratio parent/child to absorb (default: 50.0)\n"
+              << "  --errcor-max-count INT  Only absorb clusters with count <= N (default: 5)\n"
+              << "  --errcor-bucket-cap INT Max pair-key bucket size (default: 64)\n"
+              << "                          Lower = faster on low-complexity regions, fewer merges\n"
               << "\nAncient DNA damage-aware deduplication:\n"
               << "  --damage-auto        Estimate damage parameters from input (Pass 0)\n"
               << "  --damage-stride INT  Sampling stride for Pass 0 (default: 1000)\n"
@@ -1171,6 +1462,9 @@ int derep_main(int argc, char** argv) {
     bool use_pigz    = false;
     bool use_isal    = false;
 
+    // Error correction options
+    ErrCorParams errcor;
+
     // Damage model options
     bool   damage_auto     = false;
     double damage_dmax5    = -1.0;  // < 0 means "not set"
@@ -1206,6 +1500,14 @@ int derep_main(int argc, char** argv) {
             cluster_path = argv[++i];
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
+        } else if (arg == "--error-correct") {
+            errcor.enabled = true;
+        } else if (arg == "--errcor-ratio" && i + 1 < argc) {
+            errcor.ratio = std::stod(argv[++i]);
+        } else if (arg == "--errcor-max-count" && i + 1 < argc) {
+            errcor.max_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
+            errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--pigz") {
             use_pigz = true;
         } else if (arg == "--isal") {
@@ -1295,7 +1597,7 @@ int derep_main(int argc, char** argv) {
             profile.print_info(/*typical_read_length=*/0);
         }
 
-        DerepEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal, profile);
+        DerepEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal, profile, errcor);
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
