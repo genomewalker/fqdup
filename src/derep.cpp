@@ -127,6 +127,7 @@ struct DamageProfile {
     double pcr_error_rate = 0.0;   // n_cycles * phi (per bp per cycle)
     bool   enabled        = false;
 
+    // Total P(C→T) at 5'-end position p — used for reporting only.
     double p_ct(int p) const {
         return d_max_5prime * std::exp(-lambda_5prime * p) + background;
     }
@@ -134,15 +135,24 @@ struct DamageProfile {
         return d_max_3prime * std::exp(-lambda_3prime * p) + background;
     }
 
+    // Damage-ONLY excess at position p — used for masking and mismatch model.
+    // Background T/(C+T) reflects genomic AT composition, not damage.  Two
+    // reads from the same molecule at the same position always share the same
+    // reference base, so the background does NOT contribute to pairwise
+    // mismatches between duplicate reads.
+    double dmg_5(int p) const { return d_max_5prime * std::exp(-lambda_5prime * p); }
+    double dmg_3(int p) const { return d_max_3prime * std::exp(-lambda_3prime * p); }
+
     // Expected Hamming distance between two independently-damaged duplicate
-    // reads of length L (Poisson approximation, see header comment above).
+    // reads of length L.  Uses only the damage-specific excess (not background)
+    // because background T/(C+T) is genomic composition, shared by both reads.
     double expected_mismatches(int L) const {
         double e = 0.0;
         for (int p = 0; p < L; ++p) {
-            double pct = p_ct(p);
-            double pga = p_ga(L - 1 - p);
-            e += 2.0 * pct * (1.0 - pct);
-            e += 2.0 * pga * (1.0 - pga);
+            double d5 = dmg_5(p);
+            double d3 = dmg_3(L - 1 - p);
+            e += 2.0 * d5 * (1.0 - d5);
+            e += 2.0 * d3 * (1.0 - d3);
         }
         e += 2.0 * L * pcr_error_rate;
         return e;
@@ -184,26 +194,38 @@ struct DamageProfile {
 };
 
 // Mask damage-prone positions before hashing.
-// C and T at 5'-end positions with P_CT > threshold → sentinel 0x01.
-// G and A at 3'-end positions with P_GA > threshold → sentinel 0x02.
-// swap_ends=true is used for the reverse-complement strand: the 5' end of the
-// RC corresponds to the 3' end of the original molecule, so the 5' and 3'
-// damage rates are exchanged.
+// C and T at 5'-end positions where damage excess > threshold → sentinel 0x01.
+// G and A at 3'-end positions where damage excess > threshold → sentinel 0x02.
+//
+// We threshold on the DAMAGE EXCESS (d_max * exp(-lambda * p)), not on the
+// total P(C→T) = excess + background.  Background T/(C+T) is genomic AT
+// composition — it is the same for both reads in a duplicate pair and does
+// not create mismatches.  Masking based on total P would incorrectly mask
+// every C/T in high-AT genomes.
+//
+// Symmetric masking: at position i we use max(dmg_5(i), dmg_3(i)) so that
+// the mask is identical whether we are looking at the forward read or its
+// reverse complement.  Without this, apply_damage_mask(seq, swap=false) and
+// apply_damage_mask(seq, swap=true) produce different masks for the same
+// sequence, breaking canonical-hash symmetry: canonical(A) ≠ canonical(rc(A))
+// → reads from the same molecule on opposite strands end up in different
+// clusters, inflating the unique-cluster count.
 static std::string apply_damage_mask(const std::string& seq,
-                                     const DamageProfile& prof,
-                                     bool swap_ends) {
+                                     const DamageProfile& prof) {
     std::string m = seq;
     int L = static_cast<int>(seq.size());
     for (int i = 0; i < L; ++i) {
         char cu = static_cast<char>(
             std::toupper(static_cast<unsigned char>(m[i])));
 
-        double rate5 = swap_ends ? prof.p_ga(i)         : prof.p_ct(i);
-        double rate3 = swap_ends ? prof.p_ct(L - 1 - i) : prof.p_ga(L - 1 - i);
+        // Symmetric: take max over both possible strand orientations.
+        // For typical ancient DNA d_max_3 ≈ 0, so this ≈ dmg_5(i).
+        double exc5 = std::max(prof.dmg_5(i),         prof.dmg_3(i));
+        double exc3 = std::max(prof.dmg_5(L - 1 - i), prof.dmg_3(L - 1 - i));
 
-        if (rate5 > prof.mask_threshold && (cu == 'C' || cu == 'T')) {
+        if (exc5 > prof.mask_threshold && (cu == 'C' || cu == 'T')) {
             m[i] = '\x01';
-        } else if (rate3 > prof.mask_threshold && (cu == 'G' || cu == 'A')) {
+        } else if (exc3 > prof.mask_threshold && (cu == 'G' || cu == 'A')) {
             m[i] = '\x02';
         }
     }
@@ -215,17 +237,16 @@ static inline std::string revcomp(const std::string& s);
 
 // Damage-aware canonical hash: mask terminal damage positions so that reads
 // from the same molecule that differ only by deamination hash identically.
-// For the reverse-complement strand the 5'/3' damage profiles are swapped
-// (the 5' end of the RC corresponds to the 3' overhang of the original).
+// Symmetric masking ensures canonical(seq) == canonical(rc(seq)).
 static uint64_t damage_canonical_hash(const std::string& seq,
                                       const DamageProfile& prof,
                                       bool use_revcomp) {
-    std::string masked = apply_damage_mask(seq, prof, /*swap_ends=*/false);
+    std::string masked = apply_damage_mask(seq, prof);
     uint64_t h1 = XXH3_64bits(masked.data(), masked.size());
     if (!use_revcomp) return h1;
 
     std::string rc        = revcomp(seq);
-    std::string masked_rc = apply_damage_mask(rc, prof, /*swap_ends=*/true);
+    std::string masked_rc = apply_damage_mask(rc, prof);
     uint64_t h2 = XXH3_64bits(masked_rc.data(), masked_rc.size());
     return std::min(h1, h2);
 }
@@ -500,16 +521,18 @@ private:
 // Damage estimation (DART-inspired, needs FastqReader defined above)
 // ============================================================================
 
-// Sample n_reads records uniformly from a (possibly gzipped) FASTQ file,
-// accumulate per-position T/(C+T) and A/(A+G) frequencies, estimate a
-// background level from positions 20-30, then fit an exponential decay
-//   excess(p) = d_max * exp(-lambda * p)
-// via ordinary least squares on the log-linearised data.
+// Estimate damage parameters from a (possibly gzipped) FASTQ file.
+// Mirrors DART's approach (sample_profile.cpp):
+//   - Baseline from the MIDDLE THIRD of each read (not from fixed positions
+//     from the ends), so residual damage at positions 10-30 doesn't inflate
+//     the background when lambda is small.
+//   - Amplitude from position 1, not 0 — position 0 can carry adapter/
+//     trimming artifacts independent of damage.
+//   - Coverage-weighted OLS on positions 1-9 in log-space.
+//   - Lambda clamped to [0.05, 0.5] as in DART.
 //
-// Uses systematic stride sampling (every stride-th record) so that samples
-// are spread throughout the file rather than drawn from the beginning only.
-// This matters when the input is sorted — position-sorted reads would make
-// the first N records an unrepresentative subsample of one chromosome.
+// Uses systematic stride sampling (every stride-th record) so samples are
+// spread throughout sorted files rather than drawn only from the start.
 static DamageProfile estimate_damage(const std::string& path,
                                      int    n_reads,
                                      double mask_threshold,
@@ -517,90 +540,124 @@ static DamageProfile estimate_damage(const std::string& path,
     FastqReader reader(path, /*use_pigz=*/false);
     FastqRecord rec;
 
-    constexpr int MAX_POS = 35;
-    double T_5[MAX_POS]  = {};  // T  count at position p from 5' end
-    double CT_5[MAX_POS] = {};  // C+T count at position p from 5' end
-    double A_3[MAX_POS]  = {};  // A  count at position p from 3' end
-    double AG_3[MAX_POS] = {};  // A+G count at position p from 3' end
+    constexpr int FIT_POS = 15;  // Match DART: analyse first/last 15 positions
+
+    double T_5[FIT_POS]  = {};   // T    count at position p from 5' end
+    double CT_5[FIT_POS] = {};   // C+T  count at position p from 5' end
+    double A_3[FIT_POS]  = {};   // A    count at position p from 3' end
+    double AG_3[FIT_POS] = {};   // A+G  count at position p from 3' end
+
+    // Middle-third baseline (like DART's baseline_t_freq / baseline_c_freq)
+    double mid_T = 0, mid_C = 0, mid_A = 0, mid_G = 0;
 
     int      reads_scanned = 0;
     int      typical_len   = 0;
     uint64_t record_pos    = 0;
 
-    // Read up to n_reads * stride total records so that n_reads samples
-    // are spread across the first (n_reads * stride) records of the file.
-    // For a 400 M-read file with defaults (n_reads=100k, stride=1000) this
-    // scans 100 M records — roughly the whole file for typical library sizes.
     const uint64_t max_to_scan = static_cast<uint64_t>(n_reads) * stride;
 
     while (record_pos < max_to_scan && reader.read(rec)) {
         if (record_pos % stride == 0) {
             int L = static_cast<int>(rec.seq.size());
+            if (L < 30) { record_pos++; continue; }  // too short, like DART
             if (L > typical_len) typical_len = L;
 
-            for (int p = 0; p < std::min(L, MAX_POS); ++p) {
-                char c5 = static_cast<char>(
+            // 5' terminal positions
+            for (int p = 0; p < std::min(L, FIT_POS); ++p) {
+                char c = static_cast<char>(
                     std::toupper(static_cast<unsigned char>(rec.seq[p])));
-                if      (c5 == 'T') { T_5[p]++;  CT_5[p]++; }
-                else if (c5 == 'C') {             CT_5[p]++; }
-
-                char c3 = static_cast<char>(
-                    std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
-                if      (c3 == 'A') { A_3[p]++;  AG_3[p]++; }
-                else if (c3 == 'G') {             AG_3[p]++; }
+                if      (c == 'T') { T_5[p]++;  CT_5[p]++; }
+                else if (c == 'C') {             CT_5[p]++; }
             }
+
+            // 3' terminal positions
+            for (int p = 0; p < std::min(L, FIT_POS); ++p) {
+                char c = static_cast<char>(
+                    std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
+                if      (c == 'A') { A_3[p]++;  AG_3[p]++; }
+                else if (c == 'G') {             AG_3[p]++; }
+            }
+
+            // Middle third — DART's most reliable baseline
+            int mid_start = L / 3;
+            int mid_end   = 2 * L / 3;
+            for (int i = mid_start; i < mid_end; ++i) {
+                char c = static_cast<char>(
+                    std::toupper(static_cast<unsigned char>(rec.seq[i])));
+                if      (c == 'T') mid_T++;
+                else if (c == 'C') mid_C++;
+                else if (c == 'A') mid_A++;
+                else if (c == 'G') mid_G++;
+            }
+
             reads_scanned++;
         }
         record_pos++;
     }
 
-    // Per-position frequencies (-1 when count is too low)
-    double freq_T[MAX_POS] = {};
-    double freq_A[MAX_POS] = {};
-    for (int p = 0; p < MAX_POS; ++p) {
-        freq_T[p] = (CT_5[p]  >= 10.0) ? T_5[p]  / CT_5[p]  : -1.0;
-        freq_A[p] = (AG_3[p] >= 10.0) ? A_3[p] / AG_3[p] : -1.0;
+    // Per-position frequencies (-1 when coverage too low, matching DART's 100-read floor)
+    constexpr double MIN_COV = 100.0;
+    double freq_T[FIT_POS] = {};
+    double freq_A[FIT_POS] = {};
+    for (int p = 0; p < FIT_POS; ++p) {
+        freq_T[p] = (CT_5[p]  >= MIN_COV) ? T_5[p]  / CT_5[p]  : -1.0;
+        freq_A[p] = (AG_3[p] >= MIN_COV) ? A_3[p] / AG_3[p] : -1.0;
     }
 
-    // Background: average of positions 20-30 (minimal damage zone)
-    double bg_sum = 0.0;
-    int    bg_n   = 0;
-    for (int p = 20; p < std::min(30, MAX_POS); ++p) {
-        if (freq_T[p] >= 0.0) { bg_sum += freq_T[p]; bg_n++; }
-        if (freq_A[p] >= 0.0) { bg_sum += freq_A[p]; bg_n++; }
-    }
-    double background = (bg_n > 0) ? bg_sum / bg_n : 0.02;
-    background = std::max(0.005, std::min(0.15, background));
+    // Baseline from middle third (DART approach)
+    // background_5 = T/(T+C) in middle; background_3 = A/(A+G) in middle
+    double bg_5 = (mid_T + mid_C > 0) ? mid_T / (mid_T + mid_C) : 0.3;
+    double bg_3 = (mid_A + mid_G > 0) ? mid_A / (mid_A + mid_G) : 0.3;
+    bg_5 = std::max(0.001, std::min(0.999, bg_5));
+    bg_3 = std::max(0.001, std::min(0.999, bg_3));
 
-    // OLS fit: excess(p) ≈ d_max * exp(-lambda * p)
-    // → log(excess / d_max) = -lambda * p   (simple regression, slope = -lambda)
-    auto fit_exp = [&](const double* freq,
+    // Fit exponential decay: freq[p] ≈ baseline + A * exp(-lambda * p)
+    // Coverage-weighted OLS on positions 1-9 in log-space (matching DART).
+    // Amplitude estimated from position 1 (not 0, which can have artifacts).
+    auto fit_exp = [&](const double* freq, const double* cov,
+                       double baseline,
                        double& d_max_out, double& lambda_out) {
-        d_max_out  = (freq[0] >= 0.0) ? std::max(0.0, freq[0] - background) : 0.0;
-        lambda_out = 0.5;
-        if (d_max_out < 0.01) return;
+        // Amplitude from position 1
+        d_max_out  = (freq[1] >= 0.0) ? std::max(0.0, freq[1] - baseline) : 0.0;
+        lambda_out = 0.2;  // DART's default lambda_init
 
-        double sx = 0, sy = 0, sxx = 0, sxy = 0;
-        int n = 0;
-        for (int p = 0; p < std::min(20, MAX_POS); ++p) {
+        if (d_max_out < 0.005) return;  // No meaningful signal
+
+        // Coverage-weighted regression: y = log(excess) vs x = position
+        // slope = -lambda, like DART
+        double sx = 0, sy = 0, sxx = 0, sxy = 0, sw = 0;
+        for (int p = 1; p < std::min(10, FIT_POS); ++p) {  // positions 1-9
             if (freq[p] < 0.0) continue;
-            double excess = freq[p] - background;
+            double excess = freq[p] - baseline;
             if (excess < 0.005) continue;
-            double y = std::log(excess / d_max_out);
-            sx += p; sy += y; sxx += p * p; sxy += p * y;
-            n++;
+            double w = cov[p];
+            double y = std::log(excess);
+            sx  += w * p;
+            sy  += w * y;
+            sxx += w * p * p;
+            sxy += w * p * y;
+            sw  += w;
         }
-        if (n < 2) return;
-        double denom = n * sxx - sx * sx;
+        if (sw < 1.0) return;
+        double denom = sw * sxx - sx * sx;
         if (std::abs(denom) < 1e-10) return;
-        double slope = (n * sxy - sx * sy) / denom;
-        lambda_out = std::max(0.05, std::min(10.0, -slope));
+        double slope = (sw * sxy - sx * sy) / denom;
+        lambda_out = std::max(0.05, std::min(0.5, -slope));  // DART's clamp
+
+        // Re-estimate amplitude from intercept (log(A) = intercept)
+        double intercept = (sy - slope * sx) / sw;
+        double A_new = std::exp(intercept);
+        if (A_new > 0.0 && A_new < 1.0 - baseline) d_max_out = A_new;
     };
 
-    double d_max_5 = 0.0, lambda_5 = 0.5;
-    double d_max_3 = 0.0, lambda_3 = 0.5;
-    fit_exp(freq_T, d_max_5, lambda_5);
-    fit_exp(freq_A, d_max_3, lambda_3);
+    double d_max_5 = 0.0, lambda_5 = 0.2;
+    double d_max_3 = 0.0, lambda_3 = 0.2;
+    fit_exp(freq_T, CT_5, bg_5, d_max_5, lambda_5);
+    fit_exp(freq_A, AG_3, bg_3, d_max_3, lambda_3);
+
+    // Use the average of the two middle-third baselines for the stored
+    // background (kept for reporting; masking now uses per-strand backgrounds).
+    double background = (bg_5 + bg_3) / 2.0;
 
     DamageProfile profile;
     profile.d_max_5prime   = d_max_5;
@@ -616,10 +673,11 @@ static DamageProfile estimate_damage(const std::string& path,
              std::to_string(stride) + "th) from " +
              std::to_string(record_pos) + " scanned in " + path);
     log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
-             " lambda=" + std::to_string(lambda_5));
+             " lambda=" + std::to_string(lambda_5) +
+             " bg=" + std::to_string(bg_5));
     log_info("  3'-end: d_max=" + std::to_string(d_max_3) +
-             " lambda=" + std::to_string(lambda_3));
-    log_info("  Background: " + std::to_string(background));
+             " lambda=" + std::to_string(lambda_3) +
+             " bg=" + std::to_string(bg_3));
     if (profile.enabled && typical_len > 0) {
         profile.print_info(typical_len);
     } else {
