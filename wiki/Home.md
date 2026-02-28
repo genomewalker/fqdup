@@ -59,25 +59,39 @@ alone is sufficient.
 
 ## Pipeline overview
 
+The upstream steps that produce fqdup's inputs are:
+
+1. **fastp merge** — collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
+2. **Tadpole** — extend each merged read outward from both ends using de Bruijn graph assembly, recovering sequence that may be present in other reads in the library
+
+This produces two files for the same set of molecules:
+- **merged** (`-n`): the original fastp-merged read — actual ancient DNA sequence
+- **extended** (`-e`): the same read after Tadpole extension — longer, assembly-assisted fingerprint
+
+fqdup then runs in three steps:
+
 ```
-fqdup sort        fqdup derep_pairs        fqdup derep
-──────────────    ──────────────────────   ──────────────────────────────────────
-Sort reads by  →  One representative    →  Damage-aware hashing + PCR error
-read ID           pair per cluster         correction (single-file)
-(prerequisite)    (structural dedup)        (biological dedup)
+fqdup sort        fqdup derep_pairs          fqdup derep
+──────────────    ────────────────────────   ─────────────────────────────────────
+Sort merged   →   One representative      →  Damage-aware hashing + PCR error
+and extended      pair per cluster           correction on merged representatives
+reads             (uses extended as           (biological dedup)
+                   fingerprint; keeps
+                   merged as output)
 ```
 
-`derep_pairs` handles paired-file complexity: two files read in lockstep,
-one representative pair per cluster, chosen by longest non-extended read.
-No biology here — just hashing and representative selection.
+`derep_pairs` deduplicates using the Tadpole-extended sequence as the cluster
+fingerprint — it is longer and more unique than the merged read alone, reducing
+false collisions between reads from different molecules. The representative kept
+is the pair with the longest merged read (most original ancient DNA sequence).
 
-`derep` handles the biological layer: optional damage masking, optional PCR
-error correction, single-file input and output.
+`derep` then handles the biological layer on the merged output: damage masking
+collapses reads that differ only due to deamination; Phase 3 absorbs low-count
+clusters that differ from a high-count cluster by a single non-damage substitution.
 
-The split matters because the paired structure (extended vs non-extended reads)
-is a different concern from the damage biology. `derep_pairs` can be used
-without `derep` (if damage correction is not needed), and `derep` can be used
-on single-end data without `derep_pairs`.
+Any residual duplicates `derep` sees are merged reads that were identical but whose
+Tadpole extensions diverged slightly — `derep_pairs` kept both; `derep` collapses
+them on the original merged sequence.
 
 ---
 
@@ -99,19 +113,21 @@ on single-end data without `derep_pairs`.
 ### Full ancient DNA pipeline
 
 ```bash
-# Sort
-fqdup sort -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G --fast
-fqdup sort -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G --fast
+# Sort merged and Tadpole-extended reads
+fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
+fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
 
-# Structural dedup (paired)
+# Structural dedup: one representative pair per cluster (extended = fingerprint)
 fqdup derep_pairs \
-  -n nonext.sorted.fq.gz -e ext.sorted.fq.gz \
-  -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz
+  -n merged.sorted.fq.gz \
+  -e extended.sorted.fq.gz \
+  -o-non merged.deduped.fq.gz \
+  -o-ext  extended.deduped.fq.gz
 
-# Biological dedup (damage + error correction)
+# Biological dedup: damage masking + PCR error correction
 fqdup derep \
-  -i nonext.deduped.fq.gz \
-  -o nonext.final.fq.gz \
+  -i merged.deduped.fq.gz \
+  -o merged.final.fq.gz \
   --damage-auto --error-correct
 ```
 
