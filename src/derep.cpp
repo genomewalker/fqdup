@@ -58,8 +58,13 @@ namespace {
 struct ErrCorParams {
     bool     enabled    = false;
     double   ratio      = 50.0;   // parent must have count >= ratio × child count
-    uint32_t max_count  = 5;      // only query seqs with count <= max_count
+    uint32_t max_count  = 5;      // static child ceiling (hard cap; also minimum when adaptive)
     uint32_t bucket_cap = 64;     // max pair-key bucket size (limits low-complexity bloat)
+    // Adaptive child ceiling from PCR model (Potapov & Ong 2017):
+    //   phi × D_eff  (sub/base/full-PCR-run); 0 = use static max_count only.
+    // Per parent P: effective_max = max(max_count, ceil(P × pcr_rate / 3)).
+    // The /3 is for the specific-substitution spectrum under the equal-rates assumption.
+    double   pcr_rate   = 0.0;
 };
 
 // ============================================================================
@@ -206,6 +211,35 @@ static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
     return true;
 }
 #endif
+
+// Returns true if the substitution a→b (or b→a) is consistent with known
+// ancient or environmental DNA damage, and should therefore NOT be treated
+// as a PCR error:
+//   C↔T, G↔A  — ancient deamination (5'-end C→T and 3'-end G→A)
+//   G↔T, C↔A  — oxidative 8-oxoG damage (uniform across the read)
+static bool is_damage_sub(uint8_t a, uint8_t b) {
+    a &= 0xDFu; b &= 0xDFu;  // cheap ASCII uppercase
+    return ((a == 'C' && b == 'T') || (a == 'T' && b == 'C') ||
+            (a == 'G' && b == 'A') || (a == 'A' && b == 'G') ||
+            (a == 'G' && b == 'T') || (a == 'T' && b == 'G') ||
+            (a == 'C' && b == 'A') || (a == 'A' && b == 'C'));
+}
+
+// Returns true if the interior region has exactly one mismatch and that
+// mismatch is a damage-consistent substitution.  Called only when
+// interior_hamming_le1() already returned true (i.e. 0 or 1 mismatches).
+static bool interior_single_sub_is_damage(const uint8_t* a, const uint8_t* b,
+                                          int k5, int ilen) {
+    a += k5; b += k5;
+    int pos = -1;
+    for (int i = 0; i < ilen; ++i) {
+        if (a[i] != b[i]) {
+            if (pos >= 0) return false;  // >1 mismatch — shouldn't happen
+            pos = i;
+        }
+    }
+    return pos >= 0 && is_damage_sub(a[pos], b[pos]);
+}
 
 // ============================================================================
 // Ancient DNA Damage Model
@@ -633,6 +667,28 @@ private:
         for (const auto& [fp, entry] : index_)
             id_count[entry.seq_id] = entry.count;
 
+        // Adaptive child ceiling: when PCR model is active, raise the pre-filter
+        // so that sequences whose count is explained by a large parent's error rate
+        // are also evaluated as potential children.
+        // child_prefilter = max(static max_count, ceil(max_parent_count × phi×D / 3))
+        uint64_t child_prefilter = errcor_.max_count;
+        if (errcor_.pcr_rate > 0.0) {
+            uint64_t max_parent = 0;
+            for (uint32_t id = 0; id < N; ++id)
+                if (id_count[id] > errcor_.max_count)
+                    max_parent = std::max(max_parent, id_count[id]);
+            if (max_parent > 0) {
+                uint64_t adaptive = static_cast<uint64_t>(
+                    std::ceil(static_cast<double>(max_parent) * errcor_.pcr_rate / 3.0));
+                child_prefilter = std::max(child_prefilter, adaptive);
+                if (adaptive > errcor_.max_count)
+                    log_info("Phase 3: adaptive child ceiling = " +
+                             std::to_string(child_prefilter) +
+                             " (PCR model: max_parent=" + std::to_string(max_parent) +
+                             " × " + std::to_string(errcor_.pcr_rate) + "/3)");
+            }
+        }
+
         struct LenShard { std::array<PairIndex, 3> pi; };
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(64);
@@ -664,7 +720,7 @@ private:
         uint64_t epoch = 0;
 
         for (uint32_t cid = 0; cid < N; ++cid) {
-            if (id_count[cid] > errcor_.max_count) continue;
+            if (id_count[cid] > child_prefilter) continue;
             if (is_error_[cid]) continue;
 
             int L = arena_.length(cid);
@@ -692,8 +748,24 @@ private:
                 if (arena_.length(pid) != static_cast<uint16_t>(L)) return;
                 if (static_cast<double>(id_count[pid]) <
                     errcor_.ratio * id_count[cid]) return;
-                if (interior_hamming_le1(arena_.data(pid), child_seq, k5, ilen))
-                    absorbed = true;
+                // Adaptive child ceiling: per-parent effective max count.
+                // With PCR model active: ceil(parent_count × phi×D / 3).
+                uint64_t eff_max = errcor_.max_count;
+                if (errcor_.pcr_rate > 0.0) {
+                    uint64_t adaptive = static_cast<uint64_t>(
+                        std::ceil(static_cast<double>(id_count[pid]) *
+                                  errcor_.pcr_rate / 3.0));
+                    eff_max = std::max(eff_max, adaptive);
+                }
+                if (id_count[cid] > eff_max) return;
+                if (!interior_hamming_le1(arena_.data(pid), child_seq, k5, ilen))
+                    return;
+                // Protect reads carrying damage-consistent substitutions:
+                // C↔T / G↔A (ancient deamination) and G↔T / C↔A (8-oxoG).
+                if (interior_single_sub_is_damage(arena_.data(pid), child_seq,
+                                                  k5, ilen))
+                    return;
+                absorbed = true;
             };
 
             auto& sh = shard_it->second;
@@ -950,6 +1022,7 @@ int derep_main(int argc, char** argv) {
 
     double D_eff = pcr_cycles * std::log2(1.0 + pcr_efficiency);
     double pcr_total_rate = pcr_phi * D_eff;
+    errcor.pcr_rate = pcr_total_rate;   // thread into Phase 3 adaptive threshold
 
     DamageProfile profile;
     profile.mask_threshold = mask_threshold;
