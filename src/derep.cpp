@@ -489,17 +489,23 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
     auto fit_exp = [&](const double* freq, const double* cov,
                        double baseline,
                        double& d_max_out, double& lambda_out) {
-        d_max_out  = (freq[1] >= 0.0) ? std::max(0.0, freq[1] - baseline) : 0.0;
+        // Normalize excess by (1 - baseline) — the C fraction of the (T+C) pool.
+        // Converts T/(T+C) excess into estimated P(C→T) deamination rate,
+        // matching DART's damage_rate convention and making d_max comparable to metaDMG.
+        const double c_frac = 1.0 - baseline;
+        if (c_frac < 0.1) { d_max_out = 0.0; lambda_out = 0.2; return; }
+
+        d_max_out  = (freq[1] >= 0.0) ? std::max(0.0, (freq[1] - baseline) / c_frac) : 0.0;
         lambda_out = 0.2;
         if (d_max_out < 0.005) return;
 
         double sx = 0, sy = 0, sxx = 0, sxy = 0, sw = 0;
         for (int p = 1; p < std::min(10, FIT_POS); ++p) {
             if (freq[p] < 0.0) continue;
-            double excess = freq[p] - baseline;
-            if (excess < 0.005) continue;
+            double rate = (freq[p] - baseline) / c_frac;
+            if (rate < 0.005) continue;
             double w = cov[p];
-            double y = std::log(excess);
+            double y = std::log(rate);
             sx  += w * p;
             sy  += w * y;
             sxx += w * p * p;
@@ -514,7 +520,7 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
 
         double intercept = (sy - slope * sx) / sw;
         double A_new = std::exp(intercept);
-        if (A_new > 0.0 && A_new < 1.0 - baseline) d_max_out = A_new;
+        if (A_new > 0.0 && A_new < 1.0) d_max_out = A_new;
     };
 
     double d_max_5 = 0.0, lambda_5 = 0.2;
