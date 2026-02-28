@@ -4,7 +4,7 @@
 
 All benchmarks were run on sample `a88af16f35` — 25.8 M fastp-merged reads
 (from paired-end sequencing), mean read length ~91 bp, ancient DNA with
-`d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`. Storage: NFS-mounted.
+`d_max_5 ≈ 0.193`, `lambda_5 ≈ 0.25`. Storage: NFS-mounted.
 
 ### Full pipeline: deduplication quality
 
