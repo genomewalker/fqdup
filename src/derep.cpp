@@ -25,6 +25,8 @@
 #include <vector>
 #include <zlib.h>
 
+#include "dart/sample_damage_profile.hpp"
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -421,22 +423,17 @@ static uint64_t damage_canonical_hash(const std::string& seq,
 }
 
 // ============================================================================
-// Damage estimation — DART-inspired (Pass 0)
+// Damage estimation — DART full pipeline (Pass 0)
+// Uses libdart-damage: dart::FrameSelector + SampleDamageProfile
+// Channels: A (T/C nucleotide freq) + B (stop codon conversion)
+// GC-stratified d_max, Durbin mixture model, joint BIC, pos-0 artifact detection
 // ============================================================================
 
 static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
                                           const std::string& path,
                                           double mask_threshold) {
     FastqRecord rec;
-
-    constexpr int FIT_POS = 15;
-
-    double T_5[FIT_POS]  = {};
-    double CT_5[FIT_POS] = {};
-    double A_3[FIT_POS]  = {};
-    double AG_3[FIT_POS] = {};
-
-    double mid_T = 0, mid_C = 0, mid_A = 0, mid_G = 0;
+    dart::SampleDamageProfile dart_profile;
 
     int      reads_scanned = 0;
     int      typical_len   = 0;
@@ -447,88 +444,25 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
         record_pos++;
         if (L < 30) continue;
         if (L > typical_len) typical_len = L;
-
-        for (int p = 0; p < std::min(L, FIT_POS); ++p) {
-            char c = static_cast<char>(
-                std::toupper(static_cast<unsigned char>(rec.seq[p])));
-            if      (c == 'T') { T_5[p]++;  CT_5[p]++; }
-            else if (c == 'C') {             CT_5[p]++; }
-        }
-        for (int p = 0; p < std::min(L, FIT_POS); ++p) {
-            char c = static_cast<char>(
-                std::toupper(static_cast<unsigned char>(rec.seq[L - 1 - p])));
-            if      (c == 'A') { A_3[p]++;  AG_3[p]++; }
-            else if (c == 'G') {             AG_3[p]++; }
-        }
-        int mid_start = L / 3;
-        int mid_end   = 2 * L / 3;
-        for (int i = mid_start; i < mid_end; ++i) {
-            char c = static_cast<char>(
-                std::toupper(static_cast<unsigned char>(rec.seq[i])));
-            if      (c == 'T') mid_T++;
-            else if (c == 'C') mid_C++;
-            else if (c == 'A') mid_A++;
-            else if (c == 'G') mid_G++;
-        }
+        dart::FrameSelector::update_sample_profile(dart_profile, rec.seq);
         reads_scanned++;
     }
 
-    constexpr double MIN_COV = 100.0;
-    double freq_T[FIT_POS] = {};
-    double freq_A[FIT_POS] = {};
-    for (int p = 0; p < FIT_POS; ++p) {
-        freq_T[p] = (CT_5[p]  >= MIN_COV) ? T_5[p]  / CT_5[p]  : -1.0;
-        freq_A[p] = (AG_3[p] >= MIN_COV) ? A_3[p] / AG_3[p] : -1.0;
-    }
+    dart::FrameSelector::finalize_sample_profile(dart_profile);
 
-    double bg_5 = (mid_T + mid_C > 0) ? mid_T / (mid_T + mid_C) : 0.3;
-    double bg_3 = (mid_A + mid_G > 0) ? mid_A / (mid_A + mid_G) : 0.3;
-    bg_5 = std::max(0.001, std::min(0.999, bg_5));
-    bg_3 = std::max(0.001, std::min(0.999, bg_3));
-
-    auto fit_exp = [&](const double* freq, const double* cov,
-                       double baseline,
-                       double& d_max_out, double& lambda_out) {
-        // Normalize excess by (1 - baseline) — the C fraction of the (T+C) pool.
-        // Converts T/(T+C) excess into estimated P(C→T) deamination rate,
-        // matching DART's damage_rate convention and making d_max comparable to metaDMG.
-        const double c_frac = 1.0 - baseline;
-        if (c_frac < 0.1) { d_max_out = 0.0; lambda_out = 0.2; return; }
-
-        d_max_out  = (freq[1] >= 0.0) ? std::max(0.0, (freq[1] - baseline) / c_frac) : 0.0;
-        lambda_out = 0.2;
-        if (d_max_out < 0.005) return;
-
-        double sx = 0, sy = 0, sxx = 0, sxy = 0, sw = 0;
-        for (int p = 1; p < std::min(10, FIT_POS); ++p) {
-            if (freq[p] < 0.0) continue;
-            double rate = (freq[p] - baseline) / c_frac;
-            if (rate < 0.005) continue;
-            double w = cov[p];
-            double y = std::log(rate);
-            sx  += w * p;
-            sy  += w * y;
-            sxx += w * p * p;
-            sxy += w * p * y;
-            sw  += w;
-        }
-        if (sw < 1.0) return;
-        double denom = sw * sxx - sx * sx;
-        if (std::abs(denom) < 1e-10) return;
-        double slope = (sw * sxy - sx * sy) / denom;
-        lambda_out = std::max(0.05, std::min(0.5, -slope));
-
-        double intercept = (sy - slope * sx) / sw;
-        double A_new = std::exp(intercept);
-        if (A_new > 0.0 && A_new < 1.0) d_max_out = A_new;
-    };
-
-    double d_max_5 = 0.0, lambda_5 = 0.2;
-    double d_max_3 = 0.0, lambda_3 = 0.2;
-    fit_exp(freq_T, CT_5, bg_5, d_max_5, lambda_5);
-    fit_exp(freq_A, AG_3, bg_3, d_max_3, lambda_3);
-
+    // Use DART's calibrated per-end values (damage_rate[0] = raw pos0 excess) —
+    // these match DART's JSON output and are on the same scale as metaDMG's Δ.
+    double d_max_5   = dart_profile.d_max_5prime;
+    double d_max_3   = dart_profile.d_max_3prime;
+    double lambda_5  = dart_profile.lambda_5prime;
+    double lambda_3  = dart_profile.lambda_3prime;
+    double bg_5      = dart_profile.fit_baseline_5prime;
+    double bg_3      = dart_profile.fit_baseline_3prime;
     double background = (bg_5 + bg_3) / 2.0;
+
+    // d_max_combined is the primary damage signal — mixture model d_reference
+    // (metaDMG proxy) when converged; falls back to GC-weighted or joint model.
+    double d_max_combined = dart_profile.d_max_combined;
 
     DamageProfile profile;
     profile.d_max_5prime   = d_max_5;
@@ -537,26 +471,36 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
     profile.lambda_3prime  = lambda_3;
     profile.background     = background;
     profile.mask_threshold = mask_threshold;
-    profile.enabled        = (d_max_5 > 0.02 || d_max_3 > 0.02);
+    // Enable if combined or per-end d_max exceeds threshold, OR if DART validates
+    // damage even when d_max_5prime/3prime = 0 (e.g. pos0-artifact samples).
+    profile.enabled        = (d_max_combined > 0.02 || d_max_5 > 0.02 || d_max_3 > 0.02
+                              || dart_profile.damage_validated);
 
-    // Populate empirical per-position mask directly from observed excesses.
-    // Each position is independently evaluated: no exponential model, no OLS
-    // error. Positions with insufficient coverage (freq == -1) are not masked.
+    // Empirical per-position mask from DART's normalized frequencies.
+    // Uses max(5'-excess, 3'-excess) > mask_threshold; coverage-gated by tc_total.
+    constexpr double MIN_COV = 100.0;
     for (int p = 0; p < DamageProfile::MASK_POSITIONS; ++p) {
-        bool m5 = (freq_T[p] >= 0.0 && (freq_T[p] - bg_5) > mask_threshold);
-        bool m3 = (freq_A[p] >= 0.0 && (freq_A[p] - bg_3) > mask_threshold);
-        profile.mask_pos[p] = m5 || m3;
+        double excess_5 = 0.0, excess_3 = 0.0;
+        if (dart_profile.tc_total_5prime[p] >= MIN_COV)
+            excess_5 = dart_profile.t_freq_5prime[p] - bg_5;
+        if (dart_profile.ag_total_3prime[p] >= MIN_COV)
+            excess_3 = dart_profile.a_freq_3prime[p] - bg_3;
+        profile.mask_pos[p] = (excess_5 > mask_threshold) || (excess_3 > mask_threshold);
     }
 
-    log_info("Pass 0: damage estimation — " +
-             std::to_string(reads_scanned) + " reads processed (" +
-             std::to_string(record_pos) + " total) in " + path);
+    log_info("Pass 0: DART damage estimation — " +
+             std::to_string(reads_scanned) + " reads in " + path);
     log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
              " lambda=" + std::to_string(lambda_5) +
              " bg=" + std::to_string(bg_5));
     log_info("  3'-end: d_max=" + std::to_string(d_max_3) +
              " lambda=" + std::to_string(lambda_3) +
              " bg=" + std::to_string(bg_3));
+    log_info("  d_max_combined=" + std::to_string(d_max_combined) +
+             " (source=" + dart_profile.d_max_source_str() + ")" +
+             (dart_profile.mixture_converged ? " [mixture]" : "") +
+             (dart_profile.damage_validated  ? " [validated]" : "") +
+             (dart_profile.damage_artifact   ? " [ARTIFACT]" : ""));
     if (profile.enabled && typical_len > 0) {
         profile.print_info(typical_len);
     } else {
