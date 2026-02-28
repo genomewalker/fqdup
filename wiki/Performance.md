@@ -2,26 +2,27 @@
 
 ## Benchmarks
 
-All benchmarks were run on sample `a88af16f35` — 25.8 M paired-end reads,
-mean read length ~91 bp, ancient DNA with `d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`.
-Storage: NFS-mounted.
+All benchmarks were run on sample `a88af16f35` — 25.8 M fastp-merged reads
+(from paired-end sequencing), mean read length ~91 bp, ancient DNA with
+`d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`. Storage: NFS-mounted.
 
 ### Full pipeline: deduplication quality
 
-The full pipeline runs three steps. Numbers shown are from the non-extended file
-at each stage.
+The full pipeline runs three steps. Numbers shown are for the merged read file
+at each stage (the `-n` / output file of `derep_pairs`).
 
 | Step | Unique clusters | Wall time |
 |------|----------------|-----------|
-| `derep_pairs` (25.8 M pairs in) | 5,582,073 | ~25 s |
+| `derep_pairs` (25.8 M merged reads in) | 5,582,073 | ~25 s |
 | `derep` standard (exact hash) | 3,531,821 | ~22 s |
 | `derep --damage-auto` | 3,511,607 | ~31 s |
-| `derep --damage-auto --error-correct` | 3,506,272 | ~33 s |
+| `derep --damage-auto --error-correct` | 3,510,151 | ~33 s |
 
-- `derep_pairs` reduces 25.8 M pairs to 5.58 M unique (78.4% structural dedup)
+- `derep_pairs` reduces 25.8 M merged reads to 5.58 M unique (78.4% structural dedup)
 - `derep --damage-auto` merges a further 20,214 clusters split by terminal
   deamination (−0.6% vs standard)
-- `--error-correct` absorbs 5,335 PCR-error clusters (−0.15% vs damage-auto only)
+- `--error-correct` absorbs 1,456 PCR-error clusters (−0.04% vs damage-auto only;
+  C↔T and G↔A mismatches are protected as potential damage signal)
 
 Pass 0 (full-scan damage estimation) adds ~9 seconds. Phase 3 (error
 correction) adds ~2 seconds — it runs in memory on the Pass 1 index with no
@@ -137,7 +138,7 @@ Plan for 2× the read I/O of the input file. Output is written once.
 For libraries above 400 M read pairs or 100 M unique clusters:
 
 1. **Memory**: run `derep_pairs` first to reduce unique count, then run
-   `derep` on the smaller non-extended output. The non-extended file after
+   `derep` on the smaller merged read output. The merged file after
    `derep_pairs` is typically 60–80% smaller.
 
 2. **I/O**: use `--isal` or `--pigz` and `--fast` for the sort step. Place
