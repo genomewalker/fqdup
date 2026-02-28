@@ -8,7 +8,7 @@
 #
 #   B. Damaged-duplicate collapse
 #        10k molecules × 2 independently-damaged copies
-#        Asserts: unique ≤ 1.20 × n_molecules  (most pairs collapsed)
+#        Asserts: unique ≤ 1.25 × n_molecules  (most pairs collapsed)
 #
 #   C. Damage vs PCR separation
 #        10k molecules, duplicated:
@@ -95,11 +95,11 @@ import sys
 unique, n_mol = $UNIQUE_B, $N_MOL
 dedup = (n_mol*2 - unique) / (n_mol*2) * 100
 print(f"  Dedup rate: {dedup:.1f}%")
-max_unique = int(n_mol * 1.35)
+max_unique = int(n_mol * 1.25)
 if unique <= max_unique:
-    print(f"  PASS: {unique} ≤ {max_unique} (≤35% uncollapsed pairs)")
+    print(f"  PASS: {unique} ≤ {max_unique} (≤25% uncollapsed pairs)")
 else:
-    print(f"  FAIL: {unique} > {max_unique} — too many uncollapsed pairs")
+    print(f"  FAIL: {unique} > {max_unique} — too many uncollapsed pairs (damage masking degraded?)")
     sys.exit(1)
 EOF
 
@@ -148,17 +148,25 @@ import sys
 no_ec, ec, n_mol = $UNIQUE_NO_EC, $UNIQUE_EC, $N_MOL_C
 
 # PCR errors must inflate unique count above true molecule count
-if no_ec > int(n_mol * 1.5):
-    print(f"  PASS: PCR errors inflated unique count ({no_ec} > {int(n_mol*1.5)})")
+# pcr-rate=0.003 × 75 bp → P(≥1 error) ≈ 20%; at 10x we expect ~20% of clusters
+# to be PCR-error singletons → inflation ≥ 10% above true n_mol
+min_inflated = int(n_mol * 1.1)
+if no_ec > min_inflated:
+    print(f"  PASS: PCR errors inflated unique count ({no_ec} > {min_inflated})")
 else:
-    print(f"  WARN: inflation smaller than expected ({no_ec}); check --pcr-rate")
+    print(f"  FAIL: PCR errors did not inflate unique count ({no_ec} ≤ {min_inflated}); check --pcr-rate")
+    sys.exit(1)
 
-# Error correction must reduce the inflated count
+# Error correction must reduce the inflated count by at least 25% of the inflation
 if ec < no_ec:
     absorbed = no_ec - ec
     inflation = no_ec - n_mol
     pct = absorbed / inflation * 100 if inflation > 0 else 0
-    print(f"  PASS: EC absorbed {absorbed} singletons ({pct:.0f}% of PCR inflation)")
+    print(f"  EC absorbed {absorbed} singletons ({pct:.0f}% of PCR inflation)")
+    if pct < 20.0:
+        print(f"  FAIL: EC absorbed only {pct:.0f}% of inflation (expect ≥20%)")
+        sys.exit(1)
+    print(f"  PASS: EC absorbed ≥20% of PCR inflation")
 else:
     print(f"  FAIL: --error-correct did not help ({no_ec} → {ec})")
     sys.exit(1)
@@ -236,6 +244,65 @@ print(f"  PASS: PCR errors absorbed (EC reduction {red_pcr:.1f}% > 10%)")
 EOF
 
 echo "  PASS: Test D"
+
+# ---------------------------------------------------------------------------
+# Test E: Terminal-SNP false-positive protection
+#
+# Two groups of molecules with a real C/T SNP at position 0 — no ancient damage.
+# The DART estimator sees T/(T+C) ≈ 50% at pos 0 (= background), so excess ≈ 0%
+# and mask_pos[0] stays false.  --damage-auto must NOT merge the two alleles.
+#
+# Design:
+#   2000 molecules, each emitted twice: once with C at pos 0, once with T at pos 0.
+#   Same random interior (pos 1–74) → genuine C/T polymorphism, not damage.
+#   Sort → derep --damage-auto.
+#   Assert: unique ≥ 0.99 × 4000  (both alleles kept separate).
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test E: Terminal-SNP false-positive protection ---"
+N_MOL_E=2000
+
+echo "  $N_MOL_E molecules × C/T SNP at pos 0, no damage"
+echo "  Expect: both alleles preserved (mask_pos[0]=false, no excess damage signal)"
+
+python3 - <<'PYEOF' > "$TMPDIR/snp.fq"
+import random
+rng = random.Random(999)
+n_mol = 2000
+read_len = 75
+qual = 'I' * read_len
+for i in range(n_mol):
+    interior = ''.join(rng.choice('ACGT') for _ in range(read_len - 1))
+    print(f'@mol_{i:05d}_C\nC{interior}\n+\n{qual}')
+    print(f'@mol_{i:05d}_T\nT{interior}\n+\n{qual}')
+PYEOF
+
+"$FQDUP" sort -i "$TMPDIR/snp.fq" -o "$TMPDIR/snp.sorted.fq" \
+    --max-memory 512M -t "$TMPDIR" 2>/dev/null
+
+"$FQDUP" derep -i "$TMPDIR/snp.sorted.fq" -o "$TMPDIR/snp.out.fq" \
+    --damage-auto 2>"$TMPDIR/snp.log"
+
+UNIQUE_E=$(grep -c '^@' "$TMPDIR/snp.out.fq")
+echo "  Unique reads: $UNIQUE_E / $((N_MOL_E * 2)) input reads"
+
+grep -E "Masked positions:|d_max=" "$TMPDIR/snp.log" | head -4 | sed 's/^/  /'
+
+python3 - <<EOF
+import sys
+unique, n_mol = $UNIQUE_E, $N_MOL_E
+expected = n_mol * 2
+min_ok = int(expected * 0.99)
+kept_pct = unique / expected * 100
+print(f"  Kept: {unique}/{expected} ({kept_pct:.1f}%)  (expect ≥99% — no masking of pos 0)")
+if unique >= min_ok:
+    print(f"  PASS: {unique} ≥ {min_ok} — C/T alleles not collapsed")
+else:
+    print(f"  FAIL: {unique} < {min_ok} — damage masking incorrectly merged terminal SNP")
+    sys.exit(1)
+EOF
+
+echo "  PASS: Test E"
 
 echo ""
 echo "OK: all damage-auto tests passed"

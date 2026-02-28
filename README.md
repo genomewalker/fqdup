@@ -118,10 +118,11 @@ Required:
   -o-ext FILE  Output extended FASTQ
 
 Optional:
-  -c FILE          Cluster statistics (gzipped TSV: hash, ext_len, ext_count, non_len, non_count)
-  --no-revcomp     Disable reverse-complement collapsing (default: enabled)
-  --pigz           Parallel decompression via pigz
-  --isal           Hardware-accelerated decompression (ISA-L)
+  -c FILE                 Cluster statistics (gzipped TSV: hash, ext_len, pair_count, non_len)
+  --no-revcomp            Disable reverse-complement collapsing (default: enabled)
+  --allow-id-mismatch     Warn instead of failing when paired read IDs differ (default: error)
+  --pigz                  Parallel decompression via pigz
+  --isal                  Hardware-accelerated decompression (ISA-L)
 ```
 
 Representative selection: the pair whose non-extended read is longest (captures the
@@ -187,21 +188,20 @@ accelerated Hamming verification.
 
 ### Cluster statistics (`-c FILE.tsv.gz`)
 
-`derep_pairs` writes a 5-column gzipped TSV:
+`derep_pairs` writes a 4-column gzipped TSV:
 
 | Column | Description |
 |--------|-------------|
-| `hash` | 64-bit XXH3 canonical hash (hex) |
+| `hash` | 128-bit XXH3 canonical hash (32 hex chars) |
 | `ext_len` | Extended read length of the representative |
-| `ext_count` | Number of reads in the cluster |
+| `pair_count` | Number of read pairs in the cluster |
 | `non_len` | Non-extended read length of the representative |
-| `non_count` | Number of reads in the cluster (same as ext_count) |
 
 `derep` writes a 3-column gzipped TSV:
 
 | Column | Description |
 |--------|-------------|
-| `hash` | 64-bit XXH3 canonical hash (hex) |
+| `hash` | 128-bit XXH3 canonical hash (32 hex chars) |
 | `seq_len` | Sequence length of the representative |
 | `count` | Number of reads in the cluster |
 
@@ -217,13 +217,19 @@ fqdup derep:       [Pass 0] (opt) stride-sample → fit damage model
                    [Pass 2] stream → write unique representatives
 ```
 
-**Canonical hash:** `min(XXH3_64(seq), XXH3_64(revcomp(seq)))` — collapses forward
-and reverse-complement reads into the same cluster.
+**Canonical hash:** `min(XXH3_128(seq), XXH3_128(revcomp(seq)))` — collapses forward
+and reverse-complement reads into the same cluster. Uses the full 128-bit hash as the
+dedup key (collision probability ~3×10⁻²⁴ at 100 M reads).
 
 **Damage masking:** terminal positions where excess deamination probability exceeds
 `--mask-threshold` are replaced with a neutral byte before hashing. Masking is
 symmetric (`max(P_CT(i), P_GA(i))`) so `hash(seq) == hash(revcomp(seq))` is
 preserved after masking.
+
+**PCR error protection:** substitutions classified as damage-consistent are never
+absorbed by Phase 3 error correction. G↔T / C↔A (8-oxoG oxidative damage) is
+always protected. C↔T / G↔A (ancient deamination) is additionally protected when
+`--damage-auto` or manual damage parameters are active.
 
 See the [wiki](../../wiki) for full algorithmic details.
 

@@ -107,7 +107,16 @@ endif()
 # Tests
 enable_testing()
 
+add_executable(gen_synthetic tests/gen_synthetic.cpp)
+target_compile_options(gen_synthetic PRIVATE -O2)
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
     add_test(NAME smoke
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh $<TARGET_FILE:fqdup>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh)
+    add_test(NAME damage_auto
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 endif()

@@ -68,11 +68,19 @@ static size_t parse_memory_size(const std::string& str) {
     if (i < str.size()) {
         char unit = std::toupper(str[i]);
         switch (unit) {
-            case 'K': return value / 1024;
+            case 'K': {
+                size_t kb = value;
+                if (kb < 1024)
+                    throw std::runtime_error(
+                        "Memory value too small: '" + str + "' (minimum 1M / 1024K)");
+                return kb / 1024;
+            }
             case 'M': return value;
             case 'G': return value * 1024;
             case 'T': return value * 1024 * 1024;
-            default: throw std::runtime_error("Unknown unit: " + std::string(1, unit));
+            default: throw std::runtime_error("Unknown memory unit '" +
+                         std::string(1, unit) + "' in '" + str +
+                         "' (use K, M, G, or T)");
         }
     }
     return value;
@@ -659,27 +667,28 @@ private:
         // Sort indices based on keys
         if (natural_order_) {
             std::sort(indices.begin(), indices.end(), [&keys](size_t a, size_t b) {
-                const std::string& key_a = keys[a];
-                const std::string& key_b = keys[b];
+                std::string_view key_a = keys[a];
+                std::string_view key_b = keys[b];
 
-                // Parse numeric suffixes
+                // Parse numeric suffixes — no substring allocations
                 size_t i = key_a.size();
                 while (i > 0 && std::isdigit(key_a[i-1])) i--;
                 size_t j = key_b.size();
                 while (j > 0 && std::isdigit(key_b[j-1])) j--;
 
-                // Compare prefixes
-                std::string prefix_a = key_a.substr(0, i);
-                std::string prefix_b = key_b.substr(0, j);
+                // Compare prefixes as string_view (no allocation)
+                std::string_view prefix_a = key_a.substr(0, i);
+                std::string_view prefix_b = key_b.substr(0, j);
 
                 if (prefix_a != prefix_b) return prefix_a < prefix_b;
                 if (i == key_a.size() && j == key_b.size()) return false;
                 if (i == key_a.size()) return true;
                 if (j == key_b.size()) return false;
 
-                // Parse numbers and compare
-                long long num_a = std::stoll(key_a.substr(i));
-                long long num_b = std::stoll(key_b.substr(j));
+                // Parse numeric suffixes directly from string_view (no allocation)
+                long long num_a = 0, num_b = 0;
+                for (size_t k = i; k < key_a.size(); ++k) num_a = num_a * 10 + (key_a[k] - '0');
+                for (size_t k = j; k < key_b.size(); ++k) num_b = num_b * 10 + (key_b[k] - '0');
                 return num_a < num_b;
             });
         } else {

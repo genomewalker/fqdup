@@ -63,27 +63,37 @@ constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;  // 4 MB
 
 // ============================================================================
 // Sequence fingerprint — composite key for the deduplication index
+//
+// Uses XXH3_128bits (two 64-bit words) to make hash collisions negligible.
+// At 100M reads the birthday-paradox collision probability is ~3×10^-24 with
+// a 128-bit hash vs ~3×10^-10 with 64-bit. seq_len is retained as an extra
+// discriminator and to avoid recomputing length on lookup.
 // ============================================================================
 
 struct SequenceFingerprint {
-    uint64_t hash;
+    uint64_t hash_lo;   // XXH3_128bits low 64 bits
+    uint64_t hash_hi;   // XXH3_128bits high 64 bits
     uint32_t seq_len;
 
-    SequenceFingerprint() : hash(0), seq_len(0) {}
-    SequenceFingerprint(uint64_t h, size_t len) : hash(h) {
+    SequenceFingerprint() : hash_lo(0), hash_hi(0), seq_len(0) {}
+    SequenceFingerprint(XXH128_hash_t h128, size_t len)
+        : hash_lo(h128.low64), hash_hi(h128.high64) {
         if (len > std::numeric_limits<uint32_t>::max())
             throw std::runtime_error("Sequence length exceeds supported fingerprint range");
         seq_len = static_cast<uint32_t>(len);
     }
 
     bool operator==(const SequenceFingerprint& other) const {
-        return hash == other.hash && seq_len == other.seq_len;
+        return hash_lo == other.hash_lo && hash_hi == other.hash_hi &&
+               seq_len == other.seq_len;
     }
 };
 
 struct SequenceFingerprintHash {
     size_t operator()(const SequenceFingerprint& fp) const {
-        uint64_t mixed = fp.hash ^ (static_cast<uint64_t>(fp.seq_len) * 0x9e3779b97f4a7c15ULL);
+        // Combine the two halves with a mixing step
+        uint64_t mixed = fp.hash_lo ^ (fp.hash_hi * 0x9e3779b97f4a7c15ULL)
+                                    ^ (static_cast<uint64_t>(fp.seq_len) * 0x517cc1b727220a95ULL);
         return static_cast<size_t>(mixed ^ (mixed >> 32));
     }
 };
@@ -117,13 +127,16 @@ static inline std::string revcomp(const std::string& s) {
     return out;
 }
 
-static inline uint64_t canonical_hash(const std::string& seq, bool use_revcomp) {
-    uint64_t h1 = XXH3_64bits(seq.data(), seq.size());
+static inline XXH128_hash_t canonical_hash(const std::string& seq, bool use_revcomp) {
+    XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
     if (!use_revcomp)
         return h1;
     std::string rc = revcomp(seq);
-    uint64_t h2 = XXH3_64bits(rc.data(), rc.size());
-    return std::min(h1, h2);
+    XXH128_hash_t h2 = XXH3_128bits(rc.data(), rc.size());
+    // Canonical = lexicographically smaller of the two 128-bit hashes
+    if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
+        return h1;
+    return h2;
 }
 
 static std::string shell_escape_path(const std::string& path) {
@@ -175,9 +188,16 @@ public:
 
     bool read(FastqRecord& rec) override {
         if (!getline_igzip(rec.header)) return false;
-        if (!getline_igzip(rec.seq))    return false;
-        if (!getline_igzip(rec.plus))   return false;
-        if (!getline_igzip(rec.qual))   return false;
+        if (!getline_igzip(rec.seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" +
+                                     rec.header + "' (record " +
+                                     std::to_string(record_count_ + 1) + ")");
+        if (!getline_igzip(rec.plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence in record " +
+                                     std::to_string(record_count_ + 1));
+        if (!getline_igzip(rec.qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line in record " +
+                                     std::to_string(record_count_ + 1));
         record_count_++;
         return true;
     }
@@ -261,9 +281,16 @@ public:
 
     bool read(FastqRecord& rec) override {
         if (!getline_gz(rec.header)) return false;
-        if (!getline_gz(rec.seq))    return false;
-        if (!getline_gz(rec.plus))   return false;
-        if (!getline_gz(rec.qual))   return false;
+        if (!getline_gz(rec.seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" +
+                                     rec.header + "' (record " +
+                                     std::to_string(record_count_ + 1) + ")");
+        if (!getline_gz(rec.plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence in record " +
+                                     std::to_string(record_count_ + 1));
+        if (!getline_gz(rec.qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line in record " +
+                                     std::to_string(record_count_ + 1));
         record_count_++;
         return true;
     }
@@ -303,11 +330,19 @@ public:
         : path_(path), compress_(compress), gzfp_(nullptr), pigz_pipe_(nullptr) {
 
         if (compress_) {
-            std::string pigz_cmd = "pigz -c -p 4 > " + shell_escape_path(path) + " 2>/dev/null";
-            pigz_pipe_ = popen(pigz_cmd.c_str(), "w");
-            if (pigz_pipe_) {
-                setvbuf(pigz_pipe_, nullptr, _IOFBF, GZBUF_SIZE);
-            } else {
+            // Probe pigz availability before attempting popen — popen() can succeed
+            // even when pigz is missing (the shell itself opens), so the only way to
+            // detect absence reliably is to check first.
+            bool pigz_available = (system("pigz --version >/dev/null 2>&1") == 0);
+            if (pigz_available) {
+                std::string pigz_cmd = "pigz -c -p 4 > " + shell_escape_path(path);
+                pigz_pipe_ = popen(pigz_cmd.c_str(), "w");
+                if (pigz_pipe_) {
+                    setvbuf(pigz_pipe_, nullptr, _IOFBF, GZBUF_SIZE);
+                }
+            }
+            if (!pigz_pipe_) {
+                // pigz unavailable or popen failed — fall back to zlib
                 gzfp_ = gzopen(path.c_str(), "wb6");
                 if (!gzfp_)
                     throw std::runtime_error("Cannot open output: " + path);

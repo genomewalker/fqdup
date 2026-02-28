@@ -222,22 +222,37 @@ static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
 
 // Returns true if the substitution a→b (or b→a) is consistent with known
 // ancient or environmental DNA damage, and should therefore NOT be treated
-// as a PCR error:
-//   C↔T, G↔A  — ancient deamination (5'-end C→T and 3'-end G→A)
-//   G↔T, C↔A  — oxidative 8-oxoG damage (uniform across the read)
-static bool is_damage_sub(uint8_t a, uint8_t b) {
+// as a PCR error.
+//
+// protect_deamination controls whether ancient deamination (C↔T, G↔A) is
+// protected.  Set true only when a damage profile is active; false for
+// standard (non-ancient) mode so that interior C→T PCR errors are absorbed.
+//
+//   Always protected (oxidative 8-oxoG, uniform across any DNA library):
+//     G↔T, C↔A
+//
+//   Protected only when damage model active (ancient deamination):
+//     C↔T, G↔A
+static bool is_damage_sub(uint8_t a, uint8_t b, bool protect_deamination) {
     a &= 0xDFu; b &= 0xDFu;  // cheap ASCII uppercase
-    return ((a == 'C' && b == 'T') || (a == 'T' && b == 'C') ||
-            (a == 'G' && b == 'A') || (a == 'A' && b == 'G') ||
-            (a == 'G' && b == 'T') || (a == 'T' && b == 'G') ||
-            (a == 'C' && b == 'A') || (a == 'A' && b == 'C'));
+    // 8-oxoG: always protect
+    if ((a == 'G' && b == 'T') || (a == 'T' && b == 'G') ||
+        (a == 'C' && b == 'A') || (a == 'A' && b == 'C'))
+        return true;
+    // Deamination: only protect when damage model is active
+    if (protect_deamination &&
+        ((a == 'C' && b == 'T') || (a == 'T' && b == 'C') ||
+         (a == 'G' && b == 'A') || (a == 'A' && b == 'G')))
+        return true;
+    return false;
 }
 
 // Returns true if the interior region has exactly one mismatch and that
 // mismatch is a damage-consistent substitution.  Called only when
 // interior_hamming_le1() already returned true (i.e. 0 or 1 mismatches).
 static bool interior_single_sub_is_damage(const uint8_t* a, const uint8_t* b,
-                                          int k5, int ilen) {
+                                          int k5, int ilen,
+                                          bool protect_deamination) {
     a += k5; b += k5;
     int pos = -1;
     for (int i = 0; i < ilen; ++i) {
@@ -246,7 +261,7 @@ static bool interior_single_sub_is_damage(const uint8_t* a, const uint8_t* b,
             pos = i;
         }
     }
-    return pos >= 0 && is_damage_sub(a[pos], b[pos]);
+    return pos >= 0 && is_damage_sub(a[pos], b[pos], protect_deamination);
 }
 
 // ============================================================================
@@ -383,22 +398,25 @@ struct DamageProfile {
 // Symmetry: mask_pos uses max(5'-signal, 3'-signal) semantics so that position p
 // from the 5' end and position p from the 3' end are treated identically. This
 // guarantees canonical_hash(seq) == canonical_hash(revcomp(seq)).
-static std::string apply_damage_mask(const std::string& seq,
-                                     const DamageProfile& prof) {
-    std::string m = seq;
+//
+// scratch must point to a buffer of at least seq.size() bytes. Writes the
+// masked sequence into scratch without heap allocation.
+static void apply_damage_mask_inplace(const std::string& seq,
+                                      const DamageProfile& prof,
+                                      char* scratch) {
     int L = static_cast<int>(seq.size());
+    std::memcpy(scratch, seq.data(), L);
     for (int i = 0; i < L; ++i) {
         char cu = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(m[i])));
+            std::toupper(static_cast<unsigned char>(scratch[i])));
         bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
         bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
         if (in_5zone && (cu == 'C' || cu == 'T')) {
-            m[i] = '\x01';
+            scratch[i] = '\x01';
         } else if (in_3zone && (cu == 'G' || cu == 'A')) {
-            m[i] = '\x02';
+            scratch[i] = '\x02';
         }
     }
-    return m;
 }
 
 static std::pair<int,int> damage_zone_bounds(int L, const DamageProfile& prof) {
@@ -410,17 +428,44 @@ static std::pair<int,int> damage_zone_bounds(int L, const DamageProfile& prof) {
     return {k5, k3};
 }
 
-static uint64_t damage_canonical_hash(const std::string& seq,
-                                      const DamageProfile& prof,
-                                      bool use_revcomp) {
-    std::string masked = apply_damage_mask(seq, prof);
-    uint64_t h1 = XXH3_64bits(masked.data(), masked.size());
+// scratch1 and scratch2 must each be at least seq.size() bytes.
+// No heap allocation — uses caller-provided scratch buffers.
+static XXH128_hash_t damage_canonical_hash(const std::string& seq,
+                                           const DamageProfile& prof,
+                                           bool use_revcomp,
+                                           char* scratch1,
+                                           char* scratch2) {
+    int L = static_cast<int>(seq.size());
+    apply_damage_mask_inplace(seq, prof, scratch1);
+    XXH128_hash_t h1 = XXH3_128bits(scratch1, L);
     if (!use_revcomp) return h1;
 
-    std::string rc        = revcomp(seq);
-    std::string masked_rc = apply_damage_mask(rc, prof);
-    uint64_t h2 = XXH3_64bits(masked_rc.data(), masked_rc.size());
-    return std::min(h1, h2);
+    // Build revcomp+mask into scratch2 without allocating
+    for (int i = 0; i < L; ++i) {
+        unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
+        switch (c) {
+            case 'A': case 'a': scratch2[i] = (c == 'A') ? 'T' : 't'; break;
+            case 'C': case 'c': scratch2[i] = (c == 'C') ? 'G' : 'g'; break;
+            case 'G': case 'g': scratch2[i] = (c == 'G') ? 'C' : 'c'; break;
+            case 'T': case 't': scratch2[i] = (c == 'T') ? 'A' : 'a'; break;
+            default:            scratch2[i] = 'N'; break;
+        }
+    }
+    for (int i = 0; i < L; ++i) {
+        char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2[i])));
+        bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
+        bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
+        if (in_5zone && (cu == 'C' || cu == 'T')) {
+            scratch2[i] = '\x01';
+        } else if (in_3zone && (cu == 'G' || cu == 'A')) {
+            scratch2[i] = '\x02';
+        }
+    }
+    XXH128_hash_t h2 = XXH3_128bits(scratch2, L);
+    // Canonical = lexicographically smaller of the two 128-bit hashes
+    if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
+        return h1;
+    return h2;
 }
 
 // ============================================================================
@@ -585,9 +630,13 @@ public:
     }
 
 private:
-    uint64_t compute_hash(const std::string& seq) const {
-        if (profile_.enabled)
-            return damage_canonical_hash(seq, profile_, use_revcomp_);
+    XXH128_hash_t compute_hash(const std::string& seq) const {
+        if (profile_.enabled) {
+            if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
+            if (scratch2_.size() < seq.size()) scratch2_.resize(seq.size());
+            return damage_canonical_hash(seq, profile_, use_revcomp_,
+                                         scratch1_.data(), scratch2_.data());
+        }
         return canonical_hash(seq, use_revcomp_);
     }
 
@@ -613,7 +662,7 @@ private:
         uint64_t record_idx = 0;
 
         while (reader->read(rec)) {
-            uint64_t h = compute_hash(rec.seq);
+            XXH128_hash_t h = compute_hash(rec.seq);
             SequenceFingerprint fp(h, rec.seq.size());
 
             auto it = index_.find(fp);
@@ -765,10 +814,12 @@ private:
                 if (id_count[cid] > eff_max) return;
                 if (!interior_hamming_le1(arena_.data(pid), child_seq, k5, ilen))
                     return;
-                // Protect reads carrying damage-consistent substitutions:
-                // C↔T / G↔A (ancient deamination) and G↔T / C↔A (8-oxoG).
+                // Protect reads carrying damage-consistent substitutions.
+                // G↔T / C↔A (8-oxoG) is always protected.
+                // C↔T / G↔A (ancient deamination) is only protected when the
+                // damage model is active; in standard mode these are valid PCR errors.
                 if (interior_single_sub_is_damage(arena_.data(pid), child_seq,
-                                                  k5, ilen))
+                                                  k5, ilen, profile_.enabled))
                     return;
                 absorbed = true;
             };
@@ -832,8 +883,9 @@ private:
                         throw std::runtime_error(
                             "Internal error: missing fingerprint for cluster output");
                     const IndexEntry& entry = ei->second;
-                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%lu\n",
-                                 static_cast<unsigned long>(fp.hash),
+                    if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\n",
+                                 static_cast<unsigned long>(fp.hash_hi),
+                                 static_cast<unsigned long>(fp.hash_lo),
                                  static_cast<unsigned long>(rec.seq.size()),
                                  static_cast<unsigned long>(entry.count)) < 0)
                         throw std::runtime_error(
@@ -895,6 +947,11 @@ private:
     // Phase 3 error correction state (populated only when errcor_.enabled)
     SeqArena          arena_;
     std::vector<bool> is_error_;
+
+    // Reusable scratch buffers for allocation-free damage masking/hashing.
+    // Grown lazily to max sequence length seen; never shrunk.
+    mutable std::vector<char> scratch1_;
+    mutable std::vector<char> scratch2_;
 
     uint64_t total_reads_;
     uint64_t errcor_absorbed_;
@@ -1014,6 +1071,38 @@ int derep_main(int argc, char** argv) {
     if (in_path.empty() || out_path.empty()) {
         std::cerr << "Error: Missing required arguments (-i and -o)\n\n";
         print_usage(argv[0]);
+        return 1;
+    }
+
+    // Validate parameter ranges
+    if (pcr_efficiency < 0.0 || pcr_efficiency > 1.0) {
+        std::cerr << "Error: --pcr-efficiency must be in [0, 1], got "
+                  << pcr_efficiency << "\n";
+        return 1;
+    }
+    if (pcr_phi <= 0.0) {
+        std::cerr << "Error: --pcr-error-rate must be > 0, got " << pcr_phi << "\n";
+        return 1;
+    }
+    if (pcr_cycles < 0) {
+        std::cerr << "Error: --pcr-cycles must be >= 0, got " << pcr_cycles << "\n";
+        return 1;
+    }
+    if (errcor.enabled && errcor.ratio <= 0.0) {
+        std::cerr << "Error: --errcor-ratio must be > 0, got " << errcor.ratio << "\n";
+        return 1;
+    }
+    if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
+        std::cerr << "Error: --mask-threshold must be in (0, 1), got "
+                  << mask_threshold << "\n";
+        return 1;
+    }
+    if (damage_dmax5 > 1.0 || damage_dmax3 > 1.0) {
+        std::cerr << "Error: --damage-dmax values must be <= 1.0\n";
+        return 1;
+    }
+    if (damage_lambda5 <= 0.0 || damage_lambda3 <= 0.0) {
+        std::cerr << "Error: --damage-lambda values must be > 0\n";
         return 1;
     }
 
