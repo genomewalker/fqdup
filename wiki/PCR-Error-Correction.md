@@ -254,6 +254,8 @@ for the expected-mismatch log line; the static `--errcor-max-count` applies.
 
 ## Benchmarks
 
+### Damage filter: single library
+
 Sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length, Q5 library):
 
 | Mode | Absorbed | Output sequences |
@@ -261,12 +263,58 @@ Sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length, Q5 librar
 | `--error-correct` (naive, no damage protection) | 5,335 | 3,506,272 |
 | `--error-correct` (with damage substitution filter) | 1,456 | 3,510,151 |
 
-73% of what the naive version absorbed were C↔T or G↔A differences —
-real damage-carrying reads, not PCR errors. The 1,456 retained absorptions
-are A↔T and C↔G transversions only.
+73% of what the naive version absorbed were C↔T or G↔A — real damage signal,
+not PCR errors. The 1,456 absorptions are A↔T and C↔G transversions only.
 
 Phase 3 adds approximately 2 seconds to a 31-second `derep` run. It operates
 entirely in memory on the index built during Pass 1.
+
+### Batch run: 26 ancient DNA libraries
+
+All libraries processed with `--damage-auto --error-correct`, Q5 defaults
+(φ = 5.3×10⁻⁷), D_eff estimated automatically from duplication ratio.
+
+| Library | Total reads | Unique (P1) | Unique (final) | Dup% | d_max | λ | D_eff | Absorbed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0267130b40 | 15,242,307 | 10,624,058 | 10,624,058 | 30.3 | 0.000 | 0.20 | 0.52 | 0 |
+| 0c7e1a3199 | 31,727,991 | 27,011,848 | 27,011,848 | 14.9 | 0.196 | 0.38 | 0.23 | 0 |
+| 2a3189abd3 | 28,062,190 | 17,497,629 | 17,496,559 | 37.7 | 0.095 | 0.25 | 0.68 | 1,070 |
+| 32cf1bb9a2 | 91,853,574 | 82,727,024 | 82,727,024 | 9.9 | 0.073 | 0.15 | 0.15 | 0 |
+| 4940db5c8d | 41,256,425 | 32,439,601 | 32,439,601 | 21.4 | 0.168 | 0.40 | 0.35 | 0 |
+| 521588e724 | 94,736,098 | 69,697,677 | 69,697,677 | 26.4 | 0.031 | 0.08 | 0.44 | 0 |
+| 55b0793258 | 136,474,361 | 129,837,772 | 129,837,772 | 4.9 | 0.266 | 0.50 | 0.07 | 0 |
+| 68825e1df0 | 5,773,793 | 3,782,602 | 3,780,481 | 34.5 | 0.095 | 0.30 | 0.61 | 2,121 |
+| 6fb2395c87 | 2,205,562 | 2,076,532 | 2,076,532 | 5.9 | 0.008 | 0.05 | 0.09 | 0 |
+| 75c7be7787 | 155,863,098 | 150,386,512 | 150,386,512 | 3.5 | 0.186 | 0.43 | 0.05 | 0 |
+| 7646a78f08 | 121,809,247 | 109,821,675 | 109,821,675 | 9.8 | 0.126 | 0.22 | 0.15 | 0 |
+| 792a5d1378 | 82,567,031 | 72,228,459 | 72,228,459 | 12.5 | 0.253 | 0.40 | 0.19 | 0 |
+| 7abec0fc9d | 23,093,793 | 19,519,181 | 19,519,181 | 15.5 | 0.124 | 0.38 | 0.24 | 0 |
+| 83853d2471 | 50,277,392 | 30,919,799 | 30,918,892 | 38.5 | 0.086 | 0.25 | 0.70 | 907 |
+| a88af16f35 | 5,582,073 | 3,511,607 | 3,510,151 | 37.1 | 0.099 | 0.25 | 0.67 | 1,456 |
+| a97f194584 | 138,638,296 | 132,959,230 | 132,959,230 | 4.1 | 0.179 | 0.41 | 0.06 | 0 |
+| abfe73874c | 36,744,399 | 30,825,182 | 30,825,182 | 16.1 | 0.198 | 0.39 | 0.25 | 0 |
+| b984d65658 | 41,913,674 | 27,900,335 | 27,899,474 | 33.4 | 0.085 | 0.29 | 0.59 | 861 |
+| bd5c178184 | 121,462,889 | 113,302,639 | 113,302,639 | 6.7 | 0.083 | 0.22 | 0.10 | 0 |
+| ca85b7a308 | 140,960,298 | 128,936,359 | 128,936,359 | 8.5 | 0.158 | 0.35 | 0.13 | 0 |
+| d3d27b4213 | 74,766,739 | 65,848,465 | 65,848,359 | 11.9 | 0.140 | 0.21 | 0.18 | 106 |
+| dc0d65f3e9 | 57,976,670 | 49,143,249 | 49,143,249 | 15.2 | 0.198 | 0.36 | 0.24 | 0 |
+| dc76c20bfb | 9,718,337 | 5,775,523 | 5,774,048 | 40.6 | 0.063 | 0.20 | 0.75 | 1,475 |
+| dfb2272499 | 74,320,027 | 69,044,095 | 69,044,095 | 7.1 | 0.157 | 0.24 | 0.11 | 0 |
+| e30685fafc | 97,072,045 | 91,710,984 | 91,710,984 | 5.5 | 0.259 | 0.50 | 0.08 | 0 |
+| f024f0d6ad | 72,441,677 | 63,476,566 | 63,476,566 | 12.4 | 0.226 | 0.41 | 0.19 | 0 |
+
+**D_eff** is estimated from duplication ratio (log₂(total/unique_P1)) unless
+`--pcr-cycles` is given. **Absorbed** = PCR error sequences removed by Phase 3
+(after damage filter). **Unique (P1)** = after damage-aware deduplication but
+before Phase 3; **Unique (final)** = output sequence count.
+
+Across these 26 libraries, error correction fires only when D_eff ≥ ~0.6.
+The cutoff is not a hard threshold — it reflects the adaptive ceiling formula:
+at low D_eff, E[count_child] < 1 for all realistic parent counts, so the
+static `--errcor-max-count 5` ceiling dominates and no child qualifies for
+absorption. At D_eff ≈ 0.7 and above, the ceiling rises above the static
+floor for high-count parents, allowing the algorithm to absorb genuine errors
+while ignoring singletons from low-count parents.
 
 ---
 
