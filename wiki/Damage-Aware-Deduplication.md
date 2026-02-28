@@ -5,6 +5,12 @@ DNA deduplication: post-mortem deamination. PCR copying errors are covered in
 [[PCR-Error-Correction]]. Both are handled by `fqdup derep`; see [[Home]] for
 how they fit together.
 
+In the standard pipeline, `derep` receives **fastp-merged reads** that have
+already been deduplicated by `derep_pairs` against their Tadpole-extended
+counterparts. The input sequences are therefore the original collapsed R1+R2
+molecules — the sequences on which the damage signal is present and should
+be modelled.
+
 ---
 
 ## The problem
@@ -115,7 +121,7 @@ skip Pass 0 and supply them directly:
 
 ```bash
 fqdup derep \
-  -i nonext.deduped.fq.gz -o nonext.final.fq.gz \
+  -i merged.deduped.fq.gz -o merged.final.fq.gz \
   --damage-dmax5 0.35 --damage-lambda5 0.40 \
   --damage-dmax3 0.20 --damage-lambda3 0.30 \
   --mask-threshold 0.05
@@ -128,18 +134,20 @@ with symmetric damage).
 
 ## Effect on cluster counts
 
-Benchmarked on sample `a88af16f35` — 25.8 M read pairs, 91 bp mean length,
-`d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`:
+Benchmarked on sample `a88af16f35` — 25.8 M fastp-merged read pairs, 91 bp
+mean length, `d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`:
 
 | Step | Unique clusters | Change |
 |------|----------------|--------|
-| `derep_pairs` (25.8 M pairs in) | 5,582,073 | — |
+| `derep_pairs` output (merged reads in) | 5,582,073 | — |
 | `derep` standard (exact hash) | 3,531,821 | — |
 | `derep --damage-auto` | 3,511,607 | −20,214 (−0.6%) |
-| `derep --damage-auto --error-correct` | 3,506,272 | −25,549 (−0.7%) |
+| `derep --damage-auto --error-correct` | 3,510,151 | −21,670 (−0.6%) |
 
 Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
-correction absorbed a further 5,335 low-count PCR-error clusters.
+correction (with damage substitution protection) absorbed a further 1,456
+PCR-error clusters — only A↔T and C↔G mismatches are eligible; C↔T and G↔A
+are protected as potential damage signal.
 
 ---
 
