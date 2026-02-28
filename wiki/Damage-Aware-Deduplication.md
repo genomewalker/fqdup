@@ -1,5 +1,12 @@
 # Damage-aware deduplication
 
+This page covers the first of two sources of false unique clusters in ancient
+DNA deduplication: **post-mortem deamination**. The second — PCR copying
+errors — is covered in [[PCR-Error-Correction]]. Both are handled by
+`fqdup derep`; see [[Home]] for how they fit together.
+
+---
+
 ## Background
 
 Post-mortem DNA degradation produces characteristic patterns of cytosine
