@@ -169,7 +169,7 @@ fqdup derep       ... --no-revcomp
 | `--damage-lambda3 FLOAT` | Decay constant for 3' end | — |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
-| `--pcr-cycles INT` | PCR cycles (for expected-mismatch reporting) | 0 |
+| `--pcr-cycles INT` | PCR cycles; if omitted, D_eff is estimated from duplication ratio | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
 | `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | off |
