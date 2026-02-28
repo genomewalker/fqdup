@@ -57,10 +57,9 @@ struct IndexEntry {
 
 class DerepPairsEngine {
 public:
-    DerepPairsEngine(bool use_revcomp, bool write_clusters,
-                     bool use_pigz, bool use_isal)
+    DerepPairsEngine(bool use_revcomp, bool write_clusters)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
-          use_pigz_(use_pigz), use_isal_(use_isal), total_reads_(0) {}
+          total_reads_(0) {}
 
     void process(const std::string& ext_path,
                  const std::string& non_path,
@@ -71,17 +70,16 @@ public:
         log_info("=== Two-pass paired deduplication ===");
         log_info("Pass 1: Build lightweight index");
         log_info("Decompression: " + std::string(
-            use_isal_ ? "ISA-L (hardware-accelerated)" :
-            use_pigz_ ? "pigz (parallel)" : "zlib (standard)"));
-
-#ifdef HAVE_ISAL
-        if (use_isal_) {
-            pass1_isal(ext_path, non_path);
-        } else
+#ifdef HAVE_RAPIDGZIP
+            "rapidgzip (parallel multi-threaded)"
+#elif defined(HAVE_ISAL)
+            "ISA-L (hardware-accelerated)"
+#else
+            "zlib"
 #endif
-        {
-            pass1_standard(ext_path, non_path);
-        }
+        ));
+
+        pass1(ext_path, non_path);
 
         size_t index_mb = (index_.size() *
                            sizeof(std::pair<SequenceFingerprint, IndexEntry>)) /
@@ -91,21 +89,13 @@ public:
 
         log_info("Pass 2: Write unique records");
 
-#ifdef HAVE_ISAL
-        if (use_isal_) {
-            pass2_isal(ext_path, non_path, out_ext_path, out_non_path, cluster_path);
-        } else
-#endif
-        {
-            pass2_standard(ext_path, non_path, out_ext_path, out_non_path, cluster_path);
-        }
+        pass2(ext_path, non_path, out_ext_path, out_non_path, cluster_path);
 
         print_stats();
     }
 
 private:
-    template <typename TExtReader, typename TNonReader>
-    bool read_paired_checked(TExtReader& ext_reader, TNonReader& non_reader,
+    bool read_paired_checked(FastqReaderBase& ext_reader, FastqReaderBase& non_reader,
                              FastqRecord& ext_rec, FastqRecord& non_rec,
                              uint64_t record_idx, const char* phase) {
         bool ext_ok = ext_reader.read(ext_rec);
@@ -129,13 +119,13 @@ private:
         return true;
     }
 
-    void pass1_standard(const std::string& ext_path, const std::string& non_path) {
-        FastqReader ext_reader(ext_path, use_pigz_);
-        FastqReader non_reader(non_path, use_pigz_);
+    void pass1(const std::string& ext_path, const std::string& non_path) {
+        auto ext_reader = make_fastq_reader(ext_path);
+        auto non_reader = make_fastq_reader(non_path);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 
-        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec,
+        while (read_paired_checked(*ext_reader, *non_reader, ext_rec, non_rec,
                                    record_idx, "pass1")) {
             uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
             SequenceFingerprint fp(h, ext_rec.seq.size());
@@ -169,51 +159,9 @@ private:
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
     }
 
-#ifdef HAVE_ISAL
-    void pass1_isal(const std::string& ext_path, const std::string& non_path) {
-        FastqReaderIgzip ext_reader(ext_path);
-        FastqReaderIgzip non_reader(non_path);
-        FastqRecord ext_rec, non_rec;
-        uint64_t record_idx = 0;
-
-        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec,
-                                   record_idx, "pass1")) {
-            uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
-            SequenceFingerprint fp(h, ext_rec.seq.size());
-
-            auto it = index_.find(fp);
-            if (it == index_.end()) {
-                index_.emplace(fp, IndexEntry(record_idx,
-                    static_cast<uint32_t>(non_rec.seq.size())));
-            } else {
-                it->second.count++;
-                if (non_rec.seq.size() > it->second.non_len) {
-                    it->second.record_index = record_idx;
-                    it->second.non_len = static_cast<uint32_t>(non_rec.seq.size());
-                }
-            }
-
-            record_idx++;
-            total_reads_++;
-
-            if ((total_reads_ % 1000000) == 0) {
-                size_t unique = index_.size();
-                double dup_pct = 100.0 * (1.0 - (double)unique / total_reads_);
-                std::cerr << "\r[Pass 1] " << total_reads_ << " reads, "
-                          << unique << " unique, "
-                          << std::fixed << std::setprecision(1) << dup_pct << "% dedup"
-                          << std::flush;
-            }
-        }
-
-        std::cerr << "\r";
-        log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
-    }
-#endif
-
-    void write_pass2(FastqReader& ext_reader, FastqReader& non_reader,
-                     const std::string& out_ext_path, const std::string& out_non_path,
-                     const std::string& cluster_path) {
+    void pass2(const std::string& ext_path, const std::string& non_path,
+               const std::string& out_ext_path, const std::string& out_non_path,
+               const std::string& cluster_path) {
         bool compress_ext = (out_ext_path.size() > 3 &&
                              out_ext_path.substr(out_ext_path.size() - 3) == ".gz");
         bool compress_non = (out_non_path.size() > 3 &&
@@ -240,11 +188,13 @@ private:
             records_to_write[entry.record_index] = fingerprint;
         const size_t n_to_write = records_to_write.size();
 
+        auto ext_reader = make_fastq_reader(ext_path);
+        auto non_reader = make_fastq_reader(non_path);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
         size_t written = 0;
 
-        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec,
+        while (read_paired_checked(*ext_reader, *non_reader, ext_rec, non_rec,
                                    record_idx, "pass2")) {
             auto it = records_to_write.find(record_idx);
             if (it != records_to_write.end()) {
@@ -281,90 +231,6 @@ private:
         std::cerr << "\r";
         log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }
-
-    void pass2_standard(const std::string& ext_path, const std::string& non_path,
-                        const std::string& out_ext_path, const std::string& out_non_path,
-                        const std::string& cluster_path) {
-        FastqReader ext_reader(ext_path, use_pigz_);
-        FastqReader non_reader(non_path, use_pigz_);
-        write_pass2(ext_reader, non_reader, out_ext_path, out_non_path, cluster_path);
-    }
-
-#ifdef HAVE_ISAL
-    void pass2_isal(const std::string& ext_path, const std::string& non_path,
-                    const std::string& out_ext_path, const std::string& out_non_path,
-                    const std::string& cluster_path) {
-        FastqReaderIgzip ext_reader(ext_path);
-        FastqReaderIgzip non_reader(non_path);
-
-        bool compress_ext = (out_ext_path.size() > 3 &&
-                             out_ext_path.substr(out_ext_path.size() - 3) == ".gz");
-        bool compress_non = (out_non_path.size() > 3 &&
-                             out_non_path.substr(out_non_path.size() - 3) == ".gz");
-
-        FastqWriter ext_writer(out_ext_path, compress_ext);
-        FastqWriter non_writer(out_non_path, compress_non);
-
-        gzFile cluster_gz = nullptr;
-        if (write_clusters_ && !cluster_path.empty()) {
-            cluster_gz = gzopen(cluster_path.c_str(), "wb6");
-            if (cluster_gz) {
-                gzbuffer(cluster_gz, GZBUF_SIZE);
-                if (gzprintf(cluster_gz,
-                             "hash\text_len\text_count\tnon_len\tnon_count\n") < 0)
-                    throw std::runtime_error(
-                        "gzprintf failed while writing cluster header");
-            }
-        }
-
-        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
-        records_to_write.reserve(index_.size());
-        for (const auto& [fingerprint, entry] : index_)
-            records_to_write[entry.record_index] = fingerprint;
-        const size_t n_to_write = records_to_write.size();
-
-        FastqRecord ext_rec, non_rec;
-        uint64_t record_idx = 0;
-        size_t written = 0;
-
-        while (read_paired_checked(ext_reader, non_reader, ext_rec, non_rec,
-                                   record_idx, "pass2")) {
-            auto it = records_to_write.find(record_idx);
-            if (it != records_to_write.end()) {
-                ext_writer.write(ext_rec);
-                non_writer.write(non_rec);
-
-                if (cluster_gz) {
-                    const SequenceFingerprint& fp = it->second;
-                    auto ei = index_.find(fp);
-                    if (ei == index_.end())
-                        throw std::runtime_error(
-                            "Internal error: missing fingerprint for cluster output");
-                    const IndexEntry& entry = ei->second;
-                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%lu\t%u\t%lu\n",
-                                 static_cast<unsigned long>(fp.hash),
-                                 static_cast<unsigned long>(ext_rec.seq.size()),
-                                 static_cast<unsigned long>(entry.count),
-                                 entry.non_len,
-                                 static_cast<unsigned long>(entry.count)) < 0)
-                        throw std::runtime_error(
-                            "gzprintf failed while writing cluster record");
-                }
-
-                written++;
-                if ((written % 100000) == 0) {
-                    std::cerr << "\r[Pass 2] " << written << " / " << n_to_write
-                              << " unique records written" << std::flush;
-                }
-            }
-            record_idx++;
-        }
-
-        if (cluster_gz) gzclose(cluster_gz);
-        std::cerr << "\r";
-        log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
-    }
-#endif
 
     void print_stats() const {
         log_info("=== Final Statistics ===");
@@ -389,8 +255,6 @@ private:
 
     bool use_revcomp_;
     bool write_clusters_;
-    bool use_pigz_;
-    bool use_isal_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
     uint64_t total_reads_;
@@ -416,8 +280,6 @@ static void print_usage(const char* prog) {
         << "\nOptional:\n"
         << "  -c FILE      Write cluster statistics to gzipped TSV\n"
         << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
-        << "  --pigz       Use pigz for parallel decompression\n"
-        << "  --isal       Use ISA-L for hardware-accelerated decompression\n"
         << "  -h, --help   Show this help\n"
         << "\nMemory: ~24 bytes per input read pair.\n";
 }
@@ -430,8 +292,6 @@ int derep_pairs_main(int argc, char** argv) {
 
     std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path;
     bool use_revcomp = true;
-    bool use_pigz    = false;
-    bool use_isal    = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -450,10 +310,6 @@ int derep_pairs_main(int argc, char** argv) {
             cluster_path = argv[++i];
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
-        } else if (arg == "--pigz") {
-            use_pigz = true;
-        } else if (arg == "--isal") {
-            use_isal = true;
         }
     }
 
@@ -463,14 +319,6 @@ int derep_pairs_main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
-
-#ifndef HAVE_ISAL
-    if (use_isal) {
-        std::cerr << "Warning: ISA-L requested but not available.\n"
-                  << "Falling back to " << (use_pigz ? "pigz" : "zlib") << ".\n";
-        use_isal = false;
-    }
-#endif
 
     init_logger("fqdup-derep-pairs.log");
     log_info("=== fqdup derep_pairs: Paired-end two-pass deduplication ===");
@@ -483,7 +331,7 @@ int derep_pairs_main(int argc, char** argv) {
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
 
     try {
-        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal);
+        DerepPairsEngine engine(use_revcomp, !cluster_path.empty());
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

@@ -2,44 +2,30 @@
 
 ## Prerequisites
 
-Both `derep_pairs` and `derep` require sorted input. Sort first:
+Both `derep_pairs` and `derep` require their inputs to be sorted by read ID.
+Run `fqdup sort` first. For a paired library:
 
 ```bash
 fqdup sort -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G --fast
 fqdup sort -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G --fast
 ```
 
-`--fast` keeps chunk intermediates uncompressed during sorting (~3× faster I/O
-at the cost of more temporary disk space). Omit it if disk space is limited.
+`--max-memory` controls how much RAM the sort uses for in-memory chunks; set
+it to roughly 80% of available RAM. `--fast` keeps the chunk intermediates
+uncompressed, which is about 3× faster on disk at the cost of more temporary
+space. Omit it if disk is limited.
 
 ---
 
-## Tutorial: full ancient DNA pipeline
+## Full ancient DNA pipeline
+
+The typical workflow runs three commands in sequence.
 
 ### Step 1 — sort
 
-```bash
-fqdup sort \
-  -i nonext.fq.gz \
-  -o nonext.sorted.fq.gz \
-  --max-memory 64G \
-  --fast
-```
+Sort both files by read ID, as above.
 
-Repeat for the extended file:
-
-```bash
-fqdup sort \
-  -i ext.fq.gz \
-  -o ext.sorted.fq.gz \
-  --max-memory 64G \
-  --fast
-```
-
-Set `--max-memory` to about 80% of available RAM. The sort uses all cores by
-default; limit with `-p N` if needed.
-
-### Step 2 — paired deduplication
+### Step 2 — paired structural deduplication
 
 ```bash
 fqdup derep_pairs \
@@ -50,19 +36,16 @@ fqdup derep_pairs \
   -c clusters_pairs.tsv.gz
 ```
 
-Both sorted files are read in lockstep. The extended read is hashed; the
-representative pair is the one with the longest non-extended read. The `-c`
-flag writes cluster statistics:
+`derep_pairs` reads both sorted files in lockstep, hashes the extended read,
+and keeps one representative pair per cluster. The representative is the pair
+with the longest non-extended read — it preserves the most sequence from reads
+trimmed less aggressively during adapter removal. The `-c` flag writes per-cluster
+statistics (hash, lengths, and counts for both mates) to a gzipped TSV.
 
-```
-hash            ext_len  ext_count  non_len  non_count
-a3f2b1c4...     65       4          58       4
-...
-```
+For a 25.8 M-pair library, this step typically finishes in about 25 seconds
+and reduces to around 5.6 M unique pairs.
 
 ### Step 3 — single-file damage-aware deduplication
-
-Run `derep` on the non-extended output from Step 2:
 
 ```bash
 fqdup derep \
@@ -73,39 +56,44 @@ fqdup derep \
   -c clusters_derep.tsv.gz
 ```
 
-`--damage-auto` runs Pass 0: all reads are scanned, per-position C→T and G→A
-frequencies are measured, and an exponential decay model is fitted. The
-estimated parameters are logged:
+`--damage-auto` triggers Pass 0, which scans all reads to estimate the ancient
+DNA damage parameters. These are logged before deduplication starts:
 
 ```
 Pass 0: damage estimation — 5582073 reads processed (5582073 total)
   5'-end: d_max=0.099 lambda=0.246 bg=0.487
   3'-end: d_max=0.020 lambda=0.069 bg=0.509
-  --- Damage-Aware Deduplication ---
-  5'-end d_max:  0.098842
-  Mask threshold:0.050000
   Masked positions: 1 (1 bp each end)
   Expected mismatches (L=91): 1.44, 99th-pct tolerance: 5
 ```
 
-Reads differing only within the estimated damage zone hash identically.
+Reads that differ only at masked terminal positions then hash identically and
+collapse into the same cluster — recovering pairs split by post-mortem
+deamination.
 
-`--error-correct` adds Phase 3: clusters with count ≤ 5 that differ from a
-high-count cluster (count ≥ 50×) by exactly 1 substitution outside the damage
-zone are absorbed as PCR errors.
+`--error-correct` adds Phase 3 after Pass 1: any cluster with count ≤ 5 that
+differs from a high-count cluster (≥ 50× its count) by exactly one substitution
+outside the damage zone is absorbed as a PCR copying error.
+
+On the same 5.6 M-read input, the full `--damage-auto --error-correct` run
+completes in about 33 seconds and reduces to roughly 3.5 M unique clusters.
 
 ---
 
 ## Common invocations
 
-### Standard deduplication (no ancient DNA)
+### Standard deduplication
+
+For non-ancient DNA, skip the damage and error-correction flags:
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
 fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz
 ```
 
-### Paired deduplication only
+### Structural deduplication only
+
+If you want to deduplicate paired reads without the biological layer:
 
 ```bash
 fqdup derep_pairs \
@@ -113,54 +101,24 @@ fqdup derep_pairs \
   -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz
 ```
 
-### Damage-aware with manual parameters
+### Manual damage parameters
 
-If damage parameters are already known from a mapDamage2 or DART run:
+If damage parameters are already known from a mapDamage2 or DART run, supply
+them directly and skip Pass 0:
 
 ```bash
 fqdup derep \
-  -i nonext.deduped.fq.gz \
-  -o nonext.final.fq.gz \
+  -i nonext.deduped.fq.gz -o nonext.final.fq.gz \
   --damage-dmax5 0.35 --damage-lambda5 0.40 \
   --damage-dmax3 0.15 --damage-lambda3 0.30 \
-  --damage-bg 0.02 \
   --mask-threshold 0.05
 ```
 
-### PCR error model
+### Strand-specific deduplication
 
-Specify polymerase and cycle count to compute the expected number of PCR-induced
-mismatches (informational — does not change the masking, only the reported
-tolerance):
-
-```bash
-fqdup derep \
-  -i nonext.deduped.fq.gz \
-  -o nonext.final.fq.gz \
-  --damage-auto \
-  --pcr-cycles 30 \
-  --pcr-error-rate 5.3e-7     # Q5 polymerase (default)
-```
-
-For Phusion use `--pcr-error-rate 3.9e-6`; for Taq use `1.5e-4`.
-
-### Fast decompression
-
-```bash
-# ISA-L (hardware-accelerated, fastest)
-fqdup derep_pairs ... --isal
-fqdup derep       ... --isal
-
-# pigz (parallel, widely available)
-fqdup derep_pairs ... --pigz
-fqdup derep       ... --pigz
-```
-
-### Reverse-complement collapsing
-
-By default, a sequence and its reverse complement hash to the same cluster.
-This is appropriate for single-stranded library protocols. Disable with
-`--no-revcomp` for double-stranded protocols where strand matters:
+By default, a read and its reverse complement hash to the same cluster
+(appropriate for single-stranded libraries). Disable this for protocols where
+strand matters:
 
 ```bash
 fqdup derep_pairs ... --no-revcomp
@@ -193,8 +151,6 @@ fqdup derep       ... --no-revcomp
 | `-o-ext FILE` | Output extended FASTQ | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--pigz` | Parallel decompression via pigz | off |
-| `--isal` | Hardware-accelerated decompression (ISA-L) | off |
 
 ### `fqdup derep`
 
@@ -204,9 +160,7 @@ fqdup derep       ... --no-revcomp
 | `-o FILE` | Output FASTQ | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--pigz` | Parallel decompression via pigz | off |
-| `--isal` | Hardware-accelerated decompression (ISA-L) | off |
-| `--damage-auto` | Auto-estimate damage parameters (Pass 0) | off |
+| `--damage-auto` | Estimate damage parameters from data (Pass 0) | off |
 | `--damage-dmax FLOAT` | d_max for both ends | — |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | — |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | — |
@@ -215,10 +169,10 @@ fqdup derep       ... --no-revcomp
 | `--damage-lambda3 FLOAT` | Decay constant for 3' end | — |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
-| `--pcr-cycles INT` | PCR cycles (informational) | 0 |
+| `--pcr-cycles INT` | PCR cycles (for expected-mismatch reporting) | 0 |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
 | `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | off |
-| `--errcor-ratio FLOAT` | count(parent)/count(child) ≥ ratio | 50.0 |
+| `--errcor-ratio FLOAT` | count(parent)/count(child) threshold | 50.0 |
 | `--errcor-max-count INT` | Children must have count ≤ N | 5 |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |

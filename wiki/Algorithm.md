@@ -2,198 +2,118 @@
 
 ## fqdup sort
 
-External merge sort in three phases:
+The sort is a standard external merge sort. The input is streamed and
+accumulated into memory-limited chunks; each chunk is sorted in-place using
+parallel `std::sort` and written to disk. Once all chunks are flushed, a
+priority-queue k-way merge produces the single sorted output stream.
 
-```
-Phase 1: Chunk ingestion (single-threaded)
-  Stream input → accumulate reads into memory-limited chunks
-  Each full chunk: sort in-place (parallel, std::sort) → write to disk
+Chunks are gzip-compressed on disk by default. With `--fast`, chunks stay
+uncompressed — roughly 3× faster I/O at the cost of 3× more temporary disk
+space. For a 25 M-read library on NFS, the sort completes in about 20 seconds
+with `--fast`; without it, closer to 60 seconds.
 
-Phase 2: Parallel sort (already done per-chunk in Phase 1)
-
-Phase 3: k-way merge (single-threaded)
-  Priority queue over all sorted chunk files → single sorted output stream
-```
-
-Chunks are gzip-compressed by default. With `--fast`, chunks stay
-uncompressed (~3× faster I/O at the cost of more temporary disk space).
-
-Reads are sorted lexicographically by read ID (everything before the first
-space in the `@` header line). Natural-numeric sort (`-N`) is also available
-for IDs with numeric suffixes.
+Reads are sorted lexicographically by read ID (the portion of the `@` header
+line before the first space). Natural-numeric sort (`-N`) is also supported for
+IDs with numeric suffixes.
 
 ---
 
 ## fqdup derep_pairs
 
-Two-pass paired deduplication on sorted files.
+`derep_pairs` is a two-pass algorithm over two sorted FASTQ files read in
+lockstep. The extended file drives the hash; the non-extended file provides
+the mate.
 
-### Overview
+**Pass 1** streams both files simultaneously, one pair at a time. For each
+pair, the extended read's sequence is hashed to a canonical fingerprint
+`(min(XXH3(seq), XXH3(revcomp(seq))), seq_len)`. If the fingerprint is new,
+a new index entry is created recording the current record position and the
+non-extended read's length. If it already exists, the count is incremented
+and, if the current non-extended read is longer than the stored one, the
+representative is updated to this pair. The representative selection rule —
+longest non-extended mate — preserves the most sequence from adapter trimming.
 
-```
-[Pass 1]  Stream ext+non in lockstep → build hash → IndexEntry map
-             ↓
-[Pass 2]  Stream ext+non again → write representative pairs
-```
+**Pass 2** streams both files a second time. For each pair, if its record
+position matches the representative stored in the index, it is written to the
+output files. Cluster statistics (if `-c` is given) are written here as well.
 
-### Pass 1 — index construction
+No damage masking or error correction occurs in `derep_pairs`. It is a
+structural step.
 
-Both sorted files are read simultaneously, one pair at a time. Reads at each
-position are expected to share the same read ID (a warning is logged if they
-differ). For each pair `(ext, non)`:
-
-1. **Hash the extended read:**
-
-   ```
-   h = canonical_hash(ext.seq) = min(XXH3_64(ext.seq), XXH3_64(revcomp(ext.seq)))
-   ```
-
-   Taking the min over the sequence and its reverse complement ensures that a
-   molecule sequenced from either strand lands in the same cluster.
-
-2. **Form a fingerprint:** `(h, len(ext.seq))` — the sequence length is
-   included to reduce false collisions between reads of different lengths.
-
-3. **Insert into the index:**
-   - New fingerprint: `IndexEntry{ record_idx=current, non_len=len(non.seq), count=1 }`
-   - Existing fingerprint:
-     - Increment `count`
-     - If `len(non.seq) > stored non_len`: update `record_idx` and `non_len`
-
-   **Representative selection:** the pair with the longest non-extended read
-   is kept. Longer non-extended reads retain more sequence — they were trimmed
-   less aggressively during adapter removal.
-
-Memory: the index has one entry per unique cluster. With hash map overhead,
-expect approximately 40 bytes per unique cluster.
-
-### Pass 2 — output
-
-The index maps each fingerprint to the record index of its representative.
-A reverse map `record_idx → fingerprint` is built, then both files are
-streamed again:
-
-```
-for each pair (ext, non) at position record_idx:
-    if record_idx in records_to_write:
-        write ext to out_ext
-        write non to out_non
-        (optionally) write cluster stats to -c file
-```
-
-No damage masking or error correction happens here.
+Memory: the index has one entry per unique cluster, approximately 40 bytes each
+(20-byte IndexEntry plus hash-map overhead). For a 25 M-pair library with 78%
+duplication, that is about 5.6 M entries — roughly 220 MB.
 
 ---
 
 ## fqdup derep
 
-Single-file deduplication with optional damage masking and PCR error
-correction. Input is a sorted FASTQ (typically the non-extended output
-of `derep_pairs`).
+`derep` takes a single sorted FASTQ and runs up to four phases depending on
+which options are active.
 
-### Overview
+**Pass 0** (with `--damage-auto`) scans all reads to estimate the ancient DNA
+damage model. It measures the T/(T+C) frequency at each of the first 15 5'-end
+positions and the A/(A+G) frequency at the corresponding 3'-end positions.
+Background rates come from the middle third of each read. A coverage-weighted
+OLS fit in log-space (positions 1–9) gives the exponential decay parameters
+`d_max` and `lambda` for each end. Position 0 is excluded because in sorted
+files the most abundant reads appear first, which can skew terminal composition.
+Lambda is clamped to [0.05, 0.5].
 
-```
-[Pass 0]  (damage-aware only)   Full scan → fit damage model
-              ↓
-[Pass 1]  Stream input → build hash → IndexEntry map
-              ↓
-[Phase 3] (error-correct only)  Absorb PCR 1-error variants
-              ↓
-[Pass 2]  Stream again → write representative records
-```
+After fitting, positions where the observed damage excess exceeds
+`--mask-threshold` are stored in a boolean array. All subsequent hashing uses
+this precomputed array — no exponential evaluation at hash time.
 
-### Pass 0 — damage estimation
+**Pass 1** streams the input and builds the index. For each read, the sequence
+is optionally masked (neutral bytes at C/T in masked 5' positions, G/A in
+masked 3' positions), then hashed to a canonical fingerprint. New fingerprints
+get a new index entry; existing fingerprints increment the count. If
+`--error-correct` is active, the full sequence of each unique cluster is also
+stored in a contiguous sequence arena for Phase 3.
 
-See [[Damage-Aware-Deduplication]] for the full model description.
+**Phase 3** (with `--error-correct`) runs entirely in memory on the index. It
+finds child clusters (count ≤ 5) that differ from a parent cluster (count ≥ 50×
+the child's) by exactly one interior substitution and marks them as PCR errors.
+See [[PCR-Error-Correction]] for how the 3-way pigeonhole search works.
 
-All reads are scanned to measure per-position C→T (5' end) and G→A (3' end)
-frequencies. The background rate comes from the middle third of each read. An
-exponential decay model is fitted to each end:
-
-```
-P_CT(pos) = d_max_5 × exp(-lambda_5 × pos) + bg
-P_GA(pos) = d_max_3 × exp(-lambda_3 × pos) + bg
-```
-
-The fit uses coverage-weighted OLS on positions 1–9. Lambda is clamped to
-[0.05, 0.5]. After fitting, positions where the observed excess exceeds
-`--mask-threshold` are stored in a boolean mask array — no model evaluation
-happens at hash time.
-
-Damage is treated as significant when `d_max_5 > 0.02` or `d_max_3 > 0.02`.
-Below that, Pass 0 still runs but no masking is applied.
-
-### Pass 1 — index construction
-
-For each read `rec`:
-
-1. **Compute hash** (with or without damage masking):
-
-   Without damage:
-   ```
-   h = min(XXH3_64(rec.seq), XXH3_64(revcomp(rec.seq)))
-   ```
-
-   With damage masking:
-   ```
-   masked = apply_damage_mask(rec.seq)
-   h      = min(XXH3_64(masked), XXH3_64(apply_damage_mask(revcomp(rec.seq))))
-   ```
-
-   The masking substitutes a neutral byte at each position where the damage
-   excess exceeds `--mask-threshold`. Independently-deaminated copies of the
-   same molecule then hash identically. See [[Damage-Aware-Deduplication]] for
-   why the mask must be symmetric.
-
-2. **Form fingerprint:** `(h, len(rec.seq))`
-
-3. **Insert into index:**
-   - New fingerprint: record index and (if `--error-correct`) append sequence
-     to SeqArena
-   - Existing fingerprint: increment `count`
-
-### Phase 3 — PCR error correction
-
-See [[PCR-Error-Correction]] for full details.
-
-### Pass 2 — output
-
-```
-for each read at position record_idx:
-    if record_idx in records_to_write (and not flagged as PCR error):
-        write rec to output
-        (optionally) write cluster stats to -c file
-```
+**Pass 2** streams the input again and writes each read whose record position
+is the representative of a non-absorbed cluster.
 
 ---
 
 ## Canonical hashing
 
+All three subcommands use the same canonical hash:
+
 ```
 canonical_hash(seq) = min(XXH3_64(seq), XXH3_64(revcomp(seq)))
 ```
 
-[XXH3_64](https://github.com/Cyan4973/xxHash) is a non-cryptographic hash
-with throughput above 20 GB/s and excellent distribution. `ska::flat_hash_map`
-(open-addressing, robin-hood probing) provides cache-friendly O(1) lookup and
-insert. The composite key `(hash, seq_len)` reduces false-positive collisions
-between reads of different lengths.
+Taking the minimum of the two hashes means that a molecule sequenced from
+either strand maps to the same fingerprint — forward and reverse-complement
+reads collapse into the same cluster. The fingerprint key also includes the
+sequence length to reduce false collisions between reads of different lengths
+that happen to share a hash value.
+
+[XXH3_64](https://github.com/Cyan4973/xxHash) exceeds 20 GB/s on modern
+hardware with excellent distribution. The hash map is `ska::flat_hash_map`
+(open-addressing, robin-hood probing), giving cache-friendly O(1) average-case
+lookup and insert.
 
 ---
 
 ## Memory model
 
-| Component | Formula | Example (5.6 M reads, 63% dup) |
-|-----------|---------|-------------------------------|
-| `derep_pairs` Pass 1 index | ~40 bytes × N_unique_pairs | ~90 MB (2.2 M unique) |
-| `derep` Pass 1 index | ~40 bytes × N_unique_clusters | ~140 MB (3.5 M unique) |
-| SeqArena (error-correct) | ~1 byte/bp × N_unique × L_avg | ~225 MB (3.5 M × 65 bp) |
+The index grows with unique clusters, not total reads. For libraries with high
+duplication rates this makes a substantial difference.
 
-The index grows with unique clusters, not total reads. For large libraries with
-low duplication rates the distinction matters less; for highly-amplified
-libraries (50–80% duplication) the index is substantially smaller than the
-input.
+| Component | Size | Example (5.6 M reads, 37% dup) |
+|-----------|------|-------------------------------|
+| `derep` index | ~40 bytes × N_unique | ~140 MB (3.5 M unique) |
+| SeqArena (`--error-correct`) | ~L_avg bytes × N_unique | ~320 MB (3.5 M × 91 bp) |
 
 The SeqArena stores one full sequence per unique cluster and is only allocated
-when `--error-correct` is active.
+when `--error-correct` is active. Without it, `derep` on 5.6 M reads uses
+roughly 140 MB regardless of the duplication rate.
+
+For `derep_pairs`, the index similarly grows with unique pairs, not total pairs.
