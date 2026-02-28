@@ -269,10 +269,16 @@ not PCR errors. The 1,456 absorptions are A↔T and C↔G transversions only.
 Phase 3 adds approximately 2 seconds to a 31-second `derep` run. It operates
 entirely in memory on the index built during Pass 1.
 
-### Batch run: 26 ancient DNA libraries
+### Batch run: 31 ancient DNA libraries
 
 All libraries processed with `--damage-auto --error-correct`, Q5 defaults
 (φ = 5.3×10⁻⁷), D_eff estimated automatically from duplication ratio.
+
+**Input is post-`derep_pairs`** (`*.derep.non.fq.gz`). Most PCR duplicates were
+already removed by `derep_pairs`; `derep` here handles the residual structural
+duplicates (reads with identical non-extended sequence but different extended mate)
+plus damage-aware merging. D_eff here is the residual duplication D_eff, not the
+original PCR D_eff — hence values are much lower than the true amplification depth.
 
 | Library | Total reads | Unique (P1) | Unique (final) | Dup% | d_max | λ | D_eff | Absorbed |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -313,7 +319,7 @@ All libraries processed with `--damage-auto --error-correct`, Q5 defaults
 (after damage filter). **Unique (P1)** = after damage-aware deduplication but
 before Phase 3; **Unique (final)** = output sequence count.
 
-Across these 26 libraries, error correction fires only when D_eff ≥ ~0.6.
+Across all 31 libraries, error correction fires only when D_eff ≥ ~0.6.
 The cutoff is not a hard threshold — it reflects the adaptive ceiling formula:
 at low D_eff, E[count_child] < 1 for all realistic parent counts, so the
 static `--errcor-max-count 5` ceiling dominates and no child qualifies for
