@@ -1,5 +1,11 @@
 # PCR error correction (Phase 3)
 
+This page covers the second of two sources of false unique clusters in ancient
+DNA deduplication: **PCR copying errors**. The first — post-mortem deamination
+— is covered in [[Damage-Aware-Deduplication]]. The two are complementary:
+damage masking handles terminal variation, Phase 3 handles interior variation.
+See [[Home]] for the full picture.
+
 ## Motivation
 
 PCR amplification introduces substitution errors at a low but nonzero rate.
