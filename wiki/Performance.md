@@ -2,35 +2,30 @@
 
 ## Benchmarks
 
-All benchmarks were run on a 96-core server with NFS-mounted storage.
+All benchmarks were run on sample `a88af16f35` — 25.8 M paired-end reads,
+mean read length ~91 bp, ancient DNA with `d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`.
+Storage: NFS-mounted.
 
-### Deduplication quality
+### Full pipeline: deduplication quality
 
-Tested on sample `a88af16f35` — a 25.8 M-read ancient DNA library with
-mean read length ~65 bp and estimated `d_max_5 ≈ 0.071`, `lambda_5 ≈ 0.29`:
+The full pipeline runs three steps. Numbers shown are from the non-extended file
+at each stage.
 
-| Pipeline | Unique clusters | Change vs standard |
-|----------|-----------------|--------------------|
-| `derep_pairs` only (standard) | 5,582,073 | — |
-| `derep --damage-auto` | 5,547,508 | −34,565 (−0.6%) |
-| `derep --damage-auto --error-correct` | 5,532,327 | −49,746 (−0.9%) |
+| Step | Unique clusters | Wall time |
+|------|----------------|-----------|
+| `derep_pairs` (25.8 M pairs in) | 5,582,073 | ~25 s |
+| `derep` standard (exact hash) | 3,531,821 | ~22 s |
+| `derep --damage-auto` | 3,511,607 | ~31 s |
+| `derep --damage-auto --error-correct` | 3,506,272 | ~33 s |
 
-The damage-aware step correctly merged 34,565 read pairs over-split by
-terminal deamination. Phase 3 error correction absorbed a further 15,181
-PCR-error clusters.
+- `derep_pairs` reduces 25.8 M pairs to 5.58 M unique (78.4% structural dedup)
+- `derep --damage-auto` merges a further 20,214 clusters split by terminal
+  deamination (−0.6% vs standard)
+- `--error-correct` absorbs 5,335 PCR-error clusters (−0.15% vs damage-auto only)
 
-### Wall time
-
-| Step | Time |
-|------|------|
-| `sort` (25.8 M reads, gzip input) | ~20 s |
-| `derep_pairs` (25.8 M pairs, gzip input) | ~25 s |
-| `derep` (standard, gzip input) | ~30 s |
-| `derep --damage-auto` | ~31 s |
-| `derep --damage-auto --error-correct` | ~33 s |
-
-Phase 3 error correction adds only ~2–3 seconds because it operates entirely
-in memory on the index built during Pass 1 — no additional I/O.
+Pass 0 (full-scan damage estimation) adds ~9 seconds. Phase 3 (error
+correction) adds ~2 seconds — it runs in memory on the Pass 1 index with no
+additional I/O.
 
 ---
 
@@ -38,111 +33,116 @@ in memory on the index built during Pass 1 — no additional I/O.
 
 ### `fqdup derep_pairs`
 
-The Pass 1 index stores one `IndexEntry` per **input read pair** — not per
-unique cluster — because we need to track which record index is the
-representative for each cluster. `IndexEntry` is approximately 24 bytes.
+The index stores one entry per unique cluster. With hash map overhead, expect
+approximately 40 bytes per unique pair.
 
 ```
-Memory ≈ 24 bytes × N_input_pairs
+Memory ≈ 40 bytes × N_unique_pairs
 ```
 
-| Input size | Memory |
-|------------|--------|
-| 25 M pairs | ~600 MB |
-| 100 M pairs | ~2.4 GB |
-| 400 M pairs | ~9.6 GB |
+| Unique pairs | Memory |
+|-------------|--------|
+| 5 M | ~200 MB |
+| 25 M | ~1 GB |
+| 100 M | ~4 GB |
 
 ### `fqdup derep` (without `--error-correct`)
 
-The Pass 1 index stores one `IndexEntry` (~16 bytes) per **input read**:
+Same structure — one entry per unique cluster.
 
 ```
-Memory ≈ 16 bytes × N_input_reads
+Memory ≈ 40 bytes × N_unique_clusters
 ```
 
-| Input size | Memory |
-|------------|--------|
-| 25 M reads | ~400 MB |
-| 100 M reads | ~1.6 GB |
-| 400 M reads | ~6.4 GB |
+| Unique clusters | Memory |
+|----------------|--------|
+| 3.5 M | ~140 MB |
+| 25 M | ~1 GB |
+| 100 M | ~4 GB |
+| 200 M | ~8 GB |
+
+The index size from our benchmark: 134 MB for 3.53 M unique clusters from
+5.58 M reads (38 bytes/unique cluster, consistent with the formula).
 
 ### `fqdup derep` (with `--error-correct`)
 
 Error correction adds the `SeqArena` — a contiguous byte array storing the
-full sequence of every unique cluster (one sequence per cluster, not per read):
+full sequence of every unique cluster:
 
 ```
-Memory ≈ 16 bytes × N_reads           (Pass 1 index)
-       + L_avg bytes × N_unique        (SeqArena)
+Memory ≈ 40 bytes × N_unique    (Pass 1 index)
+       + L_avg bytes × N_unique  (SeqArena)
 ```
 
 | Unique clusters | Mean length | SeqArena |
 |----------------|------------|---------|
-| 5 M | 65 bp | ~325 MB |
-| 50 M | 65 bp | ~3.25 GB |
-| 200 M | 65 bp | ~13 GB |
+| 3.5 M | 91 bp | ~320 MB |
+| 25 M | 65 bp | ~1.6 GB |
+| 100 M | 65 bp | ~6.5 GB |
 
-For a 400 M-read library with 50% duplication rate and `--error-correct`:
+For a 25 M-pair library with 50% duplication (12.5 M unique) and
+`--error-correct` at 65 bp mean length:
 
 ```
-Pass 1 index:  16 × 400 M = 6.4 GB
-SeqArena:      65 × 200 M = 13 GB
-Total:        ~19–20 GB
+Index:    40 × 12.5 M = 500 MB
+SeqArena: 65 × 12.5 M = 813 MB
+Total:   ~1.3 GB
 ```
-
-Without `--error-correct` the SeqArena is never allocated: 400 M reads at
-16 bytes/read = 6.4 GB.
 
 ---
 
 ## Throughput and I/O
 
-Deduplication is primarily I/O-bound, not CPU-bound. Reads are processed at
-approximately **40,000–50,000 reads/s** on NFS. On local NVMe this rises
-significantly and CPU becomes the bottleneck.
+Deduplication is I/O-bound on network storage. On the NFS-mounted server:
+
+| Step | Observed throughput |
+|------|-------------------|
+| Pass 0 (damage estimation) | ~600 k reads/s |
+| Pass 1 (index build) | ~400–500 k reads/s |
+| Pass 2 (output) | ~200–300 k reads/s |
+
+On local NVMe, throughput is higher and CPU becomes the bottleneck.
 
 ### Decompression acceleration
 
 | Flag | Speedup | Requirement |
 |------|---------|-------------|
-| `--isal` | 4–6× decompression | Intel ISA-L library |
+| `--isal` | 3–5× decompression | Intel ISA-L library |
 | `--pigz` | 2–3× decompression | pigz in PATH |
 
 Use `--isal` when reading `.gz` files from fast storage. Both flags affect
-decompression only; gzip **output** uses pigz automatically when available.
+decompression only; gzip output uses pigz automatically when available.
 
 ### Sort acceleration
 
 ```bash
-# Faster sort: uncompressed temporaries (3× faster I/O, more disk)
+# Uncompressed temporaries: ~3× faster I/O, more temporary disk space
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 64G --fast
 
-# Control parallelism
-fqdup sort ... -p 16   # use 16 threads for sorting
+# Limit parallelism if needed
+fqdup sort ... -p 16
 ```
 
-The sort is the most parallelism-friendly step — it scales linearly with
-available cores for the in-memory chunk sort phase.
+The sort scales well with available cores for the in-memory chunk sort phase.
 
 ### Two-pass overhead
 
-Both `derep_pairs` and `derep` read their input **twice** (Pass 1 + Pass 2).
-Plan for 2× the read I/O of the input file size. Output is always written
-once (Pass 2 only).
+Both `derep_pairs` and `derep` read their input twice (Pass 1 + Pass 2).
+Plan for 2× the read I/O of the input file. Output is written once.
 
 ---
 
-## Scaling to Larger Datasets
+## Scaling to larger datasets
 
-For very large libraries (> 400 M read pairs, > 100 M unique clusters):
+For libraries above 400 M read pairs or 100 M unique clusters:
 
-1. **Memory**: use `derep_pairs` first to reduce unique clusters, then run
+1. **Memory**: run `derep_pairs` first to reduce unique count, then run
    `derep` on the smaller non-extended output. The non-extended file after
-   `derep_pairs` will typically be substantially smaller than the input.
+   `derep_pairs` is typically 60–80% smaller.
 
-2. **I/O**: use `--isal` or `--pigz` and `--fast` (for sort). If possible,
-   place temp files on fast local storage (`-t /local/scratch`).
+2. **I/O**: use `--isal` or `--pigz` and `--fast` for the sort step. Place
+   temp files on fast local storage with `-t /local/scratch`.
 
-3. **Error correction**: if memory is tight, `--error-correct` is optional.
-   The quality gain (typically < 1% additional merges) may not justify the
-   SeqArena overhead for extremely large datasets.
+3. **Error correction**: `--error-correct` is optional. For very large
+   datasets the SeqArena can be substantial; the quality gain (typically
+   < 0.2% additional merges) may not justify the memory cost.
