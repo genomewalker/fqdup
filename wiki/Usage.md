@@ -14,12 +14,9 @@ at the cost of more temporary disk space). Omit it if disk space is limited.
 
 ---
 
-## Tutorial: Full ancient DNA pipeline
+## Tutorial: full ancient DNA pipeline
 
-This tutorial walks through the full three-step workflow on a paired-end library
-with expected ancient DNA damage.
-
-### Step 1 — Sort
+### Step 1 — sort
 
 ```bash
 fqdup sort \
@@ -39,11 +36,10 @@ fqdup sort \
   --fast
 ```
 
-Memory is the main parameter. Set `--max-memory` to about 80% of available RAM
-to leave headroom. The sort is parallel (uses all cores by default); limit with
-`-p N` if needed.
+Set `--max-memory` to about 80% of available RAM. The sort uses all cores by
+default; limit with `-p N` if needed.
 
-### Step 2 — Paired deduplication
+### Step 2 — paired deduplication
 
 ```bash
 fqdup derep_pairs \
@@ -54,12 +50,9 @@ fqdup derep_pairs \
   -c clusters_pairs.tsv.gz
 ```
 
-This reads both sorted files in lockstep, hashes the **extended** read sequence,
-and selects one representative pair per cluster. The representative is the pair
-with the **longest non-extended read** — this recovers as much non-extended
-sequence as possible when duplicate reads differ in trimming length.
-
-The `-c` flag writes cluster statistics (one row per unique cluster):
+Both sorted files are read in lockstep. The extended read is hashed; the
+representative pair is the one with the longest non-extended read. The `-c`
+flag writes cluster statistics:
 
 ```
 hash            ext_len  ext_count  non_len  non_count
@@ -67,7 +60,7 @@ a3f2b1c4...     65       4          58       4
 ...
 ```
 
-### Step 3 — Single-file damage-aware deduplication
+### Step 3 — single-file damage-aware deduplication
 
 Run `derep` on the non-extended output from Step 2:
 
@@ -80,31 +73,30 @@ fqdup derep \
   -c clusters_derep.tsv.gz
 ```
 
-`--damage-auto` runs Pass 0: it stride-samples the input file (every 1000th read
-by default), fits an exponential decay model to the observed C→T and G→A
-frequencies, and logs the estimated parameters:
+`--damage-auto` runs Pass 0: all reads are scanned, per-position C→T and G→A
+frequencies are measured, and an exponential decay model is fitted. The
+estimated parameters are logged:
 
 ```
-Pass 0: damage estimation — sampled 100000 reads (every 1000th) ...
-  5'-end: d_max=0.071 lambda=0.290 bg=0.301
-  3'-end: d_max=0.011 lambda=0.250 bg=0.295
+Pass 0: damage estimation — 5582073 reads processed (5582073 total)
+  5'-end: d_max=0.099 lambda=0.246 bg=0.487
+  3'-end: d_max=0.020 lambda=0.069 bg=0.509
   --- Damage-Aware Deduplication ---
-  5'-end d_max:  0.071000
-  5'-end lambda: 0.290000
+  5'-end d_max:  0.098842
   Mask threshold:0.050000
-  Expected mismatches (L=65): 0.51, 99th-pct tolerance: 3
+  Masked positions: 1 (1 bp each end)
+  Expected mismatches (L=91): 1.44, 99th-pct tolerance: 5
 ```
 
-Reads whose sequences differ only within the estimated damage zone will now hash
-to the same cluster instead of being counted as distinct.
+Reads differing only within the estimated damage zone hash identically.
 
-`--error-correct` adds Phase 3: any cluster with count ≤ 5 that differs from a
+`--error-correct` adds Phase 3: clusters with count ≤ 5 that differ from a
 high-count cluster (count ≥ 50×) by exactly 1 substitution outside the damage
-zone is absorbed as a PCR error.
+zone are absorbed as PCR errors.
 
 ---
 
-## Common Invocations
+## Common invocations
 
 ### Standard deduplication (no ancient DNA)
 
@@ -113,7 +105,7 @@ fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
 fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz
 ```
 
-### Paired deduplication only (no biological step)
+### Paired deduplication only
 
 ```bash
 fqdup derep_pairs \
@@ -123,7 +115,7 @@ fqdup derep_pairs \
 
 ### Damage-aware with manual parameters
 
-If you know the damage parameters from a previous mapDamage or DART run:
+If damage parameters are already known from a mapDamage2 or DART run:
 
 ```bash
 fqdup derep \
@@ -135,9 +127,11 @@ fqdup derep \
   --mask-threshold 0.05
 ```
 
-### Damage-aware with PCR model
+### PCR error model
 
-If you have PCR parameters for your library preparation:
+Specify polymerase and cycle count to compute the expected number of PCR-induced
+mismatches (informational — does not change the masking, only the reported
+tolerance):
 
 ```bash
 fqdup derep \
@@ -153,19 +147,19 @@ For Phusion use `--pcr-error-rate 3.9e-6`; for Taq use `1.5e-4`.
 ### Fast decompression
 
 ```bash
-# With ISA-L (hardware-accelerated, fastest)
+# ISA-L (hardware-accelerated, fastest)
 fqdup derep_pairs ... --isal
 fqdup derep       ... --isal
 
-# With pigz (parallel, widely available)
+# pigz (parallel, widely available)
 fqdup derep_pairs ... --pigz
 fqdup derep       ... --pigz
 ```
 
-### Reverse-complement collapsing disabled
+### Reverse-complement collapsing
 
-By default, `fqdup` collapses a sequence and its reverse complement into the same
-cluster. This is appropriate for single-stranded library protocols. Disable with
+By default, a sequence and its reverse complement hash to the same cluster.
+This is appropriate for single-stranded library protocols. Disable with
 `--no-revcomp` for double-stranded protocols where strand matters:
 
 ```bash
@@ -175,15 +169,15 @@ fqdup derep       ... --no-revcomp
 
 ---
 
-## All Options
+## All options
 
 ### `fqdup sort`
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i FILE` | Input FASTQ (.gz or plain, or `/dev/stdin`) | required |
-| `-o FILE` | Output FASTQ (.gz for compression) | required |
-| `--max-memory SIZE` | Memory budget (e.g. `64G`, `16G`, `8G`) | required |
+| `-i FILE` | Input FASTQ (.gz or plain) | required |
+| `-o FILE` | Output FASTQ | required |
+| `--max-memory SIZE` | Memory budget (e.g. `64G`, `16G`) | required |
 | `-p N` | Sort threads | all cores |
 | `-t DIR` | Temp directory for chunk files | `.` |
 | `-N` | Natural sort (numeric read-ID suffixes) | off |
@@ -213,16 +207,15 @@ fqdup derep       ... --no-revcomp
 | `--pigz` | Parallel decompression via pigz | off |
 | `--isal` | Hardware-accelerated decompression (ISA-L) | off |
 | `--damage-auto` | Auto-estimate damage parameters (Pass 0) | off |
-| `--damage-stride INT` | Sampling stride for Pass 0 | 1000 |
 | `--damage-dmax FLOAT` | d_max for both ends | — |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | — |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | — |
 | `--damage-lambda FLOAT` | Decay constant for both ends | — |
 | `--damage-lambda5 FLOAT` | Decay constant for 5' end | — |
 | `--damage-lambda3 FLOAT` | Decay constant for 3' end | — |
-| `--damage-bg FLOAT` | Background deamination rate | 0.02 |
+| `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
-| `--pcr-cycles INT` | PCR cycles | 0 |
+| `--pcr-cycles INT` | PCR cycles (informational) | 0 |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
 | `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | off |

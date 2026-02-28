@@ -1,15 +1,15 @@
-# PCR Error Correction (Phase 3)
+# PCR error correction (Phase 3)
 
 ## Motivation
 
 PCR amplification introduces substitution errors at a low but nonzero rate.
-A read cluster with count=1 that differs from a cluster with count=500 by a
-single substitution in a non-damaged interior position almost certainly
-represents a PCR copying error, not a distinct original molecule.
+A cluster with count=1 that differs from a cluster with count=500 by a single
+interior substitution almost certainly represents a copying error, not a
+distinct original molecule.
 
-Phase 3 identifies these clusters and removes them, reducing the count of
-spurious unique sequences in the output. It operates on the deduplication
-index (after Pass 1), so it adds no extra I/O.
+Phase 3 identifies these clusters and flags them for removal. It runs
+entirely in memory on the index built during Pass 1, so it adds no
+extra file I/O.
 
 ---
 
@@ -24,61 +24,53 @@ index (after Pass 1), so it adds no extra I/O.
 
 ---
 
-## Interior Region
+## Interior region
 
 Only positions **outside** the damage zone are examined. The damage zone
-boundaries `k5` (from the 5' end) and `k3` (from the 3' end) are derived from
-the fitted damage model: `k5` is the largest position where the 5' damage
-excess still exceeds `--mask-threshold`, and similarly for `k3`.
+boundaries `k5` (5' end) and `k3` (3' end) come from the fitted damage model:
+`k5` is the number of masked positions from the 5' end, `k3` from the 3' end.
 
 ```
 seq: [ damaged zone 5' | ←── interior ──→ | damaged zone 3' ]
           k5 positions                         k3 positions
 ```
 
-The interior length is `ilen = L - k5 - k3`.
+Interior length: `ilen = L - k5 - k3`.
 
-This separation is essential for two reasons:
+This separation matters because a deaminated terminal C→T would look exactly
+like a single-substitution PCR error. Excluding the damage zone prevents
+legitimate damage variants from being absorbed as errors.
 
-1. **Prevents false negatives**: a deaminated terminal C→T would look like a
-   single substitution from its parent, but it is not a PCR error. Excluding
-   the damage zone avoids absorbing genuinely distinct reads that merely carry
-   terminal damage.
-
-2. **Prevents false positives**: two reads from different molecules that happen
-   to share terminal sequence but differ in the interior would not be falsely
-   merged.
-
-When `--damage-auto` or manual damage parameters are not specified, `k5 = k3 = 0`
-and Phase 3 uses the full sequence interior.
+When damage parameters are not specified, `k5 = k3 = 0` and Phase 3 uses
+the full read as the interior.
 
 ---
 
-## Algorithm: 3-way Pigeonhole
+## Algorithm: 3-way pigeonhole
 
 ### Principle
 
 If sequences A and B of the same length differ by exactly one substitution in
 the interior of length `ilen`, then at least 2 of the 3 equal-width parts of
-the interior must be identical:
+the interior are identical:
 
 ```
 interior: [─── part 0 ─── | ─── part 1 ─── | ─── part 2 ───]
 
-If mismatch falls in part 0: parts 1 and 2 match → detected by index (p1, p2)
-If mismatch falls in part 1: parts 0 and 2 match → detected by index (p0, p2)
-If mismatch falls in part 2: parts 0 and 1 match → detected by index (p0, p1)
+mismatch in part 0 → parts 1 and 2 match → detected by index (p1, p2)
+mismatch in part 1 → parts 0 and 2 match → detected by index (p0, p2)
+mismatch in part 2 → parts 0 and 1 match → detected by index (p0, p1)
 ```
 
-Therefore, three pair-key indices covering `(p0,p1)`, `(p0,p2)`, `(p1,p2)`
-are sufficient to detect every edit-distance-1 parent for every child. No
-approximation — this is exact for Hamming distance 1 in the interior.
+Three pair-key indices over `(p0,p1)`, `(p0,p2)`, `(p1,p2)` are sufficient
+to find every Hamming-distance-1 parent for every child. This is exact — no
+approximation.
 
 ### Index construction (Phase 3a)
 
-For each parent sequence (count > `--errcor-max-count`):
+For each parent (count > `--errcor-max-count`):
 
-1. Compute the three part hashes: `h0 = XXH3(interior[0:s0])`, etc.
+1. Compute three part hashes: `h0 = XXH3(interior[0:s0])`, etc.
 2. Insert into three pair-key maps, sharded by `ilen` (sequences of different
    lengths cannot be Hamming-distance-1 neighbours):
 
@@ -88,27 +80,24 @@ map_02[pair_key(h0, h2, tag=1, ilen)] → parent_id
 map_12[pair_key(h1, h2, tag=2, ilen)] → parent_id
 ```
 
-`pair_key` is commutative (sorts `ha`, `hb` before mixing), so
-`pair_key(h0, h1, ...) == pair_key(h1, h0, ...)` — the index is symmetric.
-
-Bucket sizes are capped at `--errcor-bucket-cap` (default 64) to prevent
-low-complexity or repeat regions from creating extremely large buckets that
-would slow down Phase 3b.
+`pair_key` normalises `(ha, hb)` by sorting before mixing, so the index is
+symmetric. Bucket sizes are capped at `--errcor-bucket-cap` (default 64)
+to prevent low-complexity regions from producing pathologically large buckets.
 
 ### Parent lookup (Phase 3b)
 
-For each child sequence (count ≤ `--errcor-max-count`):
+For each child (count ≤ `--errcor-max-count`):
 
 1. Compute the child's three part hashes.
-2. Query all three pair-key maps:
+2. Query all three maps:
 
 ```
-candidates ← map_01[pair_key(h0, h1)] ∪ map_02[pair_key(h0, h2)] ∪ map_12[pair_key(h1, h2)]
+candidates ← map_01[pair_key(h0, h1)]
+           ∪ map_02[pair_key(h0, h2)]
+           ∪ map_12[pair_key(h1, h2)]
 ```
 
 3. For each candidate parent, verify:
-   - Same interior length (should always hold due to length sharding, but
-     checked for safety)
    - Not already flagged as a PCR error
    - `count(parent) ≥ --errcor-ratio × count(child)`
    - `interior_hamming(parent, child) ≤ 1`
@@ -116,17 +105,14 @@ candidates ← map_01[pair_key(h0, h1)] ∪ map_02[pair_key(h0, h2)] ∪ map_12[
    The Hamming check uses AVX2 SIMD (32 bases at a time) when available,
    falling back to a scalar loop.
 
-4. If any parent passes all checks, the child is marked as absorbed.
+4. If any parent passes, the child is marked absorbed.
 
 ### Epoch deduplication
 
-The three pair-key queries for a single child may return overlapping candidate
-sets (a parent could appear in multiple maps). Each candidate is checked at
-most once per child using a `seen_epoch` vector: each child increments a
-global epoch counter, and candidates are skipped if their recorded epoch
-matches the current one.
-
-This avoids the cost of clearing a visited-set between children.
+The three queries for a single child may return overlapping candidate sets.
+Each candidate is checked at most once per child via a `seen_epoch` vector:
+each child increments a global epoch counter, and candidates with a matching
+epoch are skipped. This avoids clearing a visited-set between children.
 
 ---
 
@@ -140,29 +126,24 @@ This avoids the cost of clearing a visited-set between children.
 
 ### Choosing `--errcor-ratio`
 
-The default ratio of 50 means a child with count=1 requires a parent with
-count ≥ 50, a child with count=2 requires count ≥ 100, etc. This is
-conservative — a 1-in-50 abundance suggests a PCR error is far more likely
-than a rare biological variant.
-
-For highly sensitive applications (e.g. single-cell or ultra-deep sequencing)
-where low-count unique sequences are biologically meaningful, increase the
-ratio (100–200) or disable Phase 3 entirely.
+A ratio of 50 means a child with count=1 needs a parent with count ≥ 50. This
+is conservative for typical libraries — a 1:50 ratio strongly suggests a PCR
+copying error rather than a rare biological variant. For ultra-deep sequencing
+where low-count variants are biologically meaningful, raise the ratio to 100–200
+or disable Phase 3 entirely.
 
 ### Choosing `--errcor-max-count`
 
 Only clusters with count ≤ `--errcor-max-count` are candidates for absorption.
-The default of 5 is appropriate for typical libraries. Raising it risks
-absorbing true biological variants that happen to have low coverage; lowering
-it is safe but reduces sensitivity.
+The default of 5 works well for most libraries. Raising it risks absorbing
+true low-coverage variants; lowering it reduces sensitivity.
 
 ### Choosing `--errcor-bucket-cap`
 
-This prevents low-complexity regions (e.g. poly-A stretches, microsatellites)
-from dominating the pair-key index. When a bucket exceeds the cap, additional
-insertions are silently discarded. Children in low-complexity regions may
-therefore not find all of their parents, but this is acceptable — those regions
-are also likely to have high false positive rates regardless.
+Caps bucket size in the pair-key index to prevent low-complexity regions
+(poly-A, microsatellites) from dominating lookup time. Insertions beyond the
+cap are silently discarded; affected children may miss some parents, but
+low-complexity regions already have elevated false-positive rates.
 
 ---
 
@@ -174,38 +155,35 @@ are also likely to have high false positive rates regardless.
 | Phase 3b lookup | O(N_children × 3) pair-key queries |
 | Phase 3b verify | O(N_candidates × ilen / 32) AVX2 Hamming checks |
 
-In practice Phase 3 adds ~2–3 seconds to a 30-second deduplication run on
-25 M reads. The pair-key index is small compared to the main index (only
-parents are stored).
+Phase 3 typically adds 2–4 seconds to a run that otherwise takes 30 seconds.
 
 ---
 
 ## Benchmarks
 
-On a 25.8 M-read ancient DNA library:
+On sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length):
 
 | Mode | Unique clusters | Change |
 |------|----------------|--------|
-| Damage-aware only | 5,547,508 | — |
-| + Error correction (ratio=50, max-count=5) | 5,532,327 | −15,181 |
+| `derep --damage-auto` | 3,511,607 | — |
+| `derep --damage-auto --error-correct` | 3,506,272 | −5,335 (−0.15%) |
 
-15,181 PCR error clusters absorbed in ~2 seconds.
+5,335 PCR-error clusters absorbed in ~2 seconds.
 
 ---
 
-## Implementation Notes
+## Implementation notes
 
-- `pair_key(ha, hb, tag, ilen)` normalises `(ha, hb)` by sorting before
-  mixing, ensuring commutativity. The `tag` (0, 1, or 2) and `ilen` are
-  folded in to prevent collisions between the three maps.
+- `pair_key(ha, hb, tag, ilen)` sorts `(ha, hb)` before mixing to ensure
+  commutativity. The `tag` (0, 1, or 2) and `ilen` are folded in to prevent
+  cross-map collisions.
 
-- `IndexEntry::count` is `uint64_t` — supports datasets with > 4 G PCR
-  copies of the same molecule without silent overflow.
+- `IndexEntry::count` is `uint64_t` — supports datasets with more than 4 G
+  PCR copies of the same molecule without overflow.
 
-- `SeqArena` stores sequences as byte arrays with `uint32_t` offsets. It
-  is bounds-checked before every append and raises `std::runtime_error` on
-  overflow. Sequences longer than 65,535 bp are rejected (stored length is
-  `uint16_t`).
+- `SeqArena` stores sequences as a contiguous byte array with `uint32_t`
+  offsets, bounds-checked on every append. Sequences longer than 65,535 bp
+  are rejected (stored length is `uint16_t`).
 
-- The `is_error_` vector is indexed by `seq_id` (arena index), not by hash
-  map slot, so its iteration order during Phase 3b is cache-friendly.
+- The `is_error_` vector is indexed by `seq_id` (arena index), not hash map
+  slot, keeping Phase 3b iteration cache-friendly.
