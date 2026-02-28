@@ -103,7 +103,7 @@ struct IndexEntry {
 
 struct SeqArena {
     std::vector<uint8_t>  bases;
-    std::vector<uint32_t> offsets;
+    std::vector<uint64_t> offsets;  // 64-bit: supports >4 GB of total sequence data
     std::vector<uint16_t> lengths;
 
     uint32_t append(const std::string& seq) {
@@ -111,11 +111,8 @@ struct SeqArena {
             throw std::runtime_error("Sequence too long for arena (>65535 bp)");
         if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
-        if (bases.size() + seq.size() >
-            static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-            throw std::runtime_error("SeqArena base array overflow (> 4 GB of sequence data)");
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(static_cast<uint32_t>(bases.size()));
+        offsets.push_back(static_cast<uint64_t>(bases.size()));
         lengths.push_back(static_cast<uint16_t>(seq.size()));
         bases.insert(bases.end(),
                      reinterpret_cast<const uint8_t*>(seq.data()),
