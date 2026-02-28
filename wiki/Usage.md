@@ -2,18 +2,39 @@
 
 ## Prerequisites
 
-Both `derep_pairs` and `derep` require their inputs to be sorted by read ID.
-Run `fqdup sort` first. For a paired library:
+### Upstream steps (outside fqdup)
+
+fqdup operates on reads that have been processed by two upstream tools:
+
+**1. fastp merge** — collapse overlapping R1+R2 pairs into single sequences.
+Each merged read represents one complete ancient DNA molecule:
 
 ```bash
-fqdup sort -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G --fast
-fqdup sort -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G --fast
+fastp --merge --merged_out merged.fq.gz \
+      --in1 R1.fq.gz --in2 R2.fq.gz \
+      --disable_adapter_trimming  # (or with adapter trimming, as appropriate)
 ```
 
-`--max-memory` controls how much RAM the sort uses for in-memory chunks; set
-it to roughly 80% of available RAM. `--fast` keeps the chunk intermediates
-uncompressed, which is about 3× faster on disk at the cost of more temporary
-space. Omit it if disk is limited.
+**2. Tadpole** (BBTools) — extend each merged read from both ends using de Bruijn
+graph assembly. The extended reads serve as deduplication fingerprints; the
+original merged reads are kept as the actual output:
+
+```bash
+tadpole.sh in=merged.fq.gz out=extended.fq.gz mode=extend el=50 er=50
+```
+
+### Sort
+
+Both files must be sorted by read ID before deduplication:
+
+```bash
+fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
+fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
+```
+
+`--max-memory` controls RAM for in-memory sort chunks; set to ~80% of available
+RAM. `--fast` keeps chunk intermediates uncompressed (~3× faster, more disk).
+Omit it if disk is limited.
 
 ---
 
@@ -29,18 +50,21 @@ Sort both files by read ID, as above.
 
 ```bash
 fqdup derep_pairs \
-  -n nonext.sorted.fq.gz \
-  -e ext.sorted.fq.gz \
-  -o-non nonext.deduped.fq.gz \
-  -o-ext  ext.deduped.fq.gz \
+  -n merged.sorted.fq.gz \
+  -e extended.sorted.fq.gz \
+  -o-non merged.deduped.fq.gz \
+  -o-ext  extended.deduped.fq.gz \
   -c clusters_pairs.tsv.gz
 ```
 
-`derep_pairs` reads both sorted files in lockstep, hashes the extended read,
-and keeps one representative pair per cluster. The representative is the pair
-with the longest non-extended read — it preserves the most sequence from reads
-trimmed less aggressively during adapter removal. The `-c` flag writes per-cluster
-statistics (hash, lengths, and counts for both mates) to a gzipped TSV.
+`derep_pairs` reads both sorted files in lockstep and hashes the **extended**
+(Tadpole-assembled) read as the cluster fingerprint. Using the extended read
+reduces false collisions: two different molecules that happen to share a short
+merged sequence will typically diverge in the assembled extension.
+
+The representative kept per cluster is the pair with the longest **merged**
+read — preserving the most original ancient DNA sequence. The `-c` flag writes
+per-cluster statistics to a gzipped TSV.
 
 For a 25.8 M-pair library, this step typically finishes in about 25 seconds
 and reduces to around 5.6 M unique pairs.
@@ -145,10 +169,10 @@ fqdup derep       ... --no-revcomp
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-n FILE` | Sorted non-extended input FASTQ | required |
-| `-e FILE` | Sorted extended input FASTQ | required |
-| `-o-non FILE` | Output non-extended FASTQ | required |
-| `-o-ext FILE` | Output extended FASTQ | required |
+| `-n FILE` | Sorted merged (fastp) FASTQ | required |
+| `-e FILE` | Sorted Tadpole-extended FASTQ | required |
+| `-o-non FILE` | Output merged FASTQ (representatives) | required |
+| `-o-ext FILE` | Output extended FASTQ (representatives) | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
 
