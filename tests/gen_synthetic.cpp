@@ -73,6 +73,12 @@
 //   --pcr-eff    F     PCR efficiency 0–1           (default: 1.0)
 //   --polymerase STR   q5|phusion|kod|taq           (default: q5)
 //   --pcr-thermo       Include thermocyclic C→T damage (uniform, 1.4e-6/bp/cycle)
+//   --pcr-rate   F     Direct per-base error probability (overrides polymerase model)
+//
+//   Oxidative damage (Channel C/D — 8-oxoG):
+//   --ox-rate    F     Per-G-base G→T probability, uniform across read (default: 0)
+//                      Models 8-oxoG oxidative damage.  EC should NOT absorb these
+//                      (is_damage_sub protects G↔T differences).
 //
 //   Output mode:
 //   --dup-pair         Each molecule → 2 independently-processed reads
@@ -224,6 +230,18 @@ static std::string apply_thermo(const std::string& seq,
     return s;
 }
 
+// Channel C/D: 8-oxoG oxidative damage — G→T at any position, uniform.
+// Each G is converted to T independently with probability ox_rate.
+// EC must NOT absorb these reads (is_damage_sub protects G↔T pairs).
+static std::string apply_oxidative(const std::string& seq,
+                                   double ox_rate, PCG32& rng) {
+    if (ox_rate <= 0.0) return seq;
+    std::string s = seq;
+    for (char& c : s)
+        if (c == 'G' && rng.uniform() < ox_rate) c = 'T';
+    return s;
+}
+
 static void write_read(const std::string& name, const std::string& seq) {
     std::cout << '@' << name  << '\n'
               << seq          << '\n'
@@ -248,6 +266,7 @@ int main(int argc, char** argv) {
     double   pcr_eff    = 1.0;
     double   epsilon    = 5.3e-7;   // Q5
     double   pcr_rate   = -1.0;     // <0 = use polymerase model; ≥0 = direct per-base prob
+    double   ox_rate    = 0.0;      // per-G-base G→T probability (Channel C/D, 8-oxoG)
     bool     pcr_thermo = false;
     uint64_t seed       = 42;
     bool     dup_pair   = false;
@@ -269,6 +288,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a,"--pcr-eff"))    pcr_eff    = d();
         else if (!strcmp(a,"--pcr-thermo")) pcr_thermo = true;
         else if (!strcmp(a,"--pcr-rate"))   pcr_rate   = d();
+        else if (!strcmp(a,"--ox-rate"))    ox_rate    = d();
         else if (!strcmp(a,"--seed"))       seed       = (uint64_t)n();
         else if (!strcmp(a,"--dup-pair"))   dup_pair   = true;
         else if (!strcmp(a,"--polymerase")) {
@@ -323,6 +343,8 @@ int main(int argc, char** argv) {
                   << " mu_indep=" << mu_indep;
     if (mu_thermo > 0.0)
         std::cerr << " mu_thermo=" << mu_thermo;
+    if (ox_rate > 0.0)
+        std::cerr << " ox_rate=" << ox_rate;
     std::cerr << '\n';
 
     PCG32 rng(seed);
@@ -341,6 +363,8 @@ int main(int argc, char** argv) {
         seq = apply_indep_errors(seq, mu_indep, rng);
         // Thermocyclic oxidative C→T (uniform, independent per read)
         if (mu_thermo > 0.0) seq = apply_thermo(seq, mu_thermo, rng);
+        // 8-oxoG oxidative G→T (Channel C/D, uniform, independent per read)
+        if (ox_rate > 0.0) seq = apply_oxidative(seq, ox_rate, rng);
         // Ancient-DNA terminal deamination (independent per read)
         if (!no_damage)
             seq = apply_damage(seq, dmax5, lambda5, dmax3, lambda3, rng);
