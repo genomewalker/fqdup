@@ -1,8 +1,8 @@
-# fqdup Wiki
+# fqdup
 
-Ultra-fast, memory-efficient FASTQ deduplication for paired-end ancient DNA libraries.
+FASTQ deduplication for paired-end ancient DNA libraries.
 
-## Pipeline Overview
+## Pipeline overview
 
 ```
 fqdup sort        fqdup derep_pairs        fqdup derep
@@ -12,31 +12,30 @@ read ID           pair per cluster         correction (single-file)
 (prerequisite)    (structural dedup)        (biological dedup)
 ```
 
-The design separates two orthogonal concerns:
+The design separates two concerns:
 
 - **Structural deduplication** (`derep_pairs`): two paired files, read in
-  lockstep, one representative pair chosen per cluster (longest non-extended
-  mate wins). No biology — just hashing and representative selection.
+  lockstep, one representative pair per cluster (longest non-extended mate
+  wins). No biology — just hashing and representative selection.
 
 - **Biological deduplication** (`derep`): single file, optional ancient DNA
-  damage masking, optional PCR error correction. Does not touch the paired
-  structure at all.
+  damage masking, optional PCR error correction.
 
-Either step can be run independently. If you have single-end data, skip
-`derep_pairs` and run `derep` directly after `sort`.
+Either step can be run independently. For single-end data, skip `derep_pairs`
+and run `derep` directly after `sort`.
 
-## Wiki Pages
+## Wiki pages
 
 | Page | Contents |
 |------|----------|
-| [[Installation]] | Build from source, dependencies, Conda |
-| [[Usage]] | Tutorials and common invocations for all three steps |
+| [[Installation]] | Build from source, dependencies |
+| [[Usage]] | Tutorials and options for all three subcommands |
 | [[Algorithm]] | How sort, derep_pairs, and derep work internally |
-| [[Damage-Aware-Deduplication]] | The C→T / G→A damage model and masking strategy |
+| [[Damage-Aware-Deduplication]] | The C→T / G→A damage model and masking |
 | [[PCR-Error-Correction]] | Phase 3 count-stratified 3-way pigeonhole algorithm |
-| [[Performance]] | Benchmarks, memory usage, I/O tips |
+| [[Performance]] | Benchmarks and memory usage |
 
-## Quick Reference
+## Quick reference
 
 ### Full ancient DNA pipeline
 
@@ -45,19 +44,19 @@ Either step can be run independently. If you have single-end data, skip
 fqdup sort -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G --fast
 fqdup sort -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G --fast
 
-# Paired deduplication (structural)
+# Structural dedup (paired)
 fqdup derep_pairs \
   -n nonext.sorted.fq.gz -e ext.sorted.fq.gz \
   -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz
 
-# Single-file dedup (biological — damage + error correction)
+# Biological dedup (single-file, damage + error correction)
 fqdup derep \
   -i nonext.deduped.fq.gz \
   -o nonext.final.fq.gz \
   --damage-auto --error-correct
 ```
 
-### Standard (no damage, no error correction)
+### Standard (no ancient DNA)
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 64G

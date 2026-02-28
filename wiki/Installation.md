@@ -7,8 +7,8 @@
 | Dependency | Version | Purpose |
 |-----------|---------|---------|
 | CMake | 3.10+ | Build system |
-| C++ compiler | GCC 7+ or Clang 5+ | C++17 support required |
-| zlib | any | gzip read/write |
+| C++ compiler | GCC 7+ or Clang 5+ | C++17 |
+| zlib | any | gzip I/O |
 | xxHash | any | XXH3_64 hashing |
 
 ```bash
@@ -27,14 +27,13 @@ conda install -c conda-forge cmake cxx-compiler zlib xxhash
 
 ### Optional (performance)
 
-| Library | Speedup | Notes |
+| Library | Benefit | Notes |
 |---------|---------|-------|
-| Intel ISA-L | 4–6× decompression | `--isal` flag; detected automatically |
-| pigz | 2–3× decompression | `--pigz` flag; must be in `PATH` |
-| jemalloc | Better memory release | Detected automatically; no flag needed |
+| Intel ISA-L | 3–5× faster gzip decompression | `--isal` flag; auto-detected |
+| pigz | 2–3× faster gzip decompression | `--pigz` flag; must be in PATH |
+| jemalloc | Better memory release | auto-detected; no flag needed |
 
-ISA-L provides the largest benefit for `.gz` input files (hardware-accelerated
-inflate). It is the recommended choice when available.
+ISA-L gives the largest benefit for `.gz` input on fast storage.
 
 ```bash
 # conda (recommended)
@@ -43,7 +42,7 @@ conda install -c conda-forge isa-l
 
 ---
 
-## Build from Source
+## Build from source
 
 ```bash
 git clone https://github.com/genomewalker/fqdup.git
@@ -53,12 +52,9 @@ cmake ..
 make -j$(nproc)
 ```
 
-The binary is `build/fqdup`. No installation step is required — copy it to
-wherever is convenient or add `build/` to `PATH`.
+The binary is `build/fqdup`. Copy it wherever convenient or add `build/` to PATH.
 
-### CMake build options
-
-CMake auto-detects ISA-L and jemalloc. To check what was found:
+### Check what was detected
 
 ```bash
 cmake .. 2>&1 | grep -E "ISA-L|jemalloc|xxhash"
@@ -71,19 +67,13 @@ cmake .. 2>&1 | grep -E "ISA-L|jemalloc|xxhash"
 
 ## Verify
 
-Run the built-in smoke test to confirm everything works:
-
 ```bash
 bash tests/smoke.sh build/fqdup
-# → [INFO] ...sort...
-# → [INFO] ...derep_pairs...
-# → [INFO] ...derep...
 # → OK: fqdup smoke test passed
 ```
 
-The smoke test exercises all three subcommands on a tiny synthetic paired
-dataset and checks correctness of sorting order, deduplication, and
-representative selection.
+The smoke test exercises all three subcommands on a synthetic paired dataset
+and checks sorting order, deduplication, and representative selection.
 
 ---
 
@@ -101,21 +91,18 @@ cmake .. -DCMAKE_PREFIX_PATH=/path/to/xxhash
 
 ### ISA-L not found (optional)
 
-ISA-L is optional. Without it, `fqdup` falls back to zlib (slower).
+ISA-L is optional — `fqdup` falls back to zlib without it.
 
 ```bash
 conda install -c conda-forge isa-l
-```
 
-If ISA-L is in a non-standard path, set `CMAKE_PREFIX_PATH`:
-
-```bash
+# if ISA-L is in a non-standard path
 cmake .. -DCMAKE_PREFIX_PATH=$CONDA_PREFIX
 ```
 
 ### CMake version too old
 
-CMake 3.10 is the minimum. If the system CMake is older:
+CMake 3.10+ is required:
 
 ```bash
 conda install -c conda-forge cmake
@@ -123,10 +110,9 @@ conda install -c conda-forge cmake
 
 ### Compiler does not support C++17
 
-GCC 7+ or Clang 5+ is required. On older systems:
+GCC 7+ or Clang 5+ required:
 
 ```bash
-# conda provides a modern compiler
 conda install -c conda-forge cxx-compiler
 export CXX=$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++
 cmake ..
