@@ -166,5 +166,76 @@ EOF
 
 echo "  PASS: Test C"
 
+# ---------------------------------------------------------------------------
+# Test D: Channel C/D protection (8-oxoG G→T must NOT be absorbed by EC)
+#
+# Two datasets, same molecules (1000 × 20x coverage, no terminal deamination):
+#
+#   Oxidative  — G→T at uniform rate 0.05/G-base (Channel C/D, 8-oxoG).
+#                is_damage_sub() recognises G↔T as damage-consistent and
+#                prevents EC from absorbing these reads.
+#                Expected: EC reduction ≈ 0%.
+#
+#   PCR errors — random non-damage substitutions at rate 0.003/base.
+#                EC absorbs singleton error reads into the dominant parent.
+#                Expected: EC reduction > 10%.
+#
+# The key assertion is that the two reduction rates are clearly separated:
+# oxidative reads survive EC while PCR errors do not.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test D: Channel C/D protection (G→T not absorbed by EC) ---"
+N_MOL_D=1000
+N_READS_D=20000   # 20x coverage
+
+echo "  $N_MOL_D molecules × 20x coverage"
+echo "  Oxidative: G→T at ox-rate=0.05/G-base  |  PCR: random at rate=0.003/base"
+
+# Oxidative G→T dataset
+"$GEN" --n-unique $N_MOL_D --n-reads $N_READS_D --read-len 75 \
+    --no-damage --ox-rate 0.05 --seed 77 > "$TMPDIR/ox.fq"
+"$FQDUP" sort -i "$TMPDIR/ox.fq" -o "$TMPDIR/ox.sorted.fq" \
+    --max-memory 512M -t "$TMPDIR" 2>/dev/null
+U_OX_NO_EC=$(  "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_no.fq" \
+    2>/dev/null && grep -c '^@' "$TMPDIR/ox_no.fq")
+U_OX_EC=$(     "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
+    --error-correct --errcor-ratio 5 2>/dev/null && grep -c '^@' "$TMPDIR/ox_ec.fq")
+
+# PCR error dataset (same seed → same base molecules)
+"$GEN" --n-unique $N_MOL_D --n-reads $N_READS_D --read-len 75 \
+    --no-damage --pcr-rate 0.003 --seed 77 > "$TMPDIR/pcr_d.fq"
+"$FQDUP" sort -i "$TMPDIR/pcr_d.fq" -o "$TMPDIR/pcr_d.sorted.fq" \
+    --max-memory 512M -t "$TMPDIR" 2>/dev/null
+U_PCR_NO_EC=$( "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_no.fq" \
+    2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_no.fq")
+U_PCR_EC=$(    "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_ec.fq" \
+    --error-correct --errcor-ratio 5 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_ec.fq")
+
+echo "  Oxidative  (G→T): no-EC=$U_OX_NO_EC  EC=$U_OX_EC"
+echo "  PCR errors (rnd): no-EC=$U_PCR_NO_EC  EC=$U_PCR_EC"
+
+python3 - <<EOF
+import sys
+ox_no, ox_ec   = $U_OX_NO_EC,  $U_OX_EC
+pcr_no, pcr_ec = $U_PCR_NO_EC, $U_PCR_EC
+
+red_ox  = (ox_no  - ox_ec)  / ox_no  * 100 if ox_no  > 0 else 0
+red_pcr = (pcr_no - pcr_ec) / pcr_no * 100 if pcr_no > 0 else 0
+print(f"  Oxidative  EC reduction: {red_ox:.1f}%  (expect <2%  — G→T protected)")
+print(f"  PCR errors EC reduction: {red_pcr:.1f}%  (expect >10% — errors absorbed)")
+
+if red_ox >= 2.0:
+    print(f"  FAIL: G→T reads absorbed by EC ({red_ox:.1f}% ≥ 2%) — is_damage_sub not protecting")
+    sys.exit(1)
+print(f"  PASS: G→T reads protected (EC reduction {red_ox:.1f}% < 2%)")
+
+if red_pcr <= 10.0:
+    print(f"  FAIL: PCR errors not absorbed ({red_pcr:.1f}% ≤ 10%) — EC not working")
+    sys.exit(1)
+print(f"  PASS: PCR errors absorbed (EC reduction {red_pcr:.1f}% > 10%)")
+EOF
+
+echo "  PASS: Test D"
+
 echo ""
 echo "OK: all damage-auto tests passed"
