@@ -1,25 +1,30 @@
 // fqdup - FASTQ utilities for paired-end deduplication
 // Subcommands:
-//   fqdup sort   - External merge sort by read ID
-//   fqdup derep  - Memory-efficient two-pass deduplication (requires sorted input)
+//   fqdup sort        - External merge sort by read ID
+//   fqdup derep_pairs - Two-pass paired deduplication (no damage/error modeling)
+//   fqdup derep       - Single-file deduplication with damage-aware hashing + error correction
 
 #include <iostream>
 #include <string>
 
 int sort_main(int argc, char** argv);
+int derep_pairs_main(int argc, char** argv);
 int derep_main(int argc, char** argv);
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <subcommand> [options]\n"
               << "\nSubcommands:\n"
-              << "  sort   Sort FASTQ by read ID (external merge sort)\n"
-              << "  derep  Deduplicate sorted paired-end FASTQ (two-pass, ~16B/read)\n"
+              << "  sort        Sort FASTQ by read ID (external merge sort)\n"
+              << "  derep_pairs Deduplicate sorted paired-end FASTQ (structural dedup)\n"
+              << "  derep       Deduplicate sorted single-file FASTQ (damage + error correction)\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
               << "\nTypical workflow:\n"
-              << "  " << prog << " sort   -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G\n"
-              << "  " << prog << " sort   -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G\n"
-              << "  " << prog << " derep  -n nonext.sorted.fq.gz -e ext.sorted.fq.gz \\\n"
-              << "                       -o-non out.non.fq.gz -o-ext out.ext.fq.gz\n";
+              << "  " << prog << " sort        -i nonext.fq.gz -o nonext.sorted.fq.gz --max-memory 64G\n"
+              << "  " << prog << " sort        -i ext.fq.gz    -o ext.sorted.fq.gz    --max-memory 64G\n"
+              << "  " << prog << " derep_pairs -n nonext.sorted.fq.gz -e ext.sorted.fq.gz \\\n"
+              << "                            -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz\n"
+              << "  " << prog << " derep       -i nonext.deduped.fq.gz -o nonext.final.fq.gz \\\n"
+              << "                            --damage-auto --error-correct\n";
 }
 
 int main(int argc, char** argv) {
@@ -30,8 +35,9 @@ int main(int argc, char** argv) {
 
     std::string sub = argv[1];
 
-    if (sub == "sort")  return sort_main(argc - 1, argv + 1);
-    if (sub == "derep") return derep_main(argc - 1, argv + 1);
+    if (sub == "sort")        return sort_main(argc - 1, argv + 1);
+    if (sub == "derep_pairs") return derep_pairs_main(argc - 1, argv + 1);
+    if (sub == "derep")       return derep_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {
         usage(argv[0]);

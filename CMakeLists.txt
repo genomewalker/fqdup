@@ -49,6 +49,7 @@ FetchContent_MakeAvailable(flat_hash_map)
 add_executable(fqdup
     src/main.cpp
     src/sort.cpp
+    src/derep_pairs.cpp
     src/derep.cpp
     src/logger.cpp
 )
