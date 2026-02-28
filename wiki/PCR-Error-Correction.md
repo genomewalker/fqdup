@@ -6,6 +6,13 @@ DNA deduplication: PCR copying errors. Post-mortem deamination is covered in
 handles terminal variation, Phase 3 handles interior variation. See [[Home]]
 for the full picture.
 
+In the standard pipeline, `derep` receives the **merged read output of
+`derep_pairs`** — reads that were collapsed from R1+R2 by fastp and then
+deduplicated against their Tadpole-extended counterparts. Most PCR duplicates
+have already been removed at that stage; `derep`'s Phase 3 targets the residual
+PCR errors that survived because they happened to produce divergent Tadpole
+extensions (and were therefore treated as distinct pairs by `derep_pairs`).
+
 ---
 
 ## The problem
@@ -148,13 +155,15 @@ Phase 3: D_eff=2.21 estimated from duplication ratio 25000000/5600000
   (use --pcr-cycles for explicit value)
 ```
 
-**Caveat when running after `derep_pairs`:** the input to `derep` has already had
-most PCR duplicates removed. The residual duplication reflects structural reads
-(same non-extended sequence, different extended) rather than pure PCR amplification.
-The estimated D_eff will be lower than the true PCR D_eff, making the adaptive
-ceiling more conservative. For aDNA libraries this does not matter — parent counts
-are low enough that the static `--errcor-max-count` dominates regardless. For
-mitochondrial-enriched or high-depth modern libraries, specify `--pcr-cycles`
+**Caveat when running after `derep_pairs`:** most PCR duplicates are already
+removed before `derep` sees the data. The residual duplication that remains
+comes from PCR copies whose Tadpole extensions diverged slightly — `derep_pairs`
+treated them as distinct molecules; `derep` collapses them on the original
+merged sequence. Because most amplification has already been collapsed, D_eff
+estimated here is much lower than the true PCR D_eff, making the adaptive
+ceiling conservative. For typical aDNA libraries this does not matter — parent
+counts are low enough that the static `--errcor-max-count` dominates regardless.
+For mitochondrial-enriched or high-depth modern libraries, supply `--pcr-cycles`
 explicitly for an accurate adaptive ceiling.
 
 **Example (Q5, 30 cycles, E=1.0):**
@@ -274,11 +283,11 @@ entirely in memory on the index built during Pass 1.
 All libraries processed with `--damage-auto --error-correct`, Q5 defaults
 (φ = 5.3×10⁻⁷), D_eff estimated automatically from duplication ratio.
 
-**Input is post-`derep_pairs`** (`*.derep.non.fq.gz`). Most PCR duplicates were
-already removed by `derep_pairs`; `derep` here handles the residual structural
-duplicates (reads with identical non-extended sequence but different extended mate)
-plus damage-aware merging. D_eff here is the residual duplication D_eff, not the
-original PCR D_eff — hence values are much lower than the true amplification depth.
+**Input is post-`derep_pairs`** (`*.derep.non.fq.gz`): fastp-merged reads whose
+Tadpole-extended pairs have already been deduplicated. The duplication remaining
+at this stage comes from PCR copies that produced divergent Tadpole assemblies and
+therefore survived `derep_pairs`. D_eff here is the residual D_eff, not the original
+PCR amplification depth — hence values are much lower than the true library D_eff.
 
 | Library | Total reads | Unique (P1) | Unique (final) | Dup% | d_max | λ | D_eff | Absorbed |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
