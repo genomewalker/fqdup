@@ -85,9 +85,10 @@ struct IndexEntry {
     uint64_t record_index;  // sequential record number of the representative
     uint64_t count;         // total reads in this cluster
     uint32_t seq_id;        // index into SeqArena (populated when --error-correct)
+    uint8_t  damage_score;  // terminal C→T (5') + G→A (3') count of representative
 
-    IndexEntry() : record_index(0), count(1), seq_id(0) {}
-    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0) {}
+    IndexEntry() : record_index(0), count(1), seq_id(0), damage_score(0) {}
+    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0), damage_score(0) {}
 };
 
 // ============================================================================
@@ -590,6 +591,22 @@ private:
         return canonical_hash(seq, use_revcomp_);
     }
 
+    // Count terminal damage markers: T at masked 5' positions + A at masked 3' positions.
+    // Higher score = more terminal deamination signal = more likely to be authentic ancient DNA.
+    // Used to select the most-damaged read as cluster representative, maximising the
+    // damage signal in the output.
+    static uint8_t compute_damage_score(const std::string& seq,
+                                        const DamageProfile& prof) {
+        int score = 0;
+        int L = static_cast<int>(seq.size());
+        for (int p = 0; p < DamageProfile::MASK_POSITIONS && p < L; ++p) {
+            if (!prof.mask_pos[p]) continue;
+            if (std::toupper(static_cast<unsigned char>(seq[p]))       == 'T') ++score;
+            if (std::toupper(static_cast<unsigned char>(seq[L-1-p]))   == 'A') ++score;
+        }
+        return static_cast<uint8_t>(std::min(score, 255));
+    }
+
     void pass1(const std::string& in_path) {
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
@@ -602,11 +619,24 @@ private:
             auto it = index_.find(fp);
             if (it == index_.end()) {
                 IndexEntry entry(record_idx);
+                if (profile_.enabled)
+                    entry.damage_score = compute_damage_score(rec.seq, profile_);
                 if (errcor_.enabled)
                     entry.seq_id = arena_.append(rec.seq);
                 index_.emplace(fp, entry);
             } else {
                 it->second.count++;
+                // Maximize the ancient damage signal in the output: when a new read
+                // in this cluster carries more terminal C→T / G→A than the current
+                // representative, swap to it.  seq_id is intentionally kept pointing
+                // to the first-occurrence sequence so Phase-3 EC is unaffected.
+                if (profile_.enabled) {
+                    uint8_t score = compute_damage_score(rec.seq, profile_);
+                    if (score > it->second.damage_score) {
+                        it->second.record_index = record_idx;
+                        it->second.damage_score = score;
+                    }
+                }
             }
 
             record_idx++;
