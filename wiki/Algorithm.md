@@ -21,17 +21,26 @@ IDs with numeric suffixes.
 ## fqdup derep_pairs
 
 `derep_pairs` is a two-pass algorithm over two sorted FASTQ files read in
-lockstep. The extended file drives the hash; the non-extended file provides
-the mate.
+lockstep:
+
+- **`-n` (merged)**: fastp-merged reads — the original R1+R2 collapsed
+  sequence, representing the actual ancient DNA molecule
+- **`-e` (extended)**: the same reads after Tadpole de Bruijn graph extension
+  from both ends — longer, assembly-assisted sequences used as deduplication
+  fingerprints
+
+The extended file drives the hash. Using the Tadpole-extended sequence as the
+fingerprint reduces false collisions: two different molecules that happen to
+share a short merged core will typically diverge in the assembled extension.
 
 **Pass 1** streams both files simultaneously, one pair at a time. For each
 pair, the extended read's sequence is hashed to a canonical fingerprint
 `(min(XXH3(seq), XXH3(revcomp(seq))), seq_len)`. If the fingerprint is new,
 a new index entry is created recording the current record position and the
-non-extended read's length. If it already exists, the count is incremented
-and, if the current non-extended read is longer than the stored one, the
-representative is updated to this pair. The representative selection rule —
-longest non-extended mate — preserves the most sequence from adapter trimming.
+merged read's length. If it already exists, the count is incremented and, if
+the current merged read is longer than the stored one, the representative is
+updated to this pair. The representative selection rule — longest merged mate
+— preserves the most original ancient DNA sequence.
 
 **Pass 2** streams both files a second time. For each pair, if its record
 position matches the representative stored in the index, it is written to the
@@ -48,8 +57,9 @@ duplication, that is about 5.6 M entries — roughly 220 MB.
 
 ## fqdup derep
 
-`derep` takes a single sorted FASTQ and runs up to four phases depending on
-which options are active.
+`derep` takes a single sorted FASTQ — in the standard pipeline, the merged
+read output of `derep_pairs` — and runs up to four phases depending on which
+options are active.
 
 **Pass 0** (with `--damage-auto`) scans all reads to estimate the ancient DNA
 damage model. It measures the T/(T+C) frequency at each of the first 15 5'-end
