@@ -25,10 +25,6 @@
 #include <vector>
 #include <zlib.h>
 
-#ifdef HAVE_ISAL
-#include <isa-l/igzip_lib.h>
-#endif
-
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -389,9 +385,9 @@ static uint64_t damage_canonical_hash(const std::string& seq,
 // Damage estimation — DART-inspired (Pass 0)
 // ============================================================================
 
-static DamageProfile estimate_damage(const std::string& path,
-                                     double mask_threshold) {
-    FastqReader reader(path, /*use_pigz=*/false);
+static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
+                                          const std::string& path,
+                                          double mask_threshold) {
     FastqRecord rec;
 
     constexpr int FIT_POS = 15;
@@ -524,18 +520,23 @@ static DamageProfile estimate_damage(const std::string& path,
     return profile;
 }
 
+static DamageProfile estimate_damage(const std::string& path, double mask_threshold) {
+    auto reader = make_fastq_reader(path);
+    return estimate_damage_impl(*reader, path, mask_threshold);
+}
+
 // ============================================================================
 // DerepEngine — single-file two-pass deduplication
 // ============================================================================
 
 class DerepEngine {
 public:
-    DerepEngine(bool use_revcomp, bool write_clusters, bool use_pigz, bool use_isal,
+    DerepEngine(bool use_revcomp, bool write_clusters,
                 const DamageProfile& profile = DamageProfile{},
                 const ErrCorParams& errcor = ErrCorParams{})
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
-          use_pigz_(use_pigz), use_isal_(use_isal), profile_(profile),
-          errcor_(errcor), total_reads_(0), errcor_absorbed_(0) {}
+          profile_(profile), errcor_(errcor),
+          total_reads_(0), errcor_absorbed_(0) {}
 
     void process(const std::string& in_path,
                  const std::string& out_path,
@@ -544,17 +545,16 @@ public:
         log_info("=== Two-pass single-file deduplication ===");
         log_info("Pass 1: Build lightweight index");
         log_info("Decompression: " + std::string(
-            use_isal_ ? "ISA-L (hardware-accelerated)" :
-            use_pigz_ ? "pigz (parallel)" : "zlib (standard)"));
-
-#ifdef HAVE_ISAL
-        if (use_isal_) {
-            pass1_isal(in_path);
-        } else
+#ifdef HAVE_RAPIDGZIP
+            "rapidgzip (parallel multi-threaded)"
+#elif defined(HAVE_ISAL)
+            "ISA-L (hardware-accelerated)"
+#else
+            "zlib"
 #endif
-        {
-            pass1_standard(in_path);
-        }
+        ));
+
+        pass1(in_path);
 
         size_t index_mb = (index_.size() *
                            sizeof(std::pair<SequenceFingerprint, IndexEntry>)) /
@@ -569,14 +569,7 @@ public:
 
         log_info("Pass 2: Write unique records");
 
-#ifdef HAVE_ISAL
-        if (use_isal_) {
-            pass2_isal(in_path, out_path, cluster_path);
-        } else
-#endif
-        {
-            pass2_standard(in_path, out_path, cluster_path);
-        }
+        pass2(in_path, out_path, cluster_path);
 
         print_stats();
     }
@@ -588,12 +581,12 @@ private:
         return canonical_hash(seq, use_revcomp_);
     }
 
-    void pass1_standard(const std::string& in_path) {
-        FastqReader reader(in_path, use_pigz_);
+    void pass1(const std::string& in_path) {
+        auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
 
-        while (reader.read(rec)) {
+        while (reader->read(rec)) {
             uint64_t h = compute_hash(rec.seq);
             SequenceFingerprint fp(h, rec.seq.size());
 
@@ -623,44 +616,6 @@ private:
         std::cerr << "\r";
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
     }
-
-#ifdef HAVE_ISAL
-    void pass1_isal(const std::string& in_path) {
-        FastqReaderIgzip reader(in_path);
-        FastqRecord rec;
-        uint64_t record_idx = 0;
-
-        while (reader.read(rec)) {
-            uint64_t h = compute_hash(rec.seq);
-            SequenceFingerprint fp(h, rec.seq.size());
-
-            auto it = index_.find(fp);
-            if (it == index_.end()) {
-                IndexEntry entry(record_idx);
-                if (errcor_.enabled)
-                    entry.seq_id = arena_.append(rec.seq);
-                index_.emplace(fp, entry);
-            } else {
-                it->second.count++;
-            }
-
-            record_idx++;
-            total_reads_++;
-
-            if ((total_reads_ % 1000000) == 0) {
-                size_t unique = index_.size();
-                double dup_pct = 100.0 * (1.0 - (double)unique / total_reads_);
-                std::cerr << "\r[Pass 1] " << total_reads_ << " reads, "
-                          << unique << " unique, "
-                          << std::fixed << std::setprecision(1) << dup_pct << "% dedup"
-                          << std::flush;
-            }
-        }
-
-        std::cerr << "\r";
-        log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
-    }
-#endif
 
     // Phase 3: absorb PCR error duplicates.
     // A cluster C (count <= max_count) is absorbed into parent P
@@ -757,11 +712,9 @@ private:
                  ", max-count=" + std::to_string(errcor_.max_count) + ")");
     }
 
-    void pass2_standard(const std::string& in_path,
-                        const std::string& out_path,
-                        const std::string& cluster_path) {
-        FastqReader reader(in_path, use_pigz_);
-
+    void pass2(const std::string& in_path,
+               const std::string& out_path,
+               const std::string& cluster_path) {
         bool compress = (out_path.size() > 3 &&
                          out_path.substr(out_path.size() - 3) == ".gz");
         FastqWriter writer(out_path, compress);
@@ -785,11 +738,12 @@ private:
         }
         const size_t n_to_write = records_to_write.size();
 
+        auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
         size_t written = 0;
 
-        while (reader.read(rec)) {
+        while (reader->read(rec)) {
             auto it = records_to_write.find(record_idx);
             if (it != records_to_write.end()) {
                 writer.write(rec);
@@ -822,74 +776,6 @@ private:
         std::cerr << "\r";
         log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }
-
-#ifdef HAVE_ISAL
-    void pass2_isal(const std::string& in_path,
-                    const std::string& out_path,
-                    const std::string& cluster_path) {
-        FastqReaderIgzip reader(in_path);
-
-        bool compress = (out_path.size() > 3 &&
-                         out_path.substr(out_path.size() - 3) == ".gz");
-        FastqWriter writer(out_path, compress);
-
-        gzFile cluster_gz = nullptr;
-        if (write_clusters_ && !cluster_path.empty()) {
-            cluster_gz = gzopen(cluster_path.c_str(), "wb6");
-            if (cluster_gz) {
-                gzbuffer(cluster_gz, GZBUF_SIZE);
-                if (gzprintf(cluster_gz, "hash\tseq_len\tcount\n") < 0)
-                    throw std::runtime_error(
-                        "gzprintf failed while writing cluster header");
-            }
-        }
-
-        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
-        records_to_write.reserve(index_.size());
-        for (const auto& [fingerprint, entry] : index_) {
-            if (!is_error_.empty() && is_error_[entry.seq_id]) continue;
-            records_to_write[entry.record_index] = fingerprint;
-        }
-        const size_t n_to_write = records_to_write.size();
-
-        FastqRecord rec;
-        uint64_t record_idx = 0;
-        size_t written = 0;
-
-        while (reader.read(rec)) {
-            auto it = records_to_write.find(record_idx);
-            if (it != records_to_write.end()) {
-                writer.write(rec);
-
-                if (cluster_gz) {
-                    const SequenceFingerprint& fp = it->second;
-                    auto ei = index_.find(fp);
-                    if (ei == index_.end())
-                        throw std::runtime_error(
-                            "Internal error: missing fingerprint for cluster output");
-                    const IndexEntry& entry = ei->second;
-                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%lu\n",
-                                 static_cast<unsigned long>(fp.hash),
-                                 static_cast<unsigned long>(rec.seq.size()),
-                                 static_cast<unsigned long>(entry.count)) < 0)
-                        throw std::runtime_error(
-                            "gzprintf failed while writing cluster record");
-                }
-
-                written++;
-                if ((written % 100000) == 0) {
-                    std::cerr << "\r[Pass 2] " << written << " / " << n_to_write
-                              << " unique records written" << std::flush;
-                }
-            }
-            record_idx++;
-        }
-
-        if (cluster_gz) gzclose(cluster_gz);
-        std::cerr << "\r";
-        log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
-    }
-#endif
 
     void print_stats() const {
         log_info("=== Final Statistics ===");
@@ -924,8 +810,6 @@ private:
 
     bool use_revcomp_;
     bool write_clusters_;
-    bool use_pigz_;
-    bool use_isal_;
     DamageProfile profile_;
     ErrCorParams  errcor_;
 
@@ -958,8 +842,6 @@ static void print_usage(const char* prog) {
         << "\nOptional:\n"
         << "  -c FILE      Write cluster statistics to gzipped TSV\n"
         << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
-        << "  --pigz       Use pigz for parallel decompression\n"
-        << "  --isal       Use ISA-L for hardware-accelerated decompression\n"
         << "  -h, --help   Show this help\n"
         << "\nPCR error correction (Phase 3 — damage-aware):\n"
         << "  --error-correct          Enable PCR error duplicate removal\n"
@@ -990,8 +872,6 @@ int derep_main(int argc, char** argv) {
 
     std::string in_path, out_path, cluster_path;
     bool use_revcomp = true;
-    bool use_pigz    = false;
-    bool use_isal    = false;
 
     ErrCorParams errcor;
 
@@ -1027,10 +907,6 @@ int derep_main(int argc, char** argv) {
             errcor.max_count = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
             errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--pigz") {
-            use_pigz = true;
-        } else if (arg == "--isal") {
-            use_isal = true;
         } else if (arg == "--damage-auto") {
             damage_auto = true;
         } else if (arg == "--damage-dmax" && i + 1 < argc) {
@@ -1064,14 +940,6 @@ int derep_main(int argc, char** argv) {
         return 1;
     }
 
-#ifndef HAVE_ISAL
-    if (use_isal) {
-        std::cerr << "Warning: ISA-L requested but not available.\n"
-                  << "Falling back to " << (use_pigz ? "pigz" : "zlib") << ".\n";
-        use_isal = false;
-    }
-#endif
-
     init_logger("fqdup-derep.log");
     log_info("=== fqdup derep: Single-file two-pass deduplication ===");
     log_info("Input (sorted): " + in_path);
@@ -1104,8 +972,7 @@ int derep_main(int argc, char** argv) {
             profile.print_info(/*typical_read_length=*/0);
         }
 
-        DerepEngine engine(use_revcomp, !cluster_path.empty(), use_pigz, use_isal,
-                           profile, errcor);
+        DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

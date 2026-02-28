@@ -45,12 +45,27 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(flat_hash_map)
 
+# rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
+# Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
+set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(LIBRAPIDARCHIVE_WITH_ISAL   OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    librapidarchive
+    GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+    UPDATE_DISCONNECTED TRUE
+)
+FetchContent_MakeAvailable(librapidarchive)
+
 # Build fqdup
 add_executable(fqdup
     src/main.cpp
     src/sort.cpp
     src/derep_pairs.cpp
     src/derep.cpp
+    src/fastq_io_backend.cpp
     src/logger.cpp
 )
 
@@ -63,7 +78,9 @@ target_link_libraries(fqdup PRIVATE
     ZLIB::ZLIB
     Threads::Threads
     ${XXHASH_LIB}
+    rapidgzip::rapidgzip
 )
+target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP)
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
     target_include_directories(fqdup PRIVATE ${ISAL_INCLUDE_DIR})

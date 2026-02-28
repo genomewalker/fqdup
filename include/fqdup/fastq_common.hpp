@@ -1,17 +1,21 @@
 #pragma once
 // Shared FASTQ I/O primitives for derep_pairs.cpp and derep.cpp.
 //
-// Includes are at file scope; all type and function definitions are in an
-// anonymous namespace to give them internal linkage in every including TU,
-// avoiding ODR violations (same technique as the original derep.cpp).
+// FastqRecord and FastqReaderBase are at global scope so they can cross TU
+// boundaries via make_fastq_reader().
+//
+// Reader/writer implementations with inline method bodies are in an anonymous
+// namespace (internal linkage per TU), avoiding ODR violations.
 
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <zlib.h>
 
 #ifdef HAVE_ISAL
@@ -19,6 +23,39 @@
 #endif
 
 #include <xxhash.h>
+
+// ============================================================================
+// FASTQ Record — global scope so it can cross TU boundaries
+// ============================================================================
+
+struct FastqRecord {
+    std::string header;
+    std::string seq;
+    std::string plus;
+    std::string qual;
+
+    void clear() {
+        header.clear();
+        seq.clear();
+        plus.clear();
+        qual.clear();
+    }
+};
+
+// ============================================================================
+// Abstract reader — virtual dispatch across TU boundaries
+// ============================================================================
+
+class FastqReaderBase {
+public:
+    virtual ~FastqReaderBase() = default;
+    virtual bool read(FastqRecord& rec) = 0;
+    virtual uint64_t record_count() const = 0;
+};
+
+// Factory: picks the best available decompression backend.
+// Implemented in src/fastq_io_backend.cpp — the only TU that includes rapidgzip.
+std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path);
 
 namespace {
 
@@ -48,24 +85,6 @@ struct SequenceFingerprintHash {
     size_t operator()(const SequenceFingerprint& fp) const {
         uint64_t mixed = fp.hash ^ (static_cast<uint64_t>(fp.seq_len) * 0x9e3779b97f4a7c15ULL);
         return static_cast<size_t>(mixed ^ (mixed >> 32));
-    }
-};
-
-// ============================================================================
-// FASTQ Record
-// ============================================================================
-
-struct FastqRecord {
-    std::string header;
-    std::string seq;
-    std::string plus;
-    std::string qual;
-
-    void clear() {
-        header.clear();
-        seq.clear();
-        plus.clear();
-        qual.clear();
     }
 };
 
@@ -127,7 +146,7 @@ static std::string shell_escape_path(const std::string& path) {
 // ============================================================================
 
 #ifdef HAVE_ISAL
-class FastqReaderIgzip {
+class FastqReaderIgzip : public FastqReaderBase {
 public:
     FastqReaderIgzip(const std::string& path)
         : path_(path), eof_(false), decomp_buffer_pos_(0), decomp_buffer_used_(0),
@@ -147,14 +166,14 @@ public:
         state_->crc_flag = ISAL_GZIP;
     }
 
-    ~FastqReaderIgzip() {
+    ~FastqReaderIgzip() override {
         if (fp_) fclose(fp_);
         delete[] input_buffer_;
         delete[] decomp_buffer_;
         delete state_;
     }
 
-    bool read(FastqRecord& rec) {
+    bool read(FastqRecord& rec) override {
         if (!getline_igzip(rec.header)) return false;
         if (!getline_igzip(rec.seq))    return false;
         if (!getline_igzip(rec.plus))   return false;
@@ -163,7 +182,7 @@ public:
         return true;
     }
 
-    uint64_t record_count() const { return record_count_; }
+    uint64_t record_count() const override { return record_count_; }
 
 private:
     bool getline_igzip(std::string& line) {
@@ -222,41 +241,25 @@ private:
 #endif  // HAVE_ISAL
 
 // ============================================================================
-// FASTQ Reader — standard (zlib or pigz pipe)
+// FASTQ Reader — standard (zlib)
 // ============================================================================
 
-class FastqReader {
+class FastqReader : public FastqReaderBase {
 public:
-    FastqReader(const std::string& path, bool use_pigz = false)
-        : path_(path), use_pigz_(use_pigz), pipe_(nullptr), gzfp_(nullptr), record_count_(0) {
+    explicit FastqReader(const std::string& path)
+        : path_(path), gzfp_(nullptr), record_count_(0) {
 
-        if (use_pigz_) {
-            std::string cmd = "pigz -dc -p 4 -- " + shell_escape_path(path);
-            pipe_ = popen(cmd.c_str(), "r");
-            if (!pipe_)
-                throw std::runtime_error("Cannot open pigz pipe: " + path);
-            setvbuf(pipe_, nullptr, _IOFBF, GZBUF_SIZE);
-        } else {
-            gzfp_ = gzopen(path.c_str(), "rb");
-            if (!gzfp_)
-                throw std::runtime_error("Cannot open file: " + path);
-            gzbuffer(gzfp_, GZBUF_SIZE);
-        }
+        gzfp_ = gzopen(path.c_str(), "rb");
+        if (!gzfp_)
+            throw std::runtime_error("Cannot open file: " + path);
+        gzbuffer(gzfp_, GZBUF_SIZE);
     }
 
-    ~FastqReader() {
+    ~FastqReader() override {
         if (gzfp_) gzclose(gzfp_);
-        if (pipe_) {
-            int rc = pclose(pipe_);
-            if (rc != 0) {
-                std::cerr << "Fatal: pclose failed for pigz reader pipe (" << path_
-                          << "), status " << rc << "\n";
-                std::terminate();
-            }
-        }
     }
 
-    bool read(FastqRecord& rec) {
+    bool read(FastqRecord& rec) override {
         if (!getline_gz(rec.header)) return false;
         if (!getline_gz(rec.seq))    return false;
         if (!getline_gz(rec.plus))   return false;
@@ -265,7 +268,7 @@ public:
         return true;
     }
 
-    uint64_t record_count() const { return record_count_; }
+    uint64_t record_count() const override { return record_count_; }
 
 private:
     bool getline_gz(std::string& line) {
@@ -273,34 +276,19 @@ private:
         line.reserve(256);
         char buffer[8192];
 
-        if (pipe_) {
-            while (true) {
-                if (fgets(buffer, sizeof(buffer), pipe_) == nullptr)
-                    return !line.empty();
-                size_t len = strlen(buffer);
-                if (len > 0 && buffer[len - 1] == '\n') {
-                    line.append(buffer, len - 1);
-                    return true;
-                }
-                line.append(buffer, len);
+        while (true) {
+            if (gzgets(gzfp_, buffer, sizeof(buffer)) == nullptr)
+                return !line.empty();
+            size_t len = strlen(buffer);
+            if (len > 0 && buffer[len - 1] == '\n') {
+                line.append(buffer, len - 1);
+                return true;
             }
-        } else {
-            while (true) {
-                if (gzgets(gzfp_, buffer, sizeof(buffer)) == nullptr)
-                    return !line.empty();
-                size_t len = strlen(buffer);
-                if (len > 0 && buffer[len - 1] == '\n') {
-                    line.append(buffer, len - 1);
-                    return true;
-                }
-                line.append(buffer, len);
-            }
+            line.append(buffer, len);
         }
     }
 
     std::string path_;
-    bool        use_pigz_;
-    FILE*       pipe_;
     gzFile      gzfp_;
     uint64_t    record_count_;
 };
