@@ -57,9 +57,9 @@ struct IndexEntry {
 
 class DerepPairsEngine {
 public:
-    DerepPairsEngine(bool use_revcomp, bool write_clusters)
+    DerepPairsEngine(bool use_revcomp, bool write_clusters, bool allow_id_mismatch = false)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
-          total_reads_(0) {}
+          allow_id_mismatch_(allow_id_mismatch), total_reads_(0) {}
 
     void process(const std::string& ext_path,
                  const std::string& non_path,
@@ -112,9 +112,17 @@ private:
         const std::string ext_id = trim_id(ext_rec.header);
         const std::string non_id = trim_id(non_rec.header);
         if (ext_id != non_id) {
-            log_warn("Paired FASTQ ID mismatch in " + std::string(phase) +
-                     " at record " + std::to_string(record_idx + 1) +
-                     ": ext=" + ext_id + ", non=" + non_id);
+            if (allow_id_mismatch_) {
+                log_warn("Paired FASTQ ID mismatch in " + std::string(phase) +
+                         " at record " + std::to_string(record_idx + 1) +
+                         ": ext=" + ext_id + ", non=" + non_id);
+            } else {
+                throw std::runtime_error(
+                    "Paired FASTQ ID mismatch in " + std::string(phase) +
+                    " at record " + std::to_string(record_idx + 1) +
+                    ": ext=" + ext_id + ", non=" + non_id +
+                    " (ensure both files are sorted identically, or use --allow-id-mismatch)");
+            }
         }
         return true;
     }
@@ -127,7 +135,7 @@ private:
 
         while (read_paired_checked(*ext_reader, *non_reader, ext_rec, non_rec,
                                    record_idx, "pass1")) {
-            uint64_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            XXH128_hash_t h = canonical_hash(ext_rec.seq, use_revcomp_);
             SequenceFingerprint fp(h, ext_rec.seq.size());
 
             auto it = index_.find(fp);
@@ -176,7 +184,7 @@ private:
             if (cluster_gz) {
                 gzbuffer(cluster_gz, GZBUF_SIZE);
                 if (gzprintf(cluster_gz,
-                             "hash\text_len\text_count\tnon_len\tnon_count\n") < 0)
+                             "hash\text_len\tpair_count\tnon_len\n") < 0)
                     throw std::runtime_error(
                         "gzprintf failed while writing cluster header");
             }
@@ -208,12 +216,12 @@ private:
                         throw std::runtime_error(
                             "Internal error: missing fingerprint for cluster output");
                     const IndexEntry& entry = ei->second;
-                    if (gzprintf(cluster_gz, "%016lx\t%lu\t%lu\t%u\t%lu\n",
-                                 static_cast<unsigned long>(fp.hash),
+                    if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\t%u\n",
+                                 static_cast<unsigned long>(fp.hash_hi),
+                                 static_cast<unsigned long>(fp.hash_lo),
                                  static_cast<unsigned long>(ext_rec.seq.size()),
                                  static_cast<unsigned long>(entry.count),
-                                 entry.non_len,
-                                 static_cast<unsigned long>(entry.count)) < 0)
+                                 entry.non_len) < 0)
                         throw std::runtime_error(
                             "gzprintf failed while writing cluster record");
                 }
@@ -255,6 +263,7 @@ private:
 
     bool use_revcomp_;
     bool write_clusters_;
+    bool allow_id_mismatch_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
     uint64_t total_reads_;
@@ -278,9 +287,10 @@ static void print_usage(const char* prog) {
         << "  -o-non FILE  Output non-extended FASTQ\n"
         << "  -o-ext FILE  Output extended FASTQ\n"
         << "\nOptional:\n"
-        << "  -c FILE      Write cluster statistics to gzipped TSV\n"
-        << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
-        << "  -h, --help   Show this help\n"
+        << "  -c FILE             Write cluster statistics to gzipped TSV\n"
+        << "  --no-revcomp        Disable reverse-complement matching (default: enabled)\n"
+        << "  --allow-id-mismatch Warn instead of failing on read ID mismatches\n"
+        << "  -h, --help          Show this help\n"
         << "\nMemory: ~24 bytes per input read pair.\n";
 }
 
@@ -292,6 +302,7 @@ int derep_pairs_main(int argc, char** argv) {
 
     std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path;
     bool use_revcomp = true;
+    bool allow_id_mismatch = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -310,6 +321,8 @@ int derep_pairs_main(int argc, char** argv) {
             cluster_path = argv[++i];
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
+        } else if (arg == "--allow-id-mismatch") {
+            allow_id_mismatch = true;
         }
     }
 
@@ -329,9 +342,11 @@ int derep_pairs_main(int argc, char** argv) {
     if (!cluster_path.empty())
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
+    if (allow_id_mismatch)
+        log_info("ID mismatch handling: warn (--allow-id-mismatch)");
 
     try {
-        DerepPairsEngine engine(use_revcomp, !cluster_path.empty());
+        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), allow_id_mismatch);
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
