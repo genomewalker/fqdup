@@ -59,15 +59,18 @@ of the read — avoiding terminal damage and adapter composition bias, consisten
 with DART's approach.
 
 After scanning, a coverage-weighted ordinary least-squares fit in log-space
-(positions 1–9; position 0 is excluded because sorted files tend to put the
-most abundant reads first, which can skew terminal composition) gives the
-exponential parameters. Lambda is clamped to [0.05, 0.5]. The estimated
-parameters are logged:
+(positions 1–9; position 0 is excluded because it can carry first-cycle or
+ligation artifacts) gives the exponential parameters. Lambda is clamped to
+[0.05, 0.5]. The excess T/(T+C) at each position is divided by `(1 − bg)` —
+the C fraction of the T+C pool — to convert from raw frequency excess into
+estimated P(C→T) deamination rate, matching DART's convention and making
+`d_max` directly comparable to metaDMG output. The estimated parameters are
+logged:
 
 ```
 Pass 0: damage estimation — 5582073 reads processed (5582073 total)
-  5'-end: d_max=0.099 lambda=0.246 bg=0.487
-  3'-end: d_max=0.020 lambda=0.069 bg=0.509
+  5'-end: d_max=0.193 lambda=0.246 bg=0.487
+  3'-end: d_max=0.040 lambda=0.069 bg=0.509
 ```
 
 If both `d_max_5` and `d_max_3` are below 0.02, damage is treated as
@@ -104,8 +107,8 @@ The masked positions and expected mismatch count are reported after Pass 0:
 
 ```
 --- Damage-Aware Deduplication ---
-  5'-end d_max:  0.098842
-  3'-end d_max:  0.019759
+  5'-end d_max:  0.192754
+  3'-end d_max:  0.040259
   5'-end lambda: 0.246287
   Mask threshold:0.050000
   Masked positions: 1 (1 bp each end)
@@ -135,7 +138,7 @@ with symmetric damage).
 ## Effect on cluster counts
 
 Benchmarked on sample `a88af16f35` — 25.8 M fastp-merged read pairs, 91 bp
-mean length, `d_max_5 ≈ 0.099`, `lambda_5 ≈ 0.25`:
+mean length, `d_max_5 ≈ 0.193`, `lambda_5 ≈ 0.25`:
 
 | Step | Unique clusters | Change |
 |------|----------------|--------|
