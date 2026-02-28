@@ -248,7 +248,15 @@ struct LexicographicComparator {
     }
 };
 
-class FastqReader {
+// Abstract base for all sort-phase FASTQ readers.
+// Derived classes: FastqReader (zlib), FastqReaderIgzip (ISA-L).
+struct SortReaderBase {
+    virtual ~SortReaderBase() = default;
+    virtual bool read(FastqRecord& rec) = 0;
+    virtual bool read(FastqRecordArena& rec, StringArena& arena) = 0;
+};
+
+class FastqReader : public SortReaderBase {
 public:
     FastqReader(const std::string& path) : path_(path), use_stdin_(false), pipe_(nullptr) {
         // Check if reading from stdin
@@ -282,8 +290,7 @@ public:
         return true;
     }
 
-    // Old interface: read into std::string (for merge phase)
-    bool read(FastqRecord& rec) {
+    bool read(FastqRecord& rec) override {
         if (!getline_gz(rec.header)) return false;
         if (!getline_gz(rec.seq)) return false;
         if (!getline_gz(rec.plus)) return false;
@@ -291,8 +298,7 @@ public:
         return true;
     }
 
-    // New interface: read into arena (zero allocations for chunk creation!)
-    bool read(FastqRecordArena& rec, StringArena& arena) {
+    bool read(FastqRecordArena& rec, StringArena& arena) override {
         std::string temp;
         if (!getline_gz(temp)) return false;
         rec.header = arena.store(temp);
@@ -352,7 +358,7 @@ private:
 
 #ifdef HAVE_ISAL
 // Hardware-accelerated FastqReader using ISA-L (4-6× faster decompression)
-class FastqReaderIgzip {
+class FastqReaderIgzip : public SortReaderBase {
 public:
     FastqReaderIgzip(const std::string& path) : path_(path), use_stdin_(false), eof_(false), decomp_buffer_pos_(0), decomp_buffer_used_(0) {
         // Check if reading from stdin
@@ -382,11 +388,24 @@ public:
         delete state_;
     }
 
-    bool read(FastqRecord& rec) {
+    bool read(FastqRecord& rec) override {
         if (!getline_igzip(rec.header)) return false;
         if (!getline_igzip(rec.seq)) return false;
         if (!getline_igzip(rec.plus)) return false;
         if (!getline_igzip(rec.qual)) return false;
+        return true;
+    }
+
+    bool read(FastqRecordArena& rec, StringArena& arena) override {
+        std::string temp;
+        if (!getline_igzip(temp)) return false;
+        rec.header = arena.store(temp); rec.header_len = temp.size();
+        if (!getline_igzip(temp)) return false;
+        rec.seq    = arena.store(temp); rec.seq_len    = temp.size();
+        if (!getline_igzip(temp)) return false;
+        rec.plus   = arena.store(temp); rec.plus_len   = temp.size();
+        if (!getline_igzip(temp)) return false;
+        rec.qual   = arena.store(temp); rec.qual_len   = temp.size();
         return true;
     }
 
@@ -475,7 +494,8 @@ private:
     size_t decomp_buffer_pos_;
     size_t decomp_buffer_used_;
 };
-#endif
+#endif  // HAVE_ISAL
+
 
 class FastqWriter {
 public:
@@ -721,6 +741,15 @@ public:
         // Estimate input size and adjust chunk size accordingly
         adjust_chunk_size_for_input(input);
 
+        log_info("Decompression: " + std::string(
+#ifdef HAVE_RAPIDGZIP
+            "rapidgzip (parallel multi-threaded)"
+#elif defined(HAVE_ISAL)
+            "ISA-L (hardware-accelerated)"
+#else
+            "zlib"
+#endif
+        ));
         log_info("Phase 1: Creating sorted chunks (" + std::to_string(threads_) + " writer threads)");
         create_chunks(input);
 
@@ -784,23 +813,18 @@ private:
     void create_chunks(const std::string& input) {
         auto phase1_start = std::chrono::steady_clock::now();
 
-        // Try pigz first for parallel decompression (fastest option)
-        FILE* pigz_pipe = nullptr;
         bool is_gzipped = (input.size() > 3 && input.substr(input.size() - 3) == ".gz");
 
+        std::unique_ptr<SortReaderBase> reader;
+#ifdef HAVE_ISAL
         if (is_gzipped && input != "/dev/stdin" && input != "-") {
-            // Try to use pigz with multiple threads for parallel decompression
-            std::string pigz_cmd = "pigz -dc -p " + std::to_string(threads_) + " -- " + shell_escape_path(input) + " 2>/dev/null";
-            pigz_pipe = popen(pigz_cmd.c_str(), "r");
-        }
-
-        // Create reader
-        std::unique_ptr<FastqReader> reader;
-        if (pigz_pipe) {
-            reader = std::make_unique<FastqReader>(pigz_pipe, true);
+            reader = std::make_unique<FastqReaderIgzip>(input);
         } else {
             reader = std::make_unique<FastqReader>(input);
         }
+#else
+        reader = std::make_unique<FastqReader>(input);
+#endif
 
         // Now with string arenas, we can use maximum concurrency!
         // Each buffer has its own arena - zero malloc fragmentation
@@ -995,14 +1019,6 @@ private:
         queue_cv.notify_all();  // Wake all writers
         for (auto& t : writer_threads) {
             t.join();
-        }
-
-        // Close pigz pipe if used
-        if (pigz_pipe) {
-            int rc = pclose(pigz_pipe);
-            if (rc != 0) {
-                throw std::runtime_error("pclose failed for pigz reader pipe with status " + std::to_string(rc));
-            }
         }
 
         if (writer_exception) {
@@ -1234,7 +1250,9 @@ static void print_usage(const char* prog) {
               << "  Phase 1: Create sorted chunks (parallel writer threads)\n"
               << "  Phase 2: K-way merge (streaming)\n"
 #ifdef HAVE_ISAL
-              << "\nAcceleration: Intel ISA-L igzip (4-6× faster decompression)\n"
+              << "\nDecompression: ISA-L igzip (hardware-accelerated)\n"
+#else
+              << "\nDecompression: zlib\n"
 #endif
               ;
 }
