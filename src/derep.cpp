@@ -25,7 +25,7 @@
 #include <vector>
 #include <zlib.h>
 
-#include "dart/sample_damage_profile.hpp"
+#include "dart/frame_selector_decl.hpp"
 
 #ifdef __AVX2__
 #include <immintrin.h>
