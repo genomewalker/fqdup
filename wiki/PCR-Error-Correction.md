@@ -131,7 +131,31 @@ effective_max(P) = max(--errcor-max-count, ⌈P × φ × D_eff / 3⌉)
 ```
 
 The global pre-filter (for efficiency) uses the observed maximum parent count.
-Without `--pcr-cycles`, the static `--errcor-max-count` applies to all clusters.
+
+**When `--pcr-cycles` is not given**, fqdup estimates D_eff automatically from the
+observed duplication ratio after Pass 1:
+
+```
+D_eff_estimated = log₂(total_reads / unique_reads)
+```
+
+This follows directly from PCR kinetics: mean copies per starting molecule after n
+cycles with efficiency E is (1+E)ⁿ, so total/unique ≈ (1+E)ⁿ and
+D_eff = log₂((1+E)ⁿ) = log₂(total/unique). The estimate is logged:
+
+```
+Phase 3: D_eff=2.21 estimated from duplication ratio 25000000/5600000
+  (use --pcr-cycles for explicit value)
+```
+
+**Caveat when running after `derep_pairs`:** the input to `derep` has already had
+most PCR duplicates removed. The residual duplication reflects structural reads
+(same non-extended sequence, different extended) rather than pure PCR amplification.
+The estimated D_eff will be lower than the true PCR D_eff, making the adaptive
+ceiling more conservative. For aDNA libraries this does not matter — parent counts
+are low enough that the static `--errcor-max-count` dominates regardless. For
+mitochondrial-enriched or high-depth modern libraries, specify `--pcr-cycles`
+explicitly for an accurate adaptive ceiling.
 
 **Example (Q5, 30 cycles, E=1.0):**
 

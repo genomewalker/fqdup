@@ -61,10 +61,18 @@ struct ErrCorParams {
     uint32_t max_count  = 5;      // static child ceiling (hard cap; also minimum when adaptive)
     uint32_t bucket_cap = 64;     // max pair-key bucket size (limits low-complexity bloat)
     // Adaptive child ceiling from PCR model (Potapov & Ong 2017):
-    //   phi × D_eff  (sub/base/full-PCR-run); 0 = use static max_count only.
+    //   pcr_rate = phi × D_eff  (sub/base/full-PCR-run)
     // Per parent P: effective_max = max(max_count, ceil(P × pcr_rate / 3)).
     // The /3 is for the specific-substitution spectrum under the equal-rates assumption.
-    double   pcr_rate   = 0.0;
+    //
+    // pcr_phi: polymerase error rate (sub/base/doubling). Q5=5.3e-7 (default).
+    //   Always set from --pcr-error-rate (or default). Used to auto-estimate pcr_rate
+    //   from the observed duplication ratio when --pcr-cycles is not given.
+    //
+    // pcr_rate: phi × D_eff. Set explicitly when pcr_cycles>0; otherwise estimated
+    //   after Pass 1 from D_eff = log2(total_reads / unique_reads). 0 = not yet set.
+    double   pcr_phi    = 5.3e-7;  // polymerase error rate (sub/base/doubling)
+    double   pcr_rate   = 0.0;     // phi × D_eff; 0 = use static max_count only
 };
 
 // ============================================================================
@@ -597,6 +605,26 @@ public:
                  std::to_string(total_reads_) + " reads");
 
         if (errcor_.enabled) {
+            // Auto-estimate D_eff from duplication ratio when --pcr-cycles not given.
+            // Under PCR kinetics: mean copies per molecule = (1+E)^n, so
+            //   D_eff = log2((1+E)^n) = log2(total_reads / unique_reads).
+            // This is exact for uniform amplification; a lower bound when starting
+            // copy number varies (conservative: under-estimates errors, avoids
+            // false absorptions).
+            if (errcor_.pcr_rate == 0.0 && errcor_.pcr_phi > 0.0 &&
+                total_reads_ > index_.size() && index_.size() > 0) {
+                double dr     = static_cast<double>(total_reads_) /
+                                static_cast<double>(index_.size());
+                double d_eff  = std::log2(dr);
+                errcor_.pcr_rate = errcor_.pcr_phi * d_eff;
+                log_info("Phase 3: D_eff=" +
+                         std::to_string(d_eff).substr(0, 5) +
+                         " estimated from duplication ratio " +
+                         std::to_string(total_reads_) + "/" +
+                         std::to_string(index_.size()) +
+                         " (use --pcr-cycles for explicit value)");
+            }
+
             log_info("Phase 3: PCR error correction");
             phase3_error_correct();
         }
@@ -1020,9 +1048,20 @@ int derep_main(int argc, char** argv) {
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
 
-    double D_eff = pcr_cycles * std::log2(1.0 + pcr_efficiency);
-    double pcr_total_rate = pcr_phi * D_eff;
-    errcor.pcr_rate = pcr_total_rate;   // thread into Phase 3 adaptive threshold
+    // Thread polymerase error rate into Phase 3 adaptive threshold.
+    // When --pcr-cycles is given, D_eff is known and pcr_rate is set directly.
+    // When --pcr-cycles is not given, D_eff is estimated after Pass 1 from the
+    // observed duplication ratio: D_eff = log2(total_reads / unique_reads).
+    errcor.pcr_phi = pcr_phi;
+    double pcr_total_rate = 0.0;
+    if (pcr_cycles > 0) {
+        double D_eff = pcr_cycles * std::log2(1.0 + pcr_efficiency);
+        pcr_total_rate = pcr_phi * D_eff;
+        errcor.pcr_rate = pcr_total_rate;
+        log_info("PCR model: phi=" + std::to_string(pcr_phi) +
+                 " D_eff=" + std::to_string(D_eff).substr(0, 5) +
+                 " rate=" + std::to_string(pcr_total_rate));
+    }
 
     DamageProfile profile;
     profile.mask_threshold = mask_threshold;
