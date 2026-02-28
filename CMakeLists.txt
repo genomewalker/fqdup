@@ -59,6 +59,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
+# libdart-damage — DART's full damage estimation pipeline as a shared library.
+# Provides dart::FrameSelector::{update,finalize}_sample_profile and
+# SampleDamageProfile with d_max_combined (mixture model), all channels, GC bins.
+FetchContent_Declare(
+    libdart_damage
+    GIT_REPOSITORY https://github.com/genomewalker/libdart-damage.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+    UPDATE_DISCONNECTED TRUE
+)
+FetchContent_MakeAvailable(libdart_damage)
+
 # Build fqdup
 add_executable(fqdup
     src/main.cpp
@@ -79,6 +91,7 @@ target_link_libraries(fqdup PRIVATE
     Threads::Threads
     ${XXHASH_LIB}
     rapidgzip::rapidgzip
+    dart-damage
 )
 target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP)
 
