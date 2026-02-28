@@ -138,23 +138,28 @@ Required:
   -o FILE      Output deduplicated FASTQ
 
 Optional:
-  -c FILE          Cluster statistics (gzipped TSV: hash, seq_len, count)
-  --no-revcomp     Disable reverse-complement collapsing (default: enabled)
-  --pigz           Parallel decompression via pigz
-  --isal           Hardware-accelerated decompression (ISA-L)
+  -c FILE              Cluster statistics (gzipped TSV: hash, seq_len, count)
+  --no-revcomp         Disable reverse-complement collapsing (default: enabled)
+  --no-damage          Disable damage estimation and masking (default: auto-enabled)
+  --no-error-correct   Disable PCR error correction (default: enabled)
+  --pigz               Parallel decompression via pigz
+  --isal               Hardware-accelerated decompression (ISA-L)
 ```
 
-#### Damage-aware deduplication
+Both `--damage-auto` and `--error-correct` are **on by default** — the primary
+use case is ancient DNA where both are always appropriate. Use `--no-damage` or
+`--no-error-correct` to disable them for non-aDNA datasets.
+
+#### Damage-aware deduplication (default: on)
 
 Reads differing only by terminal C→T (5') or G→A (3') deamination are collapsed.
 A DART-style exponential model is fitted automatically or supplied manually.
+If damage is below threshold, standard exact hashing is used automatically.
 
 ```
-  --damage-auto             Estimate damage parameters from input (Pass 0)
-  --damage-stride INT       Sampling stride for Pass 0 (default: 1000)
-
-  Manual model (alternative to --damage-auto):
-  --damage-dmax   FLOAT     d_max for both 5' and 3' ends
+  --no-damage               Disable damage estimation and masking
+  --damage-auto             Explicitly enable (already default)
+  --damage-dmax   FLOAT     d_max for both 5' and 3' ends (manual model)
   --damage-dmax5  FLOAT     d_max for 5' end only
   --damage-dmax3  FLOAT     d_max for 3' end only
   --damage-lambda FLOAT     Decay constant for both ends
@@ -170,15 +175,20 @@ A DART-style exponential model is fitted automatically or supplied manually.
                             Q5/HiFi: 5.3e-7 (default), Phusion: 3.9e-6, Taq: 1.5e-4
 ```
 
-#### PCR error correction (Phase 3)
+#### PCR error correction — Phase 3 (default: on)
 
 After deduplication, low-count clusters differing from a high-count neighbour by
 exactly one substitution **outside** the damage zone are classified as PCR errors
-and removed. Uses a count-stratified 3-way pigeonhole algorithm with AVX2-
-accelerated Hamming verification.
+and removed. Uses a count-stratified 3-way pigeonhole algorithm with packed
+2-bit Hamming verification (XOR bit-tricks; no full decode in the hot path).
+
+Sequences containing ambiguous bases (N) are excluded from error correction to
+prevent false absorptions. G↔T/C↔A (8-oxoG) substitutions are always protected;
+C↔T/G↔A (deamination) additionally protected when damage mode is active.
 
 ```
-  --error-correct         Enable Phase 3
+  --no-error-correct      Disable Phase 3
+  --error-correct         Explicitly enable (already default)
   --errcor-ratio  FLOAT   count(parent)/count(child) threshold to absorb (default: 50)
   --errcor-max-count INT  Only candidates with count ≤ N are children (default: 5)
   --errcor-bucket-cap INT Max pair-key bucket size (default: 64)
@@ -240,15 +250,15 @@ Benchmarked on a 25.8 M-read ancient DNA library (`a88af16f35`, ~65 bp mean leng
 | Mode | Unique clusters | Δ vs standard |
 |------|----------------|---------------|
 | Standard (`derep_pairs` only) | 5,582,073 | — |
-| Damage-aware (`derep --damage-auto`) | 5,547,508 | −34,565 (−0.6%) |
-| + Error correction (`--error-correct`) | 5,532,327 | −49,746 (−0.9%) |
+| Damage-aware (`derep --no-error-correct`) | 5,547,508 | −34,565 (−0.6%) |
+| + Error correction (`derep`, default) | 5,532,327 | −49,746 (−0.9%) |
 
 Wall time (NFS-mounted storage): sort ~20 s, derep_pairs ~25 s, derep ~33 s.
 Throughput is I/O-bound (~40,000–50,000 reads/s). Use `--isal` or `--pigz` for
 faster decompression.
 
 Memory: ~24 bytes/read pair for `derep_pairs`; ~16 bytes/read for `derep` (plus
-~1 byte/bp of unique sequence if `--error-correct`).
+~0.25 bytes/bp of unique sequence for error correction — 2-bit packed arena).
 
 ## Citation
 

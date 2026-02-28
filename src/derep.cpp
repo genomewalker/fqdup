@@ -104,28 +104,61 @@ struct IndexEntry {
 // so any 1-error variant is found by exactly one lookup.
 // ============================================================================
 
+// 2-bit base helpers — defined before SeqArena which uses them.
+static constexpr uint8_t kDec2bit[4] = {'A', 'C', 'G', 'T'};
+static uint8_t enc2bit(uint8_t c) {
+    c &= 0xDFu;
+    if (c == 'A') return 0u;
+    if (c == 'C') return 1u;
+    if (c == 'G') return 2u;
+    if (c == 'T') return 3u;
+    return 0xFFu;
+}
+
+// 2-bit packed sequence arena.  Reduces memory ~4× vs ASCII storage.
+// Non-ACGT bases (N etc.) are encoded as A=0 and the sequence is flagged
+// ineligible so Phase 3 skips it (avoids false PCR error absorptions).
 struct SeqArena {
-    std::vector<uint8_t>  bases;
-    std::vector<uint64_t> offsets;  // 64-bit: supports >4 GB of total sequence data
-    std::vector<uint16_t> lengths;
+    std::vector<uint8_t>  packed;    // 2-bit data; (L+3)/4 bytes per sequence
+    std::vector<uint64_t> offsets;   // byte offset of each sequence start
+    std::vector<uint16_t> lengths;   // base lengths
+    std::vector<bool>     eligible;  // false when sequence contains non-ACGT
 
     uint32_t append(const std::string& seq) {
         if (seq.size() > 65535u)
             throw std::runtime_error("Sequence too long for arena (>65535 bp)");
         if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
-        uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(static_cast<uint64_t>(bases.size()));
-        lengths.push_back(static_cast<uint16_t>(seq.size()));
-        bases.insert(bases.end(),
-                     reinterpret_cast<const uint8_t*>(seq.data()),
-                     reinterpret_cast<const uint8_t*>(seq.data()) + seq.size());
+        uint32_t id    = static_cast<uint32_t>(offsets.size());
+        uint16_t L     = static_cast<uint16_t>(seq.size());
+        int      nbytes = (L + 3) / 4;
+        offsets.push_back(packed.size());
+        lengths.push_back(L);
+        packed.resize(packed.size() + nbytes, 0);
+        uint8_t* dst = packed.data() + offsets[id];
+        bool ok = true;
+        for (int i = 0; i < (int)L; ++i) {
+            uint8_t b = enc2bit(static_cast<uint8_t>(seq[i]));
+            if (b == 0xFFu) { ok = false; b = 0; }
+            dst[i >> 2] |= b << (6 - 2 * (i & 3));
+        }
+        eligible.push_back(ok);
         return id;
     }
 
-    const uint8_t* data(uint32_t id)   const { return bases.data() + offsets[id]; }
-    uint16_t       length(uint32_t id) const { return lengths[id]; }
-    size_t         size()              const { return offsets.size(); }
+    const uint8_t* data(uint32_t id)        const { return packed.data() + offsets[id]; }
+    uint16_t       length(uint32_t id)      const { return lengths[id]; }
+    bool           is_eligible(uint32_t id) const { return eligible[id]; }
+    size_t         size()                   const { return offsets.size(); }
+
+    // Decode bases [start, start+count) to ASCII scratch buffer.
+    void decode_range(uint32_t id, int start, int count, uint8_t* out) const {
+        const uint8_t* p = data(id);
+        for (int i = 0; i < count; ++i) {
+            int pos = start + i;
+            out[i] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
+        }
+    }
 };
 
 struct SpillNode { uint32_t id; uint32_t next; };
@@ -167,13 +200,10 @@ struct PairIndex {
     }
 };
 
-struct Split3 { int o0, l0, o1, l1, o2, l2; };
-
-static inline Split3 make_split3(int k5, int ilen) {
-    int s0 = ilen / 3;
-    int s1 = (ilen * 2) / 3 - s0;
-    int s2 = ilen - s0 - s1;
-    return { k5, s0, k5 + s0, s1, k5 + s0 + s1, s2 };
+static inline void split3_lens(int ilen, int& s0, int& s1, int& s2) {
+    s0 = ilen / 3;
+    s1 = (ilen * 2) / 3 - s0;
+    s2 = ilen - s0 - s1;
 }
 
 static inline uint64_t splitmix64(uint64_t x) {
@@ -193,75 +223,63 @@ static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
                       ^ static_cast<uint64_t>(ilen));
 }
 
-#ifdef __AVX2__
-static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
-                                  int k5, int ilen) {
-    a += k5; b += k5;
-    int mm = 0, i = 0;
-    for (; i + 32 <= ilen; i += 32) {
-        __m256i va = _mm256_loadu_si256((const __m256i*)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
-        int diff = ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
-        mm += __builtin_popcount(static_cast<unsigned>(diff));
-        if (mm > 1) return false;
-    }
-    for (; i < ilen; ++i)
-        if (a[i] != b[i] && ++mm > 1) return false;
-    return true;
-}
-#else
-static bool interior_hamming_le1(const uint8_t* a, const uint8_t* b,
-                                  int k5, int ilen) {
-    a += k5; b += k5;
-    int mm = 0;
-    for (int i = 0; i < ilen; ++i)
-        if (a[i] != b[i] && ++mm > 1) return false;
-    return true;
-}
-#endif
-
-// Returns true if the substitution a→b (or b→a) is consistent with known
-// ancient or environmental DNA damage, and should therefore NOT be treated
-// as a PCR error.
+// Returns true if the substitution a→b (or b→a) is damage-consistent
+// using 2-bit encoded values.
 //
-// protect_deamination controls whether ancient deamination (C↔T, G↔A) is
-// protected.  Set true only when a damage profile is active; false for
-// standard (non-ancient) mode so that interior C→T PCR errors are absorbed.
-//
-//   Always protected (oxidative 8-oxoG, uniform across any DNA library):
-//     G↔T, C↔A
-//
-//   Protected only when damage model active (ancient deamination):
-//     C↔T, G↔A
-static bool is_damage_sub(uint8_t a, uint8_t b, bool protect_deamination) {
-    a &= 0xDFu; b &= 0xDFu;  // cheap ASCII uppercase
-    // 8-oxoG: always protect
-    if ((a == 'G' && b == 'T') || (a == 'T' && b == 'G') ||
-        (a == 'C' && b == 'A') || (a == 'A' && b == 'C'))
-        return true;
-    // Deamination: only protect when damage model is active
-    if (protect_deamination &&
-        ((a == 'C' && b == 'T') || (a == 'T' && b == 'C') ||
-         (a == 'G' && b == 'A') || (a == 'A' && b == 'G')))
-        return true;
+// XOR analysis (A=0,C=1,G=2,T=3):
+//   xr=1 (01b): G↔T (10^11) or C↔A (01^00) — 8-oxoG, always protect
+//   xr=2 (10b): G↔A (10^00) or C↔T (01^11) — deamination, protect when enabled
+//   xr=3 (11b): A↔T or C↔G — transversions, never damage
+static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool protect_deamination) {
+    uint8_t xr = a ^ b;
+    if (xr == 1u) return true;
+    if (xr == 2u && protect_deamination) return true;
     return false;
 }
 
-// Returns true if the interior region has exactly one mismatch and that
-// mismatch is a damage-consistent substitution.  Called only when
-// interior_hamming_le1() already returned true (i.e. 0 or 1 mismatches).
-static bool interior_single_sub_is_damage(const uint8_t* a, const uint8_t* b,
-                                          int k5, int ilen,
-                                          bool protect_deamination) {
-    a += k5; b += k5;
-    int pos = -1;
-    for (int i = 0; i < ilen; ++i) {
-        if (a[i] != b[i]) {
-            if (pos >= 0) return false;  // >1 mismatch — shouldn't happen
-            pos = i;
+// Scan interior region [k5, k5+ilen) of two 2-bit packed sequences.
+// Returns true if child should be absorbed by parent: exactly 1 interior
+// mismatch AND the substitution is NOT damage-consistent.
+// Fast path: full-byte XOR with 2-bit popcount via (x | x>>1) & 0x55.
+static bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
+                                  int k5, int ilen, bool protect_deamination) {
+    int mismatches = 0;
+    uint8_t mm_a = 0, mm_b = 0;
+
+    for (int i = 0; i < ilen; ) {
+        int pos   = k5 + i;
+        int byte_i = pos >> 2;
+        int bit_i  = pos & 3;
+
+        if (bit_i == 0 && i + 4 <= ilen) {
+            // Full aligned byte: check all 4 bases at once
+            uint8_t diff = pa[byte_i] ^ pb[byte_i];
+            if (diff) {
+                uint8_t any = (diff | (diff >> 1)) & 0x55u;
+                mismatches += __builtin_popcount(any);
+                if (mismatches > 1) return false;
+                // Find the single mismatching 2-bit lane
+                for (int lane = 0; lane < 4; ++lane) {
+                    uint8_t sh = 6 - 2 * lane;
+                    uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
+                    uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
+                    if (ba != bb) { mm_a = ba; mm_b = bb; break; }
+                }
+            }
+            i += 4;
+        } else {
+            // Partial byte: single base
+            uint8_t sh = 6 - 2 * bit_i;
+            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
+            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
+            if (ba != bb) {
+                if (++mismatches > 1) return false;
+                mm_a = ba; mm_b = bb;
+            }
+            ++i;
         }
     }
-    return pos >= 0 && is_damage_sub(a[pos], b[pos], protect_deamination);
+    return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_deamination);
 }
 
 // ============================================================================
@@ -747,19 +765,26 @@ private:
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(64);
 
+        // Scratch buffer for decoding packed interior regions before hashing.
+        std::vector<uint8_t> scratch;
+        scratch.reserve(65535);
+
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (id_count[id] <= errcor_.max_count) continue;
+            if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
             auto [k5, k3] = damage_zone_bounds(L, profile_);
             int ilen = std::max(0, L - k5 - k3);
             if (ilen < 3) continue;
 
-            const uint8_t* seq = arena_.data(id);
-            Split3 sp = make_split3(k5, ilen);
-            uint64_t h0 = XXH3_64bits(seq + sp.o0, sp.l0);
-            uint64_t h1 = XXH3_64bits(seq + sp.o1, sp.l1);
-            uint64_t h2 = XXH3_64bits(seq + sp.o2, sp.l2);
+            // Decode interior to ASCII scratch for hashing; packed data for Hamming.
+            scratch.resize(ilen);
+            arena_.decode_range(id, k5, ilen, scratch.data());
+            int s0, s1, s2; split3_lens(ilen, s0, s1, s2);
+            uint64_t h0 = XXH3_64bits(scratch.data(),          s0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + s0,     s1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + s0 + s1, s2);
 
             auto& sh = shards[ilen];
             sh.pi[0].insert(pair_key(h0, h1, 0, ilen), id, errcor_.bucket_cap);
@@ -776,6 +801,7 @@ private:
         for (uint32_t cid = 0; cid < N; ++cid) {
             if (id_count[cid] > child_prefilter) continue;
             if (is_error_[cid]) continue;
+            if (!arena_.is_eligible(cid)) continue;
 
             int L = arena_.length(cid);
             auto [k5, k3] = damage_zone_bounds(L, profile_);
@@ -785,20 +811,23 @@ private:
             auto shard_it = shards.find(ilen);
             if (shard_it == shards.end()) continue;
 
-            const uint8_t* child_seq = arena_.data(cid);
-            Split3 sp = make_split3(k5, ilen);
-            uint64_t h0 = XXH3_64bits(child_seq + sp.o0, sp.l0);
-            uint64_t h1 = XXH3_64bits(child_seq + sp.o1, sp.l1);
-            uint64_t h2 = XXH3_64bits(child_seq + sp.o2, sp.l2);
+            scratch.resize(ilen);
+            arena_.decode_range(cid, k5, ilen, scratch.data());
+            int s0, s1, s2; split3_lens(ilen, s0, s1, s2);
+            uint64_t h0 = XXH3_64bits(scratch.data(),           s0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + s0,      s1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + s0 + s1, s2);
 
             epoch++;
             bool absorbed = false;
+            const uint8_t* child_packed = arena_.data(cid);
 
             auto check = [&](uint32_t pid) {
                 if (absorbed) return;
                 if (seen_epoch[pid] == epoch) return;
                 seen_epoch[pid] = epoch;
                 if (is_error_[pid]) return;
+                if (!arena_.is_eligible(pid)) return;
                 if (arena_.length(pid) != static_cast<uint16_t>(L)) return;
                 if (static_cast<double>(id_count[pid]) <
                     errcor_.ratio * id_count[cid]) return;
@@ -812,14 +841,10 @@ private:
                     eff_max = std::max(eff_max, adaptive);
                 }
                 if (id_count[cid] > eff_max) return;
-                if (!interior_hamming_le1(arena_.data(pid), child_seq, k5, ilen))
-                    return;
-                // Protect reads carrying damage-consistent substitutions.
-                // G↔T / C↔A (8-oxoG) is always protected.
-                // C↔T / G↔A (ancient deamination) is only protected when the
-                // damage model is active; in standard mode these are valid PCR errors.
-                if (interior_single_sub_is_damage(arena_.data(pid), child_seq,
-                                                  k5, ilen, profile_.enabled))
+                // packed_should_absorb: Hamming==1 in interior AND not damage-consistent.
+                // G↔T/C↔A (8-oxoG) always protected; C↔T/G↔A protected when damage active.
+                if (!packed_should_absorb(arena_.data(pid), child_packed,
+                                          k5, ilen, profile_.enabled))
                     return;
                 absorbed = true;
             };
@@ -977,13 +1002,15 @@ static void print_usage(const char* prog) {
         << "  -c FILE      Write cluster statistics to gzipped TSV\n"
         << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
         << "  -h, --help   Show this help\n"
-        << "\nPCR error correction (Phase 3 — damage-aware):\n"
-        << "  --error-correct          Enable PCR error duplicate removal\n"
+        << "\nPCR error correction (Phase 3 — ON by default):\n"
+        << "  --no-error-correct       Disable PCR error duplicate removal\n"
+        << "  --error-correct          Explicitly enable (already default)\n"
         << "  --errcor-ratio FLOAT     Min count ratio parent/child (default: 50.0)\n"
         << "  --errcor-max-count INT   Only absorb clusters with count <= N (default: 5)\n"
         << "  --errcor-bucket-cap INT  Max pair-key bucket size (default: 64)\n"
-        << "\nAncient DNA damage-aware deduplication:\n"
-        << "  --damage-auto            Estimate damage parameters from input (Pass 0)\n"
+        << "\nAncient DNA damage-aware deduplication (ON by default):\n"
+        << "  --no-damage              Disable damage estimation and masking\n"
+        << "  --damage-auto            Explicitly enable (already default)\n"
         << "  --damage-dmax  FLOAT     Set d_max for both 5' and 3' ends manually\n"
         << "  --damage-dmax5 FLOAT     Set d_max for 5' end only\n"
         << "  --damage-dmax3 FLOAT     Set d_max for 3' end only\n"
@@ -995,7 +1022,7 @@ static void print_usage(const char* prog) {
         << "  --pcr-cycles INT         Number of PCR cycles\n"
         << "  --pcr-efficiency FLOAT   PCR efficiency per cycle, 0-1 (default: 1.0)\n"
         << "  --pcr-error-rate FLOAT   Error rate sub/base/doubling (default: 5.3e-7 = Q5)\n"
-        << "\nMemory: ~16 bytes per input read + seq arena if --error-correct.\n";
+        << "\nMemory: ~16 bytes per input read + 2-bit seq arena (~1 byte/4 bp) for error correction.\n";
 }
 
 int derep_main(int argc, char** argv) {
@@ -1008,8 +1035,9 @@ int derep_main(int argc, char** argv) {
     bool use_revcomp = true;
 
     ErrCorParams errcor;
+    errcor.enabled = true;   // default on: aDNA primary use case
 
-    bool   damage_auto    = false;
+    bool   damage_auto    = true;   // default on: aDNA primary use case
     double damage_dmax5   = -1.0;
     double damage_dmax3   = -1.0;
     double damage_lambda5 = 0.5;
@@ -1035,6 +1063,8 @@ int derep_main(int argc, char** argv) {
             use_revcomp = false;
         } else if (arg == "--error-correct") {
             errcor.enabled = true;
+        } else if (arg == "--no-error-correct") {
+            errcor.enabled = false;
         } else if (arg == "--errcor-ratio" && i + 1 < argc) {
             errcor.ratio = std::stod(argv[++i]);
         } else if (arg == "--errcor-max-count" && i + 1 < argc) {
@@ -1043,6 +1073,9 @@ int derep_main(int argc, char** argv) {
             errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--damage-auto") {
             damage_auto = true;
+        } else if (arg == "--no-damage") {
+            damage_auto = false;
+            damage_dmax5 = damage_dmax3 = -1.0;  // clear any earlier manual values
         } else if (arg == "--damage-dmax" && i + 1 < argc) {
             damage_dmax5 = damage_dmax3 = std::stod(argv[++i]);
         } else if (arg == "--damage-dmax5" && i + 1 < argc) {
@@ -1113,6 +1146,9 @@ int derep_main(int argc, char** argv) {
     if (!cluster_path.empty())
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
+    log_info("Damage-aware mode: " + std::string(damage_auto ? "auto (default)" :
+             (damage_dmax5 >= 0.0 ? "manual" : "disabled (--no-damage)")));
+    log_info("PCR error correction: " + std::string(errcor.enabled ? "enabled (default)" : "disabled (--no-error-correct)"));
 
     // Thread polymerase error rate into Phase 3 adaptive threshold.
     // When --pcr-cycles is given, D_eff is known and pcr_rate is set directly.
