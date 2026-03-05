@@ -13,6 +13,7 @@
 // Memory: ~16 bytes per input record + seq arena if --error-correct is used.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -106,14 +107,26 @@ struct IndexEntry {
 
 // 2-bit base helpers — defined before SeqArena which uses them.
 static constexpr uint8_t kDec2bit[4] = {'A', 'C', 'G', 'T'};
-static uint8_t enc2bit(uint8_t c) {
-    c &= 0xDFu;
-    if (c == 'A') return 0u;
-    if (c == 'C') return 1u;
-    if (c == 'G') return 2u;
-    if (c == 'T') return 3u;
-    return 0xFFu;
-}
+static const std::array<uint8_t, 256> kEnc2bit = [] {
+    std::array<uint8_t, 256> lut{};
+    lut.fill(0xFFu);
+    lut[static_cast<uint8_t>('A')] = lut[static_cast<uint8_t>('a')] = 0u;
+    lut[static_cast<uint8_t>('C')] = lut[static_cast<uint8_t>('c')] = 1u;
+    lut[static_cast<uint8_t>('G')] = lut[static_cast<uint8_t>('g')] = 2u;
+    lut[static_cast<uint8_t>('T')] = lut[static_cast<uint8_t>('t')] = 3u;
+    return lut;
+}();
+
+static const std::array<std::array<uint8_t, 4>, 256> kDec4 = [] {
+    std::array<std::array<uint8_t, 4>, 256> lut{};
+    for (int v = 0; v < 256; ++v) {
+        lut[v][0] = kDec2bit[(v >> 6) & 0x3u];
+        lut[v][1] = kDec2bit[(v >> 4) & 0x3u];
+        lut[v][2] = kDec2bit[(v >> 2) & 0x3u];
+        lut[v][3] = kDec2bit[(v >> 0) & 0x3u];
+    }
+    return lut;
+}();
 
 // 2-bit packed sequence arena.  Reduces memory ~4× vs ASCII storage.
 // Non-ACGT bases (N etc.) are encoded as A=0 and the sequence is flagged
@@ -137,10 +150,15 @@ struct SeqArena {
         packed.resize(packed.size() + nbytes, 0);
         uint8_t* dst = packed.data() + offsets[id];
         bool ok = true;
-        for (int i = 0; i < (int)L; ++i) {
-            uint8_t b = enc2bit(static_cast<uint8_t>(seq[i]));
-            if (b == 0xFFu) { ok = false; b = 0; }
-            dst[i >> 2] |= b << (6 - 2 * (i & 3));
+        int i = 0, byte = 0;
+        while (i < L) {
+            uint8_t v = 0;
+            for (int lane = 0; lane < 4 && i < L; ++lane, ++i) {
+                uint8_t b = kEnc2bit[static_cast<uint8_t>(seq[i])];
+                if (b == 0xFFu) { ok = false; b = 0; }
+                v |= static_cast<uint8_t>(b << (6 - 2 * lane));
+            }
+            dst[byte++] = v;
         }
         eligible.push_back(ok);
         return id;
@@ -154,9 +172,25 @@ struct SeqArena {
     // Decode bases [start, start+count) to ASCII scratch buffer.
     void decode_range(uint32_t id, int start, int count, uint8_t* out) const {
         const uint8_t* p = data(id);
-        for (int i = 0; i < count; ++i) {
-            int pos = start + i;
-            out[i] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
+        int i = 0;
+        int pos = start;
+
+        // Handle leading unaligned bases until we can decode full bytes.
+        while (i < count && (pos & 3) != 0) {
+            out[i++] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
+            ++pos;
+        }
+
+        while (i + 4 <= count) {
+            const auto& d = kDec4[p[pos >> 2]];
+            std::memcpy(out + i, d.data(), 4);
+            i += 4;
+            pos += 4;
+        }
+
+        while (i < count) {
+            out[i++] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
+            ++pos;
         }
     }
 };
@@ -256,14 +290,13 @@ static bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
             uint8_t diff = pa[byte_i] ^ pb[byte_i];
             if (diff) {
                 uint8_t any = (diff | (diff >> 1)) & 0x55u;
-                mismatches += __builtin_popcount(any);
+                int byte_mismatches = __builtin_popcount(any);
+                mismatches += byte_mismatches;
                 if (mismatches > 1) return false;
-                // Find the single mismatching 2-bit lane
-                for (int lane = 0; lane < 4; ++lane) {
-                    uint8_t sh = 6 - 2 * lane;
-                    uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
-                    uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
-                    if (ba != bb) { mm_a = ba; mm_b = bb; break; }
+                if (byte_mismatches == 1) {
+                    uint8_t sh = static_cast<uint8_t>(__builtin_ctz(any));
+                    mm_a = (pa[byte_i] >> sh) & 0x3u;
+                    mm_b = (pb[byte_i] >> sh) & 0x3u;
                 }
             }
             i += 4;
@@ -486,6 +519,31 @@ static XXH128_hash_t damage_canonical_hash(const std::string& seq,
     return h2;
 }
 
+// Canonical hash without heap allocation for reverse-complement construction.
+// Matches fastq_common.hpp canonical_hash() behavior.
+static XXH128_hash_t canonical_hash_noalloc(const std::string& seq,
+                                            bool use_revcomp,
+                                            char* scratch) {
+    XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
+    if (!use_revcomp) return h1;
+
+    int L = static_cast<int>(seq.size());
+    for (int i = 0; i < L; ++i) {
+        unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
+        switch (c) {
+            case 'A': case 'a': scratch[i] = (c == 'A') ? 'T' : 't'; break;
+            case 'C': case 'c': scratch[i] = (c == 'C') ? 'G' : 'g'; break;
+            case 'G': case 'g': scratch[i] = (c == 'G') ? 'C' : 'c'; break;
+            case 'T': case 't': scratch[i] = (c == 'T') ? 'A' : 'a'; break;
+            default:            scratch[i] = 'N'; break;
+        }
+    }
+    XXH128_hash_t h2 = XXH3_128bits(scratch, seq.size());
+    if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
+        return h1;
+    return h2;
+}
+
 // ============================================================================
 // Damage estimation — DART full pipeline (Pass 0)
 // Uses libdart-damage: dart::FrameSelector + SampleDamageProfile
@@ -655,7 +713,9 @@ private:
             return damage_canonical_hash(seq, profile_, use_revcomp_,
                                          scratch1_.data(), scratch2_.data());
         }
-        return canonical_hash(seq, use_revcomp_);
+        if (!use_revcomp_) return XXH3_128bits(seq.data(), seq.size());
+        if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
+        return canonical_hash_noalloc(seq, true, scratch1_.data());
     }
 
     // Count terminal damage markers: T at masked 5' positions + A at masked 3' positions.
@@ -683,14 +743,12 @@ private:
             XXH128_hash_t h = compute_hash(rec.seq);
             SequenceFingerprint fp(h, rec.seq.size());
 
-            auto it = index_.find(fp);
-            if (it == index_.end()) {
-                IndexEntry entry(record_idx);
+            auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
+            if (inserted) {
                 if (profile_.enabled)
-                    entry.damage_score = compute_damage_score(rec.seq, profile_);
+                    it->second.damage_score = compute_damage_score(rec.seq, profile_);
                 if (errcor_.enabled)
-                    entry.seq_id = arena_.append(rec.seq);
-                index_.emplace(fp, entry);
+                    it->second.seq_id = arena_.append(rec.seq);
             } else {
                 it->second.count++;
                 // Maximize the ancient damage signal in the output: when a new read
@@ -768,28 +826,48 @@ private:
         // Scratch buffer for decoding packed interior regions before hashing.
         std::vector<uint8_t> scratch;
         scratch.reserve(65535);
+        struct InteriorLayout {
+            int  k5      = 0;
+            int  ilen    = 0;
+            int  s0      = 0;
+            int  s1      = 0;
+            int  s2      = 0;
+            bool ready   = false;
+        };
+        std::vector<InteriorLayout> layout_cache(65536);
+        auto get_layout = [&](int L) -> const InteriorLayout& {
+            auto& lay = layout_cache[static_cast<uint16_t>(L)];
+            if (!lay.ready) {
+                auto [k5, k3] = damage_zone_bounds(L, profile_);
+                lay.k5   = k5;
+                lay.ilen = std::max(0, L - k5 - k3);
+                if (lay.ilen >= 3)
+                    split3_lens(lay.ilen, lay.s0, lay.s1, lay.s2);
+                lay.ready = true;
+            }
+            return lay;
+        };
 
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (id_count[id] <= errcor_.max_count) continue;
             if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
-            auto [k5, k3] = damage_zone_bounds(L, profile_);
-            int ilen = std::max(0, L - k5 - k3);
-            if (ilen < 3) continue;
+            const auto& lay = get_layout(L);
+            if (lay.ilen < 3) continue;
 
             // Decode interior to ASCII scratch for hashing; packed data for Hamming.
-            scratch.resize(ilen);
-            arena_.decode_range(id, k5, ilen, scratch.data());
-            int s0, s1, s2; split3_lens(ilen, s0, s1, s2);
-            uint64_t h0 = XXH3_64bits(scratch.data(),          s0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + s0,     s1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + s0 + s1, s2);
+            if (scratch.size() < static_cast<size_t>(lay.ilen))
+                scratch.resize(lay.ilen);
+            arena_.decode_range(id, lay.k5, lay.ilen, scratch.data());
+            uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
 
-            auto& sh = shards[ilen];
-            sh.pi[0].insert(pair_key(h0, h1, 0, ilen), id, errcor_.bucket_cap);
-            sh.pi[1].insert(pair_key(h0, h2, 1, ilen), id, errcor_.bucket_cap);
-            sh.pi[2].insert(pair_key(h1, h2, 2, ilen), id, errcor_.bucket_cap);
+            auto& sh = shards[lay.ilen];
+            sh.pi[0].insert(pair_key(h0, h1, 0, lay.ilen), id, errcor_.bucket_cap);
+            sh.pi[1].insert(pair_key(h0, h2, 1, lay.ilen), id, errcor_.bucket_cap);
+            sh.pi[2].insert(pair_key(h1, h2, 2, lay.ilen), id, errcor_.bucket_cap);
             n_parents++;
         }
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
@@ -804,19 +882,18 @@ private:
             if (!arena_.is_eligible(cid)) continue;
 
             int L = arena_.length(cid);
-            auto [k5, k3] = damage_zone_bounds(L, profile_);
-            int ilen = std::max(0, L - k5 - k3);
-            if (ilen < 3) continue;
+            const auto& lay = get_layout(L);
+            if (lay.ilen < 3) continue;
 
-            auto shard_it = shards.find(ilen);
+            auto shard_it = shards.find(lay.ilen);
             if (shard_it == shards.end()) continue;
 
-            scratch.resize(ilen);
-            arena_.decode_range(cid, k5, ilen, scratch.data());
-            int s0, s1, s2; split3_lens(ilen, s0, s1, s2);
-            uint64_t h0 = XXH3_64bits(scratch.data(),           s0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + s0,      s1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + s0 + s1, s2);
+            if (scratch.size() < static_cast<size_t>(lay.ilen))
+                scratch.resize(lay.ilen);
+            arena_.decode_range(cid, lay.k5, lay.ilen, scratch.data());
+            uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
 
             epoch++;
             bool absorbed = false;
@@ -844,15 +921,15 @@ private:
                 // packed_should_absorb: Hamming==1 in interior AND not damage-consistent.
                 // G↔T/C↔A (8-oxoG) always protected; C↔T/G↔A protected when damage active.
                 if (!packed_should_absorb(arena_.data(pid), child_packed,
-                                          k5, ilen, profile_.enabled))
+                                          lay.k5, lay.ilen, profile_.enabled))
                     return;
                 absorbed = true;
             };
 
             auto& sh = shard_it->second;
-            sh.pi[0].query(pair_key(h0, h1, 0, ilen), check);
-            if (!absorbed) sh.pi[1].query(pair_key(h0, h2, 1, ilen), check);
-            if (!absorbed) sh.pi[2].query(pair_key(h1, h2, 2, ilen), check);
+            sh.pi[0].query(pair_key(h0, h1, 0, lay.ilen), check);
+            if (!absorbed) sh.pi[1].query(pair_key(h0, h2, 1, lay.ilen), check);
+            if (!absorbed) sh.pi[2].query(pair_key(h1, h2, 2, lay.ilen), check);
 
             if (absorbed) {
                 is_error_[cid] = true;
@@ -883,34 +960,39 @@ private:
             }
         }
 
-        ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
+        struct WriteEntry {
+            uint64_t            record_index;
+            SequenceFingerprint fingerprint;
+            uint64_t            count;
+        };
+        std::vector<WriteEntry> records_to_write;
         records_to_write.reserve(index_.size());
         for (const auto& [fingerprint, entry] : index_) {
             if (!is_error_.empty() && is_error_[entry.seq_id]) continue;
-            records_to_write[entry.record_index] = fingerprint;
+            records_to_write.push_back({entry.record_index, fingerprint, entry.count});
         }
+        std::sort(records_to_write.begin(), records_to_write.end(),
+                  [](const WriteEntry& a, const WriteEntry& b) {
+                      return a.record_index < b.record_index;
+                  });
         const size_t n_to_write = records_to_write.size();
 
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
         size_t written = 0;
+        size_t next_write = 0;
 
         while (reader->read(rec)) {
-            auto it = records_to_write.find(record_idx);
-            if (it != records_to_write.end()) {
+            if (next_write < n_to_write &&
+                records_to_write[next_write].record_index == record_idx) {
+                const WriteEntry& entry = records_to_write[next_write];
                 writer.write(rec);
 
                 if (cluster_gz) {
-                    const SequenceFingerprint& fp = it->second;
-                    auto ei = index_.find(fp);
-                    if (ei == index_.end())
-                        throw std::runtime_error(
-                            "Internal error: missing fingerprint for cluster output");
-                    const IndexEntry& entry = ei->second;
                     if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\n",
-                                 static_cast<unsigned long>(fp.hash_hi),
-                                 static_cast<unsigned long>(fp.hash_lo),
+                                 static_cast<unsigned long>(entry.fingerprint.hash_hi),
+                                 static_cast<unsigned long>(entry.fingerprint.hash_lo),
                                  static_cast<unsigned long>(rec.seq.size()),
                                  static_cast<unsigned long>(entry.count)) < 0)
                         throw std::runtime_error(
@@ -918,6 +1000,7 @@ private:
                 }
 
                 written++;
+                next_write++;
                 if ((written % 100000) == 0) {
                     std::cerr << "\r[Pass 2] " << written << " / " << n_to_write
                               << " unique records written" << std::flush;
@@ -1184,6 +1267,11 @@ int derep_main(int argc, char** argv) {
             profile.enabled       = (damage_dmax5 > 0.0);
             profile.populate_mask_from_model();
             profile.print_info(/*typical_read_length=*/0);
+        }
+        if (damage_auto && errcor.enabled && !profile.enabled) {
+            log_warn("WARNING: --error-correct is ON but no ancient DNA damage detected. "
+                     "On modern DNA this may absorb genuine low-frequency variants. "
+                     "Use --no-error-correct to disable.");
         }
 
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor);
