@@ -77,11 +77,11 @@ this precomputed array — no exponential evaluation at hash time.
 **Pass 1** streams the input and builds the index. For each read, the sequence
 is optionally masked (neutral bytes at C/T in masked 5' positions, G/A in
 masked 3' positions), then hashed to a canonical fingerprint. New fingerprints
-get a new index entry; existing fingerprints increment the count. If
-`--error-correct` is active, the full sequence of each unique cluster is also
-stored in a contiguous sequence arena for Phase 3.
+get a new index entry; existing fingerprints increment the count. Each unique
+cluster's sequence is also stored in a 2-bit packed arena for Phase 3 (since
+error correction is on by default).
 
-**Phase 3** (with `--error-correct`) runs entirely in memory on the index. It
+**Phase 3** (PCR error correction, on by default) runs entirely in memory on the index. It
 finds child clusters (count ≤ 5) that differ from a parent cluster (count ≥ 50×
 the child's) by exactly one interior substitution and marks them as PCR errors.
 See [[PCR-Error-Correction]] for how the 3-way pigeonhole search works.
@@ -96,16 +96,17 @@ is the representative of a non-absorbed cluster.
 All three subcommands use the same canonical hash:
 
 ```
-canonical_hash(seq) = min(XXH3_64(seq), XXH3_64(revcomp(seq)))
+canonical_hash(seq) = min(XXH3_128(seq), XXH3_128(revcomp(seq)))
 ```
 
-Taking the minimum of the two hashes means that a molecule sequenced from
-either strand maps to the same fingerprint — forward and reverse-complement
+Taking the minimum of the two 128-bit hashes means that a molecule sequenced
+from either strand maps to the same fingerprint — forward and reverse-complement
 reads collapse into the same cluster. The fingerprint key also includes the
 sequence length to reduce false collisions between reads of different lengths
-that happen to share a hash value.
+that happen to share a hash value. Using the full 128-bit hash reduces the
+collision probability to ~3×10⁻²⁴ at 100 M reads.
 
-[XXH3_64](https://github.com/Cyan4973/xxHash) exceeds 20 GB/s on modern
+[XXH3](https://github.com/Cyan4973/xxHash) exceeds 20 GB/s on modern
 hardware with excellent distribution. The hash map is `ska::flat_hash_map`
 (open-addressing, robin-hood probing), giving cache-friendly O(1) average-case
 lookup and insert.
@@ -120,10 +121,12 @@ duplication rates this makes a substantial difference.
 | Component | Size | Example (5.6 M reads, 37% dup) |
 |-----------|------|-------------------------------|
 | `derep` index | ~40 bytes × N_unique | ~140 MB (3.5 M unique) |
-| SeqArena (`--error-correct`) | ~L_avg bytes × N_unique | ~320 MB (3.5 M × 91 bp) |
+| SeqArena (default on) | ~0.25 × L_avg bytes × N_unique | ~80 MB (3.5 M × 91 bp) |
 
-The SeqArena stores one full sequence per unique cluster and is only allocated
-when `--error-correct` is active. Without it, `derep` on 5.6 M reads uses
-roughly 140 MB regardless of the duplication rate.
+The SeqArena uses 2-bit packed encoding (A=00, C=01, G=10, T=11), storing
+each base in 2 bits rather than 8 — approximately 4× more compact than ASCII.
+Sequences containing ambiguous bases (N) are stored but flagged ineligible;
+they participate in deduplication but are skipped during Phase 3 error correction.
+Use `--no-error-correct` to skip Phase 3 and avoid allocating the arena entirely.
 
 For `derep_pairs`, the index similarly grows with unique pairs, not total pairs.

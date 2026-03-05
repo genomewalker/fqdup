@@ -65,30 +65,35 @@ Memory ≈ 40 bytes × N_unique_clusters
 The index size from our benchmark: 134 MB for 3.53 M unique clusters from
 5.58 M reads (38 bytes/unique cluster, consistent with the formula).
 
-### `fqdup derep` (with `--error-correct`)
+### `fqdup derep` (with error correction, default on)
 
-Error correction adds the `SeqArena` — a contiguous byte array storing the
-full sequence of every unique cluster:
+Error correction adds the `SeqArena` — a 2-bit packed array storing each base
+in 2 bits rather than 8, approximately 4× more compact than ASCII:
 
 ```
-Memory ≈ 40 bytes × N_unique    (Pass 1 index)
-       + L_avg bytes × N_unique  (SeqArena)
+Memory ≈ 40 bytes × N_unique              (Pass 1 index)
+       + 0.25 × L_avg bytes × N_unique    (SeqArena, 2-bit packed)
 ```
 
 | Unique clusters | Mean length | SeqArena |
 |----------------|------------|---------|
-| 3.5 M | 91 bp | ~320 MB |
-| 25 M | 65 bp | ~1.6 GB |
-| 100 M | 65 bp | ~6.5 GB |
+| 3.5 M | 91 bp | ~80 MB |
+| 25 M | 65 bp | ~410 MB |
+| 100 M | 65 bp | ~1.6 GB |
+| 260 M | 65 bp | ~4.2 GB |
 
-For a 25 M-pair library with 50% duplication (12.5 M unique) and
-`--error-correct` at 65 bp mean length:
+For a 25 M-pair library with 50% duplication (12.5 M unique) and default error
+correction at 65 bp mean length:
 
 ```
-Index:    40 × 12.5 M = 500 MB
-SeqArena: 65 × 12.5 M = 813 MB
-Total:   ~1.3 GB
+Index:    40 × 12.5 M        = 500 MB
+SeqArena: 0.25 × 65 × 12.5 M = ~203 MB
+Total:   ~700 MB
 ```
+
+Use `--no-error-correct` to skip Phase 3 entirely and avoid allocating the
+SeqArena. For most aDNA libraries the SeqArena is a small fraction of total
+memory — the index dominates.
 
 ---
 
@@ -144,6 +149,7 @@ For libraries above 400 M read pairs or 100 M unique clusters:
 2. **I/O**: use `--isal` or `--pigz` and `--fast` for the sort step. Place
    temp files on fast local storage with `-t /local/scratch`.
 
-3. **Error correction**: `--error-correct` is optional. For very large
-   datasets the SeqArena can be substantial; the quality gain (typically
-   < 0.2% additional merges) may not justify the memory cost.
+3. **Error correction**: on by default. For very large datasets with 260 M
+   unique clusters the 2-bit SeqArena adds ~4 GB; the quality gain (typically
+   < 0.2% additional merges) may not justify this for extremely large
+   libraries. Use `--no-error-correct` to skip it.
