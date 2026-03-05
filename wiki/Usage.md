@@ -75,13 +75,12 @@ and reduces to around 5.6 M unique pairs.
 fqdup derep \
   -i nonext.deduped.fq.gz \
   -o nonext.final.fq.gz \
-  --damage-auto \
-  --error-correct \
   -c clusters_derep.tsv.gz
 ```
 
-`--damage-auto` triggers Pass 0, which scans all reads to estimate the ancient
-DNA damage parameters. These are logged before deduplication starts:
+Damage estimation and PCR error correction are **on by default**. Pass 0 scans
+all reads to estimate the ancient DNA damage parameters, which are logged before
+deduplication starts:
 
 ```
 Pass 0: damage estimation — 5582073 reads processed (5582073 total)
@@ -95,24 +94,24 @@ Reads that differ only at masked terminal positions then hash identically and
 collapse into the same cluster — recovering pairs split by post-mortem
 deamination.
 
-`--error-correct` adds Phase 3 after Pass 1: any cluster with count ≤ 5 that
-differs from a high-count cluster (≥ 50× its count) by exactly one substitution
-outside the damage zone is absorbed as a PCR copying error.
+Phase 3 (PCR error correction) runs after Pass 1: any cluster with count ≤ 5
+that differs from a high-count cluster (≥ 50× its count) by exactly one
+substitution outside the damage zone is absorbed as a PCR copying error.
 
-On the same 5.6 M-read input, the full `--damage-auto --error-correct` run
-completes in about 33 seconds and reduces to roughly 3.5 M unique clusters.
+On the same 5.6 M-read input, the full run completes in about 33 seconds and
+reduces to roughly 3.5 M unique clusters.
 
 ---
 
 ## Common invocations
 
-### Standard deduplication
+### Standard deduplication (non-aDNA)
 
-For non-ancient DNA, skip the damage and error-correction flags:
+For modern DNA, disable damage estimation and error correction explicitly:
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
-fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz
+fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-damage --no-error-correct
 ```
 
 ### Structural deduplication only
@@ -184,8 +183,9 @@ fqdup derep       ... --no-revcomp
 | `-o FILE` | Output FASTQ | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--damage-auto` | Estimate damage parameters from data (Pass 0) | off |
-| `--damage-dmax FLOAT` | d_max for both ends | — |
+| `--damage-auto` | Estimate damage parameters from data (Pass 0) | **on** |
+| `--no-damage` | Disable damage estimation and masking | — |
+| `--damage-dmax FLOAT` | d_max for both ends (manual model) | — |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | — |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | — |
 | `--damage-lambda FLOAT` | Decay constant for both ends | — |
@@ -196,7 +196,8 @@ fqdup derep       ... --no-revcomp
 | `--pcr-cycles INT` | PCR cycles; if omitted, D_eff is estimated from duplication ratio | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
 | `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
-| `--error-correct` | Enable Phase 3 PCR error correction | off |
+| `--error-correct` | Enable Phase 3 PCR error correction | **on** |
+| `--no-error-correct` | Disable Phase 3 PCR error correction | — |
 | `--errcor-ratio FLOAT` | count(parent)/count(child) threshold | 50.0 |
 | `--errcor-max-count INT` | Children must have count ≤ N | 5 |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |

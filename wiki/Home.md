@@ -124,16 +124,15 @@ fqdup derep_pairs \
   -o-non merged.deduped.fq.gz \
   -o-ext  extended.deduped.fq.gz
 
-# Biological dedup: damage masking + PCR error correction
+# Biological dedup: damage masking + PCR error correction (both on by default)
 fqdup derep \
   -i merged.deduped.fq.gz \
-  -o merged.final.fq.gz \
-  --damage-auto --error-correct
+  -o merged.final.fq.gz
 ```
 
 ### Standard (no ancient DNA)
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 64G
-fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz
+fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-damage --no-error-correct
 ```

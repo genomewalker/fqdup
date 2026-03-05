@@ -42,11 +42,10 @@ fqdup derep_pairs \
   -n nonext.sorted.fq.gz -e ext.sorted.fq.gz \
   -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz
 
-# 3. Single-file dedup with automatic damage estimation + PCR error correction
+# 3. Single-file dedup — damage estimation + PCR error correction (both on by default)
 fqdup derep \
   -i nonext.deduped.fq.gz \
-  -o nonext.final.fq.gz \
-  --damage-auto --error-correct
+  -o nonext.final.fq.gz
 ```
 
 See the [wiki](../../wiki) for detailed tutorials, algorithm description, and
@@ -86,9 +85,11 @@ conda install cmake cxx-compiler zlib xxhash
 Verify the build:
 
 ```bash
-bash tests/smoke.sh build/fqdup
+bash tests/smoke.sh $(pwd)/build/fqdup
 # → OK: fqdup smoke test passed
 ```
+
+> **Note:** Pass the binary as an absolute path — the test script changes directory internally.
 
 ## Options
 
