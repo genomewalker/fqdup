@@ -124,7 +124,8 @@ fqdup derep_pairs \
   -o-non merged.deduped.fq.gz \
   -o-ext  extended.deduped.fq.gz
 
-# Biological dedup: damage masking + PCR error correction (both on by default)
+# Biological dedup: PCR error correction (on by default)
+# Add --damage-auto only if NOT running DART/mapDamage on this output
 fqdup derep \
   -i merged.deduped.fq.gz \
   -o merged.final.fq.gz
@@ -134,5 +135,5 @@ fqdup derep \
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 64G
-fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-damage --no-error-correct
+fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-error-correct
 ```
