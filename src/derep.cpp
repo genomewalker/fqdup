@@ -329,6 +329,7 @@ struct DamageProfile {
     double mask_threshold = 0.05;
     double pcr_error_rate = 0.0;
     bool   enabled        = false;
+    bool   ss_mode        = false;  // true = single-stranded library (C→T at both ends)
 
     // Empirical per-position mask (primary masking authority).
     //
@@ -462,10 +463,22 @@ static void apply_damage_mask_inplace(const std::string& seq,
             std::toupper(static_cast<unsigned char>(scratch[i])));
         bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
         bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
-        if (in_5zone && (cu == 'C' || cu == 'T')) {
-            scratch[i] = '\x01';
-        } else if (in_3zone && (cu == 'G' || cu == 'A')) {
-            scratch[i] = '\x02';
+        if (prof.ss_mode) {
+            // SS: C→T at both ends. Mask the full Watson-Crick transition pair at every
+            // damage-zone position so that canonical_hash(seq)==canonical_hash(revcomp(seq)):
+            // forward C/T → \x01; revcomp of those positions has G/A → \x02.
+            if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) {
+                scratch[i] = '\x01';
+            } else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) {
+                scratch[i] = '\x02';
+            }
+        } else {
+            // DS: C→T at 5', G→A at 3'.
+            if (in_5zone && (cu == 'C' || cu == 'T')) {
+                scratch[i] = '\x01';
+            } else if (in_3zone && (cu == 'G' || cu == 'A')) {
+                scratch[i] = '\x02';
+            }
         }
     }
 }
@@ -506,10 +519,12 @@ static XXH128_hash_t damage_canonical_hash(const std::string& seq,
         char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2[i])));
         bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
         bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
-        if (in_5zone && (cu == 'C' || cu == 'T')) {
-            scratch2[i] = '\x01';
-        } else if (in_3zone && (cu == 'G' || cu == 'A')) {
-            scratch2[i] = '\x02';
+        if (prof.ss_mode) {
+            if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) scratch2[i] = '\x01';
+            else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) scratch2[i] = '\x02';
+        } else {
+            if (in_5zone && (cu == 'C' || cu == 'T')) scratch2[i] = '\x01';
+            else if (in_3zone && (cu == 'G' || cu == 'A')) scratch2[i] = '\x02';
         }
     }
     XXH128_hash_t h2 = XXH3_128bits(scratch2, L);
@@ -553,9 +568,12 @@ static XXH128_hash_t canonical_hash_noalloc(const std::string& seq,
 
 static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
                                           const std::string& path,
-                                          double mask_threshold) {
+                                          double mask_threshold,
+                                          dart::SampleDamageProfile::LibraryType forced_lib =
+                                              dart::SampleDamageProfile::LibraryType::UNKNOWN) {
     FastqRecord rec;
     dart::SampleDamageProfile dart_profile;
+    dart_profile.forced_library_type = forced_lib;
 
     int      reads_scanned = 0;
     int      typical_len   = 0;
@@ -586,6 +604,9 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
     // (metaDMG proxy) when converged; falls back to GC-weighted or joint model.
     double d_max_combined = dart_profile.d_max_combined;
 
+    const bool is_ss = (dart_profile.library_type ==
+                        dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+
     DamageProfile profile;
     profile.d_max_5prime   = d_max_5;
     profile.d_max_3prime   = d_max_3;
@@ -593,25 +614,43 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
     profile.lambda_3prime  = lambda_3;
     profile.background     = background;
     profile.mask_threshold = mask_threshold;
+    profile.ss_mode        = is_ss;
     // Enable if combined or per-end d_max exceeds threshold, OR if DART validates
     // damage even when d_max_5prime/3prime = 0 (e.g. pos0-artifact samples).
     profile.enabled        = (d_max_combined > 0.02 || d_max_5 > 0.02 || d_max_3 > 0.02
                               || dart_profile.damage_validated);
 
     // Empirical per-position mask from DART's normalized frequencies.
-    // Uses max(5'-excess, 3'-excess) > mask_threshold; coverage-gated by tc_total.
+    // DS: max(5' C→T excess, 3' G→A excess) > threshold.
+    // SS: max(5' C→T excess, 3' T/(T+C) excess) > threshold — both ends have C→T.
     constexpr double MIN_COV = 100.0;
+    double bg_tc = dart_profile.baseline_t_freq /
+                   (dart_profile.baseline_t_freq + dart_profile.baseline_c_freq + 1e-9);
     for (int p = 0; p < DamageProfile::MASK_POSITIONS; ++p) {
         double excess_5 = 0.0, excess_3 = 0.0;
         if (dart_profile.tc_total_5prime[p] >= MIN_COV)
             excess_5 = dart_profile.t_freq_5prime[p] - bg_5;
-        if (dart_profile.ag_total_3prime[p] >= MIN_COV)
-            excess_3 = dart_profile.a_freq_3prime[p] - bg_3;
+        if (is_ss) {
+            // SS: 3' damage signal is T/(T+C) excess (same type as 5')
+            if (dart_profile.tc_total_3prime[p] >= MIN_COV) {
+                double tc3 = dart_profile.tc_total_3prime[p];
+                double ct3_freq = (tc3 > 0)
+                    ? dart_profile.t_freq_3prime[p] / tc3
+                    : bg_tc;
+                excess_3 = ct3_freq - bg_tc;
+            }
+        } else {
+            // DS: 3' damage signal is A/(A+G) excess
+            if (dart_profile.ag_total_3prime[p] >= MIN_COV)
+                excess_3 = dart_profile.a_freq_3prime[p] - bg_3;
+        }
         profile.mask_pos[p] = (excess_5 > mask_threshold) || (excess_3 > mask_threshold);
     }
 
     log_info("Pass 0: DART damage estimation — " +
              std::to_string(reads_scanned) + " reads in " + path);
+    log_info("  Library type: " + std::string(dart_profile.library_type_str()) +
+             (dart_profile.library_type_auto_detected ? " (auto-detected)" : " (forced)"));
     log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
              " lambda=" + std::to_string(lambda_5) +
              " bg=" + std::to_string(bg_5));
@@ -631,9 +670,11 @@ static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
     return profile;
 }
 
-static DamageProfile estimate_damage(const std::string& path, double mask_threshold) {
+static DamageProfile estimate_damage(const std::string& path, double mask_threshold,
+                                     dart::SampleDamageProfile::LibraryType forced_lib =
+                                         dart::SampleDamageProfile::LibraryType::UNKNOWN) {
     auto reader = make_fastq_reader(path);
-    return estimate_damage_impl(*reader, path, mask_threshold);
+    return estimate_damage_impl(*reader, path, mask_threshold, forced_lib);
 }
 
 // ============================================================================
@@ -1094,6 +1135,8 @@ static void print_usage(const char* prog) {
         << "\nAncient DNA damage-aware deduplication (OFF by default):\n"
         << "  --damage-auto            Enable damage estimation and masking (Pass 0)\n"
         << "  --no-damage              Explicitly disable (already default)\n"
+        << "  --library-type TYPE      Library prep: auto (default), ds, ss\n"
+        << "                           auto = DART infers from data; ds/ss = override\n"
         << "  --damage-dmax  FLOAT     Set d_max for both 5' and 3' ends manually\n"
         << "  --damage-dmax5 FLOAT     Set d_max for 5' end only\n"
         << "  --damage-dmax3 FLOAT     Set d_max for 3' end only\n"
@@ -1123,6 +1166,8 @@ int derep_main(int argc, char** argv) {
     bool   damage_auto    = false;  // default off: damage-aware hashing distorts
                                     // downstream damage analysis (e.g. DART) when
                                     // run on fqdup output. Use --damage-auto explicitly.
+    dart::SampleDamageProfile::LibraryType forced_library_type =
+        dart::SampleDamageProfile::LibraryType::UNKNOWN;  // auto-detect by default
     double damage_dmax5   = -1.0;
     double damage_dmax3   = -1.0;
     double damage_lambda5 = 0.5;
@@ -1156,6 +1201,15 @@ int derep_main(int argc, char** argv) {
             errcor.max_count = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
             errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--library-type" && i + 1 < argc) {
+            std::string lt(argv[++i]);
+            if (lt == "ss" || lt == "single-stranded")
+                forced_library_type = dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
+            else if (lt == "ds" || lt == "double-stranded")
+                forced_library_type = dart::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+            else if (lt == "auto")
+                forced_library_type = dart::SampleDamageProfile::LibraryType::UNKNOWN;
+            else { std::cerr << "Error: Unknown --library-type: " << lt << " (use auto, ds, ss)\n"; return 1; }
         } else if (arg == "--damage-auto") {
             damage_auto = true;
         } else if (arg == "--no-damage") {
@@ -1256,7 +1310,7 @@ int derep_main(int argc, char** argv) {
 
     try {
         if (damage_auto) {
-            profile = estimate_damage(in_path, mask_threshold);
+            profile = estimate_damage(in_path, mask_threshold, forced_library_type);
             profile.pcr_error_rate = pcr_total_rate;
         } else if (damage_dmax5 >= 0.0) {
             profile.d_max_5prime  = damage_dmax5;
