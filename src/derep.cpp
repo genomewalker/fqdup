@@ -1321,6 +1321,8 @@ int derep_main(int argc, char** argv) {
             profile.mask_threshold = mask_threshold;
             profile.pcr_error_rate = pcr_total_rate;
             profile.enabled       = (damage_dmax5 > 0.0);
+            profile.ss_mode       = (forced_library_type ==
+                                     dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
             profile.populate_mask_from_model();
             profile.print_info(/*typical_read_length=*/0);
         }
