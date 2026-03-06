@@ -1091,9 +1091,9 @@ static void print_usage(const char* prog) {
         << "  --errcor-ratio FLOAT     Min count ratio parent/child (default: 50.0)\n"
         << "  --errcor-max-count INT   Only absorb clusters with count <= N (default: 5)\n"
         << "  --errcor-bucket-cap INT  Max pair-key bucket size (default: 64)\n"
-        << "\nAncient DNA damage-aware deduplication (ON by default):\n"
-        << "  --no-damage              Disable damage estimation and masking\n"
-        << "  --damage-auto            Explicitly enable (already default)\n"
+        << "\nAncient DNA damage-aware deduplication (OFF by default):\n"
+        << "  --damage-auto            Enable damage estimation and masking (Pass 0)\n"
+        << "  --no-damage              Explicitly disable (already default)\n"
         << "  --damage-dmax  FLOAT     Set d_max for both 5' and 3' ends manually\n"
         << "  --damage-dmax5 FLOAT     Set d_max for 5' end only\n"
         << "  --damage-dmax3 FLOAT     Set d_max for 3' end only\n"
@@ -1120,7 +1120,9 @@ int derep_main(int argc, char** argv) {
     ErrCorParams errcor;
     errcor.enabled = true;   // default on: aDNA primary use case
 
-    bool   damage_auto    = true;   // default on: aDNA primary use case
+    bool   damage_auto    = false;  // default off: damage-aware hashing distorts
+                                    // downstream damage analysis (e.g. DART) when
+                                    // run on fqdup output. Use --damage-auto explicitly.
     double damage_dmax5   = -1.0;
     double damage_dmax3   = -1.0;
     double damage_lambda5 = 0.5;
@@ -1229,8 +1231,8 @@ int derep_main(int argc, char** argv) {
     if (!cluster_path.empty())
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
-    log_info("Damage-aware mode: " + std::string(damage_auto ? "auto (default)" :
-             (damage_dmax5 >= 0.0 ? "manual" : "disabled (--no-damage)")));
+    log_info("Damage-aware mode: " + std::string(damage_auto ? "auto (--damage-auto)" :
+             (damage_dmax5 >= 0.0 ? "manual" : "disabled (default)")));
     log_info("PCR error correction: " + std::string(errcor.enabled ? "enabled (default)" : "disabled (--no-error-correct)"));
 
     // Thread polymerase error rate into Phase 3 adaptive threshold.

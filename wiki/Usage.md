@@ -78,9 +78,14 @@ fqdup derep \
   -c clusters_derep.tsv.gz
 ```
 
-Damage estimation and PCR error correction are **on by default**. Pass 0 scans
-all reads to estimate the ancient DNA damage parameters, which are logged before
-deduplication starts:
+PCR error correction is **on by default**. Damage-aware hashing is **off by
+default** — if you run DART or mapDamage on the fqdup output, enabling it would
+distort per-position damage frequencies (only the most-damaged representative is
+retained per cluster). Enable with `--damage-auto` only when accurate
+unique-molecule counting matters more than downstream damage estimation.
+
+When `--damage-auto` is given, Pass 0 scans all reads and logs the estimated
+damage parameters before deduplication starts:
 
 ```
 Pass 0: damage estimation — 5582073 reads processed (5582073 total)
@@ -97,9 +102,10 @@ deamination.
 Phase 3 (PCR error correction) runs after Pass 1: any cluster with count ≤ 5
 that differs from a high-count cluster (≥ 50× its count) by exactly one
 substitution outside the damage zone is absorbed as a PCR copying error.
+C↔T and G↔A mismatches are never absorbed.
 
-On the same 5.6 M-read input, the full run completes in about 33 seconds and
-reduces to roughly 3.5 M unique clusters.
+On the 5.6 M-read input with `--damage-auto` enabled, the full run completes
+in about 33 seconds and reduces to roughly 3.5 M unique clusters.
 
 ---
 
@@ -183,8 +189,8 @@ fqdup derep       ... --no-revcomp
 | `-o FILE` | Output FASTQ | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--damage-auto` | Estimate damage parameters from data (Pass 0) | **on** |
-| `--no-damage` | Disable damage estimation and masking | — |
+| `--damage-auto` | Estimate damage parameters from data (Pass 0) | off |
+| `--no-damage` | Explicitly disable damage estimation | **default** |
 | `--damage-dmax FLOAT` | d_max for both ends (manual model) | — |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | — |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | — |

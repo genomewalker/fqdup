@@ -30,20 +30,24 @@ with the longest merged read.
 **3. `fqdup derep`** — biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
 
-- **Damage-aware hashing.** Terminal positions where the observed C→T or
-  G→A rate exceeds a threshold are replaced with a neutral byte before hashing.
-  Two reads from the same molecule that differ only at a deaminated position
-  then produce the same hash and collapse. The mask is derived from the data
-  itself (Pass 0) using the same exponential decay model as DART and mapDamage2.
+- **PCR error correction (Phase 3, default: on).** After the index is built,
+  a 3-way pigeonhole Hamming search finds clusters with low count that differ
+  from a high-count cluster by exactly one interior substitution. These are PCR
+  copying errors and are removed. Crucially, C↔T and G↔A mismatches are *never*
+  absorbed — they are indistinguishable from damage signal and are always kept.
 
-- **PCR error correction (Phase 3).** After the index is built, a 3-way
-  pigeonhole Hamming search finds clusters with low count that differ from a
-  high-count cluster by exactly one interior substitution. These are PCR copying
-  errors. Crucially, C↔T and G↔A mismatches are *never* absorbed — they are
-  indistinguishable from damage signal and are always kept.
+- **Damage-aware hashing (default: off).** When enabled with `--damage-auto`,
+  terminal positions where the observed C→T or G→A rate exceeds a threshold are
+  replaced with a neutral byte before hashing, collapsing reads that differ only
+  by deamination into the same cluster. **Use with caution:** if downstream
+  damage analysis (DART, mapDamage) runs on the fqdup output, this distorts
+  per-position damage frequencies because only the most-damaged representative
+  is retained. Enable it when accurate unique-molecule counting matters more
+  than downstream damage estimation.
 
-Use `--no-damage` or `--no-error-correct` to disable either mechanism. For
-non-aDNA data, use both.
+Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
+error correction is the only relevant step — `--no-damage` is already the
+default.
 
 ---
 
@@ -63,10 +67,13 @@ fqdup derep_pairs \
   -o-non merged.deduped.fq.gz \
   -o-ext  extended.deduped.fq.gz
 
-# 3. Damage-aware dedup + PCR error correction (both on by default)
+# 3. PCR error correction (on by default); damage-aware hashing off by default
 fqdup derep \
   -i merged.deduped.fq.gz \
   -o merged.final.fq.gz
+
+# Optional: also enable damage-aware hashing (only if NOT running DART/mapDamage downstream)
+# fqdup derep -i merged.deduped.fq.gz -o merged.final.fq.gz --damage-auto
 ```
 
 ### Non-aDNA (modern DNA)
@@ -163,14 +170,15 @@ Optional:
   --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```
 
-Both `--damage-auto` and `--error-correct` are **on by default**. Use the
-`--no-*` flags to disable them for non-aDNA datasets.
+PCR error correction is **on by default**. Damage-aware hashing is **off by
+default** — enable it with `--damage-auto` only when downstream tools do not
+run damage analysis on the fqdup output.
 
-#### Damage-aware hashing (default: on)
+#### Damage-aware hashing (default: off)
 
 ```
-  --no-damage               Disable damage estimation and masking
-  --damage-auto             Explicitly enable (already default)
+  --damage-auto             Enable damage estimation and masking (Pass 0)
+  --no-damage               Explicitly disable (already default)
   --damage-dmax   FLOAT     d_max for both 5' and 3' ends (manual model)
   --damage-dmax5  FLOAT     d_max for 5' end only
   --damage-dmax3  FLOAT     d_max for 3' end only
