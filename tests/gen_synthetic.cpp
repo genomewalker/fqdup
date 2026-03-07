@@ -58,6 +58,9 @@
 //   --n-unique  N      Distinct molecules           (default: 10000)
 //   --n-reads   N      Total reads in estimation mode (default: 100000)
 //   --read-len  N      Read length bp               (default: 75)
+//   --len-sd    F      Std dev of fragment length distribution (default: 0 = fixed)
+//   --min-len   N      Minimum fragment length when variable   (default: 30)
+//   --max-len   N      Maximum fragment length when variable   (default: 150)
 //   --seed      N      RNG seed                     (default: 42)
 //
 //   Damage:
@@ -111,6 +114,14 @@ struct PCG32 {
     }
     double uniform() { return (next() >> 8) * (1.0 / (1u << 24)); }
     int base4()      { return (int)(next() & 3u); }
+    double normal01() {
+        // Box-Muller transform
+        double u1, u2;
+        do { u1 = uniform(); } while (u1 <= 0.0);
+        u2 = uniform();
+        static const double M_PI_val = std::acos(-1.0);
+        return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI_val * u2);
+    }
     // Poisson variate (Knuth, exact for small μ; Gaussian approx for large)
     int poisson(double mu) {
         if (mu <= 0.0) return 0;
@@ -141,6 +152,12 @@ static std::string random_seq(int len, PCG32& rng) {
     std::string s(len, 'N');
     for (int i = 0; i < len; ++i) s[i] = BASES[rng.base4()];
     return s;
+}
+
+static int draw_length(PCG32& rng, int read_len, double len_sd, int min_len, int max_len) {
+    if (len_sd <= 0.0) return read_len;
+    int L = (int)std::round(read_len + len_sd * rng.normal01());
+    return std::max(min_len, std::min(max_len, L));
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +273,9 @@ int main(int argc, char** argv) {
     int      n_unique   = 10000;
     int      n_reads    = 100000;
     int      read_len   = 75;
+    double   len_sd     = 0.0;
+    int      min_len    = 30;
+    int      max_len    = 150;
     double   dmax5      = 0.25;
     double   dmax3      = 0.20;
     double   lambda5    = 0.35;
@@ -278,6 +298,9 @@ int main(int argc, char** argv) {
         if      (!strcmp(a,"--n-unique"))   n_unique   = n();
         else if (!strcmp(a,"--n-reads"))    n_reads    = n();
         else if (!strcmp(a,"--read-len"))   read_len   = n();
+        else if (!strcmp(a,"--len-sd"))     len_sd     = d();
+        else if (!strcmp(a,"--min-len"))    min_len    = n();
+        else if (!strcmp(a,"--max-len"))    max_len    = n();
         else if (!strcmp(a,"--dmax5"))      dmax5      = d();
         else if (!strcmp(a,"--dmax3"))      dmax3      = d();
         else if (!strcmp(a,"--lambda5"))    lambda5    = d();
@@ -306,27 +329,32 @@ int main(int argc, char** argv) {
 
     // -------------------------------------------------------------------------
     // PCR error rates (Pienaar 2006 + Potapov & Ong 2017)
-    // -------------------------------------------------------------------------
+    //
+    // Per-molecule mu values scale with molecule length L.  We store per-base
+    // rate scalars here and compute actual mu inside make_read / mol_chains.
+    //
     // Effective doublings:  D = n_cycles * log2(1 + efficiency)
     // Total μ per read:     μ_total = ε_pol * L * D
     //
     // Chained vs independent split:
     //   Coverage per molecule ≈ n_reads / n_unique
     //   k* = max(0, floor(log2(coverage)))  — cycles where error affects >1 read
-    //   μ_chained  = ε_pol * L * k*                (early cycles, per molecule)
-    //   μ_indep    = ε_pol * L * (D - k*)          (late cycles, per read)
+    //   rate_chained = ε_pol * k*           (per base, per molecule)
+    //   rate_indep   = ε_pol * (D - k*)     (per base, per read)
     // -------------------------------------------------------------------------
-    double mu_chained = 0.0, mu_indep = 0.0, mu_thermo = 0.0;
+    double rate_chained = 0.0;  // per-base rate for chained (early-cycle) errors
+    double rate_indep   = 0.0;  // per-base rate for independent (late-cycle) errors
+    double mu_thermo    = 0.0;  // per-C probability (not length-dependent)
     if (pcr_rate >= 0.0) {
         // Direct per-base error probability — bypasses polymerase/cycles model.
-        // All errors are independent (no chaining); mu = rate × L.
-        mu_indep = pcr_rate * read_len;
+        // All errors are independent (no chaining).
+        rate_indep = pcr_rate;
     } else if (pcr_cycles > 0) {
         double D    = pcr_cycles * std::log2(1.0 + pcr_eff);
         double cov  = (double)n_reads / n_unique;
         double k_star = std::max(0.0, std::floor(std::log2(std::max(1.0, cov))));
-        mu_chained  = epsilon * read_len * std::min(k_star, D);
-        mu_indep    = epsilon * read_len * std::max(0.0, D - k_star);
+        rate_chained = epsilon * std::min(k_star, D);
+        rate_indep   = epsilon * std::max(0.0, D - k_star);
         if (pcr_thermo)
             mu_thermo = 1.4e-6 * 0.97 * pcr_cycles;  // per C, per read
     }
@@ -334,13 +362,18 @@ int main(int argc, char** argv) {
     std::cerr << "gen_synthetic:"
               << " n_unique="  << n_unique
               << " n_reads="   << (dup_pair ? n_unique*2 : n_reads)
-              << " L="         << read_len
-              << " dmax5="     << dmax5 << " dmax3=" << dmax3
+              << " L="         << read_len;
+    if (len_sd > 0.0)
+        std::cerr << " len_sd=" << len_sd
+                  << " min_len=" << min_len << " max_len=" << max_len;
+    std::cerr << " dmax5="     << dmax5 << " dmax3=" << dmax3
               << " lambda="    << lambda5;
     if (pcr_cycles > 0)
         std::cerr << " pcr=" << pcr_cycles << "cyc"
-                  << " mu_chain=" << mu_chained
-                  << " mu_indep=" << mu_indep;
+                  << " rate_chain=" << rate_chained
+                  << " rate_indep=" << rate_indep;
+    if (pcr_rate >= 0.0)
+        std::cerr << " pcr_rate=" << pcr_rate;
     if (mu_thermo > 0.0)
         std::cerr << " mu_thermo=" << mu_thermo;
     if (ox_rate > 0.0)
@@ -350,17 +383,19 @@ int main(int argc, char** argv) {
     PCG32 rng(seed);
 
     std::vector<std::string> molecules(n_unique);
-    for (auto& m : molecules) m = random_seq(read_len, rng);
+    for (auto& m : molecules) m = random_seq(draw_length(rng, read_len, len_sd, min_len, max_len), rng);
 
     // -------------------------------------------------------------------------
     // Generate reads
     // -------------------------------------------------------------------------
     auto make_read = [&](const std::string& mol,
                          const std::vector<Mutation>& shared_muts) -> std::string {
+        int L = (int)mol.size();
         // Apply shared chained PCR errors first (same for all reads from this molecule)
         std::string seq = apply_mutations(mol, shared_muts, rng);
-        // Independent late-cycle PCR errors (unique to this read)
-        seq = apply_indep_errors(seq, mu_indep, rng);
+        // Independent late-cycle PCR errors (unique to this read), scaled by length
+        double mol_mu_indep = rate_indep * L;
+        seq = apply_indep_errors(seq, mol_mu_indep, rng);
         // Thermocyclic oxidative C→T (uniform, independent per read)
         if (mu_thermo > 0.0) seq = apply_thermo(seq, mu_thermo, rng);
         // 8-oxoG oxidative G→T (Channel C/D, uniform, independent per read)
@@ -375,7 +410,9 @@ int main(int argc, char** argv) {
         // Each molecule → exactly 2 reads with independent processing.
         // Shared chained errors apply to both (they come from same template).
         for (int i = 0; i < n_unique; ++i) {
-            auto shared = draw_chained_errors(read_len, mu_chained, rng);
+            int L = (int)molecules[i].size();
+            double mol_mu_chained = rate_chained * L;
+            auto shared = draw_chained_errors(L, mol_mu_chained, rng);
             for (int copy = 0; copy < 2; ++copy) {
                 char name[64];
                 std::snprintf(name, sizeof(name), "mol%05d_c%d", i, copy);
@@ -390,14 +427,16 @@ int main(int argc, char** argv) {
     // For simplicity in this mode: no per-molecule chaining (molecules are
     // rarely sampled >1 time at low coverage).  At high coverage
     // (n_reads >> n_unique), chained errors do matter and we pre-compute them.
-    bool need_chain = (mu_chained > 0.0 && n_reads > n_unique);
+    bool need_chain = (rate_chained > 0.0 && n_reads > n_unique);
 
     // Pre-compute chained mutations per molecule (only if coverage > 1)
     std::vector<std::vector<Mutation>> mol_chains;
     if (need_chain) {
         mol_chains.resize(n_unique);
-        for (int i = 0; i < n_unique; ++i)
-            mol_chains[i] = draw_chained_errors(read_len, mu_chained, rng);
+        for (int i = 0; i < n_unique; ++i) {
+            int L = (int)molecules[i].size();
+            mol_chains[i] = draw_chained_errors(L, rate_chained * L, rng);
+        }
     }
 
     static const std::vector<Mutation> empty_chain;
