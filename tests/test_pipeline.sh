@@ -645,5 +645,228 @@ EOF
 
 echo "  PASS: Test P7"
 
+# ---------------------------------------------------------------------------
+# Test P8: PCR mismatch inflation and correction (explicit mismatch counting)
+#
+# Same molecules generated twice:
+#   clean  — no PCR errors (ground truth)
+#   errors — same molecules + PCR errors at rate 0.003/base (→ ~20% of reads
+#            carry ≥1 mismatch from their parent molecule)
+#
+# Without error correction, each PCR-error read forms its own singleton cluster.
+# With error correction (--error-correct --errcor-ratio 5 for 5x coverage),
+# singleton clusters differing by 1 interior base from a high-count parent are
+# absorbed back.
+#
+# Assert:
+#   clean, no EC → unique ≈ N_mol (baseline: errors don't exist)
+#   errors, no EC → unique >> N_mol (PCR mismatches inflate the count)
+#   errors, with EC → unique between N_mol and no-EC count (correction partial)
+#   errors, with EC < errors no-EC (EC strictly helps)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test P8: PCR mismatch inflation and correction ---"
+N_MOL=1000
+N_READS=5000    # 5x coverage
+PCR_RATE=0.003  # P(≥1 error per read) = 1 - e^{-0.003*75} ≈ 20%
+
+echo "  $N_MOL molecules × 5x coverage"
+echo "  Clean dataset (no errors) vs PCR errors at rate=$PCR_RATE/base"
+
+# Clean — no PCR errors, ground-truth unique count
+"$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
+    --no-damage --seed 400 > "$TMPDIR/p8_clean.fq"
+
+# Errors — same molecules (same seed), PCR errors added
+"$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
+    --no-damage --pcr-rate $PCR_RATE --seed 400 > "$TMPDIR/p8_err.fq"
+
+for tag in clean err; do
+    make_ext "$TMPDIR/p8_${tag}.fq" "$TMPDIR/p8_${tag}_ext.fq" rnd 400 15
+    "$FQDUP" sort -i "$TMPDIR/p8_${tag}.fq"     -o "$TMPDIR/p8_${tag}.sorted.fq" \
+        --max-memory 512M -t "$TMPDIR" 2>/dev/null
+    "$FQDUP" sort -i "$TMPDIR/p8_${tag}_ext.fq" -o "$TMPDIR/p8_${tag}_ext.sorted.fq" \
+        --max-memory 512M -t "$TMPDIR" 2>/dev/null
+    "$FQDUP" derep_pairs \
+        -n "$TMPDIR/p8_${tag}.sorted.fq" -e "$TMPDIR/p8_${tag}_ext.sorted.fq" \
+        -o-non "$TMPDIR/p8_${tag}_dp.fq" -o-ext /dev/null 2>/dev/null
+done
+
+# Clean: no EC needed
+"$FQDUP" derep -i "$TMPDIR/p8_clean_dp.fq" -o "$TMPDIR/p8_clean_out.fq" \
+    --no-error-correct 2>/dev/null
+
+# Errors: without EC
+"$FQDUP" derep -i "$TMPDIR/p8_err_dp.fq"   -o "$TMPDIR/p8_err_noec.fq" \
+    --no-error-correct 2>/dev/null
+
+# Errors: with EC (ratio=5 matches 5x coverage; default ratio=50 is for high-cov production)
+"$FQDUP" derep -i "$TMPDIR/p8_err_dp.fq"   -o "$TMPDIR/p8_err_ec.fq" \
+    --error-correct --errcor-ratio 5 2>/dev/null
+
+U_CLEAN=$(grep -c '^@' "$TMPDIR/p8_clean_out.fq" || true)
+U_NOEC=$(grep -c '^@' "$TMPDIR/p8_err_noec.fq"   || true)
+U_EC=$(grep -c '^@' "$TMPDIR/p8_err_ec.fq"        || true)
+
+echo ""
+echo "  True molecules:            $N_MOL"
+echo "  Clean, no EC:              $U_CLEAN unique  (baseline, no errors)"
+echo "  Errors, no EC:             $U_NOEC  unique  (PCR mismatches inflate)"
+echo "  Errors, with EC (ratio=5): $U_EC    unique  (correction absorbs singletons)"
+
+python3 - <<EOF
+import sys
+n_mol = $N_MOL
+clean, noec, ec = $U_CLEAN, $U_NOEC, $U_EC
+
+# Clean baseline: no errors → should collapse to ≈ n_mol
+lo_c, hi_c = int(n_mol * 0.95), int(n_mol * 1.05)
+if not (lo_c <= clean <= hi_c):
+    print(f"  FAIL: clean baseline {clean} not in [{lo_c}, {hi_c}]")
+    sys.exit(1)
+print(f"  PASS: clean baseline {clean} ≈ {n_mol}")
+
+# PCR errors must inflate the count (the mismatch problem)
+min_inflated = int(n_mol * 1.10)
+if noec <= min_inflated:
+    print(f"  FAIL: PCR errors did not inflate ({noec} ≤ {min_inflated}) — check --pcr-rate")
+    sys.exit(1)
+inflation = noec - n_mol
+pct_inflation = inflation / n_mol * 100
+print(f"  PASS: PCR errors inflated unique by {inflation} reads (+{pct_inflation:.0f}%)")
+
+# EC must reduce the inflation
+if ec >= noec:
+    print(f"  FAIL: EC gave no improvement ({ec} >= {noec})")
+    sys.exit(1)
+absorbed = noec - ec
+pct_absorbed = absorbed / inflation * 100
+print(f"  PASS: EC absorbed {absorbed} mismatch singletons ({pct_absorbed:.0f}% of inflation)")
+EOF
+
+echo "  PASS: Test P8"
+
+# ---------------------------------------------------------------------------
+# Test P9: False-positive protection — real SNPs must not be merged
+#
+# Two sub-tests using hand-crafted FASTQ:
+#
+#   P9a. Two molecules differing by 1 interior SNP, equal high coverage.
+#        count(A) / count(B) ≈ 1 < errcor-ratio (default 50).
+#        EC must NOT absorb B into A — they are truly different molecules.
+#        Assert: unique = 2 with AND without EC.
+#
+#   P9b. One molecule (high coverage) + one PCR-error singleton (1 interior SNP).
+#        count(parent) / count(singleton) >> errcor-ratio → singleton absorbed.
+#        Assert: unique = 2 without EC; unique = 1 with EC.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test P9: False-positive protection (real SNPs preserved by EC) ---"
+READ_LEN=75
+COV=200         # high coverage for both molecules in P9a
+QUAL=$(python3 -c "print('I' * $READ_LEN)")
+
+# Python inline: generate two molecules (A and B = A with SNP at pos 37)
+python3 - <<PYEOF > "$TMPDIR/p9a.fq"
+import random
+rng = random.Random(999)
+L = $READ_LEN
+qual = 'I' * L
+
+mol_A = ''.join(rng.choice('ACGT') for _ in range(L))
+mol_B = list(mol_A)
+mol_B[37] = {'A':'G','C':'T','G':'A','T':'C'}[mol_A[37]]  # interior SNP at pos 37
+mol_B = ''.join(mol_B)
+
+cov = $COV
+for i in range(cov):
+    print(f'@molA_r{i:05d}\n{mol_A}\n+\n{qual}')
+for i in range(cov):
+    print(f'@molB_r{i:05d}\n{mol_B}\n+\n{qual}')
+PYEOF
+
+# Python inline: generate one molecule (A, high coverage) + one PCR-error singleton
+python3 - <<PYEOF > "$TMPDIR/p9b.fq"
+import random
+rng = random.Random(999)
+L = $READ_LEN
+qual = 'I' * L
+
+mol_A = ''.join(rng.choice('ACGT') for _ in range(L))
+mol_snp = list(mol_A)
+mol_snp[37] = {'A':'G','C':'T','G':'A','T':'C'}[mol_A[37]]  # same interior SNP
+mol_snp = ''.join(mol_snp)
+
+cov = $COV
+for i in range(cov):
+    print(f'@molA_r{i:05d}\n{mol_A}\n+\n{qual}')
+# Exactly one singleton PCR-error read
+print(f'@snp_r00000\n{mol_snp}\n+\n{qual}')
+PYEOF
+
+# Run full pipeline on both sub-tests
+for tag in p9a p9b; do
+    make_ext "$TMPDIR/${tag}.fq" "$TMPDIR/${tag}_ext.fq" rnd 999 15
+    "$FQDUP" sort -i "$TMPDIR/${tag}.fq"     -o "$TMPDIR/${tag}.sorted.fq" \
+        --max-memory 512M -t "$TMPDIR" 2>/dev/null
+    "$FQDUP" sort -i "$TMPDIR/${tag}_ext.fq" -o "$TMPDIR/${tag}_ext.sorted.fq" \
+        --max-memory 512M -t "$TMPDIR" 2>/dev/null
+    "$FQDUP" derep_pairs \
+        -n "$TMPDIR/${tag}.sorted.fq" -e "$TMPDIR/${tag}_ext.sorted.fq" \
+        -o-non "$TMPDIR/${tag}_dp.fq" -o-ext /dev/null 2>/dev/null
+    "$FQDUP" derep -i "$TMPDIR/${tag}_dp.fq" -o "$TMPDIR/${tag}_noec.fq" \
+        --no-error-correct 2>/dev/null
+    "$FQDUP" derep -i "$TMPDIR/${tag}_dp.fq" -o "$TMPDIR/${tag}_ec.fq" \
+        --error-correct 2>/dev/null
+done
+
+U9A_NOEC=$(grep -c '^@' "$TMPDIR/p9a_noec.fq" || true)
+U9A_EC=$(grep -c '^@'   "$TMPDIR/p9a_ec.fq"   || true)
+U9B_NOEC=$(grep -c '^@' "$TMPDIR/p9b_noec.fq" || true)
+U9B_EC=$(grep -c '^@'   "$TMPDIR/p9b_ec.fq"   || true)
+
+echo ""
+echo "  P9a: mol_A (${COV}×) + mol_B (1 SNP, ${COV}×) — equal coverage, real SNP"
+echo "    No EC: $U9A_NOEC unique  |  With EC: $U9A_EC unique  (expect 2 in both — no merge)"
+echo ""
+echo "  P9b: mol_A (${COV}×) + pcr_error_singleton (1 read, 1 SNP) — high-count parent"
+echo "    No EC: $U9B_NOEC unique  |  With EC: $U9B_EC unique  (expect 2→1 — singleton absorbed)"
+
+python3 - <<EOF
+import sys
+u9a_noec, u9a_ec = $U9A_NOEC, $U9A_EC
+u9b_noec, u9b_ec = $U9B_NOEC, $U9B_EC
+ok = True
+
+# P9a: two equal-count clusters must stay separate
+if u9a_noec != 2:
+    print(f"  FAIL P9a: without EC, expected 2 unique, got {u9a_noec}")
+    ok = False
+else:
+    print(f"  PASS P9a no-EC:  {u9a_noec} unique (correct — 2 distinct molecules)")
+if u9a_ec != 2:
+    print(f"  FAIL P9a: EC incorrectly merged real SNP ({u9a_ec} unique, expected 2)")
+    ok = False
+else:
+    print(f"  PASS P9a with-EC: {u9a_ec} unique (false positive protected — count ratio 1:1 < threshold)")
+
+# P9b: without EC the singleton stays; with EC it is absorbed
+if u9b_noec != 2:
+    print(f"  FAIL P9b: without EC, expected 2 unique, got {u9b_noec}")
+    ok = False
+else:
+    print(f"  PASS P9b no-EC:  {u9b_noec} unique (singleton not absorbed without EC)")
+if u9b_ec != 1:
+    print(f"  FAIL P9b: EC did not absorb singleton ({u9b_ec} unique, expected 1)")
+    ok = False
+else:
+    print(f"  PASS P9b with-EC: {u9b_ec} unique (PCR-error singleton absorbed into parent)")
+
+if not ok:
+    sys.exit(1)
+EOF
+
+echo "  PASS: Test P9"
+
 echo ""
 echo "OK: all pipeline tests passed"
