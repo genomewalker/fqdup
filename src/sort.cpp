@@ -292,17 +292,23 @@ public:
     // Old interface (for merge phase that needs std::string)
     bool read(std::string& header, std::string& seq, std::string& plus, std::string& qual) {
         if (!getline_gz(header)) return false;
-        if (!getline_gz(seq)) return false;
-        if (!getline_gz(plus)) return false;
-        if (!getline_gz(qual)) return false;
+        if (!getline_gz(seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + header + "'");
+        if (!getline_gz(plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
+        if (!getline_gz(qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line");
         return true;
     }
 
     bool read(FastqRecord& rec) override {
         if (!getline_gz(rec.header)) return false;
-        if (!getline_gz(rec.seq)) return false;
-        if (!getline_gz(rec.plus)) return false;
-        if (!getline_gz(rec.qual)) return false;
+        if (!getline_gz(rec.seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + rec.header + "'");
+        if (!getline_gz(rec.plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
+        if (!getline_gz(rec.qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line");
         return true;
     }
 
@@ -312,15 +318,18 @@ public:
         rec.header = arena.store(temp);
         rec.header_len = temp.size();
 
-        if (!getline_gz(temp)) return false;
+        if (!getline_gz(temp))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + std::string(rec.header, rec.header_len) + "'");
         rec.seq = arena.store(temp);
         rec.seq_len = temp.size();
 
-        if (!getline_gz(temp)) return false;
+        if (!getline_gz(temp))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
         rec.plus = arena.store(temp);
         rec.plus_len = temp.size();
 
-        if (!getline_gz(temp)) return false;
+        if (!getline_gz(temp))
+            throw std::runtime_error("Truncated FASTQ: missing quality line");
         rec.qual = arena.store(temp);
         rec.qual_len = temp.size();
 
@@ -398,9 +407,12 @@ public:
 
     bool read(FastqRecord& rec) override {
         if (!getline_igzip(rec.header)) return false;
-        if (!getline_igzip(rec.seq)) return false;
-        if (!getline_igzip(rec.plus)) return false;
-        if (!getline_igzip(rec.qual)) return false;
+        if (!getline_igzip(rec.seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + rec.header + "'");
+        if (!getline_igzip(rec.plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
+        if (!getline_igzip(rec.qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line");
         return true;
     }
 
@@ -408,11 +420,14 @@ public:
         std::string temp;
         if (!getline_igzip(temp)) return false;
         rec.header = arena.store(temp); rec.header_len = temp.size();
-        if (!getline_igzip(temp)) return false;
+        if (!getline_igzip(temp))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + std::string(rec.header, rec.header_len) + "'");
         rec.seq    = arena.store(temp); rec.seq_len    = temp.size();
-        if (!getline_igzip(temp)) return false;
+        if (!getline_igzip(temp))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
         rec.plus   = arena.store(temp); rec.plus_len   = temp.size();
-        if (!getline_igzip(temp)) return false;
+        if (!getline_igzip(temp))
+            throw std::runtime_error("Truncated FASTQ: missing quality line");
         rec.qual   = arena.store(temp); rec.qual_len   = temp.size();
         return true;
     }
