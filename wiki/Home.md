@@ -4,7 +4,7 @@ FASTQ deduplication for paired-end ancient DNA libraries.
 
 ---
 
-## The problem
+## Background
 
 Standard deduplication identifies duplicate reads by exact sequence match. Two
 reads are duplicates if and only if they are identical. This works for modern

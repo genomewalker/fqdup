@@ -13,7 +13,7 @@ be modelled.
 
 ---
 
-## The problem
+## Background
 
 Ancient DNA carries characteristic substitution patterns at the ends of
 sequenced fragments. Cytosine residues in single-stranded overhangs deaminate

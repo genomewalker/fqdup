@@ -15,7 +15,7 @@ extensions (and were therefore treated as distinct pairs by `derep_pairs`).
 
 ---
 
-## The problem
+## Background
 
 PCR amplification introduces substitution errors at a rate that depends on the
 polymerase used. High-fidelity polymerases such as Q5 make roughly
