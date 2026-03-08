@@ -28,10 +28,7 @@
 #include <vector>
 #include <zlib.h>
 
-#ifdef HAVE_ISAL
-#include <isa-l/igzip_lib.h>
-#endif
-
+#include "fqdup/fastq_types.hpp"  // FastqRecord, FastqReaderBase, make_fastq_reader
 #include "fqdup/logger.hpp"
 
 // For memory release to OS
@@ -47,9 +44,36 @@ extern "C" {
 }
 #endif
 
-// All file-local types are in an anonymous namespace to give their member
-// functions internal linkage and avoid ODR violations with derep.cpp (which
-// defines identically-named classes with different layouts).
+// SortReaderBridge: wraps make_fastq_reader() (rapidgzip/ISA-L/zlib) and bridges
+// its FastqRecord interface to the arena-based read used by Phase 1 chunk creation.
+// Lives outside the anonymous namespace — uses global FastqRecord from fastq_types.hpp.
+class SortReaderBridge {
+    std::unique_ptr<FastqReaderBase> inner_;
+    FastqRecord tmp_;
+public:
+    explicit SortReaderBridge(const std::string& path)
+        : inner_(make_fastq_reader(path)) {}
+
+    // Arena-based read for Phase 1: zero heap allocation per record.
+    // StringArena and FastqRecordArena are defined below in the anonymous namespace;
+    // this method is defined after them (see bottom of anonymous namespace section).
+    template<typename Arena, typename ArenRec>
+    bool read(ArenRec& rec, Arena& arena) {
+        if (!inner_->read(tmp_)) return false;
+        auto store = [&](const std::string& s) { return arena.store(s.data(), s.size()); };
+        rec.header     = store(tmp_.header); rec.header_len = tmp_.header.size();
+        rec.seq        = store(tmp_.seq);    rec.seq_len    = tmp_.seq.size();
+        rec.plus       = store(tmp_.plus);   rec.plus_len   = tmp_.plus.size();
+        rec.qual       = store(tmp_.qual);   rec.qual_len   = tmp_.qual.size();
+        return true;
+    }
+
+    // Direct read for merge phase (no arena needed).
+    bool read(FastqRecord& rec) { return inner_->read(rec); }
+};
+
+// All remaining file-local types are in an anonymous namespace to give their
+// member functions internal linkage and avoid ODR violations.
 namespace {
 
 constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;  // 4MB for better I/O performance
@@ -141,14 +165,7 @@ private:
     size_t used_;
 };
 
-// FastqRecord using std::string (for merge phase where records need to persist)
-struct FastqRecord {
-    std::string header, seq, plus, qual;
-
-    size_t memory_size() const {
-        return header.size() + seq.size() + plus.size() + qual.size();
-    }
-};
+// FastqRecord is provided by fastq_types.hpp (global scope).
 
 // FastqRecordArena using raw pointers + lengths (zero allocations for chunk creation!)
 struct FastqRecordArena {
@@ -256,15 +273,9 @@ struct LexicographicComparator {
     }
 };
 
-// Abstract base for all sort-phase FASTQ readers.
-// Derived classes: FastqReader (zlib), FastqReaderIgzip (ISA-L).
-struct SortReaderBase {
-    virtual ~SortReaderBase() = default;
-    virtual bool read(FastqRecord& rec) = 0;
-    virtual bool read(FastqRecordArena& rec, StringArena& arena) = 0;
-};
-
-class FastqReader : public SortReaderBase {
+// Legacy zlib reader — used by the dead-code ParallelChunkSorter only.
+// Live paths (create_chunks, merge_chunks) now use SortReaderBridge above.
+class FastqReader {
 public:
     FastqReader(const std::string& path) : path_(path), use_stdin_(false), pipe_(nullptr) {
         // Check if reading from stdin
@@ -301,7 +312,7 @@ public:
         return true;
     }
 
-    bool read(FastqRecord& rec) override {
+    bool read(FastqRecord& rec) {
         if (!getline_gz(rec.header)) return false;
         if (!getline_gz(rec.seq))
             throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + rec.header + "'");
@@ -309,30 +320,6 @@ public:
             throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
         if (!getline_gz(rec.qual))
             throw std::runtime_error("Truncated FASTQ: missing quality line");
-        return true;
-    }
-
-    bool read(FastqRecordArena& rec, StringArena& arena) override {
-        std::string temp;
-        if (!getline_gz(temp)) return false;
-        rec.header = arena.store(temp);
-        rec.header_len = temp.size();
-
-        if (!getline_gz(temp))
-            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + std::string(rec.header, rec.header_len) + "'");
-        rec.seq = arena.store(temp);
-        rec.seq_len = temp.size();
-
-        if (!getline_gz(temp))
-            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
-        rec.plus = arena.store(temp);
-        rec.plus_len = temp.size();
-
-        if (!getline_gz(temp))
-            throw std::runtime_error("Truncated FASTQ: missing quality line");
-        rec.qual = arena.store(temp);
-        rec.qual_len = temp.size();
-
         return true;
     }
 
@@ -373,151 +360,8 @@ private:
     gzFile gzfp_;
 };
 
-#ifdef HAVE_ISAL
-// Hardware-accelerated FastqReader using ISA-L (4-6× faster decompression)
-class FastqReaderIgzip : public SortReaderBase {
-public:
-    FastqReaderIgzip(const std::string& path) : path_(path), use_stdin_(false), eof_(false), decomp_buffer_pos_(0), decomp_buffer_used_(0) {
-        // Check if reading from stdin
-        if (path == "/dev/stdin" || path == "-") {
-            use_stdin_ = true;
-            fp_ = stdin;
-        } else {
-            fp_ = fopen(path.c_str(), "rb");
-            if (!fp_) throw std::runtime_error("Cannot open: " + path);
-        }
-
-        // Allocate buffers on heap (too large for stack: 8MB+ per reader)
-        input_buffer_ = new uint8_t[GZBUF_SIZE];
-        decomp_buffer_ = new uint8_t[GZBUF_SIZE];
-        state_ = new inflate_state();
-
-        // Initialize ISA-L inflate state
-        memset(state_, 0, sizeof(*state_));  // Zero-initialize first
-        isal_inflate_init(state_);
-        state_->crc_flag = ISAL_GZIP;  // Expect gzip format
-    }
-
-    ~FastqReaderIgzip() {
-        if (fp_ && !use_stdin_) fclose(fp_);
-        delete[] input_buffer_;
-        delete[] decomp_buffer_;
-        delete state_;
-    }
-
-    bool read(FastqRecord& rec) override {
-        if (!getline_igzip(rec.header)) return false;
-        if (!getline_igzip(rec.seq))
-            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + rec.header + "'");
-        if (!getline_igzip(rec.plus))
-            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
-        if (!getline_igzip(rec.qual))
-            throw std::runtime_error("Truncated FASTQ: missing quality line");
-        return true;
-    }
-
-    bool read(FastqRecordArena& rec, StringArena& arena) override {
-        std::string temp;
-        if (!getline_igzip(temp)) return false;
-        rec.header = arena.store(temp); rec.header_len = temp.size();
-        if (!getline_igzip(temp))
-            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" + std::string(rec.header, rec.header_len) + "'");
-        rec.seq    = arena.store(temp); rec.seq_len    = temp.size();
-        if (!getline_igzip(temp))
-            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence");
-        rec.plus   = arena.store(temp); rec.plus_len   = temp.size();
-        if (!getline_igzip(temp))
-            throw std::runtime_error("Truncated FASTQ: missing quality line");
-        rec.qual   = arena.store(temp); rec.qual_len   = temp.size();
-        return true;
-    }
-
-private:
-    bool getline_igzip(std::string& line) {
-        line.clear();
-        line.reserve(256);
-
-        while (true) {
-            // Ensure we have decompressed data available
-            if (decomp_buffer_pos_ >= decomp_buffer_used_) {
-                if (!refill_decomp_buffer()) {
-                    return !line.empty();  // EOF
-                }
-            }
-
-            // Read from decompressed buffer until newline
-            while (decomp_buffer_pos_ < decomp_buffer_used_) {
-                char c = decomp_buffer_[decomp_buffer_pos_++];
-                if (c == '\n') {
-                    return true;
-                }
-                line.push_back(c);
-            }
-        }
-    }
-
-    bool refill_decomp_buffer() {
-        // If we've hit EOF and processed all input, we're done
-        if (eof_ && state_->avail_in == 0) {
-            return false;
-        }
-
-        // Read more compressed data if needed
-        if (state_->avail_in == 0 && !eof_) {
-            size_t bytes_read = fread(input_buffer_, 1, GZBUF_SIZE, fp_);
-            if (bytes_read == 0) {
-                eof_ = true;
-                if (state_->avail_in == 0) {
-                    return false;
-                }
-            } else {
-                state_->next_in = input_buffer_;
-                state_->avail_in = bytes_read;
-            }
-        }
-
-        // Decompress into buffer
-        state_->next_out = decomp_buffer_;
-        state_->avail_out = GZBUF_SIZE;
-
-        int ret = isal_inflate(state_);
-
-        // Handle return codes:
-        // ISAL_DECOMP_OK (0): Decompression successful
-        // ISAL_END_INPUT (1): End of input reached (need more input)
-        // ISAL_OUT_OVERFLOW (2): Output buffer full (normal - just means we filled the output buffer)
-        // Negative values are errors
-        if (ret < 0) {
-            std::string error_msg;
-            switch (ret) {
-                case -1: error_msg = "ISAL_INVALID_BLOCK"; break;
-                case -2: error_msg = "ISAL_INVALID_SYMBOL"; break;
-                case -3: error_msg = "ISAL_INVALID_LOOKBACK"; break;
-                case -4: error_msg = "ISAL_INVALID_WRAPPER"; break;
-                default: error_msg = "Unknown error " + std::to_string(ret); break;
-            }
-            throw std::runtime_error("ISA-L decompression error: " + error_msg);
-        }
-
-        decomp_buffer_used_ = GZBUF_SIZE - state_->avail_out;
-        decomp_buffer_pos_ = 0;
-
-        return decomp_buffer_used_ > 0;
-    }
-
-    std::string path_;
-    bool use_stdin_;
-    bool eof_;
-    FILE* fp_;
-    inflate_state* state_;
-
-    // Buffers (heap-allocated to avoid stack overflow)
-    uint8_t* input_buffer_;        // Compressed input (4MB)
-    uint8_t* decomp_buffer_;       // Decompressed output (4MB)
-    size_t decomp_buffer_pos_;
-    size_t decomp_buffer_used_;
-};
-#endif  // HAVE_ISAL
+// FastqReaderIgzip removed from sort.cpp — ISA-L and rapidgzip decompression
+// are now accessed through SortReaderBridge → make_fastq_reader().
 
 
 class FastqWriter {
@@ -664,50 +508,37 @@ private:
             records.push_back(std::move(rec));
         }
 
-        // CRITICAL FIX: Extract keys ONCE to avoid O(N log N) string allocations
-        // This is what seqkit does - cache the keys before sorting
-        std::vector<std::string> keys;
-        keys.reserve(records.size());
-        for (const auto& r : records) {
-            std::string_view id = trim_id(r.header);
-            keys.emplace_back(id);
-        }
+        const uint32_t N = static_cast<uint32_t>(records.size());
+        std::vector<uint32_t> indices(N);
+        for (uint32_t i = 0; i < N; ++i) indices[i] = i;
 
-        // Create index array for indirect sorting
-        std::vector<size_t> indices(records.size());
-        for (size_t i = 0; i < indices.size(); ++i) {
-            indices[i] = i;
-        }
-
-        // Sort indices based on keys
         if (natural_order_) {
-            std::sort(indices.begin(), indices.end(), [&keys](size_t a, size_t b) {
-                std::string_view key_a = keys[a];
-                std::string_view key_b = keys[b];
-
-                // Parse numeric suffixes — no substring allocations
-                size_t i = key_a.size();
-                while (i > 0 && std::isdigit(key_a[i-1])) i--;
-                size_t j = key_b.size();
-                while (j > 0 && std::isdigit(key_b[j-1])) j--;
-
-                // Compare prefixes as string_view (no allocation)
-                std::string_view prefix_a = key_a.substr(0, i);
-                std::string_view prefix_b = key_b.substr(0, j);
-
-                if (prefix_a != prefix_b) return prefix_a < prefix_b;
-                if (i == key_a.size() && j == key_b.size()) return false;
-                if (i == key_a.size()) return true;
-                if (j == key_b.size()) return false;
-
-                // Parse numeric suffixes directly from string_view (no allocation)
-                long long num_a = 0, num_b = 0;
-                for (size_t k = i; k < key_a.size(); ++k) num_a = num_a * 10 + (key_a[k] - '0');
-                for (size_t k = j; k < key_b.size(); ++k) num_b = num_b * 10 + (key_b[k] - '0');
-                return num_a < num_b;
+            struct NatKey { std::string_view prefix; uint64_t suffix; bool has_suffix; };
+            std::vector<NatKey> keys;
+            keys.reserve(N);
+            for (const auto& r : records) {
+                std::string_view id = trim_id(r.header);
+                size_t i = id.size();
+                while (i > 0 && static_cast<unsigned>(id[i-1] - '0') <= 9u) --i;
+                uint64_t suf = 0;
+                for (size_t p = i; p < id.size(); ++p)
+                    suf = suf * 10u + static_cast<unsigned>(id[p] - '0');
+                keys.push_back({id.substr(0, i), suf, i < id.size()});
+            }
+            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
+                const NatKey& ka = keys[a]; const NatKey& kb = keys[b];
+                if (ka.prefix != kb.prefix) return ka.prefix < kb.prefix;
+                if (!ka.has_suffix && !kb.has_suffix) return false;
+                if (!ka.has_suffix) return true;
+                if (!kb.has_suffix) return false;
+                return ka.suffix < kb.suffix;
             });
         } else {
-            std::sort(indices.begin(), indices.end(), [&keys](size_t a, size_t b) {
+            std::vector<std::string_view> keys;
+            keys.reserve(N);
+            for (const auto& r : records)
+                keys.push_back(trim_id(r.header));
+            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
                 return keys[a] < keys[b];
             });
         }
@@ -716,7 +547,7 @@ private:
         // In fast mode, write uncompressed for speed
         bool compress = !fast_mode_;
         FastqWriter writer(output, compress);
-        for (size_t idx : indices) {
+        for (uint32_t idx : indices) {
             writer.write(records[idx]);
         }
     }
@@ -765,10 +596,10 @@ public:
         // Estimate input size and adjust chunk size accordingly
         adjust_chunk_size_for_input(input);
 
+        // sort.cpp cannot use rapidgzip (ODR constraint — fastq_io_backend.cpp owns
+        // all rapidgzip symbols). Reader selection is ISA-L or zlib only.
         log_info("Decompression: " + std::string(
-#ifdef HAVE_RAPIDGZIP
-            "rapidgzip (parallel multi-threaded)"
-#elif defined(HAVE_ISAL)
+#ifdef HAVE_ISAL
             "ISA-L (hardware-accelerated)"
 #else
             "zlib"
@@ -837,18 +668,9 @@ private:
     void create_chunks(const std::string& input) {
         auto phase1_start = std::chrono::steady_clock::now();
 
-        bool is_gzipped = (input.size() > 3 && input.substr(input.size() - 3) == ".gz");
-
-        std::unique_ptr<SortReaderBase> reader;
-#ifdef HAVE_ISAL
-        if (is_gzipped && input != "/dev/stdin" && input != "-") {
-            reader = std::make_unique<FastqReaderIgzip>(input);
-        } else {
-            reader = std::make_unique<FastqReader>(input);
-        }
-#else
-        reader = std::make_unique<FastqReader>(input);
-#endif
+        // SortReaderBridge dispatches to the best available backend via make_fastq_reader():
+        // rapidgzip (parallel, multi-threaded) > ISA-L (SIMD) > zlib.
+        SortReaderBridge reader(input);
 
         // Now with string arenas, we can use maximum concurrency!
         // Each buffer has its own arena - zero malloc fragmentation
@@ -964,7 +786,7 @@ private:
         }
 
         FastqRecordArena rec;
-        while (!writer_failed.load() && reader->read(rec, chunk_pool[current_buffer_idx].arena)) {
+        while (!writer_failed.load() && reader.read(rec, chunk_pool[current_buffer_idx].arena)) {
             auto read_end = std::chrono::steady_clock::now();
             read_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(read_end - last_read_start).count();
 
@@ -1074,59 +896,52 @@ private:
 
     void write_sorted_chunk(ChunkBuffer&& chunk) {
         size_t chunk_id = chunks_created_++;
-        bool compress = !fast_mode_;
-        std::string ext = compress ? ".sorted.fq.gz" : ".sorted.fq";
-        std::string sorted_file = temp_dir_ + "/chunk_" + std::to_string(chunk_id) + ext;
+        // Temp files are always uncompressed — they are written, read once, and deleted.
+        // Gzip here burns CPU with zero user benefit; final output compression is
+        // determined by the output filename extension in merge_chunks.
+        std::string sorted_file = temp_dir_ + "/chunk_" + std::to_string(chunk_id) + ".sorted.fq";
 
         {
             std::lock_guard<std::mutex> lock(sorted_mutex_);
             sorted_files_.push_back(sorted_file);
         }
 
-        // Sort chunk before writing
-        // Extract keys ONCE to avoid O(N log N) allocations during sort
-        // This is critical for performance - seqkit does the same thing
-        std::vector<std::string> keys;
-        keys.reserve(chunk.records.size());
-        for (const auto& r : chunk.records) {
-            keys.emplace_back(trim_id(r.get_header()));
-        }
+        const uint32_t N = static_cast<uint32_t>(chunk.records.size());
 
-        // Create index array for indirect sorting
-        std::vector<size_t> indices(chunk.records.size());
-        for (size_t i = 0; i < indices.size(); ++i) {
-            indices[i] = i;
-        }
+        // uint32_t indices: 4 bytes vs 8 — fits 2× more entries per cache line
+        std::vector<uint32_t> indices(N);
+        for (uint32_t i = 0; i < N; ++i) indices[i] = i;
 
-        // Sort indices based on keys
         if (natural_order_) {
-            std::sort(indices.begin(), indices.end(), [&keys](size_t a, size_t b) {
-                const std::string& key_a = keys[a];
-                const std::string& key_b = keys[b];
-
-                // Parse numeric suffixes
-                size_t i = key_a.size();
-                while (i > 0 && std::isdigit(key_a[i-1])) i--;
-                size_t j = key_b.size();
-                while (j > 0 && std::isdigit(key_b[j-1])) j--;
-
-                // Compare prefixes
-                if (i != j || key_a.compare(0, i, key_b, 0, j) != 0) {
-                    return key_a.compare(0, i, key_b, 0, j) < 0;
-                }
-
-                // Same prefix - compare numeric suffix
-                if (i == key_a.size() && j == key_b.size()) return false;
-                if (i == key_a.size()) return true;
-                if (j == key_b.size()) return false;
-
-                // Parse and compare numbers
-                long long num_a = std::stoll(key_a.substr(i));
-                long long num_b = std::stoll(key_b.substr(j));
-                return num_a < num_b;
+            // Precompute (prefix_view, numeric_suffix) once — zero allocs, O(1) per comparison.
+            // Keys point into chunk.arena which lives for the duration of this function.
+            struct NatKey { std::string_view prefix; uint64_t suffix; bool has_suffix; };
+            std::vector<NatKey> keys;
+            keys.reserve(N);
+            for (const auto& r : chunk.records) {
+                std::string_view id = trim_id(r.get_header());
+                size_t i = id.size();
+                while (i > 0 && static_cast<unsigned>(id[i-1] - '0') <= 9u) --i;
+                uint64_t suf = 0;
+                for (size_t p = i; p < id.size(); ++p)
+                    suf = suf * 10u + static_cast<unsigned>(id[p] - '0');
+                keys.push_back({id.substr(0, i), suf, i < id.size()});
+            }
+            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
+                const NatKey& ka = keys[a]; const NatKey& kb = keys[b];
+                if (ka.prefix != kb.prefix) return ka.prefix < kb.prefix;
+                if (!ka.has_suffix && !kb.has_suffix) return false;
+                if (!ka.has_suffix) return true;
+                if (!kb.has_suffix) return false;
+                return ka.suffix < kb.suffix;
             });
         } else {
-            std::sort(indices.begin(), indices.end(), [&keys](size_t a, size_t b) {
+            // string_view points into chunk.arena — zero allocs, comparison = fast memcmp
+            std::vector<std::string_view> keys;
+            keys.reserve(N);
+            for (const auto& r : chunk.records)
+                keys.push_back(trim_id(r.get_header()));
+            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
                 return keys[a] < keys[b];
             });
         }
@@ -1134,8 +949,8 @@ private:
         // Write sorted chunk
         auto start = std::chrono::steady_clock::now();
 
-        FastqWriter writer(sorted_file, compress);
-        for (size_t idx : indices) {
+        FastqWriter writer(sorted_file, false);
+        for (uint32_t idx : indices) {
             writer.write(chunk.records[idx]);
         }
 
@@ -1161,10 +976,10 @@ private:
             return;
         }
 
-        // Use standard FastqReader for merge (chunks may be uncompressed in fast mode)
-        std::vector<std::unique_ptr<FastqReader>> readers;
+        // Temp files are always uncompressed .fq — make_fastq_reader detects plain text.
+        std::vector<std::unique_ptr<FastqReaderBase>> readers;
         for (const auto& f : sorted_files_) {
-            readers.push_back(std::make_unique<FastqReader>(f));
+            readers.push_back(make_fastq_reader(f));
         }
 
         // Use lambda comparator to avoid static member in local struct

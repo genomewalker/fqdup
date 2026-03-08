@@ -70,6 +70,7 @@ private:
 }  // anonymous namespace
 
 static bool is_gzip(const std::string& path) {
+    if (path == "/dev/stdin" || path == "-") return false;  // can't peek; gzopen handles both
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
     unsigned char magic[2] = {0, 0};

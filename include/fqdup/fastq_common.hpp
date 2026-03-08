@@ -1,20 +1,20 @@
 #pragma once
 // Shared FASTQ I/O primitives for derep_pairs.cpp and derep.cpp.
 //
-// FastqRecord and FastqReaderBase are at global scope so they can cross TU
-// boundaries via make_fastq_reader().
+// FastqRecord, FastqReaderBase, and make_fastq_reader() are declared in
+// fastq_types.hpp (global scope, ODR-safe, includeable from any TU).
 //
 // Reader/writer implementations with inline method bodies are in an anonymous
-// namespace (internal linkage per TU), avoiding ODR violations.
+// namespace below (internal linkage per TU), avoiding ODR violations.
+
+#include "fqdup/fastq_types.hpp"
 
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <memory>
 #include <stdexcept>
-#include <string>
 #include <vector>
 #include <zlib.h>
 
@@ -23,39 +23,6 @@
 #endif
 
 #include <xxhash.h>
-
-// ============================================================================
-// FASTQ Record — global scope so it can cross TU boundaries
-// ============================================================================
-
-struct FastqRecord {
-    std::string header;
-    std::string seq;
-    std::string plus;
-    std::string qual;
-
-    void clear() {
-        header.clear();
-        seq.clear();
-        plus.clear();
-        qual.clear();
-    }
-};
-
-// ============================================================================
-// Abstract reader — virtual dispatch across TU boundaries
-// ============================================================================
-
-class FastqReaderBase {
-public:
-    virtual ~FastqReaderBase() = default;
-    virtual bool read(FastqRecord& rec) = 0;
-    virtual uint64_t record_count() const = 0;
-};
-
-// Factory: picks the best available decompression backend.
-// Implemented in src/fastq_io_backend.cpp — the only TU that includes rapidgzip.
-std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path);
 
 namespace {
 
