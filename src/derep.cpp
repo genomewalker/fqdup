@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -76,6 +77,34 @@ struct ErrCorParams {
     //   after Pass 1 from D_eff = log2(total_reads / unique_reads). 0 = not yet set.
     double   pcr_phi    = 5.3e-7;  // polymerase error rate (sub/base/doubling)
     double   pcr_rate   = 0.0;     // phi × D_eff; 0 = use static max_count only
+};
+
+struct Phase3Stats {
+    double decode_hash_parent_ms = 0;
+    double insert_ms             = 0;
+    double decode_hash_child_ms  = 0;
+    double query_ms              = 0;
+    double check_ms              = 0;
+    uint64_t total_candidates    = 0;
+    uint64_t cap_fires           = 0;
+    uint64_t children_scanned    = 0;
+    uint64_t parents_indexed     = 0;
+    void log() const {
+        auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
+        log_info("Phase 3 timing:");
+        log_info("  Parent decode+hash : " + f(decode_hash_parent_ms));
+        log_info("  Parent insert      : " + f(insert_ms));
+        log_info("  Child decode+hash  : " + f(decode_hash_child_ms));
+        log_info("  Child query        : " + f(query_ms));
+        log_info("  Candidate check    : " + f(check_ms));
+        log_info("  Parents indexed    : " + std::to_string(parents_indexed));
+        log_info("  Children scanned   : " + std::to_string(children_scanned));
+        log_info("  Total candidates   : " + std::to_string(total_candidates));
+        if (children_scanned > 0)
+            log_info("  Avg cand/child     : " +
+                     std::to_string(static_cast<double>(total_candidates)/children_scanned));
+        log_info("  Bucket cap fires   : " + std::to_string(cap_fires));
+    }
 };
 
 // ============================================================================
@@ -209,9 +238,9 @@ struct PairIndex {
 
     PairIndex() { pool.push_back({0, 0}); }  // index 0 = sentinel
 
-    void insert(uint64_t key, uint32_t id, uint32_t cap) {
+    bool insert(uint64_t key, uint32_t id, uint32_t cap) {
         auto& bv = map[key];
-        if (bv.len >= cap) return;
+        if (bv.len >= cap) return false;
         if (bv.len == 0) {
             bv.first = id;
         } else {
@@ -222,6 +251,7 @@ struct PairIndex {
             bv.spill_head = node;
         }
         bv.len++;
+        return true;
     }
 
     template <typename F>
@@ -889,6 +919,9 @@ private:
             return lay;
         };
 
+        Phase3Stats stats;
+        using clk = std::chrono::steady_clock;
+
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (id_count[id] <= errcor_.max_count) continue;
@@ -897,22 +930,43 @@ private:
             const auto& lay = get_layout(L);
             if (lay.ilen < 3) continue;
 
-            // Decode interior to ASCII scratch for hashing; packed data for Hamming.
+            auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.ilen))
                 scratch.resize(lay.ilen);
             arena_.decode_range(id, lay.k5, lay.ilen, scratch.data());
             uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
             uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
             uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
+            auto t1 = clk::now();
 
             auto& sh = shards[lay.ilen];
-            sh.pi[0].insert(pair_key(h0, h1, 0, lay.ilen), id, errcor_.bucket_cap);
-            sh.pi[1].insert(pair_key(h0, h2, 1, lay.ilen), id, errcor_.bucket_cap);
-            sh.pi[2].insert(pair_key(h1, h2, 2, lay.ilen), id, errcor_.bucket_cap);
+            if (!sh.pi[0].insert(pair_key(h0, h1, 0, lay.ilen), id, errcor_.bucket_cap))
+                stats.cap_fires++;
+            if (!sh.pi[1].insert(pair_key(h0, h2, 1, lay.ilen), id, errcor_.bucket_cap))
+                stats.cap_fires++;
+            if (!sh.pi[2].insert(pair_key(h1, h2, 2, lay.ilen), id, errcor_.bucket_cap))
+                stats.cap_fires++;
+            auto t2 = clk::now();
+
+            stats.decode_hash_parent_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            stats.insert_ms             += std::chrono::duration<double, std::milli>(t2 - t1).count();
             n_parents++;
         }
+        stats.parents_indexed = n_parents;
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
                  " parent sequences (count>" + std::to_string(errcor_.max_count) + ")");
+
+        // Bucket-size histogram
+        std::array<uint64_t, 8> bhist{};
+        for (const auto& [ilen, sh] : shards)
+            for (const auto& pi : sh.pi)
+                for (const auto& [key, bv] : pi.map) {
+                    unsigned b = bv.len == 0 ? 0 : 31 - __builtin_clz(bv.len);
+                    bhist[std::min(b, 7u)]++;
+                }
+        std::string hstr;
+        for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
+        log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
         std::vector<uint64_t> seen_epoch(N, 0);
         uint64_t epoch = 0;
@@ -929,48 +983,58 @@ private:
             auto shard_it = shards.find(lay.ilen);
             if (shard_it == shards.end()) continue;
 
+            auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.ilen))
                 scratch.resize(lay.ilen);
             arena_.decode_range(cid, lay.k5, lay.ilen, scratch.data());
             uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
             uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
             uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
+            auto t1 = clk::now();
+            stats.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             epoch++;
             bool absorbed = false;
             const uint8_t* child_packed = arena_.data(cid);
+            stats.children_scanned++;
 
             auto check = [&](uint32_t pid) {
                 if (absorbed) return;
                 if (seen_epoch[pid] == epoch) return;
                 seen_epoch[pid] = epoch;
-                if (is_error_[pid]) return;
-                if (!arena_.is_eligible(pid)) return;
-                if (arena_.length(pid) != static_cast<uint16_t>(L)) return;
-                if (static_cast<double>(id_count[pid]) <
-                    errcor_.ratio * id_count[cid]) return;
-                // Adaptive child ceiling: per-parent effective max count.
-                // With PCR model active: ceil(parent_count × phi×D / 3).
-                uint64_t eff_max = errcor_.max_count;
-                if (errcor_.pcr_rate > 0.0) {
-                    uint64_t adaptive = static_cast<uint64_t>(
-                        std::ceil(static_cast<double>(id_count[pid]) *
-                                  errcor_.pcr_rate / 3.0));
-                    eff_max = std::max(eff_max, adaptive);
-                }
-                if (id_count[cid] > eff_max) return;
-                // packed_should_absorb: Hamming==1 in interior AND not damage-consistent.
-                // G↔T/C↔A (8-oxoG) always protected; C↔T/G↔A protected when damage active.
-                if (!packed_should_absorb(arena_.data(pid), child_packed,
-                                          lay.k5, lay.ilen, profile_.enabled))
-                    return;
-                absorbed = true;
+                stats.total_candidates++;
+                auto tc0 = clk::now();
+                bool do_absorb = false;
+                do {
+                    if (is_error_[pid]) break;
+                    if (!arena_.is_eligible(pid)) break;
+                    if (arena_.length(pid) != static_cast<uint16_t>(L)) break;
+                    if (static_cast<double>(id_count[pid]) <
+                        errcor_.ratio * id_count[cid]) break;
+                    uint64_t eff_max = errcor_.max_count;
+                    if (errcor_.pcr_rate > 0.0) {
+                        uint64_t adaptive = static_cast<uint64_t>(
+                            std::ceil(static_cast<double>(id_count[pid]) *
+                                      errcor_.pcr_rate / 3.0));
+                        eff_max = std::max(eff_max, adaptive);
+                    }
+                    if (id_count[cid] > eff_max) break;
+                    if (!packed_should_absorb(arena_.data(pid), child_packed,
+                                              lay.k5, lay.ilen, profile_.enabled))
+                        break;
+                    do_absorb = true;
+                } while (false);
+                stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+                if (do_absorb) absorbed = true;
             };
 
+            auto tq0 = clk::now();
             auto& sh = shard_it->second;
             sh.pi[0].query(pair_key(h0, h1, 0, lay.ilen), check);
             if (!absorbed) sh.pi[1].query(pair_key(h0, h2, 1, lay.ilen), check);
             if (!absorbed) sh.pi[2].query(pair_key(h1, h2, 2, lay.ilen), check);
+            auto tq1 = clk::now();
+            stats.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
 
             if (absorbed) {
                 is_error_[cid] = true;
@@ -978,6 +1042,7 @@ private:
             }
         }
 
+        stats.log();
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
                  " PCR error sequences (ratio=" + std::to_string(errcor_.ratio) +
                  ", max-count=" + std::to_string(errcor_.max_count) + ")");
