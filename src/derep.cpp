@@ -895,7 +895,7 @@ private:
 
         struct LenShard { std::array<FlatPairIndex, 3> pi; };
 
-        // Scratch buffer for decoding packed interior regions before hashing.
+        // Scratch buffer for packed interior parts before hashing (≤ (ilen/4)+3 bytes).
         std::vector<uint8_t> scratch;
         scratch.reserve(65535);
         struct InteriorLayout {
@@ -904,6 +904,10 @@ private:
             int  s0      = 0;
             int  s1      = 0;
             int  s2      = 0;
+            int  nb0     = 0;  // packed bytes per part ((s+3)/4)
+            int  nb1     = 0;
+            int  nb2     = 0;
+            int  nbytes  = 0;  // nb0+nb1+nb2
             bool ready   = false;
         };
         std::vector<InteriorLayout> layout_cache(65536);
@@ -913,8 +917,13 @@ private:
                 auto [k5, k3] = damage_zone_bounds(L, profile_);
                 lay.k5   = k5;
                 lay.ilen = std::max(0, L - k5 - k3);
-                if (lay.ilen >= 3)
+                if (lay.ilen >= 3) {
                     split3_lens(lay.ilen, lay.s0, lay.s1, lay.s2);
+                    lay.nb0    = (lay.s0 + 3) / 4;
+                    lay.nb1    = (lay.s1 + 3) / 4;
+                    lay.nb2    = (lay.s2 + 3) / 4;
+                    lay.nbytes = lay.nb0 + lay.nb1 + lay.nb2;
+                }
                 lay.ready = true;
             }
             return lay;
@@ -937,12 +946,15 @@ private:
             if (lay.ilen < 3) continue;
 
             auto t0 = clk::now();
-            if (scratch.size() < static_cast<size_t>(lay.ilen))
-                scratch.resize(lay.ilen);
-            arena_.decode_range(id, lay.k5, lay.ilen, scratch.data());
-            uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
+            if (scratch.size() < static_cast<size_t>(lay.nbytes))
+                scratch.resize(lay.nbytes);
+            const uint8_t* psrc_p = arena_.data(id);
+            extract_packed_part(psrc_p, lay.k5,                     lay.s0, scratch.data());
+            extract_packed_part(psrc_p, lay.k5 + lay.s0,            lay.s1, scratch.data() + lay.nb0);
+            extract_packed_part(psrc_p, lay.k5 + lay.s0 + lay.s1,  lay.s2, scratch.data() + lay.nb0 + lay.nb1);
+            uint64_t h0 = XXH3_64bits(scratch.data(),                      lay.nb0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,            lay.nb1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1,  lay.nb2);
             auto t1 = clk::now();
 
             auto& entries = build_map[lay.ilen];
@@ -1003,9 +1015,6 @@ private:
         for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
         log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
-        std::vector<uint64_t> seen_epoch(N, 0);
-        uint64_t epoch = 0;
-
         for (uint32_t cid = 0; cid < N; ++cid) {
             if (id_count[cid] > child_prefilter) continue;
             if (is_error_[cid]) continue;
@@ -1019,25 +1028,45 @@ private:
             if (shard_it == shards.end()) continue;
 
             auto t0 = clk::now();
-            if (scratch.size() < static_cast<size_t>(lay.ilen))
-                scratch.resize(lay.ilen);
-            arena_.decode_range(cid, lay.k5, lay.ilen, scratch.data());
-            uint64_t h0 = XXH3_64bits(scratch.data(),                   lay.s0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + lay.s0,          lay.s1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
+            if (scratch.size() < static_cast<size_t>(lay.nbytes))
+                scratch.resize(lay.nbytes);
+            const uint8_t* psrc_c = arena_.data(cid);
+            extract_packed_part(psrc_c, lay.k5,                     lay.s0, scratch.data());
+            extract_packed_part(psrc_c, lay.k5 + lay.s0,            lay.s1, scratch.data() + lay.nb0);
+            extract_packed_part(psrc_c, lay.k5 + lay.s0 + lay.s1,  lay.s2, scratch.data() + lay.nb0 + lay.nb1);
+            uint64_t h0 = XXH3_64bits(scratch.data(),                      lay.nb0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,            lay.nb1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1,  lay.nb2);
             auto t1 = clk::now();
             stats.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-            epoch++;
-            bool absorbed = false;
-            const uint8_t* child_packed = arena_.data(cid);
             stats.children_scanned++;
 
-            auto check = [&](uint32_t pid) {
-                if (absorbed) return;
-                if (seen_epoch[pid] == epoch) return;
-                seen_epoch[pid] = epoch;
-                stats.total_candidates++;
+            // Collect candidates from the three pigeonhole lookups, then deduplicate.
+            // With bucket_cap=64, at most 3×64=192 candidates per child.
+            uint32_t cand_buf[192];
+            uint32_t n_cands = 0;
+            auto collect = [&](uint32_t pid) {
+                if (n_cands < 192) cand_buf[n_cands++] = pid;
+            };
+
+            auto tq0 = clk::now();
+            auto& sh = shard_it->second;
+            sh.pi[0].query(pair_key(h0, h1, 0, lay.ilen), collect);
+            sh.pi[1].query(pair_key(h0, h2, 1, lay.ilen), collect);
+            sh.pi[2].query(pair_key(h1, h2, 2, lay.ilen), collect);
+            auto tq1 = clk::now();
+            stats.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+
+            std::sort(cand_buf, cand_buf + n_cands);
+            n_cands = static_cast<uint32_t>(
+                std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
+            stats.total_candidates += n_cands;
+
+            bool absorbed = false;
+            const uint8_t* child_packed = arena_.data(cid);
+            for (uint32_t ci = 0; ci < n_cands && !absorbed; ++ci) {
+                uint32_t pid = cand_buf[ci];
                 auto tc0 = clk::now();
                 bool do_absorb = false;
                 do {
@@ -1061,15 +1090,7 @@ private:
                 } while (false);
                 stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
                 if (do_absorb) absorbed = true;
-            };
-
-            auto tq0 = clk::now();
-            auto& sh = shard_it->second;
-            sh.pi[0].query(pair_key(h0, h1, 0, lay.ilen), check);
-            if (!absorbed) sh.pi[1].query(pair_key(h0, h2, 1, lay.ilen), check);
-            if (!absorbed) sh.pi[2].query(pair_key(h1, h2, 2, lay.ilen), check);
-            auto tq1 = clk::now();
-            stats.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+            }
 
             if (absorbed) {
                 is_error_[cid] = true;
