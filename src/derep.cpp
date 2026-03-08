@@ -224,43 +224,18 @@ struct SeqArena {
     }
 };
 
-struct SpillNode { uint32_t id; uint32_t next; };
-
-struct BucketVal {
-    uint32_t first      = 0;
-    uint32_t spill_head = 0;
-    uint32_t len        = 0;
-};
-
-struct PairIndex {
-    ska::flat_hash_map<uint64_t, BucketVal> map;
-    std::vector<SpillNode> pool;
-
-    PairIndex() { pool.push_back({0, 0}); }  // index 0 = sentinel
-
-    bool insert(uint64_t key, uint32_t id, uint32_t cap) {
-        auto& bv = map[key];
-        if (bv.len >= cap) return false;
-        if (bv.len == 0) {
-            bv.first = id;
-        } else {
-            if (pool.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-                throw std::runtime_error("PairIndex pool overflow (> 4 G spill nodes)");
-            uint32_t node = static_cast<uint32_t>(pool.size());
-            pool.push_back({id, bv.spill_head});
-            bv.spill_head = node;
-        }
-        bv.len++;
-        return true;
-    }
+struct FlatPairIndex {
+    std::vector<uint64_t> keys;
+    std::vector<uint32_t> offsets;
+    std::vector<uint32_t> ids;
 
     template <typename F>
     void query(uint64_t key, F&& fn) const {
-        auto it = map.find(key);
-        if (it == map.end() || it->second.len == 0) return;
-        fn(it->second.first);
-        uint32_t idx = it->second.spill_head;
-        while (idx != 0) { fn(pool[idx].id); idx = pool[idx].next; }
+        auto it = std::lower_bound(keys.begin(), keys.end(), key);
+        if (it == keys.end() || *it != key) return;
+        size_t idx = static_cast<size_t>(it - keys.begin());
+        for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
+            fn(ids[i]);
     }
 };
 
@@ -343,6 +318,31 @@ static bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
         }
     }
     return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_deamination);
+}
+
+// Extract bases [start, start+count) from 2-bit packed data into dst[],
+// byte-normalized (first base at MSB of dst[0], trailing bits zeroed).
+// dst must have at least (count+3)/4 bytes.
+// Returns number of bytes written.
+static int extract_packed_part(const uint8_t* packed, int start, int count, uint8_t* dst) {
+    int nbytes = (count + 3) / 4;
+    int src_byte = start >> 2;
+    int src_shift = (start & 3) << 1;  // 0,2,4,6 bits into first src byte
+
+    if (src_shift == 0) {
+        std::memcpy(dst, packed + src_byte, nbytes);
+    } else {
+        int rshift = 8 - src_shift;
+        for (int i = 0; i < nbytes; ++i) {
+            dst[i] = static_cast<uint8_t>(
+                (packed[src_byte + i] << src_shift) |
+                (packed[src_byte + i + 1] >> rshift));
+        }
+    }
+    // Zero trailing unused bits in last byte
+    int used = count & 3;
+    if (used) dst[nbytes - 1] &= static_cast<uint8_t>(0xFFu << ((4 - used) << 1));
+    return nbytes;
 }
 
 // ============================================================================
@@ -862,6 +862,9 @@ private:
         const uint32_t N = static_cast<uint32_t>(arena_.size());
         if (N == 0) return;
 
+        // Trailing padding byte for safe unaligned extraction in extract_packed_part.
+        arena_.packed.push_back(0);
+
         is_error_.assign(N, false);
 
         std::vector<uint64_t> id_count(N, 0);
@@ -890,9 +893,7 @@ private:
             }
         }
 
-        struct LenShard { std::array<PairIndex, 3> pi; };
-        ska::flat_hash_map<int, LenShard> shards;
-        shards.reserve(64);
+        struct LenShard { std::array<FlatPairIndex, 3> pi; };
 
         // Scratch buffer for decoding packed interior regions before hashing.
         std::vector<uint8_t> scratch;
@@ -922,6 +923,11 @@ private:
         Phase3Stats stats;
         using clk = std::chrono::steady_clock;
 
+        // Phase A: collect (key, id) entries per ilen shard and tag
+        struct BuildEntry { uint64_t key; uint32_t id; };
+        ska::flat_hash_map<int, std::array<std::vector<BuildEntry>, 3>> build_map;
+        build_map.reserve(64);
+
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (id_count[id] <= errcor_.max_count) continue;
@@ -939,13 +945,10 @@ private:
             uint64_t h2 = XXH3_64bits(scratch.data() + lay.s0 + lay.s1, lay.s2);
             auto t1 = clk::now();
 
-            auto& sh = shards[lay.ilen];
-            if (!sh.pi[0].insert(pair_key(h0, h1, 0, lay.ilen), id, errcor_.bucket_cap))
-                stats.cap_fires++;
-            if (!sh.pi[1].insert(pair_key(h0, h2, 1, lay.ilen), id, errcor_.bucket_cap))
-                stats.cap_fires++;
-            if (!sh.pi[2].insert(pair_key(h1, h2, 2, lay.ilen), id, errcor_.bucket_cap))
-                stats.cap_fires++;
+            auto& entries = build_map[lay.ilen];
+            entries[0].push_back({pair_key(h0, h1, 0, lay.ilen), id});
+            entries[1].push_back({pair_key(h0, h2, 1, lay.ilen), id});
+            entries[2].push_back({pair_key(h1, h2, 2, lay.ilen), id});
             auto t2 = clk::now();
 
             stats.decode_hash_parent_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -956,12 +959,44 @@ private:
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
                  " parent sequences (count>" + std::to_string(errcor_.max_count) + ")");
 
+        // Phase B: sort and build CSR per shard per tag
+        ska::flat_hash_map<int, LenShard> shards;
+        shards.reserve(build_map.size());
+        for (auto& [ilen, tag_entries] : build_map) {
+            auto& sh = shards[ilen];
+            for (int t = 0; t < 3; ++t) {
+                auto& ev = tag_entries[t];
+                std::sort(ev.begin(), ev.end(),
+                          [](const BuildEntry& a, const BuildEntry& b){ return a.key < b.key; });
+
+                auto& pi = sh.pi[t];
+                size_t i = 0;
+                pi.offsets.push_back(0);
+                while (i < ev.size()) {
+                    uint64_t k = ev[i].key;
+                    pi.keys.push_back(k);
+                    uint32_t count = 0;
+                    while (i < ev.size() && ev[i].key == k) {
+                        if (count < errcor_.bucket_cap) {
+                            pi.ids.push_back(ev[i].id);
+                            count++;
+                        } else {
+                            stats.cap_fires++;
+                        }
+                        i++;
+                    }
+                    pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
+                }
+            }
+        }
+
         // Bucket-size histogram
         std::array<uint64_t, 8> bhist{};
         for (const auto& [ilen, sh] : shards)
             for (const auto& pi : sh.pi)
-                for (const auto& [key, bv] : pi.map) {
-                    unsigned b = bv.len == 0 ? 0 : 31 - __builtin_clz(bv.len);
+                for (size_t ki = 0; ki < pi.keys.size(); ++ki) {
+                    uint32_t blen = pi.offsets[ki + 1] - pi.offsets[ki];
+                    unsigned b = blen == 0 ? 0 : 31 - __builtin_clz(blen);
                     bhist[std::min(b, 7u)]++;
                 }
         std::string hstr;
