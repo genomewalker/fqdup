@@ -114,8 +114,7 @@ echo "  PASS: Test B"
 # With EC (--errcor-ratio 5 matches 10x coverage parent:singleton ratio ~8:1),
 # those singletons are absorbed back into the dominant parent cluster.
 #
-# Note: errcor-ratio default (50) suits high-coverage production data; at 10x
-# we set ratio=5 explicitly so the test exercises the real absorption path.
+# Note: default min_parent_count=3 suits 10x coverage (true parents have count~10).
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test C: PCR error correction ---"
@@ -131,12 +130,13 @@ echo "  $N_MOL_C molecules × 10x coverage, no damage, PCR rate=$PCR_RATE/base"
 "$FQDUP" sort -i "$TMPDIR/pcr.fq" -o "$TMPDIR/pcr.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
 # Without error correction: PCR error reads inflate unique count
-"$FQDUP" derep -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_no_ec.out.fq" 2>/dev/null
+"$FQDUP" derep -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_no_ec.out.fq" \
+    --no-error-correct 2>/dev/null
 UNIQUE_NO_EC=$(grep -c '^@' "$TMPDIR/pcr_no_ec.out.fq")
 
-# With error correction (ratio=5 suits 10x coverage)
+# With error correction (default min_parent=3 works at 10x: true parents have count~10)
 "$FQDUP" derep -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_ec.out.fq" \
-    --error-correct --errcor-ratio 5 2>/dev/null
+    --error-correct 2>/dev/null
 UNIQUE_EC=$(grep -c '^@' "$TMPDIR/pcr_ec.out.fq")
 
 echo "  Unique without --error-correct: $UNIQUE_NO_EC"
@@ -205,9 +205,9 @@ echo "  Oxidative: G→T at ox-rate=0.05/G-base  |  PCR: random at rate=0.003/ba
 "$FQDUP" sort -i "$TMPDIR/ox.fq" -o "$TMPDIR/ox.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
 U_OX_NO_EC=$(  "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_no.fq" \
-    2>/dev/null && grep -c '^@' "$TMPDIR/ox_no.fq")
+    --no-error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/ox_no.fq")
 U_OX_EC=$(     "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
-    --error-correct --errcor-ratio 5 2>/dev/null && grep -c '^@' "$TMPDIR/ox_ec.fq")
+    --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/ox_ec.fq")
 
 # PCR error dataset (same seed → same base molecules)
 "$GEN" --n-unique $N_MOL_D --n-reads $N_READS_D --read-len 75 \
@@ -215,9 +215,9 @@ U_OX_EC=$(     "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
 "$FQDUP" sort -i "$TMPDIR/pcr_d.fq" -o "$TMPDIR/pcr_d.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
 U_PCR_NO_EC=$( "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_no.fq" \
-    2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_no.fq")
+    --no-error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_no.fq")
 U_PCR_EC=$(    "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_ec.fq" \
-    --error-correct --errcor-ratio 5 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_ec.fq")
+    --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_ec.fq")
 
 echo "  Oxidative  (G→T): no-EC=$U_OX_NO_EC  EC=$U_OX_EC"
 echo "  PCR errors (rnd): no-EC=$U_PCR_NO_EC  EC=$U_PCR_EC"

@@ -619,8 +619,8 @@ echo "  PASS: Test P7"
 # gen_synthetic output to demonstrate EC working on its intended input.
 #
 # 300 molecules × 30x = 9000 reads, 40bp, pcr-rate=0.003
-# At 30x: parent clusters have ~29 clean copies (count≈29 >> max_count=5)
-# EC with errcor-ratio=25 absorbs singletons where parent_count ≥ 25×1
+# At 30x: parent clusters have ~29 clean copies (count≈29 >> min_parent_count=3)
+# EC absorbs PCR-error singletons (count≤3) with matching H=1 parents
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test P8: PCR error correction standalone (raw reads → derep --error-correct) ---"
@@ -638,9 +638,9 @@ echo "  derep runs directly on raw reads; EC absorbs PCR-error singletons into 3
 "$FQDUP" derep -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_noec.fq" \
     --no-error-correct 2>/dev/null
 
-# With EC at ratio=25 (appropriate for 30x: parent_count~29 ≥ 25×child_count=1)
+# With EC (default min_parent=3 works at 30x: true parents have count~29)
 "$FQDUP" derep -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_ec.fq" \
-    --error-correct --errcor-ratio 25 2>"$TMPDIR/p8_ec.log"
+    --error-correct 2>"$TMPDIR/p8_ec.log"
 
 U_NOEC=$(grep -c '^@' "$TMPDIR/p8_noec.fq" || true)
 U_EC=$(grep -c '^@'   "$TMPDIR/p8_ec.fq"   || true)
@@ -648,7 +648,7 @@ U_EC=$(grep -c '^@'   "$TMPDIR/p8_ec.fq"   || true)
 echo ""
 echo "  True molecules:                $N_MOL"
 echo "  After derep no-EC:             $U_NOEC unique  (PCR errors inflate)"
-echo "  After derep EC (ratio=25):     $U_EC   unique  (singletons absorbed)"
+echo "  After derep EC (min_parent=3): $U_EC   unique  (singletons absorbed)"
 grep "Phase 3 complete" "$TMPDIR/p8_ec.log" | sed 's/^.*INFO: /  INFO: /'
 
 python3 - <<EOF
@@ -700,11 +700,11 @@ echo "  PASS: Test P8"
 # a high-count cluster.
 #
 # P9a: mol_A (200×) + mol_B (200×, 1 interior SNP at pos 37)
-#      count ratio A:B = 1:1 < errcor-ratio (default 50) → EC must NOT merge
+#      sig_count=200 / parent_count=200 = 1.0 ≥ snp_threshold → SNP veto → EC must NOT merge
 #      Assert: 2 unique with and without EC
 #
 # P9b: mol_A (200×) + one singleton with interior SNP at pos 37
-#      count ratio 200:1 >> errcor-ratio → EC absorbs singleton
+#      sig_count=1, snp_threshold check fails → EC absorbs singleton
 #      Assert: 2 unique without EC; 1 unique with EC
 # ---------------------------------------------------------------------------
 echo ""
@@ -782,7 +782,7 @@ if u9a_ec != 2:
     print(f"  FAIL P9a: EC incorrectly merged real SNP ({u9a_ec} unique, expected 2)")
     ok = False
 else:
-    print(f"  PASS P9a with-EC: {u9a_ec} unique (false positive protected — count ratio 1:1 < threshold)")
+    print(f"  PASS P9a with-EC: {u9a_ec} unique (false positive protected — SNP veto fired)")
 
 if u9b_noec != 2:
     print(f"  FAIL P9b: without EC, expected 2 unique, got {u9b_noec}")

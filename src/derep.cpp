@@ -60,23 +60,13 @@ namespace {
 // ============================================================================
 
 struct ErrCorParams {
-    bool     enabled    = false;
-    double   ratio      = 50.0;   // parent must have count >= ratio × child count
-    uint32_t max_count  = 5;      // static child ceiling (hard cap; also minimum when adaptive)
-    uint32_t bucket_cap = 64;     // max pair-key bucket size (limits low-complexity bloat)
-    // Adaptive child ceiling from PCR model (Potapov & Ong 2017):
-    //   pcr_rate = phi × D_eff  (sub/base/full-PCR-run)
-    // Per parent P: effective_max = max(max_count, ceil(P × pcr_rate / 3)).
-    // The /3 is for the specific-substitution spectrum under the equal-rates assumption.
-    //
-    // pcr_phi: polymerase error rate (sub/base/doubling). Q5=5.3e-7 (default).
-    //   Always set from --pcr-error-rate (or default). Used to auto-estimate pcr_rate
-    //   from the observed duplication ratio when --pcr-cycles is not given.
-    //
-    // pcr_rate: phi × D_eff. Set explicitly when pcr_cycles>0; otherwise estimated
-    //   after Pass 1 from D_eff = log2(total_reads / unique_reads). 0 = not yet set.
-    double   pcr_phi    = 5.3e-7;  // polymerase error rate (sub/base/doubling)
-    double   pcr_rate   = 0.0;     // phi × D_eff; 0 = use static max_count only
+    bool     enabled          = false;
+    uint32_t min_parent_count = 3;    // sequences with count > this are indexed as parents
+    double   snp_threshold    = 0.05; // sig_count_weighted/parent_count >= this → SNP protection
+    uint32_t snp_min_count    = 2;    // absolute minimum sig_count for SNP veto
+    uint32_t bucket_cap       = 64;
+    double   pcr_phi          = 5.3e-7;
+    double   pcr_rate         = 0.0;  // still estimated for logging but no longer gates absorption
 };
 
 struct Phase3Stats {
@@ -89,6 +79,9 @@ struct Phase3Stats {
     uint64_t cap_fires           = 0;
     uint64_t children_scanned    = 0;
     uint64_t parents_indexed     = 0;
+    uint64_t children_found      = 0;  // H=1 child-parent pairs detected
+    uint64_t snp_protected       = 0;  // children not absorbed due to SNP veto
+    uint64_t absorbed            = 0;  // children absorbed as PCR errors
     void log() const {
         auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
         log_info("Phase 3 timing:");
@@ -99,6 +92,9 @@ struct Phase3Stats {
         log_info("  Candidate check    : " + f(check_ms));
         log_info("  Parents indexed    : " + std::to_string(parents_indexed));
         log_info("  Children scanned   : " + std::to_string(children_scanned));
+        log_info("  Children found     : " + std::to_string(children_found));
+        log_info("  SNP protected      : " + std::to_string(snp_protected));
+        log_info("  Absorbed           : " + std::to_string(absorbed));
         log_info("  Total candidates   : " + std::to_string(total_candidates));
         if (children_scanned > 0)
             log_info("  Avg cand/child     : " +
@@ -184,6 +180,32 @@ struct SeqArena {
             uint8_t v = 0;
             for (int lane = 0; lane < 4 && i < L; ++lane, ++i) {
                 uint8_t b = kEnc2bit[static_cast<uint8_t>(seq[i])];
+                if (b == 0xFFu) { ok = false; b = 0; }
+                v |= static_cast<uint8_t>(b << (6 - 2 * lane));
+            }
+            dst[byte++] = v;
+        }
+        eligible.push_back(ok);
+        return id;
+    }
+
+    uint32_t append_chars(const char* data_in, int L) {
+        if (L > 65535)
+            throw std::runtime_error("Sequence too long for arena (>65535 bp)");
+        if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
+        uint32_t id    = static_cast<uint32_t>(offsets.size());
+        int      nbytes = (L + 3) / 4;
+        offsets.push_back(packed.size());
+        lengths.push_back(static_cast<uint16_t>(L));
+        packed.resize(packed.size() + nbytes, 0);
+        uint8_t* dst = packed.data() + offsets[id];
+        bool ok = true;
+        int i = 0, byte = 0;
+        while (i < L) {
+            uint8_t v = 0;
+            for (int lane = 0; lane < 4 && i < L; ++lane, ++i) {
+                uint8_t b = kEnc2bit[static_cast<uint8_t>(data_in[i])];
                 if (b == 0xFFu) { ok = false; b = 0; }
                 v |= static_cast<uint8_t>(b << (6 - 2 * lane));
             }
@@ -319,6 +341,71 @@ static bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
     }
     return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_deamination);
 }
+
+struct MismatchInfo {
+    bool     found;
+    uint16_t position;  // interior-relative position (0-based) of the single mismatch
+    uint8_t  base_a;    // parent's 2-bit base
+    uint8_t  base_b;    // child's 2-bit base
+};
+
+// Like packed_should_absorb but also returns position and bases of the single mismatch.
+// Returns {false,...} if mismatches != 1 or the substitution is damage-consistent.
+static MismatchInfo packed_find_mismatch(const uint8_t* pa, const uint8_t* pb,
+                                          int k5, int ilen, bool protect_deamination) {
+    int mismatches = 0;
+    uint8_t mm_a = 0, mm_b = 0;
+    uint16_t mm_pos = 0;
+
+    for (int i = 0; i < ilen; ) {
+        int pos    = k5 + i;
+        int byte_i = pos >> 2;
+        int bit_i  = pos & 3;
+
+        if (bit_i == 0 && i + 4 <= ilen) {
+            uint8_t diff = pa[byte_i] ^ pb[byte_i];
+            if (diff) {
+                uint8_t any = (diff | (diff >> 1)) & 0x55u;
+                int nm = __builtin_popcount(any);
+                mismatches += nm;
+                if (mismatches > 1) return {false, 0, 0, 0};
+                if (nm == 1) {
+                    uint8_t sh = static_cast<uint8_t>(__builtin_ctz(any));
+                    mm_a = (pa[byte_i] >> sh) & 0x3u;
+                    mm_b = (pb[byte_i] >> sh) & 0x3u;
+                    // sh is 0,2,4,6 bits from MSB side → offset within 4-base block
+                    // Bit position from MSB: bit 7=base0, bit 5=base1, bit 3=base2, bit 1=base3
+                    // sh=6→base0, sh=4→base1, sh=2→base2, sh=0→base3
+                    mm_pos = static_cast<uint16_t>(i + (3 - (sh >> 1)));
+                }
+            }
+            i += 4;
+        } else {
+            uint8_t sh = static_cast<uint8_t>(6 - 2 * bit_i);
+            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
+            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
+            if (ba != bb) {
+                if (++mismatches > 1) return {false, 0, 0, 0};
+                mm_a = ba; mm_b = bb;
+                mm_pos = static_cast<uint16_t>(i);
+            }
+            ++i;
+        }
+    }
+    if (mismatches != 1) return {false, 0, 0, 0};
+    if (is_damage_sub_packed(mm_a, mm_b, protect_deamination)) return {false, 0, 0, 0};
+    return {true, mm_pos, mm_a, mm_b};
+}
+
+// ── ChildMismatch record ────────────────────────────────────────────────────
+struct ChildMismatch {
+    uint32_t parent_id;
+    uint32_t child_id;
+    uint16_t mismatch_pos;  // interior-relative position (0-based)
+    uint8_t  alt_base;      // child's 2-bit base
+    uint8_t  parent_base;   // parent's 2-bit base
+};  // 12 bytes
+static_assert(sizeof(ChildMismatch) == 12, "ChildMismatch must be 12 bytes");
 
 // Extract bases [start, start+count) from 2-bit packed data into dst[],
 // byte-normalized (first base at MSB of dst[0], trailing bits zeroed).
@@ -765,7 +852,7 @@ public:
                          " (use --pcr-cycles for explicit value)");
             }
 
-            log_info("Phase 3: PCR error correction");
+            log_info("Phase 3: parent-centric mismatch pattern detection");
             phase3_error_correct();
         }
 
@@ -777,16 +864,61 @@ public:
     }
 
 private:
-    XXH128_hash_t compute_hash(const std::string& seq) const {
+    XXH128_hash_t compute_hash(const std::string& seq, bool& is_forward) const {
+        int L = static_cast<int>(seq.size());
         if (profile_.enabled) {
             if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
             if (scratch2_.size() < seq.size()) scratch2_.resize(seq.size());
-            return damage_canonical_hash(seq, profile_, use_revcomp_,
-                                         scratch1_.data(), scratch2_.data());
+            apply_damage_mask_inplace(seq, profile_, scratch1_.data());
+            XXH128_hash_t h1 = XXH3_128bits(scratch1_.data(), L);
+            if (!use_revcomp_) { is_forward = true; return h1; }
+            // Build RC into scratch2_
+            for (int i = 0; i < L; ++i) {
+                unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
+                switch (c) {
+                    case 'A': case 'a': scratch2_[i] = (c == 'A') ? 'T' : 't'; break;
+                    case 'C': case 'c': scratch2_[i] = (c == 'C') ? 'G' : 'g'; break;
+                    case 'G': case 'g': scratch2_[i] = (c == 'G') ? 'C' : 'c'; break;
+                    case 'T': case 't': scratch2_[i] = (c == 'T') ? 'A' : 'a'; break;
+                    default:            scratch2_[i] = 'N'; break;
+                }
+            }
+            // Apply damage mask to RC
+            for (int i = 0; i < L; ++i) {
+                char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2_[i])));
+                bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[i];
+                bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[L - 1 - i];
+                if (profile_.ss_mode) {
+                    if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
+                    else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                } else {
+                    if (in_5zone && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
+                    else if (in_3zone && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                }
+            }
+            XXH128_hash_t h2 = XXH3_128bits(scratch2_.data(), L);
+            is_forward = (h1.high64 < h2.high64 ||
+                          (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
+            return is_forward ? h1 : h2;
         }
-        if (!use_revcomp_) return XXH3_128bits(seq.data(), seq.size());
+        // No damage masking
+        XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
+        if (!use_revcomp_) { is_forward = true; return h1; }
         if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
-        return canonical_hash_noalloc(seq, true, scratch1_.data());
+        for (int i = 0; i < L; ++i) {
+            unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
+            switch (c) {
+                case 'A': case 'a': scratch1_[i] = (c == 'A') ? 'T' : 't'; break;
+                case 'C': case 'c': scratch1_[i] = (c == 'C') ? 'G' : 'g'; break;
+                case 'G': case 'g': scratch1_[i] = (c == 'G') ? 'C' : 'c'; break;
+                case 'T': case 't': scratch1_[i] = (c == 'T') ? 'A' : 'a'; break;
+                default:            scratch1_[i] = 'N'; break;
+            }
+        }
+        XXH128_hash_t h2 = XXH3_128bits(scratch1_.data(), L);
+        is_forward = (h1.high64 < h2.high64 ||
+                      (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
+        return is_forward ? h1 : h2;
     }
 
     // Count terminal damage markers: T at masked 5' positions + A at masked 3' positions.
@@ -811,15 +943,35 @@ private:
         uint64_t record_idx = 0;
 
         while (reader->read(rec)) {
-            XXH128_hash_t h = compute_hash(rec.seq);
+            bool is_forward = true;
+            XXH128_hash_t h = compute_hash(rec.seq, is_forward);
             SequenceFingerprint fp(h, rec.seq.size());
 
             auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
             if (inserted) {
                 if (profile_.enabled)
                     it->second.damage_score = compute_damage_score(rec.seq, profile_);
-                if (errcor_.enabled)
-                    it->second.seq_id = arena_.append(rec.seq);
+                if (errcor_.enabled) {
+                    if (is_forward) {
+                        it->second.seq_id = arena_.append(rec.seq);
+                    } else {
+                        // Store in canonical orientation so Phase 3 comparisons are correct.
+                        // Compute the unmasked revcomp into rc_buf_.
+                        int L = static_cast<int>(rec.seq.size());
+                        if (rc_buf_.size() < static_cast<size_t>(L)) rc_buf_.resize(L);
+                        for (int i = 0; i < L; ++i) {
+                            unsigned char c = static_cast<unsigned char>(rec.seq[L - 1 - i]);
+                            switch (c) {
+                                case 'A': case 'a': rc_buf_[i] = 'T'; break;
+                                case 'C': case 'c': rc_buf_[i] = 'G'; break;
+                                case 'G': case 'g': rc_buf_[i] = 'C'; break;
+                                case 'T': case 't': rc_buf_[i] = 'A'; break;
+                                default:            rc_buf_[i] = 'N'; break;
+                            }
+                        }
+                        it->second.seq_id = arena_.append_chars(rc_buf_.data(), L);
+                    }
+                }
             } else {
                 it->second.count++;
                 // Maximize the ancient damage signal in the output: when a new read
@@ -852,17 +1004,19 @@ private:
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
     }
 
-    // Phase 3: absorb PCR error duplicates.
-    // A cluster C (count <= max_count) is absorbed into parent P
-    // (count >= ratio*C.count) if their sequences differ by at most 1
-    // substitution OUTSIDE the damage zone.
+    // Phase 3: parent-centric mismatch pattern detection.
+    // Indexes sequences with count > min_parent_count as parents, then for each
+    // potential child (count <= min_parent_count) finds all H=1 parent neighbours.
+    // A child is absorbed unless the mismatch pattern is recurrent (SNP veto):
+    //   sig_count_weighted >= snp_min_count AND
+    //   sig_count_weighted / parent_count >= snp_threshold.
     void phase3_error_correct() {
         if (arena_.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("Phase 3: arena size exceeds uint32_t range");
         const uint32_t N = static_cast<uint32_t>(arena_.size());
         if (N == 0) return;
 
-        // Trailing padding byte for safe unaligned extraction in extract_packed_part.
+        // Trailing padding for safe extraction in extract_packed_part
         arena_.packed.push_back(0);
 
         is_error_.assign(N, false);
@@ -871,44 +1025,14 @@ private:
         for (const auto& [fp, entry] : index_)
             id_count[entry.seq_id] = entry.count;
 
-        // Adaptive child ceiling: when PCR model is active, raise the pre-filter
-        // so that sequences whose count is explained by a large parent's error rate
-        // are also evaluated as potential children.
-        // child_prefilter = max(static max_count, ceil(max_parent_count × phi×D / 3))
-        uint64_t child_prefilter = errcor_.max_count;
-        if (errcor_.pcr_rate > 0.0) {
-            uint64_t max_parent = 0;
-            for (uint32_t id = 0; id < N; ++id)
-                if (id_count[id] > errcor_.max_count)
-                    max_parent = std::max(max_parent, id_count[id]);
-            if (max_parent > 0) {
-                uint64_t adaptive = static_cast<uint64_t>(
-                    std::ceil(static_cast<double>(max_parent) * errcor_.pcr_rate / 3.0));
-                child_prefilter = std::max(child_prefilter, adaptive);
-                if (adaptive > errcor_.max_count)
-                    log_info("Phase 3: adaptive child ceiling = " +
-                             std::to_string(child_prefilter) +
-                             " (PCR model: max_parent=" + std::to_string(max_parent) +
-                             " × " + std::to_string(errcor_.pcr_rate) + "/3)");
-            }
-        }
-
-        struct LenShard { std::array<FlatPairIndex, 3> pi; };
-
-        // Scratch buffer for packed interior parts before hashing (≤ (ilen/4)+3 bytes).
+        // Scratch for packed interior hashing
         std::vector<uint8_t> scratch;
         scratch.reserve(65535);
+
         struct InteriorLayout {
-            int  k5      = 0;
-            int  ilen    = 0;
-            int  s0      = 0;
-            int  s1      = 0;
-            int  s2      = 0;
-            int  nb0     = 0;  // packed bytes per part ((s+3)/4)
-            int  nb1     = 0;
-            int  nb2     = 0;
-            int  nbytes  = 0;  // nb0+nb1+nb2
-            bool ready   = false;
+            int  k5 = 0, ilen = 0, s0 = 0, s1 = 0, s2 = 0;
+            int  nb0 = 0, nb1 = 0, nb2 = 0, nbytes = 0;
+            bool ready = false;
         };
         std::vector<InteriorLayout> layout_cache(65536);
         auto get_layout = [&](int L) -> const InteriorLayout& {
@@ -932,14 +1056,15 @@ private:
         Phase3Stats stats;
         using clk = std::chrono::steady_clock;
 
-        // Phase A: collect (key, id) entries per ilen shard and tag
+        // ── Phase A: index parents (count > min_parent_count) ──────────────
         struct BuildEntry { uint64_t key; uint32_t id; };
         ska::flat_hash_map<int, std::array<std::vector<BuildEntry>, 3>> build_map;
         build_map.reserve(64);
+        struct LenShard { std::array<FlatPairIndex, 3> pi; };
 
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
-            if (id_count[id] <= errcor_.max_count) continue;
+            if (id_count[id] <= errcor_.min_parent_count) continue;
             if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
             const auto& lay = get_layout(L);
@@ -948,13 +1073,13 @@ private:
             auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
                 scratch.resize(lay.nbytes);
-            const uint8_t* psrc_p = arena_.data(id);
-            extract_packed_part(psrc_p, lay.k5,                     lay.s0, scratch.data());
-            extract_packed_part(psrc_p, lay.k5 + lay.s0,            lay.s1, scratch.data() + lay.nb0);
-            extract_packed_part(psrc_p, lay.k5 + lay.s0 + lay.s1,  lay.s2, scratch.data() + lay.nb0 + lay.nb1);
-            uint64_t h0 = XXH3_64bits(scratch.data(),                      lay.nb0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,            lay.nb1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1,  lay.nb2);
+            const uint8_t* psrc = arena_.data(id);
+            extract_packed_part(psrc, lay.k5,                    lay.s0, scratch.data());
+            extract_packed_part(psrc, lay.k5 + lay.s0,           lay.s1, scratch.data() + lay.nb0);
+            extract_packed_part(psrc, lay.k5 + lay.s0 + lay.s1, lay.s2, scratch.data() + lay.nb0 + lay.nb1);
+            uint64_t h0 = XXH3_64bits(scratch.data(),                     lay.nb0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,           lay.nb1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1, lay.nb2);
             auto t1 = clk::now();
 
             auto& entries = build_map[lay.ilen];
@@ -969,9 +1094,9 @@ private:
         }
         stats.parents_indexed = n_parents;
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
-                 " parent sequences (count>" + std::to_string(errcor_.max_count) + ")");
+                 " parent sequences (count>" + std::to_string(errcor_.min_parent_count) + ")");
 
-        // Phase B: sort and build CSR per shard per tag
+        // Build CSR per shard per tag
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(build_map.size());
         for (auto& [ilen, tag_entries] : build_map) {
@@ -980,29 +1105,25 @@ private:
                 auto& ev = tag_entries[t];
                 std::sort(ev.begin(), ev.end(),
                           [](const BuildEntry& a, const BuildEntry& b){ return a.key < b.key; });
-
                 auto& pi = sh.pi[t];
                 size_t i = 0;
                 pi.offsets.push_back(0);
                 while (i < ev.size()) {
                     uint64_t k = ev[i].key;
                     pi.keys.push_back(k);
-                    uint32_t count = 0;
+                    uint32_t cnt = 0;
                     while (i < ev.size() && ev[i].key == k) {
-                        if (count < errcor_.bucket_cap) {
-                            pi.ids.push_back(ev[i].id);
-                            count++;
-                        } else {
-                            stats.cap_fires++;
-                        }
+                        if (cnt < errcor_.bucket_cap) { pi.ids.push_back(ev[i].id); cnt++; }
+                        else { stats.cap_fires++; }
                         i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
                 }
             }
         }
+        build_map.clear();  // free memory before allocating ChildMismatch vector
 
-        // Bucket-size histogram
+        // Bucket histogram
         std::array<uint64_t, 8> bhist{};
         for (const auto& [ilen, sh] : shards)
             for (const auto& pi : sh.pi)
@@ -1015,8 +1136,12 @@ private:
         for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
         log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
+        // ── Phase B1: collect ChildMismatch records ─────────────────────────
+        std::vector<ChildMismatch> mismatches;
+        mismatches.reserve(std::min(static_cast<size_t>(N) * 2, static_cast<size_t>(1 << 24)));
+
         for (uint32_t cid = 0; cid < N; ++cid) {
-            if (id_count[cid] > child_prefilter) continue;
+            if (id_count[cid] > errcor_.min_parent_count) continue;  // not a child
             if (is_error_[cid]) continue;
             if (!arena_.is_eligible(cid)) continue;
 
@@ -1031,19 +1156,18 @@ private:
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
                 scratch.resize(lay.nbytes);
             const uint8_t* psrc_c = arena_.data(cid);
-            extract_packed_part(psrc_c, lay.k5,                     lay.s0, scratch.data());
-            extract_packed_part(psrc_c, lay.k5 + lay.s0,            lay.s1, scratch.data() + lay.nb0);
-            extract_packed_part(psrc_c, lay.k5 + lay.s0 + lay.s1,  lay.s2, scratch.data() + lay.nb0 + lay.nb1);
-            uint64_t h0 = XXH3_64bits(scratch.data(),                      lay.nb0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,            lay.nb1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1,  lay.nb2);
+            extract_packed_part(psrc_c, lay.k5,                    lay.s0, scratch.data());
+            extract_packed_part(psrc_c, lay.k5 + lay.s0,           lay.s1, scratch.data() + lay.nb0);
+            extract_packed_part(psrc_c, lay.k5 + lay.s0 + lay.s1, lay.s2, scratch.data() + lay.nb0 + lay.nb1);
+            uint64_t h0 = XXH3_64bits(scratch.data(),                     lay.nb0);
+            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,           lay.nb1);
+            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1, lay.nb2);
             auto t1 = clk::now();
             stats.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             stats.children_scanned++;
 
-            // Collect candidates from the three pigeonhole lookups, then deduplicate.
-            // With bucket_cap=64, at most 3×64=192 candidates per child.
+            // Collect unique parent candidates
             uint32_t cand_buf[192];
             uint32_t n_cands = 0;
             auto collect = [&](uint32_t pid) {
@@ -1063,45 +1187,99 @@ private:
                 std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
             stats.total_candidates += n_cands;
 
-            bool absorbed = false;
             const uint8_t* child_packed = arena_.data(cid);
-            for (uint32_t ci = 0; ci < n_cands && !absorbed; ++ci) {
+            auto tc0 = clk::now();
+            for (uint32_t ci = 0; ci < n_cands; ++ci) {
                 uint32_t pid = cand_buf[ci];
-                auto tc0 = clk::now();
-                bool do_absorb = false;
-                do {
-                    if (is_error_[pid]) break;
-                    if (!arena_.is_eligible(pid)) break;
-                    if (arena_.length(pid) != static_cast<uint16_t>(L)) break;
-                    if (static_cast<double>(id_count[pid]) <
-                        errcor_.ratio * id_count[cid]) break;
-                    uint64_t eff_max = errcor_.max_count;
-                    if (errcor_.pcr_rate > 0.0) {
-                        uint64_t adaptive = static_cast<uint64_t>(
-                            std::ceil(static_cast<double>(id_count[pid]) *
-                                      errcor_.pcr_rate / 3.0));
-                        eff_max = std::max(eff_max, adaptive);
+                if (is_error_[pid]) continue;
+                if (!arena_.is_eligible(pid)) continue;
+                if (arena_.length(pid) != static_cast<uint16_t>(L)) continue;
+
+                MismatchInfo mm = packed_find_mismatch(arena_.data(pid), child_packed,
+                                                       lay.k5, lay.ilen, profile_.enabled);
+                if (!mm.found) continue;
+
+                mismatches.push_back({pid, cid, mm.position, mm.base_b, mm.base_a});
+                stats.children_found++;
+            }
+            stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+        }
+
+        log_info("Phase 3 B1: found " + std::to_string(stats.children_found) +
+                 " child-parent pairs from " + std::to_string(stats.children_scanned) + " children scanned");
+
+        // ── Phase B2: sort and apply SNP veto ──────────────────────────────
+        // Sort by parent_id (primary), then mismatch_pos, then alt_base for grouping
+        std::sort(mismatches.begin(), mismatches.end(),
+                  [](const ChildMismatch& a, const ChildMismatch& b) {
+                      if (a.parent_id != b.parent_id) return a.parent_id < b.parent_id;
+                      if (a.mismatch_pos != b.mismatch_pos) return a.mismatch_pos < b.mismatch_pos;
+                      return a.alt_base < b.alt_base;
+                  });
+
+        size_t i = 0;
+        while (i < mismatches.size()) {
+            uint32_t pid = mismatches[i].parent_id;
+            uint64_t parent_count = id_count[pid];
+
+            // Collect all children for this parent
+            size_t parent_start = i;
+            while (i < mismatches.size() && mismatches[i].parent_id == pid) ++i;
+            size_t parent_end = i;
+
+            // Accumulate sig_count per (pos, alt_base) for SNP detection.
+            // Key: mismatch_pos * 4 + alt_base. Entries already sorted by (pos, alt).
+            std::vector<std::pair<uint32_t, uint64_t>> pos_alt_counts;
+            pos_alt_counts.reserve(parent_end - parent_start);
+
+            {
+                size_t j = parent_start;
+                while (j < parent_end) {
+                    uint16_t cur_pos = mismatches[j].mismatch_pos;
+                    uint8_t  cur_alt = mismatches[j].alt_base;
+                    uint32_t key     = static_cast<uint32_t>(cur_pos) * 4 + cur_alt;
+                    uint64_t weight  = 0;
+                    while (j < parent_end && mismatches[j].mismatch_pos == cur_pos &&
+                           mismatches[j].alt_base == cur_alt) {
+                        weight += id_count[mismatches[j].child_id];
+                        ++j;
                     }
-                    if (id_count[cid] > eff_max) break;
-                    if (!packed_should_absorb(arena_.data(pid), child_packed,
-                                              lay.k5, lay.ilen, profile_.enabled))
-                        break;
-                    do_absorb = true;
-                } while (false);
-                stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
-                if (do_absorb) absorbed = true;
+                    pos_alt_counts.push_back({key, weight});
+                }
             }
 
-            if (absorbed) {
-                is_error_[cid] = true;
-                errcor_absorbed_++;
+            // For each child, decide: SNP-protected or absorb
+            for (size_t j = parent_start; j < parent_end; ++j) {
+                const ChildMismatch& cm = mismatches[j];
+                uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4 + cm.alt_base;
+
+                // Find sig_count for this (pos, alt)
+                uint64_t sig = 0;
+                for (const auto& [k, w] : pos_alt_counts) {
+                    if (k == key) { sig = w; break; }
+                }
+
+                bool snp_veto = (sig >= errcor_.snp_min_count) &&
+                                (static_cast<double>(sig) >= errcor_.snp_threshold *
+                                                              static_cast<double>(parent_count));
+
+                if (snp_veto) {
+                    stats.snp_protected++;
+                } else {
+                    if (!is_error_[cm.child_id]) {
+                        is_error_[cm.child_id] = true;
+                        stats.absorbed++;
+                        errcor_absorbed_++;
+                    }
+                }
             }
         }
 
         stats.log();
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
-                 " PCR error sequences (ratio=" + std::to_string(errcor_.ratio) +
-                 ", max-count=" + std::to_string(errcor_.max_count) + ")");
+                 " PCR error sequences (min_parent=" + std::to_string(errcor_.min_parent_count) +
+                 ", snp_threshold=" + std::to_string(errcor_.snp_threshold) +
+                 ", snp_min_count=" + std::to_string(errcor_.snp_min_count) + ")");
     }
 
     void pass2(const std::string& in_path,
@@ -1188,7 +1366,9 @@ private:
 
         if (errcor_.enabled) {
             size_t output = index_.size() - errcor_absorbed_;
-            log_info("PCR error sequences removed: " + std::to_string(errcor_absorbed_));
+            log_info("PCR error sequences removed: " + std::to_string(errcor_absorbed_) +
+                     " (min_parent=" + std::to_string(errcor_.min_parent_count) +
+                     ", snp_threshold=" + std::to_string(errcor_.snp_threshold) + ")");
             log_info("Output sequences: " + std::to_string(output));
             if (index_.size() > 0) {
                 double ecr = 100.0 * errcor_absorbed_ / index_.size();
@@ -1222,6 +1402,7 @@ private:
     // Grown lazily to max sequence length seen; never shrunk.
     mutable std::vector<char> scratch1_;
     mutable std::vector<char> scratch2_;
+    mutable std::vector<char> rc_buf_;  // unmasked revcomp for canonical arena storage
 
     uint64_t total_reads_;
     uint64_t errcor_absorbed_;
@@ -1248,11 +1429,12 @@ static void print_usage(const char* prog) {
         << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
         << "  -h, --help   Show this help\n"
         << "\nPCR error correction (Phase 3 — ON by default):\n"
-        << "  --no-error-correct       Disable PCR error duplicate removal\n"
-        << "  --error-correct          Explicitly enable (already default)\n"
-        << "  --errcor-ratio FLOAT     Min count ratio parent/child (default: 50.0)\n"
-        << "  --errcor-max-count INT   Only absorb clusters with count <= N (default: 5)\n"
-        << "  --errcor-bucket-cap INT  Max pair-key bucket size (default: 64)\n"
+        << "  --no-error-correct           Disable PCR error duplicate removal\n"
+        << "  --error-correct              Explicitly enable (already default)\n"
+        << "  --errcor-min-parent INT      Min count to be indexed as parent (default: 3)\n"
+        << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.05)\n"
+        << "  --errcor-snp-min-count INT   SNP veto: minimum absolute sig_count (default: 2)\n"
+        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64)\n"
         << "\nAncient DNA damage-aware deduplication (OFF by default):\n"
         << "  --damage-auto            Enable damage estimation and masking (Pass 0)\n"
         << "  --no-damage              Explicitly disable (already default)\n"
@@ -1266,7 +1448,7 @@ static void print_usage(const char* prog) {
         << "  --damage-lambda3 FLOAT   Set lambda for 3' end only\n"
         << "  --damage-bg FLOAT        Background deamination rate (default: 0.02)\n"
         << "  --mask-threshold FLOAT   Mask positions with excess damage > T (default: 0.05)\n"
-        << "  --pcr-cycles INT         Number of PCR cycles\n"
+        << "  --pcr-cycles INT         Number of PCR cycles (informational; for log only)\n"
         << "  --pcr-efficiency FLOAT   PCR efficiency per cycle, 0-1 (default: 1.0)\n"
         << "  --pcr-error-rate FLOAT   Error rate sub/base/doubling (default: 5.3e-7 = Q5)\n"
         << "\nMemory: ~16 bytes per input read + 2-bit seq arena (~1 byte/4 bp) for error correction.\n";
@@ -1316,10 +1498,12 @@ int derep_main(int argc, char** argv) {
             errcor.enabled = true;
         } else if (arg == "--no-error-correct") {
             errcor.enabled = false;
-        } else if (arg == "--errcor-ratio" && i + 1 < argc) {
-            errcor.ratio = std::stod(argv[++i]);
-        } else if (arg == "--errcor-max-count" && i + 1 < argc) {
-            errcor.max_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--errcor-min-parent" && i + 1 < argc) {
+            errcor.min_parent_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--errcor-snp-threshold" && i + 1 < argc) {
+            errcor.snp_threshold = std::stod(argv[++i]);
+        } else if (arg == "--errcor-snp-min-count" && i + 1 < argc) {
+            errcor.snp_min_count = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
             errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--library-type" && i + 1 < argc) {
@@ -1379,10 +1563,6 @@ int derep_main(int argc, char** argv) {
     }
     if (pcr_cycles < 0) {
         std::cerr << "Error: --pcr-cycles must be >= 0, got " << pcr_cycles << "\n";
-        return 1;
-    }
-    if (errcor.enabled && errcor.ratio <= 0.0) {
-        std::cerr << "Error: --errcor-ratio must be > 0, got " << errcor.ratio << "\n";
         return 1;
     }
     if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
