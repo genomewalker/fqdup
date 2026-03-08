@@ -1583,6 +1583,7 @@ private:
                     if (arena_.length(pid) != static_cast<uint16_t>(L)) continue;
 
                     uint32_t eff_pid  = is_error_[pid] ? find_root_chain(pid) : pid;
+                    if (eff_pid == cid) continue;  // pid already absorbed into cid — skip self
                     // Boundary check uses accumulated mass (includes absorbed children),
                     // matching SWARM's OTU mass criterion for fastidious grafting.
                     if (acc_count[eff_pid] < boundary) continue;
