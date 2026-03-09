@@ -15,7 +15,7 @@ deaminate to uracil over time, producing C→T substitutions at the 5' end and
 G→A substitutions at the 3' end (the complement on the reverse strand). The
 rate is highest at the terminal positions and decays exponentially toward the
 interior. Two reads from the same original molecule may therefore differ at
-position 1 — one carrying the original C, the other carrying a deaminated T —
+position 1, one carrying the original C, the other carrying a deaminated T -
 and an exact-match deduplicator counts them as distinct. The true unique molecule
 count is inflated.
 
@@ -61,12 +61,12 @@ alone is sufficient.
 
 The upstream steps that produce fqdup's inputs are:
 
-1. **fastp merge** — collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
-2. **`fqdup extend`** — extend each merged read outward from both ends using the built-in de Bruijn graph assembler, recovering sequence that may be present in other reads in the library
+1. **fastp merge**, collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
+2. **`fqdup extend`**, extend each merged read outward from both ends using the built-in de Bruijn graph assembler, recovering sequence that may be present in other reads in the library
 
 This produces two files for the same set of molecules:
-- **merged** (`-n`): the original fastp-merged read — actual ancient DNA sequence
-- **extended** (`-e`): the same read after `fqdup extend` assembly — longer, assembly-assisted fingerprint
+- **merged** (`-n`): the original fastp-merged read, actual ancient DNA sequence
+- **extended** (`-e`): the same read after `fqdup extend` assembly, longer, assembly-assisted fingerprint
 
 fqdup then runs in three steps:
 
@@ -81,7 +81,7 @@ graph                               fingerprint; keeps          (biological dedu
 ```
 
 `derep_pairs` deduplicates using the `fqdup extend`-assembled sequence as the
-cluster fingerprint — it is longer and more unique than the merged read alone,
+cluster fingerprint, it is longer and more unique than the merged read alone,
 reducing false collisions between reads from different molecules. The
 representative kept is the pair with the longest merged read (most original
 ancient DNA sequence).
@@ -91,7 +91,7 @@ collapses reads that differ only due to deamination; Phase 3 absorbs low-count
 clusters that differ from a high-count cluster by a single non-damage substitution.
 
 Any residual duplicates `derep` sees are merged reads that were identical but whose
-extensions diverged slightly — `derep_pairs` kept both; `derep` collapses
+extensions diverged slightly, `derep_pairs` kept both; `derep` collapses
 them on the original merged sequence.
 
 ---
@@ -103,7 +103,7 @@ them on the original merged sequence.
 | [[Installation]] | Build from source, dependencies |
 | [[Usage]] | Tutorials and options for all subcommands |
 | [[Extend]] | fqdup extend: de Bruijn graph extension algorithm, CLI, benchmarks |
-| [[Damage]] | fqdup damage: standalone damage profiler — inspect d_max, library type, mask positions |
+| [[Damage]] | fqdup damage: standalone damage profiler, inspect d_max, library type, mask positions |
 | [[Algorithm]] | Internal mechanics of sort, derep_pairs, and derep |
 | [[Damage-Aware-Deduplication]] | The deamination model, empirical masking, and symmetry |
 | [[PCR-Error-Correction]] | Phase 3: 3-way pigeonhole Hamming search |

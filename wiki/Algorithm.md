@@ -5,14 +5,14 @@
 `fqdup extend` builds a self-referential de Bruijn k-mer graph from the merged
 reads and extends each read outward from both ends. It runs three passes:
 
-**Pass 0 — damage estimation.** Samples the first 500k reads (configurable via
+**Pass 0: damage estimation.** Samples the first 500k reads (configurable via
 `--damage-sample`) to fit an exponential decay model to C→T and G→A frequencies.
 Identifies terminal positions where excess damage exceeds `--mask-threshold`
 (default 0.05). These positions are masked in Pass 1 to exclude damaged k-mers
 from the graph. Pass 0 is skipped when `--no-damage` or `--mask-5`/`--mask-3` are
 given.
 
-**Pass 1 — k-mer graph construction.** Streams all reads and inserts every
+**Pass 1: k-mer graph construction.** Streams all reads and inserts every
 interior k-mer (excluding masked terminal positions) into an oriented k-mer
 store. Oriented storage: for each canonical k-mer K, both K and RC(K) are
 inserted so that left-extension is equivalent to a right-walk on the reverse
@@ -20,7 +20,7 @@ complement. This avoids separate forward/reverse traversal logic.
 
 Key properties of the graph:
 - **Exact 2-bit k-mer keys** (no hashing, no collision risk). k≤31 fits in a
-  single `uint64_t`. Two separate stores are NOT kept — one canonical store
+  single `uint64_t`. Two separate stores are NOT kept, one canonical store
   covers all orientations.
 - **Low-complexity filter**: k-mers with fewer than 3 distinct 2-mers (e.g.
   homopolymers) are discarded. This prevents spurious extensions in repetitive
@@ -34,7 +34,7 @@ Key properties of the graph:
 - **Per-shard prefix index**: 2^12 bucket directory reduces binary search
   depth from 19 to 7 during Pass 2 lookups.
 
-**Pass 2 — extension and output.** Extends each read via a 3-stage pipeline:
+**Pass 2: extension and output.** Extends each read via a 3-stage pipeline:
 reader → work queue → N worker threads → done queue → writer with reorder
 buffer (to preserve input order).
 
@@ -48,7 +48,7 @@ Each worker applies the following algorithm to one read:
 3. Repeat in the reverse direction for left extension (implemented as a
    right-walk on the reverse complement).
 4. n_skip logic: anchoring at position p re-derives L−(p+k) in-read bases
-   before producing new sequence — anchoring never extends past the read end.
+   before producing new sequence, anchoring never extends past the read end.
 5. Reads with no clean interior k-mer are written unchanged.
 
 Added bases receive quality `#` (Phred 2). Original base qualities are
@@ -64,7 +64,7 @@ parallel `std::sort` and written to disk. Once all chunks are flushed, a
 priority-queue k-way merge produces the single sorted output stream.
 
 Chunks are gzip-compressed on disk by default. With `--fast`, chunks stay
-uncompressed — roughly 3× faster I/O at the cost of 3× more temporary disk
+uncompressed, roughly 3× faster I/O at the cost of 3× more temporary disk
 space. For a 25 M-read library on NFS, the sort completes in about 20 seconds
 with `--fast`; without it, closer to 60 seconds.
 
@@ -79,10 +79,10 @@ IDs with numeric suffixes.
 `derep_pairs` is a two-pass algorithm over two sorted FASTQ files read in
 lockstep:
 
-- **`-n` (merged)**: fastp-merged reads — the original R1+R2 collapsed
+- **`-n` (merged)**: fastp-merged reads, the original R1+R2 collapsed
   sequence, representing the actual ancient DNA molecule
 - **`-e` (extended)**: the same reads after `fqdup extend` de Bruijn graph
-  extension from both ends — longer, assembly-assisted sequences used as
+  extension from both ends, longer, assembly-assisted sequences used as
   deduplication fingerprints
 
 The extended file drives the hash. Using the `fqdup extend`-assembled sequence
@@ -95,8 +95,8 @@ pair, the extended read's sequence is hashed to a canonical fingerprint
 a new index entry is created recording the current record position and the
 merged read's length. If it already exists, the count is incremented and, if
 the current merged read is longer than the stored one, the representative is
-updated to this pair. The representative selection rule — longest merged mate
-— preserves the most original ancient DNA sequence.
+updated to this pair. The representative selection rule, longest merged mate
+- preserves the most original ancient DNA sequence.
 
 **Pass 2** streams both files a second time. For each pair, if its record
 position matches the representative stored in the index, it is written to the
@@ -107,14 +107,14 @@ structural step.
 
 Memory: the index has one entry per unique cluster, approximately 40 bytes each
 (20-byte IndexEntry plus hash-map overhead). For a 25 M-pair library with 78%
-duplication, that is about 5.6 M entries — roughly 220 MB.
+duplication, that is about 5.6 M entries, roughly 220 MB.
 
 ---
 
 ## fqdup derep
 
-`derep` takes a single sorted FASTQ — in the standard pipeline, the merged
-read output of `derep_pairs` — and runs up to four phases depending on which
+`derep` takes a single sorted FASTQ, in the standard pipeline, the merged
+read output of `derep_pairs`, and runs up to four phases depending on which
 options are active.
 
 **Pass 0** (with `--damage-auto`) scans all reads to estimate the ancient DNA
@@ -128,7 +128,7 @@ Lambda is clamped to [0.05, 0.5].
 
 After fitting, positions where the observed damage excess exceeds
 `--mask-threshold` are stored in a boolean array. All subsequent hashing uses
-this precomputed array — no exponential evaluation at hash time.
+this precomputed array, no exponential evaluation at hash time.
 
 **Pass 1** streams the input and builds the index. For each read, the sequence
 is optionally masked (neutral bytes at C/T in masked 5' positions, G/A in
@@ -156,7 +156,7 @@ canonical_hash(seq) = min(XXH3_128(seq), XXH3_128(revcomp(seq)))
 ```
 
 Taking the minimum of the two 128-bit hashes means that a molecule sequenced
-from either strand maps to the same fingerprint — forward and reverse-complement
+from either strand maps to the same fingerprint, forward and reverse-complement
 reads collapse into the same cluster. The fingerprint key also includes the
 sequence length to reduce false collisions between reads of different lengths
 that happen to share a hash value. Using the full 128-bit hash reduces the
@@ -180,7 +180,7 @@ duplication rates this makes a substantial difference.
 | SeqArena (default on) | ~0.25 × L_avg bytes × N_unique | ~80 MB (3.5 M × 91 bp) |
 
 The SeqArena uses 2-bit packed encoding (A=00, C=01, G=10, T=11), storing
-each base in 2 bits rather than 8 — approximately 4× more compact than ASCII.
+each base in 2 bits rather than 8, approximately 4× more compact than ASCII.
 Sequences containing ambiguous bases (N) are stored but flagged ineligible;
 they participate in deduplication but are skipped during Phase 3 error correction.
 Use `--no-error-correct` to skip Phase 3 and avoid allocating the arena entirely.
