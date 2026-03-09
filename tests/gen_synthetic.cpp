@@ -86,6 +86,19 @@
 //   Output mode:
 //   --dup-pair         Each molecule → 2 independently-processed reads
 //                      (dedup correctness test)
+//   --trim-sd   N      After all processing, randomly trim [0,N] bases from 3' end
+//                      per read (models QC quality/adapter trimming producing variable-
+//                      length copies of the same molecule).  Clamped at min_len.
+//
+//   SNP-stress modes (emit two or more alleles at Hamming distance 1):
+//   --snp-pair         Two alleles differing at one position
+//   --snp-chain        Three alleles in chain: A–B H=1, B–C H=1, A–C H=2
+//   --snp-star         Three alleles in star:  A–B H=1, A–C H=1, B–C H=2
+//   --snp-4way         Four alleles at same position (all 6 pairs H=1)
+//   --allele-a N       Copy count for allele A    (default: 100)
+//   --allele-b N       Copy count for allele B    (default: 100)
+//   --allele-c N       Copy count for allele C    (default: 100, chain/star only)
+//   --allele-each N    Copy count for all alleles (--snp-4way; default: 100)
 
 #include <algorithm>
 #include <cmath>
@@ -290,6 +303,14 @@ int main(int argc, char** argv) {
     bool     pcr_thermo = false;
     uint64_t seed       = 42;
     bool     dup_pair   = false;
+    int      trim_sd    = 0;    // per-read 3' QC trim: uniform in [0, trim_sd]
+
+    // SNP stress modes
+    enum class SnpMode { None, Pair, Chain, Star, FourWay } snp_mode = SnpMode::None;
+    int      allele_a   = 100;
+    int      allele_b   = 100;
+    int      allele_c   = 100;
+    int      allele_each = 100;
 
     for (int i = 1; i < argc; ++i) {
         auto d = [&]{ return std::stod(argv[++i]); };
@@ -313,7 +334,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(a,"--pcr-rate"))   pcr_rate   = d();
         else if (!strcmp(a,"--ox-rate"))    ox_rate    = d();
         else if (!strcmp(a,"--seed"))       seed       = (uint64_t)n();
-        else if (!strcmp(a,"--dup-pair"))   dup_pair   = true;
+        else if (!strcmp(a,"--dup-pair"))    dup_pair    = true;
+        else if (!strcmp(a,"--trim-sd"))     trim_sd     = n();
+        else if (!strcmp(a,"--snp-pair"))   snp_mode    = SnpMode::Pair;
+        else if (!strcmp(a,"--snp-chain"))  snp_mode    = SnpMode::Chain;
+        else if (!strcmp(a,"--snp-star"))   snp_mode    = SnpMode::Star;
+        else if (!strcmp(a,"--snp-4way"))   snp_mode    = SnpMode::FourWay;
+        else if (!strcmp(a,"--allele-a"))   allele_a    = n();
+        else if (!strcmp(a,"--allele-b"))   allele_b    = n();
+        else if (!strcmp(a,"--allele-c"))   allele_c    = n();
+        else if (!strcmp(a,"--allele-each")) allele_each = n();
         else if (!strcmp(a,"--polymerase")) {
             const char* p = argv[++i];
             if      (!strcmp(p,"q5"))      epsilon = 5.3e-7;
@@ -378,9 +408,99 @@ int main(int argc, char** argv) {
         std::cerr << " mu_thermo=" << mu_thermo;
     if (ox_rate > 0.0)
         std::cerr << " ox_rate=" << ox_rate;
+    if (trim_sd > 0)
+        std::cerr << " trim_sd=" << trim_sd;
     std::cerr << '\n';
 
     PCG32 rng(seed);
+
+    // -------------------------------------------------------------------------
+    // SNP stress modes — emit allele sets and exit early
+    // -------------------------------------------------------------------------
+    if (snp_mode != SnpMode::None) {
+        // Generate one base sequence of read_len
+        std::string base = random_seq(read_len, rng);
+        const std::string qual(read_len, 'I');
+
+        // Substitution: cycle through non-original bases deterministically
+        auto alt_base = [](char c) -> char {
+            switch (c) {
+                case 'A': return 'C';
+                case 'C': return 'G';
+                case 'G': return 'T';
+                default:  return 'A';
+            }
+        };
+
+        // Mutate base at position p
+        auto mutate = [&](const std::string& s, int p) -> std::string {
+            std::string r = s;
+            r[p] = alt_base(s[p]);
+            return r;
+        };
+
+        auto emit = [&](const std::string& seq, const char* label, int count) {
+            for (int i = 0; i < count; ++i) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "@%s_%05d", label, i);
+                std::cout << name << '\n' << seq << '\n' << '+' << '\n' << qual << '\n';
+            }
+        };
+
+        const int mid  = read_len / 2;
+        const int mid1 = mid - 3;   // chain/star position 1
+        const int mid2 = mid + 3;   // chain/star position 2
+
+        if (snp_mode == SnpMode::Pair) {
+            // A and B differ at position mid
+            std::string seqA = base;
+            std::string seqB = mutate(base, mid);
+            std::cerr << "gen_synthetic snp-pair: allele_a=" << allele_a
+                      << " allele_b=" << allele_b
+                      << " read_len=" << read_len << " snp_pos=" << mid << '\n';
+            emit(seqA, "molA", allele_a);
+            emit(seqB, "molB", allele_b);
+
+        } else if (snp_mode == SnpMode::Chain) {
+            // A–B H=1 (pos mid1), B–C H=1 (pos mid2), A–C H=2
+            std::string seqA = base;
+            std::string seqB = mutate(seqA, mid1);
+            std::string seqC = mutate(seqB, mid2);
+            std::cerr << "gen_synthetic snp-chain: allele_a=" << allele_a
+                      << " allele_b=" << allele_b << " allele_c=" << allele_c
+                      << " read_len=" << read_len
+                      << " pos1=" << mid1 << " pos2=" << mid2 << '\n';
+            emit(seqA, "molA", allele_a);
+            emit(seqB, "molB", allele_b);
+            emit(seqC, "molC", allele_c);
+
+        } else if (snp_mode == SnpMode::Star) {
+            // A–B H=1 (pos mid1), A–C H=1 (pos mid2), B–C H=2
+            std::string seqA = base;
+            std::string seqB = mutate(seqA, mid1);
+            std::string seqC = mutate(seqA, mid2);
+            std::cerr << "gen_synthetic snp-star: allele_a=" << allele_a
+                      << " allele_b=" << allele_b << " allele_c=" << allele_c
+                      << " read_len=" << read_len
+                      << " pos1=" << mid1 << " pos2=" << mid2 << '\n';
+            emit(seqA, "molA", allele_a);
+            emit(seqB, "molB", allele_b);
+            emit(seqC, "molC", allele_c);
+
+        } else {  // FourWay: A/C/G/T at position mid, all 6 pairs H=1
+            std::string seqA = base; seqA[mid] = 'A';
+            std::string seqC = base; seqC[mid] = 'C';
+            std::string seqG = base; seqG[mid] = 'G';
+            std::string seqT = base; seqT[mid] = 'T';
+            std::cerr << "gen_synthetic snp-4way: allele_each=" << allele_each
+                      << " read_len=" << read_len << " snp_pos=" << mid << '\n';
+            emit(seqA, "molA", allele_each);
+            emit(seqC, "molC", allele_each);
+            emit(seqG, "molG", allele_each);
+            emit(seqT, "molT", allele_each);
+        }
+        return 0;
+    }
 
     std::vector<std::string> molecules(n_unique);
     for (auto& m : molecules) m = random_seq(draw_length(rng, read_len, len_sd, min_len, max_len), rng);
@@ -403,6 +523,12 @@ int main(int argc, char** argv) {
         // Ancient-DNA terminal deamination (independent per read)
         if (!no_damage)
             seq = apply_damage(seq, dmax5, lambda5, dmax3, lambda3, rng);
+        // QC trimming simulation: trim [0, trim_sd] bases from 3' end per read
+        if (trim_sd > 0) {
+            int trim = (int)(rng.next() % (unsigned)(trim_sd + 1));
+            int newlen = std::max(min_len, (int)seq.size() - trim);
+            seq.resize(newlen);
+        }
         return seq;
     };
 

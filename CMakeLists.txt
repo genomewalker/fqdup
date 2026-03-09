@@ -28,6 +28,15 @@ else()
     message(STATUS "ISA-L not found - using zlib (slower decompression)")
 endif()
 
+# htslib (optional - bgzf multi-threaded compressed output)
+find_library(HTS_LIB NAMES hts)
+find_path(HTS_INCLUDE_DIR htslib/bgzf.h)
+if(HTS_LIB AND HTS_INCLUDE_DIR)
+    message(STATUS "Found htslib: ${HTS_LIB} (bgzf multi-threaded output enabled)")
+else()
+    message(STATUS "htslib not found - using single-threaded zlib output")
+endif()
+
 # jemalloc (optional - better memory release to OS)
 find_library(JEMALLOC_LIB NAMES jemalloc)
 if(JEMALLOC_LIB)
@@ -71,12 +80,25 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libdart_damage)
 
+# BBHash (header-only MPHF — O(1) pass2 lookup for extend, ~3.7 bits/key)
+FetchContent_Declare(
+    bbhash
+    GIT_REPOSITORY https://github.com/rizkg/BBHash.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+    UPDATE_DISCONNECTED TRUE
+)
+FetchContent_MakeAvailable(bbhash)
+
 # Build fqdup
 add_executable(fqdup
     src/main.cpp
     src/sort.cpp
+    src/extend.cpp
     src/derep_pairs.cpp
     src/derep.cpp
+    src/damage.cpp
+    src/damage_profile.cpp
     src/fastq_io_backend.cpp
     src/logger.cpp
 )
@@ -84,6 +106,7 @@ add_executable(fqdup
 target_include_directories(fqdup PRIVATE
     ${XXHASH_INCLUDE_DIR}
     ${flat_hash_map_SOURCE_DIR}
+    ${bbhash_SOURCE_DIR}
 )
 
 target_link_libraries(fqdup PRIVATE
@@ -93,11 +116,17 @@ target_link_libraries(fqdup PRIVATE
     rapidgzip::rapidgzip
     dart-damage
 )
-target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP)
+target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP HAVE_BBHASH)
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
     target_include_directories(fqdup PRIVATE ${ISAL_INCLUDE_DIR})
     target_link_libraries(fqdup PRIVATE ${ISAL_LIB})
+endif()
+
+if(HTS_LIB AND HTS_INCLUDE_DIR)
+    target_include_directories(fqdup PRIVATE ${HTS_INCLUDE_DIR})
+    target_link_libraries(fqdup PRIVATE ${HTS_LIB})
+    target_compile_definitions(fqdup PRIVATE HAVE_BGZF)
 endif()
 
 if(JEMALLOC_LIB)
@@ -110,6 +139,9 @@ enable_testing()
 add_executable(gen_synthetic tests/gen_synthetic.cpp)
 target_compile_options(gen_synthetic PRIVATE -O2)
 
+add_executable(gen_genome_frags tests/gen_genome_frags.cpp)
+target_compile_options(gen_genome_frags PRIVATE -O2)
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
     add_test(NAME smoke
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh $<TARGET_FILE:fqdup>)
@@ -119,4 +151,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh)
     add_test(NAME damage_auto
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh
                      $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh)
+    add_test(NAME extend_dmgcor
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_genome_frags>)
 endif()
