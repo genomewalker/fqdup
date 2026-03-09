@@ -9,7 +9,7 @@ Ancient DNA deamination turns one original molecule into a cloud of C→T/G→A
 sequence variants, so exact-sequence dedup splits true duplicates and inflates
 unique read counts. `fqdup` collapses those damage variants into a single cluster
 with damage-aware hashing, then optionally merges PCR-error variants with a fast
-mismatch-tolerant search — so downstream complexity metrics reflect molecules,
+mismatch-tolerant search, so downstream complexity metrics reflect molecules,
 not damage patterns.
 
 ## How it works
@@ -17,34 +17,34 @@ not damage patterns.
 `fqdup` runs three steps in order, each targeting a distinct layer of the
 duplication problem:
 
-**1. `fqdup extend`** — extend each merged read outward from both ends using a
+**1. `fqdup extend`**: extend each merged read outward from both ends using a
 built-in de Bruijn graph assembler. The extended reads serve as deduplication
 fingerprints; the original merged reads remain the primary output. Extension
 also solves QC-trim length variation: PCR copies of the same molecule trimmed
 to different lengths by quality/adapter trimming produce different raw sequences
 but extend to the same shared interior k-mers, collapsing correctly. Ancient
-DNA terminal damage is accounted for automatically — damaged terminal positions
+DNA terminal damage is accounted for automatically, damaged terminal positions
 are excluded from k-mer graph construction so they do not create spurious
 branches.
 
-**2. `fqdup sort`** — sort both input files by read ID. Required by both
+**2. `fqdup sort`**: sort both input files by read ID. Required by both
 dedup steps.
 
-**3. `fqdup derep_pairs`** — structural deduplication of paired reads.
+**3. `fqdup derep_pairs`**: structural deduplication of paired reads.
 Uses the `fqdup extend`-assembled sequence as the cluster fingerprint rather
 than the raw merged read. Short aDNA fragments that share a merged-read core
 often diverge in the assembled extension, so false collisions between different
 molecules are greatly reduced. The representative kept per cluster is the pair
 with the longest merged read.
 
-**4. `fqdup derep`** — biological deduplication of the merged-read output.
+**4. `fqdup derep`**: biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
 
 - **PCR error correction (Phase 3, default: on).** After the index is built,
   a 3-way pigeonhole Hamming search finds clusters with low count that differ
   from a high-count cluster by exactly one interior substitution. These are PCR
   copying errors and are removed. Crucially, C↔T and G↔A mismatches are *never*
-  absorbed — they are indistinguishable from damage signal and are always kept.
+  absorbed, they are indistinguishable from damage signal and are always kept.
 
 - **Damage-aware hashing (default: off).** When enabled with `--damage-auto`,
   terminal positions where the observed C→T or G→A rate exceeds a threshold are
@@ -58,7 +58,7 @@ Two mechanisms, both on by default:
   than downstream damage estimation.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
-error correction is the only relevant step — `--no-damage` is already the
+error correction is the only relevant step, `--no-damage` is already the
 default.
 
 ---
@@ -75,7 +75,7 @@ fqdup extend -i merged.fq.gz -o extended.fq.gz
 fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
 fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
 
-# 3. Paired dedup — one representative pair per cluster
+# 3. Paired dedup: one representative pair per cluster
 fqdup derep_pairs \
   -n merged.sorted.fq.gz \
   -e extended.sorted.fq.gz \
@@ -133,7 +133,7 @@ bash tests/smoke.sh $(pwd)/build/fqdup
 # → OK: fqdup smoke test passed
 ```
 
-> Pass the binary as an absolute path — the test script changes directory internally.
+> Pass the binary as an absolute path, the test script changes directory internally.
 
 ---
 
@@ -229,7 +229,7 @@ Optional:
 ```
 
 PCR error correction is **on by default**. Damage-aware hashing is **off by
-default** — enable it with `--damage-auto` only when downstream tools do not
+default**, enable it with `--damage-auto` only when downstream tools do not
 run damage analysis on the fqdup output.
 
 #### Damage-aware hashing (default: off)
@@ -249,10 +249,10 @@ run damage analysis on the fqdup output.
 ```
 
 If both `d_max_5` and `d_max_3` are below 0.02 after estimation, damage is
-treated as negligible and standard exact hashing is used — no user intervention
+treated as negligible and standard exact hashing is used, no user intervention
 required.
 
-#### PCR error correction — Phase 3 (default: on)
+#### PCR error correction: Phase 3 (default: on)
 
 ```
   --no-error-correct      Disable Phase 3
@@ -264,7 +264,7 @@ required.
   PCR model (for adaptive thresholds):
   --pcr-cycles      INT   Number of PCR cycles
   --pcr-efficiency  FLOAT Amplification efficiency per cycle, 0–1 (default: 1.0)
-  --pcr-error-rate  FLOAT Sub/base/doubling — Q5: 5.3e-7 (default),
+  --pcr-error-rate  FLOAT Sub/base/doubling, Q5: 5.3e-7 (default),
                           Phusion: 3.9e-6, Taq: 1.5e-4
 ```
 
@@ -297,7 +297,7 @@ required.
 
 ### fqdup extend
 
-Benchmarked on DS4 — 198 M reads, 16 threads, dandycomp02fl:
+Benchmarked on DS4, 198 M reads, 16 threads, dandycomp02fl:
 
 | Metric | Value |
 |--------|-------|
@@ -310,7 +310,7 @@ Comparison: Tadpole achieves 14.75% extension on the same dataset in ~5 min; `fq
 
 ### fqdup derep_pairs / derep
 
-Benchmarked on `a88af16f35` — 25.8 M fastp-merged reads, ~91 bp mean length,
+Benchmarked on `a88af16f35`, 25.8 M fastp-merged reads, ~91 bp mean length,
 `d_max_5 ≈ 0.19`, NFS-mounted storage:
 
 | Step | Unique clusters | Wall time |
@@ -351,7 +351,7 @@ fqdup derep:       [Pass 0] stride-sample → fit damage model (--damage-auto)
                    [Pass 2] stream → write unique representatives
 ```
 
-**Canonical hash:** `min(XXH3_128(seq), XXH3_128(revcomp(seq)))` — collapses
+**Canonical hash:** `min(XXH3_128(seq), XXH3_128(revcomp(seq)))`: collapses
 forward and reverse-complement reads into the same cluster. Collision probability
 ~3×10⁻²⁴ at 100 M reads.
 

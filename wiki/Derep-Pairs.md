@@ -13,7 +13,7 @@ duplicates that differ only because one was captured in a slightly shifted
 window extend to the same flanking sequence and collapse correctly.
 
 The representative kept per cluster is the pair with the **longest merged
-read** — preserving the most original ancient DNA sequence for downstream
+read**, preserving the most original ancient DNA sequence for downstream
 analysis.
 
 `fqdup derep_pairs` does not perform damage-aware hashing or PCR error
@@ -25,15 +25,15 @@ correction. Those are handled by the subsequent `fqdup derep` step.
 
 `fqdup derep_pairs` is a two-pass streaming algorithm.
 
-**Pass 1 — index construction**
+**Pass 1: index construction**
 Both sorted files are streamed in lockstep. For each pair, the canonical hash
 of the **extended** read is computed: `min(XXH3_128(ext), XXH3_128(revcomp(ext)))`.
-The index stores `{record_offset, count, merged_len}` — ~40 bytes per unique
+The index stores `{record_offset, count, merged_len}`, ~40 bytes per unique
 pair. When the same extended hash appears again, the count is incremented; if
 the new merged read is longer than the stored representative, the representative
 is updated.
 
-**Pass 2 — output**
+**Pass 2: output**
 Both files are re-streamed. For each pair, if this is the representative
 (longest merged read of its cluster), it is written to both output files.
 
@@ -56,7 +56,7 @@ Optional:
 ```
 
 Both input files must be sorted by read ID (`fqdup sort`). The two files must
-contain reads in the same order — the same read ID at the same position in
+contain reads in the same order, the same read ID at the same position in
 both files.
 
 ---
@@ -66,8 +66,8 @@ both files.
 ### Reads
 
 Two FASTQ files:
-- `-o-non`: merged reads (representatives) — use this for downstream analysis
-- `-o-ext`: extended reads (representatives) — only needed if further
+- `-o-non`: merged reads (representatives), use this for downstream analysis
+- `-o-ext`: extended reads (representatives), only needed if further
   processing requires the extended fingerprints
 
 ### Cluster statistics (`-c FILE.tsv.gz`)
@@ -93,7 +93,7 @@ scales linearly with unique pair count, not total reads.
 
 ## Benchmarks
 
-On sample `a88af16f35` — 25.8 M read pairs in, ~91 bp merged-read mean
+On sample `a88af16f35`, 25.8 M read pairs in, ~91 bp merged-read mean
 length:
 
 | Metric | Value |
