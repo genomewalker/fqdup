@@ -1,5 +1,61 @@
 # Algorithm
 
+## fqdup extend
+
+`fqdup extend` builds a self-referential de Bruijn k-mer graph from the merged
+reads and extends each read outward from both ends. It runs three passes:
+
+**Pass 0 — damage estimation.** Samples the first 500k reads (configurable via
+`--damage-sample`) to fit an exponential decay model to C→T and G→A frequencies.
+Identifies terminal positions where excess damage exceeds `--mask-threshold`
+(default 0.05). These positions are masked in Pass 1 to exclude damaged k-mers
+from the graph. Pass 0 is skipped when `--no-damage` or `--mask-5`/`--mask-3` are
+given.
+
+**Pass 1 — k-mer graph construction.** Streams all reads and inserts every
+interior k-mer (excluding masked terminal positions) into an oriented k-mer
+store. Oriented storage: for each canonical k-mer K, both K and RC(K) are
+inserted so that left-extension is equivalent to a right-walk on the reverse
+complement. This avoids separate forward/reverse traversal logic.
+
+Key properties of the graph:
+- **Exact 2-bit k-mer keys** (no hashing, no collision risk). k≤31 fits in a
+  single `uint64_t`. Two separate stores are NOT kept — one canonical store
+  covers all orientations.
+- **Low-complexity filter**: k-mers with fewer than 3 distinct 2-mers (e.g.
+  homopolymers) are discarded. This prevents spurious extensions in repetitive
+  regions.
+- **Minimum count filter**: k-mers with edge support below `--min-count`
+  (default 2) are discarded after counting.
+- **KMC3-in-RAM approach**: k-mer observations are accumulated in sharded
+  append buffers, then sorted and reduced in place. On DS4 (198 M reads):
+  6.7 B observations × 8 bytes demand-paged during accumulation; after
+  finalize: 1.644 B distinct k-mers × 16 bytes = 26 GB. Peak RSS 41 GB.
+- **Per-shard prefix index**: 2^12 bucket directory reduces binary search
+  depth from 19 to 7 during Pass 2 lookups.
+
+**Pass 2 — extension and output.** Extends each read via a 3-stage pipeline:
+reader → work queue → N worker threads → done queue → writer with reorder
+buffer (to preserve input order).
+
+Each worker applies the following algorithm to one read:
+1. Find the rightmost clean (unmasked) k-mer as the right anchor; find the
+   leftmost clean k-mer as the left anchor.
+2. Walk right from the right anchor along the k-mer graph. A step is taken only
+   when the transition is **reciprocally unique**: K→K' is unique AND the
+   back-edge K'→K is also unique (unitig walk). Walk stops at `--max-extend`
+   bases added.
+3. Repeat in the reverse direction for left extension (implemented as a
+   right-walk on the reverse complement).
+4. n_skip logic: anchoring at position p re-derives L−(p+k) in-read bases
+   before producing new sequence — anchoring never extends past the read end.
+5. Reads with no clean interior k-mer are written unchanged.
+
+Added bases receive quality `#` (Phred 2). Original base qualities are
+preserved.
+
+---
+
 ## fqdup sort
 
 The sort is a standard external merge sort. The input is streamed and
@@ -25,13 +81,13 @@ lockstep:
 
 - **`-n` (merged)**: fastp-merged reads — the original R1+R2 collapsed
   sequence, representing the actual ancient DNA molecule
-- **`-e` (extended)**: the same reads after Tadpole de Bruijn graph extension
-  from both ends — longer, assembly-assisted sequences used as deduplication
-  fingerprints
+- **`-e` (extended)**: the same reads after `fqdup extend` de Bruijn graph
+  extension from both ends — longer, assembly-assisted sequences used as
+  deduplication fingerprints
 
-The extended file drives the hash. Using the Tadpole-extended sequence as the
-fingerprint reduces false collisions: two different molecules that happen to
-share a short merged core will typically diverge in the assembled extension.
+The extended file drives the hash. Using the `fqdup extend`-assembled sequence
+as the fingerprint reduces false collisions: two different molecules that happen
+to share a short merged core will typically diverge in the assembled extension.
 
 **Pass 1** streams both files simultaneously, one pair at a time. For each
 pair, the extended read's sequence is hashed to a canonical fingerprint

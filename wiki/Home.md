@@ -62,35 +62,36 @@ alone is sufficient.
 The upstream steps that produce fqdup's inputs are:
 
 1. **fastp merge** — collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
-2. **Tadpole** — extend each merged read outward from both ends using de Bruijn graph assembly, recovering sequence that may be present in other reads in the library
+2. **`fqdup extend`** — extend each merged read outward from both ends using the built-in de Bruijn graph assembler, recovering sequence that may be present in other reads in the library
 
 This produces two files for the same set of molecules:
 - **merged** (`-n`): the original fastp-merged read — actual ancient DNA sequence
-- **extended** (`-e`): the same read after Tadpole extension — longer, assembly-assisted fingerprint
+- **extended** (`-e`): the same read after `fqdup extend` assembly — longer, assembly-assisted fingerprint
 
 fqdup then runs in three steps:
 
 ```
-fqdup sort        fqdup derep_pairs          fqdup derep
-──────────────    ────────────────────────   ─────────────────────────────────────
-Sort merged   →   One representative      →  Damage-aware hashing + PCR error
-and extended      pair per cluster           correction on merged representatives
-reads             (uses extended as           (biological dedup)
-                   fingerprint; keeps
-                   merged as output)
+fqdup extend      fqdup sort        fqdup derep_pairs          fqdup derep
+──────────────    ──────────────    ────────────────────────   ─────────────────────
+Extend merged  →  Sort merged   →   One representative      →  Damage-aware hashing
+reads via         and extended      pair per cluster           + PCR error correction
+de Bruijn         reads             (uses extended as           on merged reps
+graph                               fingerprint; keeps          (biological dedup)
+                                    merged as output)
 ```
 
-`derep_pairs` deduplicates using the Tadpole-extended sequence as the cluster
-fingerprint — it is longer and more unique than the merged read alone, reducing
-false collisions between reads from different molecules. The representative kept
-is the pair with the longest merged read (most original ancient DNA sequence).
+`derep_pairs` deduplicates using the `fqdup extend`-assembled sequence as the
+cluster fingerprint — it is longer and more unique than the merged read alone,
+reducing false collisions between reads from different molecules. The
+representative kept is the pair with the longest merged read (most original
+ancient DNA sequence).
 
 `derep` then handles the biological layer on the merged output: damage masking
 collapses reads that differ only due to deamination; Phase 3 absorbs low-count
 clusters that differ from a high-count cluster by a single non-damage substitution.
 
 Any residual duplicates `derep` sees are merged reads that were identical but whose
-Tadpole extensions diverged slightly — `derep_pairs` kept both; `derep` collapses
+extensions diverged slightly — `derep_pairs` kept both; `derep` collapses
 them on the original merged sequence.
 
 ---
@@ -100,7 +101,9 @@ them on the original merged sequence.
 | Page | Contents |
 |------|----------|
 | [[Installation]] | Build from source, dependencies |
-| [[Usage]] | Tutorials and options for all three subcommands |
+| [[Usage]] | Tutorials and options for all subcommands |
+| [[Extend]] | fqdup extend: de Bruijn graph extension algorithm, CLI, benchmarks |
+| [[Damage]] | fqdup damage: standalone damage profiler — inspect d_max, library type, mask positions |
 | [[Algorithm]] | Internal mechanics of sort, derep_pairs, and derep |
 | [[Damage-Aware-Deduplication]] | The deamination model, empirical masking, and symmetry |
 | [[PCR-Error-Correction]] | Phase 3: 3-way pigeonhole Hamming search |
@@ -113,7 +116,10 @@ them on the original merged sequence.
 ### Full ancient DNA pipeline
 
 ```bash
-# Sort merged and Tadpole-extended reads
+# Extend merged reads using the built-in de Bruijn graph assembler
+fqdup extend -i merged.fq.gz -o extended.fq.gz
+
+# Sort merged and extended reads
 fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
 fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
 

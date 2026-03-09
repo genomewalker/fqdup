@@ -97,6 +97,29 @@ memory — the index dominates.
 
 ---
 
+## fqdup extend
+
+Benchmarked on DS4 — 198 M reads, 16 threads, dandycomp02fl:
+
+| Metric | Value |
+|--------|-------|
+| Reads extended | 50% |
+| Average extension | 3.82 / 3.83 bp per side |
+| Pass 1 (build) | 68 s |
+| Finalize | 19 s |
+| Pass 2 (extend + write) | 5:27 |
+| Total wall time | 6:56 |
+| Peak RSS | 41.3 GB |
+
+Memory breakdown: 6.7 B k-mer observations × 8 bytes during accumulation; after
+finalize 1.644 B distinct k-mers × 16 bytes = 26 GB; peak RSS 41 GB (k-mer store
++ read buffers + thread overhead).
+
+Comparison with Tadpole on the same DS4 dataset: Tadpole achieves 14.75%
+extension in ~5 min; `fqdup extend` achieves 50% in 7 min.
+
+---
+
 ## Throughput and I/O
 
 Deduplication is I/O-bound on network storage. On the NFS-mounted server:
@@ -109,15 +132,14 @@ Deduplication is I/O-bound on network storage. On the NFS-mounted server:
 
 On local NVMe, throughput is higher and CPU becomes the bottleneck.
 
-### Decompression acceleration
+### Decompression and compression
 
-| Flag | Speedup | Requirement |
-|------|---------|-------------|
-| `--isal` | 3–5× decompression | Intel ISA-L library |
-| `--pigz` | 2–3× decompression | pigz in PATH |
+Decompression uses rapidgzip — a built-in parallel gzip decoder. It is always
+active and requires no flags. On `.gz` input it uses multiple threads
+automatically.
 
-Use `--isal` when reading `.gz` files from fast storage. Both flags affect
-decompression only; gzip output uses pigz automatically when available.
+Output compression uses bgzf (htslib) when `--threads > 1`, otherwise standard
+zlib gzip. No flags are required.
 
 ### Sort acceleration
 
@@ -146,8 +168,8 @@ For libraries above 400 M read pairs or 100 M unique clusters:
    `derep` on the smaller merged read output. The merged file after
    `derep_pairs` is typically 60–80% smaller.
 
-2. **I/O**: use `--isal` or `--pigz` and `--fast` for the sort step. Place
-   temp files on fast local storage with `-t /local/scratch`.
+2. **I/O**: use `--fast` for the sort step. Place temp files on fast local
+   storage with `-t /local/scratch`. Decompression uses rapidgzip automatically.
 
 3. **Error correction**: on by default. For very large datasets with 260 M
    unique clusters the 2-bit SeqArena adds ~4 GB; the quality gain (typically

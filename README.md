@@ -17,17 +17,27 @@ not damage patterns.
 `fqdup` runs three steps in order, each targeting a distinct layer of the
 duplication problem:
 
-**1. `fqdup sort`** — sort both input files by read ID. Required by both
+**1. `fqdup extend`** — extend each merged read outward from both ends using a
+built-in de Bruijn graph assembler. The extended reads serve as deduplication
+fingerprints; the original merged reads remain the primary output. Extension
+also solves QC-trim length variation: PCR copies of the same molecule trimmed
+to different lengths by quality/adapter trimming produce different raw sequences
+but extend to the same shared interior k-mers, collapsing correctly. Ancient
+DNA terminal damage is accounted for automatically — damaged terminal positions
+are excluded from k-mer graph construction so they do not create spurious
+branches.
+
+**2. `fqdup sort`** — sort both input files by read ID. Required by both
 dedup steps.
 
-**2. `fqdup derep_pairs`** — structural deduplication of paired reads.
-Uses the Tadpole-extended sequence as the cluster fingerprint rather than the
-raw merged read. Short aDNA fragments that share a merged-read core often
-diverge in the assembled extension, so false collisions between different
+**3. `fqdup derep_pairs`** — structural deduplication of paired reads.
+Uses the `fqdup extend`-assembled sequence as the cluster fingerprint rather
+than the raw merged read. Short aDNA fragments that share a merged-read core
+often diverge in the assembled extension, so false collisions between different
 molecules are greatly reduced. The representative kept per cluster is the pair
 with the longest merged read.
 
-**3. `fqdup derep`** — biological deduplication of the merged-read output.
+**4. `fqdup derep`** — biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
 
 - **PCR error correction (Phase 3, default: on).** After the index is built,
@@ -39,7 +49,9 @@ Two mechanisms, both on by default:
 - **Damage-aware hashing (default: off).** When enabled with `--damage-auto`,
   terminal positions where the observed C→T or G→A rate exceeds a threshold are
   replaced with a neutral byte before hashing, collapsing reads that differ only
-  by deamination into the same cluster. **Use with caution:** if downstream
+  by deamination into the same cluster. Library type (double-stranded vs
+  single-stranded) is detected automatically via a 7-model BIC competition;
+  override with `--library-type ds|ss`. **Use with caution:** if downstream
   damage analysis (DART, mapDamage) runs on the fqdup output, this distorts
   per-position damage frequencies because only the most-damaged representative
   is retained. Enable it when accurate unique-molecule counting matters more
@@ -56,18 +68,21 @@ default.
 ### Full ancient DNA pipeline
 
 ```bash
-# 1. Sort merged and Tadpole-extended reads by read ID
+# 1. Extend merged reads using the built-in de Bruijn graph assembler
+fqdup extend -i merged.fq.gz -o extended.fq.gz
+
+# 2. Sort merged and extended reads by read ID
 fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
 fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
 
-# 2. Paired dedup — one representative pair per cluster
+# 3. Paired dedup — one representative pair per cluster
 fqdup derep_pairs \
   -n merged.sorted.fq.gz \
   -e extended.sorted.fq.gz \
   -o-non merged.deduped.fq.gz \
   -o-ext  extended.deduped.fq.gz
 
-# 3. PCR error correction (on by default); damage-aware hashing off by default
+# 4. PCR error correction (on by default); damage-aware hashing off by default
 fqdup derep \
   -i merged.deduped.fq.gz \
   -o merged.final.fq.gz
@@ -124,6 +139,49 @@ bash tests/smoke.sh $(pwd)/build/fqdup
 
 ## Options
 
+### `fqdup damage`
+
+Standalone damage profiler. Run this before the full pipeline to inspect d_max,
+library type, and which positions would be masked.
+
+```
+fqdup damage -i INPUT [options]
+
+  -i FILE                    Input FASTQ (.gz or plain)
+  -p N                       Worker threads (default: all cores)
+  --library-type auto|ds|ss  Override library-type auto-detection (default: auto)
+  --mask-threshold FLOAT     Mask positions where excess P(deam) > T (default: 0.05)
+  --tsv FILE                 Write per-position frequency table as TSV
+```
+
+Prints a human-readable report: library type with BIC scores, d_max/lambda per end,
+per-position deamination frequencies, and the positions that exceed the mask threshold.
+Use the output to decide whether `--damage-auto` is warranted, verify the library-type
+call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
+
+### `fqdup extend`
+
+```
+fqdup extend -i INPUT -o OUTPUT [options]
+
+  -i FILE                Input merged FASTQ (.gz supported)
+  -o FILE                Output extended FASTQ
+
+  -k N                   k-mer size (default: 17, max: 31)
+  --min-count N          Minimum edge support to include a k-mer (default: 2)
+  --max-extend N         Maximum bases added per side (default: 100)
+  --threads N            Worker threads (default: all CPU cores)
+  --min-qual N           Exclude bases below this Phred quality (default: 20)
+  --library-type TYPE    Damage model library type: auto|ds|ss (default: auto)
+  --no-damage            Skip damage estimation; no masking
+  --mask-5 N             Manually mask N bp at 5' end (skips Pass 0)
+  --mask-3 N             Manually mask N bp at 3' end (skips Pass 0)
+  --mask-threshold F     Excess damage threshold for terminal masking (default: 0.05)
+  --damage-sample N      Estimate damage from first N reads only (default: 500000; 0=all)
+```
+
+Added bases receive quality '#' (Phred 2); original bases keep their original quality scores.
+
 ### `fqdup sort`
 
 ```
@@ -145,7 +203,7 @@ fqdup derep_pairs -n NON -e EXT -o-non OUT -o-ext OUT [options]
 
 Required:
   -n FILE      Sorted merged (fastp) FASTQ
-  -e FILE      Sorted Tadpole-extended FASTQ
+  -e FILE      Sorted fqdup-extended FASTQ
   -o-non FILE  Output merged FASTQ (representatives)
   -o-ext FILE  Output extended FASTQ (representatives)
 
@@ -237,6 +295,21 @@ required.
 
 ## Performance
 
+### fqdup extend
+
+Benchmarked on DS4 — 198 M reads, 16 threads, dandycomp02fl:
+
+| Metric | Value |
+|--------|-------|
+| Reads extended | 50% |
+| Average extension | 3.82 / 3.83 bp per side |
+| Wall time | 6:56 (pass1=68 s, finalize=19 s, pass2=5:27) |
+| Peak RSS | 41.3 GB |
+
+Comparison: Tadpole achieves 14.75% extension on the same dataset in ~5 min; `fqdup extend` achieves 50% in 7 min.
+
+### fqdup derep_pairs / derep
+
 Benchmarked on `a88af16f35` — 25.8 M fastp-merged reads, ~91 bp mean length,
 `d_max_5 ≈ 0.19`, NFS-mounted storage:
 
@@ -266,6 +339,9 @@ ASCII. Sequences containing N are stored but skipped during Phase 3.
 ## Algorithm summary
 
 ```
+fqdup extend:      [Pass 0] damage estimation (samples 500k reads)
+                   [Pass 1] build oriented k-mer graph (masks damaged terminals)
+                   [Pass 2] multi-threaded anchor scan + unitig walk → write extended reads
 fqdup sort:        chunk ingestion → parallel sort → k-way merge
 fqdup derep_pairs: [Pass 1] stream (ext + non) → build index
                    [Pass 2] stream again → write representative pairs
@@ -303,3 +379,4 @@ If you use `fqdup`, please cite:
 - Jónsson et al. (2013) mapDamage2.0: fast approximate Bayesian estimates of ancient DNA damage parameters. *Bioinformatics*. doi:10.1093/bioinformatics/btt193
 - Fernandez-Guerra et al. (2025) DART: damage-aware reference-based taxonomic profiling. *bioRxiv*.
 - Potapov & Ong (2017) Examining sources of error in PCR by single-molecule sequencing. *PLOS ONE*. doi:10.1371/journal.pone.0169774
+- Rochette NC et al. (2023) On the causes, consequences, and avoidance of PCR duplicates. *Mol Ecol Resour* 23:1299–1318. doi:10.1111/1755-0998.13800
