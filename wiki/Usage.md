@@ -2,9 +2,10 @@
 
 ## Prerequisites
 
-### Upstream steps (outside fqdup)
+### Upstream steps
 
-fqdup operates on reads that have been processed by two upstream tools:
+fqdup operates on reads that have been processed by one upstream tool, then
+extends them using its built-in assembler:
 
 **1. fastp merge** — collapse overlapping R1+R2 pairs into single sequences.
 Each merged read represents one complete ancient DNA molecule:
@@ -15,13 +16,15 @@ fastp --merge --merged_out merged.fq.gz \
       --disable_adapter_trimming  # (or with adapter trimming, as appropriate)
 ```
 
-**2. Tadpole** (BBTools) — extend each merged read from both ends using de Bruijn
-graph assembly. The extended reads serve as deduplication fingerprints; the
-original merged reads are kept as the actual output:
+**2. fqdup extend** — extend each merged read from both ends using the built-in
+de Bruijn graph assembler. The extended reads serve as deduplication fingerprints;
+the original merged reads are kept as the actual output:
 
 ```bash
-tadpole.sh in=merged.fq.gz out=extended.fq.gz mode=extend el=50 er=50
+fqdup extend -i merged.fq.gz -o extended.fq.gz
 ```
+
+See [[Extend]] for full options and algorithm details.
 
 ### Sort
 
@@ -40,13 +43,28 @@ Omit it if disk is limited.
 
 ## Full ancient DNA pipeline
 
-The typical workflow runs three commands in sequence.
+The typical workflow runs four commands in sequence.
 
-### Step 1 — sort
+### Step 1 — extend
+
+```bash
+fqdup extend -i merged.fq.gz -o extended.fq.gz
+```
+
+Extends each merged read outward from both ends using a 3-pass de Bruijn graph
+algorithm. Pass 0 estimates damage parameters; Pass 1 builds an oriented k-mer
+graph while masking damaged terminals; Pass 2 extends reads via multi-threaded
+anchor scan and unitig walk.
+
+Added bases receive quality `#` (Phred 2). Original bases keep their original
+quality. For large datasets (≥100 M reads) specify `--threads` to use all
+available cores.
+
+### Step 2 — sort
 
 Sort both files by read ID, as above.
 
-### Step 2 — paired structural deduplication
+### Step 3 — paired structural deduplication
 
 ```bash
 fqdup derep_pairs \
@@ -58,9 +76,9 @@ fqdup derep_pairs \
 ```
 
 `derep_pairs` reads both sorted files in lockstep and hashes the **extended**
-(Tadpole-assembled) read as the cluster fingerprint. Using the extended read
-reduces false collisions: two different molecules that happen to share a short
-merged sequence will typically diverge in the assembled extension.
+(`fqdup extend`-assembled) read as the cluster fingerprint. Using the extended
+read reduces false collisions: two different molecules that happen to share a
+short merged sequence will typically diverge in the assembled extension.
 
 The representative kept per cluster is the pair with the longest **merged**
 read — preserving the most original ancient DNA sequence. The `-c` flag writes
@@ -69,7 +87,7 @@ per-cluster statistics to a gzipped TSV.
 For a 25.8 M-pair library, this step typically finishes in about 25 seconds
 and reduces to around 5.6 M unique pairs.
 
-### Step 3 — single-file damage-aware deduplication
+### Step 4 — single-file damage-aware deduplication
 
 ```bash
 fqdup derep \
@@ -158,6 +176,27 @@ fqdup derep       ... --no-revcomp
 
 ## All options
 
+### `fqdup extend`
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i FILE` | Input merged FASTQ (.gz or plain) | required |
+| `-o FILE` | Output extended FASTQ | required |
+| `-k N` | k-mer size (max 31) | 17 |
+| `--min-count N` | Minimum edge support to include a k-mer | 2 |
+| `--max-extend N` | Maximum bases added per side | 100 |
+| `--threads N` | Worker threads | all cores |
+| `--min-qual N` | Exclude bases below this Phred quality | 20 |
+| `--library-type TYPE` | Damage model library type: `auto`, `ds`, `ss` | auto |
+| `--no-damage` | Skip damage estimation; no masking | off |
+| `--mask-5 N` | Manually mask N bp at 5' end (skips Pass 0) | — |
+| `--mask-3 N` | Manually mask N bp at 3' end (skips Pass 0) | — |
+| `--mask-threshold F` | Excess damage threshold for terminal masking | 0.05 |
+| `--damage-sample N` | Estimate damage from first N reads only (0=all) | 500000 |
+
+Added bases receive quality `#` (Phred 2). Reads with no clean interior k-mers
+are written unchanged.
+
 ### `fqdup sort`
 
 | Flag | Description | Default |
@@ -175,11 +214,23 @@ fqdup derep       ... --no-revcomp
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-n FILE` | Sorted merged (fastp) FASTQ | required |
-| `-e FILE` | Sorted Tadpole-extended FASTQ | required |
+| `-e FILE` | Sorted fqdup-extended FASTQ | required |
 | `-o-non FILE` | Output merged FASTQ (representatives) | required |
 | `-o-ext FILE` | Output extended FASTQ (representatives) | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
+
+### `fqdup damage`
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i FILE` | Input FASTQ (.gz or plain) | required |
+| `-p N` | Worker threads | all cores |
+| `--library-type auto\|ds\|ss` | Override library-type detection | auto |
+| `--mask-threshold FLOAT` | Mask positions where excess P(deam) > T | 0.05 |
+| `--tsv FILE` | Write per-position frequency table as TSV | — |
+
+See [[Damage]] for full output description and typical workflow.
 
 ### `fqdup derep`
 
