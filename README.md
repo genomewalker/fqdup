@@ -14,8 +14,17 @@ not damage patterns.
 
 ## How it works
 
-`fqdup` runs three steps in order, each targeting a distinct layer of the
-duplication problem:
+`fqdup` runs four steps in order, each targeting a distinct layer of the
+duplication problem. An optional diagnostic command, `fqdup damage`, can be
+run beforehand to inspect the damage profile and verify library-type detection.
+
+**0. `fqdup damage` (optional diagnostic)**: standalone multi-threaded damage
+profiler. Scans the input reads and reports d_max, lambda, background rate, and
+per-position C→T/G→A frequencies. Classifies the library as double-stranded or
+single-stranded via a 7-model BIC competition before fitting. Run this before the
+full pipeline to confirm that `--damage-auto` is warranted, check the mask
+threshold, or obtain parameters for manual `--damage-dmax`/`--damage-lambda`
+overrides. It does not modify reads.
 
 **1. `fqdup extend`**: extend each merged read outward from both ends using a
 built-in de Bruijn graph assembler. The extended reads serve as deduplication
