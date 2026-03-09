@@ -29,15 +29,17 @@ conda install -c conda-forge cmake cxx-compiler zlib xxhash
 
 | Library | Benefit | Notes |
 |---------|---------|-------|
-| Intel ISA-L | 3–5× faster gzip decompression | `--isal` flag; auto-detected |
-| pigz | 2–3× faster gzip decompression | `--pigz` flag; must be in PATH |
-| jemalloc | Better memory release | auto-detected; no flag needed |
+| htslib | Multi-threaded bgzf output compression | auto-detected; no flag needed |
+| jemalloc | Better memory release to OS | auto-detected; no flag needed |
 
-ISA-L gives the largest benefit for `.gz` input on fast storage.
+Decompression uses rapidgzip (built-in, parallel, no external dependency). Output
+compression uses bgzf (htslib) when `--threads > 1` and htslib is detected,
+otherwise standard zlib gzip.
 
 ```bash
 # conda (recommended)
-conda install -c conda-forge isa-l
+conda install -c bioconda htslib
+conda install -c conda-forge jemalloc
 ```
 
 ---
@@ -57,9 +59,9 @@ The binary is `build/fqdup`. Copy it wherever convenient or add `build/` to PATH
 ### Check what was detected
 
 ```bash
-cmake .. 2>&1 | grep -E "ISA-L|jemalloc|xxhash"
+cmake .. 2>&1 | grep -E "htslib|jemalloc|xxhash|rapidgzip"
 # Found xxhash: include=/usr/include lib=/usr/lib/libxxhash.so
-# Found ISA-L: /usr/lib/libisal.so (hardware-accelerated decompression enabled)
+# Found htslib: /usr/lib/libhts.so (bgzf multi-threaded output enabled)
 # jemalloc not found - using system allocator
 ```
 
@@ -89,14 +91,14 @@ conda install xxhash
 cmake .. -DCMAKE_PREFIX_PATH=/path/to/xxhash
 ```
 
-### ISA-L not found (optional)
+### htslib not found (optional)
 
-ISA-L is optional — `fqdup` falls back to zlib without it.
+htslib is optional — `fqdup` falls back to single-threaded zlib output without it.
 
 ```bash
-conda install -c conda-forge isa-l
+conda install -c bioconda htslib
 
-# if ISA-L is in a non-standard path
+# if htslib is in a non-standard path
 cmake .. -DCMAKE_PREFIX_PATH=$CONDA_PREFIX
 ```
 
