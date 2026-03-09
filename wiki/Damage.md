@@ -4,7 +4,7 @@
 
 `fqdup damage` profiles ancient DNA deamination damage and computes the
 per-position mask that would be applied by `fqdup extend` and `fqdup derep
---damage-auto`. It is a standalone diagnostic command — run it before the
+--damage-auto`. It is a standalone diagnostic command, run it before the
 full pipeline to inspect the damage profile, verify that library-type
 auto-detection is correct, and decide whether `--damage-auto` is warranted.
 
@@ -24,7 +24,7 @@ fqdup damage -i FILE [options]
 | `-p N` | Worker threads | all cores |
 | `--library-type auto\|ds\|ss` | Override library-type auto-detection | auto |
 | `--mask-threshold FLOAT` | Mask positions where excess P(deam) > T | 0.05 |
-| `--tsv FILE` | Write per-position frequency table as TSV | — |
+| `--tsv FILE` | Write per-position frequency table as TSV | - |
 
 ---
 
@@ -39,10 +39,10 @@ The profiling and finalization logic is provided by DART's
 [libdart-damage](https://github.com/genomewalker/libdart-damage). It measures
 four biological channels per position:
 
-- **5' C→T** — T/(T+C) at positions 0–14 from the 5' end
-- **3' G→A decay** — A/(A+G) at positions 0–14 from the 3' end
-- **3' G→A spike** — amplitude at 3' position 0 (ligation-site signal in SS libraries)
-- **3' C→T** — T/(T+C) at 3' positions 0–14 (SS-original reads only)
+- **5' C→T**, T/(T+C) at positions 0–14 from the 5' end
+- **3' G→A decay**, A/(A+G) at positions 0–14 from the 3' end
+- **3' G→A spike**, amplitude at 3' position 0 (ligation-site signal in SS libraries)
+- **3' C→T**, T/(T+C) at 3' positions 0–14 (SS-original reads only)
 
 Background rates are estimated from the middle third of reads (consistent with
 DART and mapDamage2).
@@ -99,14 +99,14 @@ pos  5'_CT   5'_GA   3'_GA
 
 Fields:
 
-- **Library** — DS or SS, auto-detected or forced. Composition-bias warnings are printed if the read-end base composition makes library-type detection unreliable.
-- **BIC** — BIC scores for the null model (bias), DS, SS, and SS-full (diagnostic). Higher means better fit.
-- **fit** — Amplitude and ΔBIC for each of the four biological channels.
-- **terminal shift / z-score** — Observed minus background T/(T+C) or A/(A+G) at the terminal positions; the z-score indicates significance.
-- **d_max / lambda / bg** — Exponential decay parameters for each end, and the combined d_max (the larger of the two, used as the aggregate damage indicator).
-- **\[validated\] / \[mixture\] / \[ARTIFACT\]** — Additional flags from the libdart-damage classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
-- **Mask threshold** — Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --damage-auto`.
-- **Per-position table** — Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
+- **Library**, DS or SS, auto-detected or forced. Composition-bias warnings are printed if the read-end base composition makes library-type detection unreliable.
+- **BIC**, BIC scores for the null model (bias), DS, SS, and SS-full (diagnostic). Higher means better fit.
+- **fit**, Amplitude and ΔBIC for each of the four biological channels.
+- **terminal shift / z-score**, Observed minus background T/(T+C) or A/(A+G) at the terminal positions; the z-score indicates significance.
+- **d_max / lambda / bg**, Exponential decay parameters for each end, and the combined d_max (the larger of the two, used as the aggregate damage indicator).
+- **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libdart-damage classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
+- **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --damage-auto`.
+- **Per-position table**, Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
 
 ### TSV output (`--tsv`)
 
@@ -132,19 +132,19 @@ fqdup damage -i merged.fq.gz --tsv damage_profile.tsv
 
 Then use the output to decide:
 
-1. **d_max_5 < 0.02 and d_max_3 < 0.02** — no meaningful damage; skip
+1. **d_max_5 < 0.02 and d_max_3 < 0.02**, no meaningful damage; skip
    `--damage-auto` in `fqdup derep` entirely.
 
-2. **Library type looks wrong** — override with `--library-type ds|ss` in
+2. **Library type looks wrong**, override with `--library-type ds|ss` in
    `fqdup damage` first to confirm, then pass the same flag to `fqdup extend`
    and `fqdup derep`.
 
-3. **mask-threshold produces too many / too few masked positions** — adjust
+3. **mask-threshold produces too many / too few masked positions**, adjust
    `--mask-threshold` and re-run `fqdup damage` until the masked zone matches
    the damage plot. Then pass the same threshold to `fqdup extend` and
    `fqdup derep`.
 
-4. **Supply manual parameters** — use the printed d_max and lambda values
+4. **Supply manual parameters**, use the printed d_max and lambda values
    directly:
 
 ```bash

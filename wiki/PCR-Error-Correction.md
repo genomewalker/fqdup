@@ -2,12 +2,12 @@
 
 This page covers the second of two sources of false unique clusters in ancient
 DNA deduplication: PCR copying errors. Post-mortem deamination is covered in
-[[Damage-Aware-Deduplication]]. The two are complementary — damage masking
+[[Damage-Aware-Deduplication]]. The two are complementary, damage masking
 handles terminal variation, Phase 3 handles interior variation. See [[Home]]
 for the full picture.
 
 In the standard pipeline, `derep` receives the **merged read output of
-`derep_pairs`** — reads that were collapsed from R1+R2 by fastp and then
+`derep_pairs`**, reads that were collapsed from R1+R2 by fastp and then
 deduplicated against their `fqdup extend`-assembled counterparts. Most PCR
 duplicates have already been removed at that stage; `derep`'s Phase 3 targets
 the residual PCR errors that survived because they happened to produce divergent
@@ -23,7 +23,7 @@ polymerase used. High-fidelity polymerases such as Q5 make roughly
 1.5×10⁻⁴ (Potapov & Ong 2017). Most errors occur in early cycles, when the
 pool of template molecules is small, and therefore propagate into a modest
 cluster of copies carrying the wrong base. After deduplication, these clusters
-appear as genuine unique sequences — count 2 or 3 rather than count 1, which
+appear as genuine unique sequences, count 2 or 3 rather than count 1, which
 is enough to survive any simple singleton filter.
 
 The distinguishing feature of a PCR error cluster is the count ratio: the
@@ -37,7 +37,7 @@ cluster is almost never a distinct biological molecule.
 ## Approach
 
 Phase 3 runs entirely in memory on the deduplication index built during Pass 1
-— no additional file I/O. It classifies clusters as **parents** (count above
+- no additional file I/O. It classifies clusters as **parents** (count above
 `--errcor-max-count`, default 5) and **children** (count at or below that
 threshold). A child is absorbed into a parent when:
 
@@ -52,7 +52,7 @@ threshold). A child is absorbed into a parent when:
 The damage zone exclusion skips positions already flagged by the masking model,
 but sub-threshold positions still carry real C→T and G→A signal. And oxidative
 damage (8-oxoG, Channel C in DART) produces G→T transversions uniformly across
-the entire read — no position-based masking can protect those.
+the entire read, no position-based masking can protect those.
 
 Phase 3 therefore applies a substitution-type filter: a child is **never**
 absorbed if the single mismatch is associated with a known DNA damage mechanism,
@@ -65,8 +65,8 @@ regardless of its position:
 | G↔T | Oxidative 8-oxoG (uniform across read) |
 | C↔A | Oxidative 8-oxoG (complementary strand) |
 
-Only **A↔T** and **C↔G** mismatches — the two transversion pairs with no known
-DNA damage mechanism — are eligible for absorption. In practice this protects
+Only **A↔T** and **C↔G** mismatches, the two transversion pairs with no known
+DNA damage mechanism, are eligible for absorption. In practice this protects
 73% of what a naive Phase 3 would absorb on an ancient DNA library with
 d_max ≈ 0.10 (sample a88af16f35, see benchmarks below).
 
@@ -157,11 +157,11 @@ Phase 3: D_eff=2.21 estimated from duplication ratio 25000000/5600000
 
 **Caveat when running after `derep_pairs`:** most PCR duplicates are already
 removed before `derep` sees the data. The residual duplication that remains
-comes from PCR copies whose `fqdup extend` assemblies diverged slightly —
+comes from PCR copies whose `fqdup extend` assemblies diverged slightly -
 `derep_pairs` treated them as distinct molecules; `derep` collapses them on the original
 merged sequence. Because most amplification has already been collapsed, D_eff
 estimated here is much lower than the true PCR D_eff, making the adaptive
-ceiling conservative. For typical aDNA libraries this does not matter — parent
+ceiling conservative. For typical aDNA libraries this does not matter, parent
 counts are low enough that the static `--errcor-max-count` dominates regardless.
 For mitochondrial-enriched or high-depth modern libraries, supply `--pcr-cycles`
 explicitly for an accurate adaptive ceiling.
@@ -192,7 +192,7 @@ reduce this to effectively O(n).
 
 Divide the interior region into three equal parts. If two sequences of the same
 length differ by **exactly one** substitution, that substitution falls in one
-of the three parts — so the other two parts must be identical. Three hash
+of the three parts, so the other two parts must be identical. Three hash
 indexes, each covering a different pair of parts, are sufficient to find every
 Hamming-distance-1 neighbour:
 
@@ -224,7 +224,7 @@ Child:   h0 = hash(ACGAA)   h1 = hash(CGTAC)   h2 = hash(GAATG)
               ↑ same              ↑ different        ↑ same
 ```
 
-The pair-key `(h0, h2)` is identical for parent and child — index (0,2) fires.
+The pair-key `(h0, h2)` is identical for parent and child, index (0,2) fires.
 The candidate is retrieved and the exact Hamming check confirms one mismatch.
 A→T is not a damage substitution, so the child is absorbed.
 
@@ -233,7 +233,7 @@ fire, but `is_damage_sub('C','T')` returns true and the child is **kept**.
 
 ### Complexity
 
-Building the three indexes is O(n_parents). Each child queries three buckets —
+Building the three indexes is O(n_parents). Each child queries three buckets -
 O(1) per bucket under the assumption of few collisions. The full character-level
 Hamming check runs only on the small set of candidates returned per child. In
 practice Phase 3 completes in 1–3 seconds for 5M sequences.
@@ -251,8 +251,8 @@ single-cell or low-input sequencing.
 a hard lower bound; with `--pcr-cycles` the effective ceiling may be higher for
 large parents (see adaptive thresholds above).
 
-`--errcor-bucket-cap` (default 64) prevents low-complexity regions — poly-A
-stretches, microsatellites — from producing enormous bucket collisions in the
+`--errcor-bucket-cap` (default 64) prevents low-complexity regions, poly-A
+stretches, microsatellites, from producing enormous bucket collisions in the
 pair-hash index.
 
 `--pcr-cycles`, `--pcr-efficiency`, `--pcr-error-rate` (default Q5: 5.3e-7)
@@ -272,7 +272,7 @@ Sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length, Q5 librar
 | `--error-correct` (naive, no damage protection) | 5,335 | 3,506,272 |
 | `--error-correct` (with damage substitution filter) | 1,456 | 3,510,151 |
 
-73% of what the naive version absorbed were C↔T or G↔A — real damage signal,
+73% of what the naive version absorbed were C↔T or G↔A, real damage signal,
 not PCR errors. The 1,456 absorptions are A↔T and C↔G transversions only.
 
 Phase 3 adds approximately 2 seconds to a 31-second `derep` run. It operates
@@ -287,7 +287,7 @@ All libraries processed with `--damage-auto --error-correct`, Q5 defaults
 `fqdup extend`-assembled pairs have already been deduplicated. The duplication
 remaining at this stage comes from PCR copies that produced divergent assemblies
 and therefore survived `derep_pairs`. D_eff here is the residual D_eff, not the
-original PCR amplification depth — hence values are much lower than the true library D_eff.
+original PCR amplification depth, hence values are much lower than the true library D_eff.
 
 | Library | Total reads | Unique (P1) | Unique (final) | Dup% | d_max | λ | D_eff | Absorbed |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -329,7 +329,7 @@ original PCR amplification depth — hence values are much lower than the true l
 before Phase 3; **Unique (final)** = output sequence count.
 
 Across all 31 libraries, error correction fires only when D_eff ≥ ~0.6.
-The cutoff is not a hard threshold — it reflects the adaptive ceiling formula:
+The cutoff is not a hard threshold, it reflects the adaptive ceiling formula:
 at low D_eff, E[count_child] < 1 for all realistic parent counts, so the
 static `--errcor-max-count 5` ceiling dominates and no child qualifies for
 absorption. At D_eff ≈ 0.7 and above, the ceiling rises above the static

@@ -7,7 +7,7 @@
 fqdup operates on reads that have been processed by one upstream tool, then
 extends them using its built-in assembler:
 
-**1. fastp merge** — collapse overlapping R1+R2 pairs into single sequences.
+**1. fastp merge**: collapse overlapping R1+R2 pairs into single sequences.
 Each merged read represents one complete ancient DNA molecule:
 
 ```bash
@@ -16,7 +16,7 @@ fastp --merge --merged_out merged.fq.gz \
       --disable_adapter_trimming  # (or with adapter trimming, as appropriate)
 ```
 
-**2. fqdup extend** — extend each merged read from both ends using the built-in
+**2. fqdup extend**: extend each merged read from both ends using the built-in
 de Bruijn graph assembler. The extended reads serve as deduplication fingerprints;
 the original merged reads are kept as the actual output:
 
@@ -45,7 +45,7 @@ Omit it if disk is limited.
 
 The typical workflow runs four commands in sequence.
 
-### Step 1 — extend
+### Step 1: extend
 
 ```bash
 fqdup extend -i merged.fq.gz -o extended.fq.gz
@@ -60,11 +60,11 @@ Added bases receive quality `#` (Phred 2). Original bases keep their original
 quality. For large datasets (≥100 M reads) specify `--threads` to use all
 available cores.
 
-### Step 2 — sort
+### Step 2: sort
 
 Sort both files by read ID, as above.
 
-### Step 3 — paired structural deduplication
+### Step 3: paired structural deduplication
 
 ```bash
 fqdup derep_pairs \
@@ -81,13 +81,13 @@ read reduces false collisions: two different molecules that happen to share a
 short merged sequence will typically diverge in the assembled extension.
 
 The representative kept per cluster is the pair with the longest **merged**
-read — preserving the most original ancient DNA sequence. The `-c` flag writes
+read, preserving the most original ancient DNA sequence. The `-c` flag writes
 per-cluster statistics to a gzipped TSV.
 
 For a 25.8 M-pair library, this step typically finishes in about 25 seconds
 and reduces to around 5.6 M unique pairs.
 
-### Step 4 — single-file damage-aware deduplication
+### Step 4: single-file damage-aware deduplication
 
 ```bash
 fqdup derep \
@@ -97,7 +97,7 @@ fqdup derep \
 ```
 
 PCR error correction is **on by default**. Damage-aware hashing is **off by
-default** — if you run DART or mapDamage on the fqdup output, enabling it would
+default**, if you run DART or mapDamage on the fqdup output, enabling it would
 distort per-position damage frequencies (only the most-damaged representative is
 retained per cluster). Enable with `--damage-auto` only when accurate
 unique-molecule counting matters more than downstream damage estimation.
@@ -106,7 +106,7 @@ When `--damage-auto` is given, Pass 0 scans all reads and logs the estimated
 damage parameters before deduplication starts:
 
 ```
-Pass 0: damage estimation — 5582073 reads processed (5582073 total)
+Pass 0: damage estimation, 5582073 reads processed (5582073 total)
   5'-end: d_max=0.099 lambda=0.246 bg=0.487
   3'-end: d_max=0.020 lambda=0.069 bg=0.509
   Masked positions: 1 (1 bp each end)
@@ -114,7 +114,7 @@ Pass 0: damage estimation — 5582073 reads processed (5582073 total)
 ```
 
 Reads that differ only at masked terminal positions then hash identically and
-collapse into the same cluster — recovering pairs split by post-mortem
+collapse into the same cluster, recovering pairs split by post-mortem
 deamination.
 
 Phase 3 (PCR error correction) runs after Pass 1: any cluster with count ≤ 5
@@ -189,8 +189,8 @@ fqdup derep       ... --no-revcomp
 | `--min-qual N` | Exclude bases below this Phred quality | 20 |
 | `--library-type TYPE` | Damage model library type: `auto`, `ds`, `ss` | auto |
 | `--no-damage` | Skip damage estimation; no masking | off |
-| `--mask-5 N` | Manually mask N bp at 5' end (skips Pass 0) | — |
-| `--mask-3 N` | Manually mask N bp at 3' end (skips Pass 0) | — |
+| `--mask-5 N` | Manually mask N bp at 5' end (skips Pass 0) | - |
+| `--mask-3 N` | Manually mask N bp at 3' end (skips Pass 0) | - |
 | `--mask-threshold F` | Excess damage threshold for terminal masking | 0.05 |
 | `--damage-sample N` | Estimate damage from first N reads only (0=all) | 500000 |
 
@@ -228,7 +228,7 @@ are written unchanged.
 | `-p N` | Worker threads | all cores |
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
 | `--mask-threshold FLOAT` | Mask positions where excess P(deam) > T | 0.05 |
-| `--tsv FILE` | Write per-position frequency table as TSV | — |
+| `--tsv FILE` | Write per-position frequency table as TSV | - |
 
 See [[Damage]] for full output description and typical workflow.
 
@@ -242,19 +242,19 @@ See [[Damage]] for full output description and typical workflow.
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
 | `--damage-auto` | Estimate damage parameters from data (Pass 0) | off |
 | `--no-damage` | Explicitly disable damage estimation | **default** |
-| `--damage-dmax FLOAT` | d_max for both ends (manual model) | — |
-| `--damage-dmax5 FLOAT` | d_max for 5' end | — |
-| `--damage-dmax3 FLOAT` | d_max for 3' end | — |
-| `--damage-lambda FLOAT` | Decay constant for both ends | — |
-| `--damage-lambda5 FLOAT` | Decay constant for 5' end | — |
-| `--damage-lambda3 FLOAT` | Decay constant for 3' end | — |
+| `--damage-dmax FLOAT` | d_max for both ends (manual model) | - |
+| `--damage-dmax5 FLOAT` | d_max for 5' end | - |
+| `--damage-dmax3 FLOAT` | d_max for 3' end | - |
+| `--damage-lambda FLOAT` | Decay constant for both ends | - |
+| `--damage-lambda5 FLOAT` | Decay constant for 5' end | - |
+| `--damage-lambda3 FLOAT` | Decay constant for 3' end | - |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
 | `--pcr-cycles INT` | PCR cycles; if omitted, D_eff is estimated from duplication ratio | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
 | `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | **on** |
-| `--no-error-correct` | Disable Phase 3 PCR error correction | — |
+| `--no-error-correct` | Disable Phase 3 PCR error correction | - |
 | `--errcor-ratio FLOAT` | count(parent)/count(child) threshold | 50.0 |
 | `--errcor-max-count INT` | Children must have count ≤ N | 5 |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |

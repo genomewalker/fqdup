@@ -2,7 +2,7 @@
 
 ## Benchmarks
 
-All benchmarks were run on sample `a88af16f35` — 25.8 M fastp-merged reads
+All benchmarks were run on sample `a88af16f35`, 25.8 M fastp-merged reads
 (from paired-end sequencing), mean read length ~91 bp, ancient DNA with
 `d_max_5 ≈ 0.193`, `lambda_5 ≈ 0.25`. Storage: NFS-mounted.
 
@@ -25,7 +25,7 @@ at each stage (the `-n` / output file of `derep_pairs`).
   C↔T and G↔A mismatches are protected as potential damage signal)
 
 Pass 0 (full-scan damage estimation) adds ~9 seconds. Phase 3 (error
-correction) adds ~2 seconds — it runs in memory on the Pass 1 index with no
+correction) adds ~2 seconds, it runs in memory on the Pass 1 index with no
 additional I/O.
 
 ---
@@ -49,7 +49,7 @@ Memory ≈ 40 bytes × N_unique_pairs
 
 ### `fqdup derep` (without `--error-correct`)
 
-Same structure — one entry per unique cluster.
+Same structure, one entry per unique cluster.
 
 ```
 Memory ≈ 40 bytes × N_unique_clusters
@@ -67,7 +67,7 @@ The index size from our benchmark: 134 MB for 3.53 M unique clusters from
 
 ### `fqdup derep` (with error correction, default on)
 
-Error correction adds the `SeqArena` — a 2-bit packed array storing each base
+Error correction adds the `SeqArena`, a 2-bit packed array storing each base
 in 2 bits rather than 8, approximately 4× more compact than ASCII:
 
 ```
@@ -93,13 +93,13 @@ Total:   ~700 MB
 
 Use `--no-error-correct` to skip Phase 3 entirely and avoid allocating the
 SeqArena. For most aDNA libraries the SeqArena is a small fraction of total
-memory — the index dominates.
+memory, the index dominates.
 
 ---
 
 ## fqdup extend
 
-Benchmarked on DS4 — 198 M reads, 16 threads, dandycomp02fl:
+Benchmarked on DS4, 198 M reads, 16 threads, dandycomp02fl:
 
 | Metric | Value |
 |--------|-------|
@@ -134,7 +134,7 @@ On local NVMe, throughput is higher and CPU becomes the bottleneck.
 
 ### Decompression and compression
 
-Decompression uses rapidgzip — a built-in parallel gzip decoder. It is always
+Decompression uses rapidgzip, a built-in parallel gzip decoder. It is always
 active and requires no flags. On `.gz` input it uses multiple threads
 automatically.
 

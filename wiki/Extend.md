@@ -10,7 +10,7 @@ assembly-assisted fingerprint for the `derep_pairs` deduplication step.
 ### Why extension helps
 
 **Shifted-window duplicates.** Two PCR duplicates from the same original
-molecule may be captured in slightly different "windows" — one read starts 2 bp
+molecule may be captured in slightly different "windows", one read starts 2 bp
 earlier or ends 3 bp later. After fastp merge, these reads have different
 lengths and different sequences, so an exact-match deduplicator counts them as
 distinct molecules. Extension recovers the shared flanking sequence present in
@@ -36,7 +36,7 @@ using synthetic data with Gaussian-distributed trim lengths
 | `fqdup derep` (no extend) | 4 035 | +1 245 % |
 | `fqdup extend` → `fqdup derep` | 410 | +37 % |
 
-With σ=5 bp (mild trimming), `fqdup extend` reaches +4.3 % — essentially
+With σ=5 bp (mild trimming), `fqdup extend` reaches +4.3 %, essentially
 perfect. The residual error at σ=15 bp comes from reads trimmed so short
 (<~20 bp) that no valid k-mer anchor exists; those are written unchanged by
 `fqdup extend` and remain as separate clusters.
@@ -53,7 +53,7 @@ fully-trimmed aDNA workflow, use `--no-damage`.
 
 `fqdup extend` is a 3-pass algorithm.
 
-### Pass 0 — damage estimation
+### Pass 0: damage estimation
 
 Samples the first N reads (default: 500k, set with `--damage-sample`) to fit an
 exponential decay model of ancient DNA damage:
@@ -72,18 +72,18 @@ by overlapping longer reads.
 Pass 0 is skipped when `--no-damage` is given, or when `--mask-5`/`--mask-3`
 are provided (explicit mask lengths skip damage estimation entirely).
 
-### Pass 1 — k-mer graph construction
+### Pass 1: k-mer graph construction
 
 Streams all reads and builds an oriented k-mer store from interior k-mers
 (masked terminals excluded).
 
 **Oriented storage.** For each canonical k-mer K, both K and RC(K) are
 inserted. This means left-extension is equivalent to a right-walk on the
-reverse complement — no separate forward/reverse traversal is needed.
+reverse complement, no separate forward/reverse traversal is needed.
 
 **Exact 2-bit k-mer encoding.** Each base is packed into 2 bits (A=00, C=01,
 G=10, T=11). For k≤31 the entire k-mer fits in a `uint64_t`. There is no
-hashing — keys are exact with zero collision risk.
+hashing, keys are exact with zero collision risk.
 
 **Low-complexity filter.** K-mers with fewer than 3 distinct 2-mers are
 discarded before insertion. This eliminates homopolymers and other repetitive
@@ -103,7 +103,7 @@ Memory model (DS4, 198 M reads, k=17):
 - After finalize: 1.644 B distinct k-mers × 16 bytes = 26 GB
 - Peak RSS: 41 GB (k-mer store + read buffers + thread overhead)
 
-### Pass 2 — extension and output
+### Pass 2: extension and output
 
 A 3-stage pipeline processes reads in parallel while preserving input order:
 
@@ -168,7 +168,7 @@ Damage handling:
 
 ## Performance
 
-Benchmarked on DS4 — 198 M reads, 16 threads, dandycomp02fl:
+Benchmarked on DS4, 198 M reads, 16 threads, dandycomp02fl:
 
 | Metric | Value |
 |--------|-------|
@@ -188,7 +188,7 @@ Comparison with Tadpole on the same DS4 dataset:
 | `fqdup extend` (k=17, --max-extend 100, 16 threads) | 50% | 7 min |
 
 `fqdup extend` achieves significantly higher extension rates because it uses
-all reads in the library to build the graph — reads that carry flanking context
+all reads in the library to build the graph, reads that carry flanking context
 for other reads contribute their k-mers regardless of their own extension
 status.
 
