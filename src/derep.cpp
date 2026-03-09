@@ -47,6 +47,7 @@ extern "C" {
 // fastq_common.hpp provides: FastqRecord, FastqReader, FastqReaderIgzip,
 // FastqWriter, SequenceFingerprint, SequenceFingerprintHash, canonical_hash,
 // revcomp, trim_id, shell_escape_path, GZBUF_SIZE — all in anonymous namespace.
+#include "fqdup/damage_profile.hpp"
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
 #include "flat_hash_map.hpp"
@@ -487,121 +488,9 @@ static void compute_interior_rc(const uint8_t* interior, int ilen, uint8_t* out)
 
 // ============================================================================
 // Ancient DNA Damage Model
+// DamageProfile struct and estimate_damage() are in damage_profile.hpp/.cpp
+// (shared with extend.cpp).  TU-specific helpers follow below.
 // ============================================================================
-
-struct DamageProfile {
-    // Fitted exponential model parameters (for logging and expected_mismatches only).
-    double d_max_5prime   = 0.0;
-    double d_max_3prime   = 0.0;
-    double lambda_5prime  = 0.5;
-    double lambda_3prime  = 0.5;
-    double background     = 0.02;
-    double mask_threshold = 0.05;
-    double pcr_error_rate = 0.0;
-    bool   enabled        = false;
-    bool   ss_mode        = false;  // true = single-stranded library (C→T at both ends)
-
-    // Empirical per-position mask (primary masking authority).
-    //
-    // mask_pos[p] = true means position p (measured from either terminus) sits
-    // in the damage zone and will be replaced with a neutral byte before hashing.
-    //
-    // Populated by:
-    //   - estimate_damage(): directly from observed T/(T+C) and A/(A+G) excesses
-    //     at each position (no model assumption, no OLS fit error).
-    //   - populate_mask_from_model(): from the fitted exponential when damage
-    //     parameters are supplied manually (--damage-dmax / --damage-lambda).
-    //
-    // Why empirical masking is more precise than recomputing the exponential at
-    // hash time:
-    //   The exponential is a convenient approximation, but real damage profiles
-    //   can deviate — UDG-treated libraries, mixed fragment lengths, or unusual
-    //   protocols can produce non-exponential patterns. By recording which
-    //   positions actually exceed the threshold in the observed frequency data,
-    //   we mask exactly the positions that are damaged, not the positions the
-    //   model predicts to be damaged. This eliminates both OLS fit error and
-    //   model misspecification as sources of masking inaccuracy.
-    //
-    // Symmetry invariant: canonical_hash(seq) == canonical_hash(revcomp(seq)).
-    //   apply_damage_mask() uses max(mask_pos[i], mask_pos[j]) semantics
-    //   (matching the original max(dmg_5, dmg_3) logic), so the same set of
-    //   position indices is masked regardless of which strand is processed.
-    static constexpr int MASK_POSITIONS = 15;
-    bool mask_pos[MASK_POSITIONS] = {};
-
-    // Populate mask_pos from the fitted exponential model.
-    // Used when damage parameters are given manually rather than estimated.
-    void populate_mask_from_model() {
-        for (int p = 0; p < MASK_POSITIONS; ++p) {
-            double exc5 = d_max_5prime * std::exp(-lambda_5prime * p);
-            double exc3 = d_max_3prime * std::exp(-lambda_3prime * p);
-            mask_pos[p] = std::max(exc5, exc3) > mask_threshold;
-        }
-    }
-
-    // Helpers retained for expected_mismatches() and informational logging only.
-    double dmg_5(int p) const { return d_max_5prime * std::exp(-lambda_5prime * p); }
-    double dmg_3(int p) const { return d_max_3prime * std::exp(-lambda_3prime * p); }
-
-    double expected_mismatches(int L) const {
-        double e = 0.0;
-        for (int p = 0; p < L; ++p) {
-            double d5 = dmg_5(p);
-            double d3 = dmg_3(L - 1 - p);
-            e += 2.0 * d5 * (1.0 - d5);
-            e += 2.0 * d3 * (1.0 - d3);
-        }
-        e += 2.0 * L * pcr_error_rate;
-        return e;
-    }
-
-    int mismatch_tolerance(int L) const {
-        double lam = expected_mismatches(L);
-        if (lam < 1e-9) return 0;
-        double cumP = 0.0, pois = std::exp(-lam);
-        int k = 0;
-        while (cumP + pois < 0.99 && k < 100) {
-            cumP += pois;
-            ++k;
-            pois *= lam / k;
-        }
-        return k;
-    }
-
-    void print_info(int typical_read_length) const {
-        log_info("--- Damage-Aware Deduplication ---");
-        log_info("  5'-end d_max:  " + std::to_string(d_max_5prime));
-        log_info("  3'-end d_max:  " + std::to_string(d_max_3prime));
-        log_info("  5'-end lambda: " + std::to_string(lambda_5prime));
-        log_info("  3'-end lambda: " + std::to_string(lambda_3prime));
-        log_info("  Background:    " + std::to_string(background));
-        log_info("  Mask threshold:" + std::to_string(mask_threshold));
-        if (pcr_error_rate > 0.0)
-            log_info("  PCR error rate:" + std::to_string(pcr_error_rate) + " per bp");
-        // Log which positions are actually masked.
-        int n_masked = 0;
-        std::string pos_str;
-        for (int p = 0; p < MASK_POSITIONS; ++p) {
-            if (mask_pos[p]) {
-                if (n_masked > 0) pos_str += ',';
-                pos_str += std::to_string(p);
-                ++n_masked;
-            }
-        }
-        if (n_masked > 0)
-            log_info("  Masked positions: " + pos_str + " (" +
-                     std::to_string(n_masked) + " bp each end)");
-        else
-            log_info("  Masked positions: none");
-        if (typical_read_length > 0) {
-            double e   = expected_mismatches(typical_read_length);
-            int    tol = mismatch_tolerance(typical_read_length);
-            log_info("  Expected mismatches (L=" + std::to_string(typical_read_length) +
-                     "): " + std::to_string(e) +
-                     ", 99th-pct tolerance: " + std::to_string(tol));
-        }
-    }
-};
 
 // Replace damage-prone terminal bases with neutral bytes before hashing.
 //
@@ -729,143 +618,6 @@ static XXH128_hash_t canonical_hash_noalloc(const std::string& seq,
     return h2;
 }
 
-// ============================================================================
-// Damage estimation — DART full pipeline (Pass 0)
-// Uses libdart-damage: dart::FrameSelector + SampleDamageProfile
-// Channels: A (T/C nucleotide freq) + B (stop codon conversion)
-// GC-stratified d_max, Durbin mixture model, joint BIC, pos-0 artifact detection
-// ============================================================================
-
-static DamageProfile estimate_damage_impl(FastqReaderBase& reader,
-                                          const std::string& path,
-                                          double mask_threshold,
-                                          dart::SampleDamageProfile::LibraryType forced_lib =
-                                              dart::SampleDamageProfile::LibraryType::UNKNOWN) {
-    FastqRecord rec;
-    dart::SampleDamageProfile dart_profile;
-    dart_profile.forced_library_type = forced_lib;
-
-    int      reads_scanned = 0;
-    int      typical_len   = 0;
-    uint64_t record_pos    = 0;
-
-    while (reader.read(rec)) {
-        int L = static_cast<int>(rec.seq.size());
-        record_pos++;
-        if (L < 30) continue;
-        if (L > typical_len) typical_len = L;
-        dart::FrameSelector::update_sample_profile(dart_profile, rec.seq);
-        reads_scanned++;
-    }
-
-    dart::FrameSelector::finalize_sample_profile(dart_profile);
-
-    // Use DART's calibrated per-end values (damage_rate[0] = raw pos0 excess) —
-    // these match DART's JSON output and are on the same scale as metaDMG's Δ.
-    double d_max_5   = dart_profile.d_max_5prime;
-    double d_max_3   = dart_profile.d_max_3prime;
-    double lambda_5  = dart_profile.lambda_5prime;
-    double lambda_3  = dart_profile.lambda_3prime;
-    double bg_5      = dart_profile.fit_baseline_5prime;
-    double bg_3      = dart_profile.fit_baseline_3prime;
-    double background = (bg_5 + bg_3) / 2.0;
-
-    // d_max_combined is the primary damage signal — mixture model d_reference
-    // (metaDMG proxy) when converged; falls back to GC-weighted or joint model.
-    double d_max_combined = dart_profile.d_max_combined;
-
-    const bool is_ss = (dart_profile.library_type ==
-                        dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
-
-    DamageProfile profile;
-    profile.d_max_5prime   = d_max_5;
-    profile.d_max_3prime   = d_max_3;
-    profile.lambda_5prime  = lambda_5;
-    profile.lambda_3prime  = lambda_3;
-    profile.background     = background;
-    profile.mask_threshold = mask_threshold;
-    profile.ss_mode        = is_ss;
-    // Enable if combined or per-end d_max exceeds threshold, OR if DART validates
-    // damage even when d_max_5prime/3prime = 0 (e.g. pos0-artifact samples).
-    profile.enabled        = (d_max_combined > 0.02 || d_max_5 > 0.02 || d_max_3 > 0.02
-                              || dart_profile.damage_validated);
-
-    // Empirical per-position mask from DART's normalized frequencies.
-    // DS: max(5' C→T excess, 3' G→A excess) > threshold.
-    // SS: max(5' C→T excess, 3' T/(T+C) excess) > threshold — both ends have C→T.
-    constexpr double MIN_COV = 100.0;
-    double bg_tc = dart_profile.baseline_t_freq /
-                   (dart_profile.baseline_t_freq + dart_profile.baseline_c_freq + 1e-9);
-    for (int p = 0; p < DamageProfile::MASK_POSITIONS; ++p) {
-        double excess_5 = 0.0, excess_3 = 0.0;
-        if (dart_profile.tc_total_5prime[p] >= MIN_COV)
-            excess_5 = dart_profile.t_freq_5prime[p] - bg_5;
-        if (is_ss) {
-            // SS: 3' damage signal is T/(T+C) excess (same type as 5')
-            if (dart_profile.tc_total_3prime[p] >= MIN_COV) {
-                double tc3 = dart_profile.tc_total_3prime[p];
-                double ct3_freq = (tc3 > 0)
-                    ? dart_profile.t_freq_3prime[p] / tc3
-                    : bg_tc;
-                excess_3 = ct3_freq - bg_tc;
-            }
-        } else {
-            // DS: 3' damage signal is A/(A+G) excess
-            if (dart_profile.ag_total_3prime[p] >= MIN_COV)
-                excess_3 = dart_profile.a_freq_3prime[p] - bg_3;
-        }
-        profile.mask_pos[p] = (excess_5 > mask_threshold) || (excess_3 > mask_threshold);
-    }
-
-    // Fill short gaps in the empirical damage mask.
-    // Reason: DART's per-position significance test can produce non-contiguous masks
-    // (e.g. 0,1,2,_,4,_,6 with gaps at 3 and 5) when sampling noise pushes a single
-    // position's excess just below the threshold despite true monotone damage decay.
-    // Gaps ≤ MAX_GAP positions are filled; larger gaps (genuine low-damage regions) are
-    // left open to avoid false-merging reads from different molecules at those positions.
-    {
-        constexpr int MAX_GAP = 1;
-        int last_p = -1;
-        for (int p = 0; p < DamageProfile::MASK_POSITIONS; ++p) {
-            if (profile.mask_pos[p]) {
-                if (last_p >= 0 && (p - last_p - 1) <= MAX_GAP) {
-                    for (int g = last_p + 1; g < p; ++g)
-                        profile.mask_pos[g] = true;
-                }
-                last_p = p;
-            }
-        }
-    }
-
-    log_info("Pass 0: DART damage estimation — " +
-             std::to_string(reads_scanned) + " reads in " + path);
-    log_info("  Library type: " + std::string(dart_profile.library_type_str()) +
-             (dart_profile.library_type_auto_detected ? " (auto-detected)" : " (forced)"));
-    log_info("  5'-end: d_max=" + std::to_string(d_max_5) +
-             " lambda=" + std::to_string(lambda_5) +
-             " bg=" + std::to_string(bg_5));
-    log_info("  3'-end: d_max=" + std::to_string(d_max_3) +
-             " lambda=" + std::to_string(lambda_3) +
-             " bg=" + std::to_string(bg_3));
-    log_info("  d_max_combined=" + std::to_string(d_max_combined) +
-             " (source=" + dart_profile.d_max_source_str() + ")" +
-             (dart_profile.mixture_converged ? " [mixture]" : "") +
-             (dart_profile.damage_validated  ? " [validated]" : "") +
-             (dart_profile.damage_artifact   ? " [ARTIFACT]" : ""));
-    if (profile.enabled && typical_len > 0) {
-        profile.print_info(typical_len);
-    } else {
-        log_info("  Damage below threshold — standard exact hashing will be used");
-    }
-    return profile;
-}
-
-static DamageProfile estimate_damage(const std::string& path, double mask_threshold,
-                                     dart::SampleDamageProfile::LibraryType forced_lib =
-                                         dart::SampleDamageProfile::LibraryType::UNKNOWN) {
-    auto reader = make_fastq_reader(path);
-    return estimate_damage_impl(*reader, path, mask_threshold, forced_lib);
-}
 
 // ============================================================================
 // DerepEngine — single-file two-pass deduplication
@@ -878,7 +630,7 @@ public:
                 const ErrCorParams& errcor = ErrCorParams{})
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
-          total_reads_(0), errcor_absorbed_(0) {}
+          total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     void process(const std::string& in_path,
                  const std::string& out_path,
@@ -949,6 +701,22 @@ public:
             log_info("Phase 3: parent-centric mismatch pattern detection");
             phase3_error_correct();
         }
+
+        // Free arena_ — only needed for phase3, not pass2.
+        { SeqArena empty; std::swap(arena_, empty); }
+
+        // Return freed phase3 structures (build_map, shards, id_count, acc_count)
+        // to the OS before pass2 allocates records_to_write.  Without this,
+        // jemalloc holds freed pages in its arenas and they count toward RSS.
+#ifdef __linux__
+        if (mallctl != nullptr) {
+            try {
+                mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0);
+                mallctl("arena.0.purge", nullptr, nullptr, nullptr, 0);
+            } catch (...) {}
+        }
+        malloc_trim(0);
+#endif
 
         log_info("Pass 2: Write unique records");
 
@@ -1702,6 +1470,21 @@ private:
                       return a.record_index < b.record_index;
                   });
         const size_t n_to_write = records_to_write.size();
+        n_unique_clusters_ = n_to_write;
+
+        // Free index_ and is_error_ — no longer needed; records_to_write has everything.
+        // Frees ~10 GB (index_) before the write loop begins.
+        { decltype(index_) tmp; std::swap(index_, tmp); }
+        { std::vector<bool> tmp; std::swap(is_error_, tmp); }
+#ifdef __linux__
+        if (mallctl != nullptr) {
+            try {
+                mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0);
+                mallctl("arena.0.purge", nullptr, nullptr, nullptr, 0);
+            } catch (...) {}
+        }
+        malloc_trim(0);
+#endif
 
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
@@ -1743,21 +1526,21 @@ private:
     void print_stats() const {
         log_info("=== Final Statistics ===");
         log_info("Total reads processed: " + std::to_string(total_reads_));
-        log_info("Unique clusters (dedup): " + std::to_string(index_.size()));
+        log_info("Unique clusters (dedup): " + std::to_string(n_unique_clusters_));
 
         if (total_reads_ > 0) {
-            double dup_rate = 100.0 * (1.0 - (double)index_.size() / total_reads_);
+            double dup_rate = 100.0 * (1.0 - (double)n_unique_clusters_ / total_reads_);
             log_info("Deduplication rate: " + std::to_string(dup_rate) + "%");
         }
 
         if (errcor_.enabled) {
-            size_t output = index_.size() - errcor_absorbed_;
+            size_t output = n_unique_clusters_;
             log_info("PCR error sequences removed: " + std::to_string(errcor_absorbed_) +
                      " (min_parent=" + std::to_string(errcor_.min_parent_count) +
                      ", snp_threshold=" + std::to_string(errcor_.snp_threshold) + ")");
             log_info("Output sequences: " + std::to_string(output));
-            if (index_.size() > 0) {
-                double ecr = 100.0 * errcor_absorbed_ / index_.size();
+            if (n_unique_clusters_ + errcor_absorbed_ > 0) {
+                double ecr = 100.0 * errcor_absorbed_ / (n_unique_clusters_ + errcor_absorbed_);
                 log_info("Error correction rate: " + std::to_string(ecr) + "%");
             }
         }
@@ -1792,6 +1575,7 @@ private:
 
     uint64_t total_reads_;
     uint64_t errcor_absorbed_;
+    size_t   n_unique_clusters_;  // saved before index_ is freed in pass2
 };
 
 }  // anonymous namespace

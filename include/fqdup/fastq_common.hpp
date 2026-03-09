@@ -22,6 +22,10 @@
 #include <isa-l/igzip_lib.h>
 #endif
 
+#ifdef HAVE_BGZF
+#include <htslib/bgzf.h>
+#endif
+
 #include <xxhash.h>
 
 namespace {
@@ -104,21 +108,6 @@ static inline XXH128_hash_t canonical_hash(const std::string& seq, bool use_revc
     if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
         return h1;
     return h2;
-}
-
-static std::string shell_escape_path(const std::string& path) {
-    std::string escaped;
-    escaped.reserve(path.size() + 2);
-    escaped.push_back('\'');
-    for (char c : path) {
-        if (c == '\'') {
-            escaped += "'\\''";
-        } else {
-            escaped.push_back(c);
-        }
-    }
-    escaped.push_back('\'');
-    return escaped;
 }
 
 // ============================================================================
@@ -288,33 +277,33 @@ private:
 };
 
 // ============================================================================
-// FASTQ Writer — pigz (parallel), zlib, or plain text
+// FASTQ Writer — in-process zlib gzip or plain text
 // ============================================================================
 
 class FastqWriter {
 public:
-    FastqWriter(const std::string& path, bool compress)
-        : path_(path), compress_(compress), gzfp_(nullptr), pigz_pipe_(nullptr) {
-
+    FastqWriter(const std::string& path, bool compress, int n_threads = 1)
+        : path_(path), compress_(compress), gzfp_(nullptr)
+#ifdef HAVE_BGZF
+        , bgzfp_(nullptr)
+#endif
+    {
         if (compress_) {
-            // Probe pigz availability before attempting popen — popen() can succeed
-            // even when pigz is missing (the shell itself opens), so the only way to
-            // detect absence reliably is to check first.
-            bool pigz_available = (system("pigz --version >/dev/null 2>&1") == 0);
-            if (pigz_available) {
-                std::string pigz_cmd = "pigz -c -p 4 > " + shell_escape_path(path);
-                pigz_pipe_ = popen(pigz_cmd.c_str(), "w");
-                if (pigz_pipe_) {
-                    setvbuf(pigz_pipe_, nullptr, _IOFBF, GZBUF_SIZE);
-                }
-            }
-            if (!pigz_pipe_) {
-                // pigz unavailable or popen failed — fall back to zlib
+#ifdef HAVE_BGZF
+            if (n_threads > 1) {
+                bgzfp_ = bgzf_open(path.c_str(), "w");
+                if (!bgzfp_)
+                    throw std::runtime_error("Cannot open output: " + path);
+                bgzf_mt(bgzfp_, n_threads, 0);
+            } else {
+#endif
                 gzfp_ = gzopen(path.c_str(), "wb6");
                 if (!gzfp_)
                     throw std::runtime_error("Cannot open output: " + path);
                 gzbuffer(gzfp_, GZBUF_SIZE);
+#ifdef HAVE_BGZF
             }
+#endif
         } else {
             plain_out_.open(path);
             if (!plain_out_.good())
@@ -323,31 +312,31 @@ public:
     }
 
     ~FastqWriter() {
-        if (pigz_pipe_) {
-            int rc = pclose(pigz_pipe_);
-            if (rc != 0) {
-                std::cerr << "Fatal: pclose failed for pigz writer pipe (" << path_
-                          << "), status " << rc << "\n";
-                std::terminate();
-            }
-        } else if (gzfp_) {
-            gzclose(gzfp_);
-        }
+        if (gzfp_) gzclose(gzfp_);
+#ifdef HAVE_BGZF
+        if (bgzfp_) bgzf_close(bgzfp_);
+#endif
     }
 
     void write(const FastqRecord& rec) {
+#ifdef HAVE_BGZF
+        if (bgzfp_) {
+            auto bw = [&](const void* d, size_t n) {
+                if (bgzf_write(bgzfp_, d, n) < 0)
+                    throw std::runtime_error("bgzf_write failed");
+            };
+            bw(rec.header.data(), rec.header.size()); bw("\n", 1);
+            bw(rec.seq.data(),    rec.seq.size());    bw("\n", 1);
+            bw(rec.plus.data(),   rec.plus.size());   bw("\n", 1);
+            bw(rec.qual.data(),   rec.qual.size());   bw("\n", 1);
+            return;
+        }
+#endif
         if (compress_) {
-            if (pigz_pipe_) {
-                fprintf(pigz_pipe_, "%s\n%s\n%s\n%s\n",
-                        rec.header.c_str(), rec.seq.c_str(),
-                        rec.plus.c_str(), rec.qual.c_str());
-            } else {
-                if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                             rec.header.c_str(), rec.seq.c_str(),
-                             rec.plus.c_str(), rec.qual.c_str()) < 0) {
-                    throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
-                }
-            }
+            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
+                         rec.header.c_str(), rec.seq.c_str(),
+                         rec.plus.c_str(), rec.qual.c_str()) < 0)
+                throw std::runtime_error("gzprintf failed writing FASTQ record");
         } else {
             plain_out_ << rec.header << '\n'
                        << rec.seq    << '\n'
@@ -360,7 +349,9 @@ private:
     std::string   path_;
     bool          compress_;
     gzFile        gzfp_;
-    FILE*         pigz_pipe_;
+#ifdef HAVE_BGZF
+    BGZF*         bgzfp_;
+#endif
     std::ofstream plain_out_;
 };
 

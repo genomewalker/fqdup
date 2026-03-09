@@ -62,71 +62,34 @@ set -euo pipefail
 
 FQDUP=${1:-build/fqdup}
 GEN=${2:-build/gen_synthetic}
+# Tadpole: try PATH first, then known conda location
+TADPOLE=$(command -v tadpole.sh 2>/dev/null || \
+          ls /maps/projects/fernandezguerra/apps/opt/conda/envs/find-markers/bin/tadpole.sh \
+             /maps/projects/fernandezguerra/apps/opt/conda/envs/read2Struct/bin/tadpole.sh \
+             /maps/projects/fernandezguerra/apps/opt/conda/pkgs/bbmap-*/bin/tadpole.sh \
+             2>/dev/null | head -1 || echo "")
+if [[ -z "$TADPOLE" ]]; then
+    echo "ERROR: tadpole.sh not found in PATH or conda pkgs" >&2
+    exit 1
+fi
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-echo "=== fqdup full pipeline tests (sort → derep_pairs → derep) ==="
+echo "=== fqdup full pipeline tests (extend → derep_pairs → derep) ==="
+echo "    Tadpole: $TADPOLE"
 
 # ---------------------------------------------------------------------------
-# make_ext_tadpole: generate ext.fq from non.fq using interior k-mer (k=31) model.
-#
-#   non_fq  — source non-extended FASTQ (gen_synthetic output)
-#   ext_fq  — output path for extended FASTQ
-#   ext_bp  — number of bases to prepend and append
-#
-# For reads ≥ 2*K (≥62bp): extension derived from interior sequence
-# (positions K..L-K), unaffected by terminal damage.
-# Same molecule → same interior → same extension even with terminal damage.
-# Interior PCR error → different interior → different extension.
-#
-# For reads < 2*K (<62bp): Tadpole cannot extend → ext_seq = non_seq.
+# run_tadpole: extend non.fq → ext.fq using real Tadpole.
+#   el/er = extension left/right length limit.
+#   k=31 (default) — safe interior k-mer for reads ≥ 62bp.
+#   For reads < 62bp Tadpole cannot extend (no interior k-mers) → pass through.
 # ---------------------------------------------------------------------------
-make_ext_tadpole() {
+run_tadpole() {
     local non_fq=$1 ext_fq=$2 ext_bp=$3
-    python3 - "$non_fq" "$ext_fq" "$ext_bp" <<'PYEOF'
-import sys, hashlib, random
-
-non_fq, ext_fq, ext_bp = sys.argv[1], sys.argv[2], int(sys.argv[3])
-K = 31   # Tadpole default k-mer size
-BASES = 'ACGT'
-
-def det_bases(seed_int, n):
-    r = random.Random(seed_int)
-    return ''.join(r.choice(BASES) for _ in range(n))
-
-with open(non_fq) as fin, open(ext_fq, 'w') as fout:
-    while True:
-        header = fin.readline()
-        if not header:
-            break
-        seq  = fin.readline().rstrip()
-        plus = fin.readline()
-        qual = fin.readline()
-
-        L = len(seq)
-        if L >= 2 * K:
-            # Interior k-mers (positions K..L-K) are unaffected by terminal damage.
-            # Tadpole uses these k-mers to extend and error-correct terminals, so the
-            # full extended read has the same sequence for all copies of the same molecule
-            # regardless of terminal damage.  Model: ext = prefix + interior + suffix
-            # (no terminal bases from the original read, just the interior and new flanks).
-            # Interior PCR error → different interior → different ext → pass through.
-            interior = seq[K : L - K]
-            h = int(hashlib.sha256(interior.encode()).hexdigest()[:16], 16)
-            prefix = det_bases(h,     ext_bp)
-            suffix = det_bases(h + 1, ext_bp)
-            ext_seq = prefix + interior + suffix
-        else:
-            # Short read: Tadpole cannot extend → pass through unchanged
-            ext_seq = seq
-
-        ext_qual = 'I' * len(ext_seq)
-        fout.write(header)
-        fout.write(ext_seq + '\n')
-        fout.write(plus)
-        fout.write(ext_qual + '\n')
-PYEOF
+    bash "$TADPOLE" in="$non_fq" out="$ext_fq" \
+        el="$ext_bp" er="$ext_bp" k=31 threads=4 \
+        overwrite=t -Xmx4g 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -148,7 +111,7 @@ echo "  $N_MOL molecules × 5x coverage, 75bp fixed, no damage, Tadpole ext (${E
 "$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
     --no-damage --seed 42 > "$TMPDIR/p1_non.fq"
 
-make_ext_tadpole "$TMPDIR/p1_non.fq" "$TMPDIR/p1_ext.fq" $EXT_BP
+run_tadpole "$TMPDIR/p1_non.fq" "$TMPDIR/p1_ext.fq" $EXT_BP
 
 "$FQDUP" sort -i "$TMPDIR/p1_non.fq" -o "$TMPDIR/p1_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -216,7 +179,7 @@ echo "  Terminal PCR errors (pos 0..30, 44..74) → same interior → same ext �
 "$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
     --no-damage --pcr-rate 0.003 --seed 55 > "$TMPDIR/p2_non.fq"
 
-make_ext_tadpole "$TMPDIR/p2_non.fq" "$TMPDIR/p2_ext.fq" 15
+run_tadpole "$TMPDIR/p2_non.fq" "$TMPDIR/p2_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p2_non.fq" -o "$TMPDIR/p2_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -285,7 +248,7 @@ echo "  Terminal damage outside interior k-mers → same ext despite damage → 
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
     --seed 77 > "$TMPDIR/p3_non.fq"
 
-make_ext_tadpole "$TMPDIR/p3_non.fq" "$TMPDIR/p3_ext.fq" 15
+run_tadpole "$TMPDIR/p3_non.fq" "$TMPDIR/p3_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p3_non.fq" -o "$TMPDIR/p3_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -340,7 +303,7 @@ echo "  derep --damage-auto handles short-read residuals"
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
     --seed 88 > "$TMPDIR/p4_non.fq"
 
-make_ext_tadpole "$TMPDIR/p4_non.fq" "$TMPDIR/p4_ext.fq" 15
+run_tadpole "$TMPDIR/p4_non.fq" "$TMPDIR/p4_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p4_non.fq" -o "$TMPDIR/p4_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -417,7 +380,7 @@ echo "  variable length (mean=65bp, sd=15), dmax5=$DMAX5 dmax3=$DMAX3, pcr-rate=
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
     --pcr-rate $PCR_RATE --seed 101 > "$TMPDIR/p5_non.fq"
 
-make_ext_tadpole "$TMPDIR/p5_non.fq" "$TMPDIR/p5_ext.fq" 15
+run_tadpole "$TMPDIR/p5_non.fq" "$TMPDIR/p5_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p5_non.fq" -o "$TMPDIR/p5_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -492,7 +455,7 @@ echo "  dmax5=$DMAX5 dmax3=$DMAX3"
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 0.35 --lambda3 0.35 \
     --seed 202 > "$TMPDIR/p6_non.fq"
 
-make_ext_tadpole "$TMPDIR/p6_non.fq" "$TMPDIR/p6_ext.fq" 15
+run_tadpole "$TMPDIR/p6_non.fq" "$TMPDIR/p6_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p6_non.fq" -o "$TMPDIR/p6_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -554,7 +517,7 @@ echo "  $N_MOL molecules × 1.2x coverage, variable length (mean=65bp, sd=15), n
     --min-len 30 --max-len 150 \
     --no-damage --seed 303 > "$TMPDIR/p7_non.fq"
 
-make_ext_tadpole "$TMPDIR/p7_non.fq" "$TMPDIR/p7_ext.fq" 15
+run_tadpole "$TMPDIR/p7_non.fq" "$TMPDIR/p7_ext.fq" 15
 
 "$FQDUP" sort -i "$TMPDIR/p7_non.fq" -o "$TMPDIR/p7_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -800,6 +763,99 @@ if not ok:
 EOF
 
 echo "  PASS: Test P9"
+
+# ---------------------------------------------------------------------------
+# Test P10: QC trimming creates variable-length copies of the same molecule
+#
+# This is the primary real-world motivation for extension in the pipeline.
+# After fastp adapter + quality trimming, PCR duplicates of the same molecule
+# emerge at different lengths (one copy trimmed aggressively, another lightly).
+# Without extension these look like distinct sequences → inflate unique count.
+# With Tadpole extension, the interior k-mers reconstruct a shared fingerprint
+# regardless of how far 3' trimming went → derep_pairs collapses them.
+#
+# Modelled by --trim-sd: each read independently has [0, TRIM_SD] bases
+# removed from 3' end after damage application (simulating per-read QC trim).
+#
+# 500 molecules × 10x, 75bp, dmax5=0.25, TRIM_SD=15 → reads range 60–75bp.
+# Assert: unique_with_ext << unique_without_ext
+#         unique_with_ext ≈ N_MOL
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test P10: QC trimming — variable-length copies of the same molecule ---"
+N_MOL=500
+N_READS=5000    # 10x coverage
+TRIM_SD=15
+DMAX5=0.25; DMAX3=0.20; LAMBDA=0.35
+
+echo "  $N_MOL molecules × 10x, 75bp, dmax5=$DMAX5, trim_sd=$TRIM_SD"
+echo "  Same molecule → reads of varying length (60–75bp after 3' QC trim)"
+echo "  Without ext: different-length copies are distinct → inflate unique"
+echo "  With Tadpole ext: interior k-mers shared → derep_pairs collapses"
+
+"$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
+    --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
+    --trim-sd $TRIM_SD --min-len 30 \
+    --seed 500 > "$TMPDIR/p10_non.fq"
+
+run_tadpole "$TMPDIR/p10_non.fq" "$TMPDIR/p10_ext.fq" 25
+
+"$FQDUP" sort -i "$TMPDIR/p10_non.fq" -o "$TMPDIR/p10_non.sorted.fq" \
+    --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
+"$FQDUP" sort -i "$TMPDIR/p10_ext.fq" -o "$TMPDIR/p10_ext.sorted.fq" \
+    --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
+
+# Without extension: derep alone on variable-length copies (expect inflation)
+"$FQDUP" derep -i "$TMPDIR/p10_non.sorted.fq" -o "$TMPDIR/p10_noext.fq" \
+    --damage-auto --no-error-correct 2>/dev/null
+
+# With extension: derep_pairs fingerprint → derep residuals
+"$FQDUP" derep_pairs \
+    -n "$TMPDIR/p10_non.sorted.fq" -e "$TMPDIR/p10_ext.sorted.fq" \
+    -o-non "$TMPDIR/p10_dp_non.fq" -o-ext "$TMPDIR/p10_dp_ext.fq" 2>/dev/null
+
+"$FQDUP" derep -i "$TMPDIR/p10_dp_non.fq" -o "$TMPDIR/p10_final.fq" \
+    --damage-auto --no-error-correct 2>/dev/null
+
+NOEXT=$(grep -c '^@' "$TMPDIR/p10_noext.fq" || true)
+AFTER_DP=$(grep -c '^@' "$TMPDIR/p10_dp_non.fq" || true)
+AFTER_EXT=$(grep -c '^@' "$TMPDIR/p10_final.fq" || true)
+echo "  Without extension (derep only):  $NOEXT unique"
+echo "  With extension (derep_pairs+derep): $AFTER_EXT unique  |  True: $N_MOL"
+
+python3 - <<EOF
+import sys
+n_mol = $N_MOL
+noext, after_ext = $NOEXT, $AFTER_EXT
+
+# Extension must recover a meaningful fraction of QC-trimming inflation
+if noext <= n_mol:
+    print(f"  FAIL: without extension no inflation ({noext} <= {n_mol}) — check --trim-sd")
+    sys.exit(1)
+inflation = (noext - n_mol) / n_mol * 100
+print(f"  INFO: without extension: {noext} unique (+{inflation:.1f}% above n_mol — QC trim inflation)")
+
+if after_ext >= noext:
+    print(f"  FAIL: extension gave no improvement ({after_ext} >= {noext})")
+    sys.exit(1)
+recovery = (noext - after_ext) / noext * 100
+print(f"  INFO: recovery {recovery:.1f}% ({noext} → {after_ext})")
+
+if recovery < 20.0:
+    print(f"  FAIL: recovery {recovery:.1f}% < 20% — extension not helping with trim inflation")
+    sys.exit(1)
+print(f"  PASS: extension recovered {recovery:.1f}% of QC-trim inflation")
+
+# Extended result must be closer to truth
+dist_ext   = abs(after_ext - n_mol)
+dist_noext = abs(noext     - n_mol)
+if dist_ext >= dist_noext:
+    print(f"  FAIL: with-ext ({after_ext}) not closer to n_mol ({n_mol}) than no-ext ({noext})")
+    sys.exit(1)
+print(f"  PASS: extension closer to true molecule count ({dist_ext} < {dist_noext})")
+EOF
+
+echo "  PASS: Test P10"
 
 echo ""
 echo "OK: all pipeline tests passed"
