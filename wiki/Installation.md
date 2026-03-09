@@ -93,7 +93,7 @@ cmake .. -DCMAKE_PREFIX_PATH=/path/to/xxhash
 
 ### htslib not found (optional)
 
-htslib is optional — `fqdup` falls back to single-threaded zlib output without it.
+htslib is optional, `fqdup` falls back to single-threaded zlib output without it.
 
 ```bash
 conda install -c bioconda htslib
