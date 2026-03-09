@@ -6,7 +6,7 @@ DNA deduplication: post-mortem deamination. PCR copying errors are covered in
 how they fit together.
 
 In the standard pipeline, `derep` receives **fastp-merged reads** that have
-already been deduplicated by `derep_pairs` against their Tadpole-extended
+already been deduplicated by `derep_pairs` against their `fqdup extend`-assembled
 counterparts. The input sequences are therefore the original collapsed R1+R2
 molecules — the sequences on which the damage signal is present and should
 be modelled.
@@ -151,6 +151,57 @@ Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
 correction (with damage substitution protection) absorbed a further 1,456
 PCR-error clusters — only A↔T and C↔G mismatches are eligible; C↔T and G↔A
 are protected as potential damage signal.
+
+---
+
+## Library-type detection (DS vs SS)
+
+Ancient DNA libraries prepared with different protocols show distinct damage
+patterns:
+
+- **Double-stranded (DS) libraries** carry symmetric C→T signal at the 5' end
+  and G→A at the 3' end; both signals decay at similar rates.
+- **Single-stranded (SS) libraries** carry only C→T at the 5' end (original
+  strand) or only G→A at the 3' end (complementary strand), depending on
+  ligation orientation. Some SS protocols produce a sharp G→A spike at the last
+  3' position from ligation artifacts, without the gradual 3' decay seen in DS.
+
+`fqdup extend` and `fqdup derep` both auto-detect library type through a
+7-model BIC competition (powered by DART's
+[libdart-damage](https://github.com/genomewalker/libdart-damage)) before
+fitting the decay parameters. The models jointly evaluate four biological
+channels — 5' C→T, 3' G→A decay, 3' G→A spike at position 0, and 3' C→T
+(SS-original reads only). The winning model determines whether the damage
+profile is treated as DS, SS complementary, SS original, or negligible.
+
+The detected library type is printed in the log:
+
+```
+Library type: DS (d_max_5=0.193, d_max_3=0.040)
+Library type: SS (complement-only; d_max_3=0.221, spike at pos 0)
+```
+
+Override with `--library-type ds|ss` if the auto-detection is incorrect (e.g.
+mixed libraries or very low-coverage samples where the BIC test is
+underpowered). The library type only affects which channels are used for the
+damage model fit and masking; the downstream deduplication steps are identical.
+
+---
+
+## Damage estimation in `fqdup extend`
+
+`fqdup extend` runs the same Pass 0 damage estimation before building its k-mer
+graph. The estimated mask lengths determine which terminal positions are excluded
+from k-mer indexing — damaged terminal k-mers would create spurious branches in
+the de Bruijn graph because some reads carry C→T and others do not. Excluding
+them from graph construction lets the walk traverse damaged positions via k-mers
+contributed by overlapping longer reads, which carry the same terminal sequence
+without damage.
+
+The `--damage-sample` parameter (default 500 000 reads) controls the estimation
+sample size for `fqdup extend`. For most libraries, 500k reads gives stable
+estimates; for very low-complexity inputs the full file can be used with
+`--damage-sample 0`.
 
 ---
 
