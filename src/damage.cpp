@@ -642,6 +642,22 @@ int damage_main(int argc, char** argv) {
         j << "    \"bg_3prime\": " << dp.fit_baseline_3prime << ",\n";
         j << "    \"validated\": " << (dp.damage_validated ? "true" : "false") << ",\n";
         j << "    \"artifact\": " << (dp.damage_artifact ? "true" : "false") << ",\n";
+        // Context-split CpG-like estimates
+        auto nan_or = [](float v) -> std::string {
+            return std::isnan(v) ? "null" : std::to_string(v);
+        };
+        j << "    \"cpg_like\": {\n";
+        j << "      \"dmax_ct5_cpg\": "         << nan_or(dp.dmax_ct5_cpg_like)    << ",\n";
+        j << "      \"dmax_ct5_noncpg\": "      << nan_or(dp.dmax_ct5_noncpg_like) << ",\n";
+        j << "      \"cpg_ratio\": "            << nan_or(dp.cpg_ratio)            << ",\n";
+        j << "      \"log2_cpg_ratio\": "       << nan_or(dp.log2_cpg_ratio)       << ",\n";
+        j << "      \"baseline_cpg\": "         << nan_or(dp.fit_baseline_ct5_cpg_like)    << ",\n";
+        j << "      \"baseline_noncpg\": "      << nan_or(dp.fit_baseline_ct5_noncpg_like) << ",\n";
+        j << "      \"cov_terminal_cpg\": "     << std::setprecision(0) << dp.cov_ct5_cpg_like_terminal    << ",\n";
+        j << "      \"cov_terminal_noncpg\": "  << dp.cov_ct5_noncpg_like_terminal << ",\n";
+        j << "      \"effcov_terminal_cpg\": "  << dp.effcov_ct5_cpg_like_terminal    << ",\n";
+        j << "      \"effcov_terminal_noncpg\": " << dp.effcov_ct5_noncpg_like_terminal << "\n";
+        j << "    },\n";
         j << "    \"per_pos_5prime_ct\": [";
         for (int p = 0; p < N_POS; ++p) {
             double v = (dp.tc_total_5prime[p] >= MIN_COV) ? dp.t_freq_5prime[p] : -1.0;
@@ -679,7 +695,21 @@ int damage_main(int argc, char** argv) {
         j << "],\n";
         j << "    \"channel_c_detected\": " << (dp.ox_damage_detected ? "true" : "false") << ",\n";
         j << "    \"s_oxog\": " << std::setprecision(6) << (has_oxog_score ? S_oxog : 0.0) << ",\n";
-        j << "    \"se_s_oxog\": " << (has_oxog_score ? SE_oxog : 0.0) << "\n";
+        j << "    \"se_s_oxog\": " << (has_oxog_score ? SE_oxog : 0.0) << ",\n";
+        j << "    \"s_oxog_16ctx\": [";
+        for (int i = 0; i < 16; ++i) {
+            float v = dp.s_oxog_16ctx[i];
+            if (std::isnan(v)) j << "null";
+            else j << std::setprecision(6) << v;
+            if (i < 15) j << ",";
+        }
+        j << "],\n";
+        j << "    \"cov_oxog_16ctx\": [";
+        for (int i = 0; i < 16; ++i) {
+            j << std::setprecision(0) << dp.cov_oxog_16ctx[i];
+            if (i < 15) j << ",";
+        }
+        j << "]\n";
         j << "  },\n";
         j << "  \"depurination\": {\n";
         j << "    \"detected\": " << (dp.depurination_detected ? "true" : "false") << ",\n";
