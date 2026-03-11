@@ -169,11 +169,23 @@ per-position deamination frequencies, and the positions that exceed the mask thr
 Use the output to decide whether `--damage-auto` is warranted, verify the library-type
 call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
 
-The `--json` output includes the complete machine-readable profile: deamination
-estimates (`d_max_5prime`, `d_max_combined`, `d_metamatch`), per-position CT/GA
-arrays, 8-oxoG asymmetry (`s_oxog`), depurination enrichment, and BIC scores for
-library-type classification. `d_metamatch` is a channel-B anchored blended estimate
-calibrated against metaDMG; achieves r=0.818 on clean DS samples (DART wiki: r=0.81).
+The `--json` output includes the complete machine-readable profile:
+
+- **Deamination estimates**: `d_max_5prime`, `d_max_combined`, `d_metamatch` (channel-B
+  anchored blended estimate calibrated against metaDMG, r=0.818 on clean DS samples),
+  per-position CT/GA arrays, BIC scores for library-type classification.
+- **CpG-like context split** (`deamination.cpg_like`): 5' C→T amplitude fitted
+  separately for CpG-context (`xG`) vs non-CpG positions, with interior baselines as
+  reference. `cpg_ratio = dmax_cpg / dmax_noncpg`; values >1 indicate methylation-enhanced
+  deamination, as expected for most ancient organisms.
+- **Interior C→T clustering** (`interior_ct_cluster`): excess co-occurrence of T at
+  non-CpG `{C,T}` sites within the read interior, measured at separations d=1–10 bp.
+  `short_asym_log2oe` is the CT-track minus AG-control log₂ observed/expected; significant
+  positive values indicate clustered interior deamination. `short_z` is the normalised
+  contrast statistic.
+- **8-oxoG asymmetry**: `s_oxog` (overall strand asymmetry), plus `s_oxog_16ctx[16]` —
+  the G→T asymmetry split across all 16 flanking-dinucleotide contexts (NxN where x=G).
+- **Depurination enrichment** at 5′ and 3′ termini.
 
 Library-type classification returns `unknown` when no damage signal is detectable
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
