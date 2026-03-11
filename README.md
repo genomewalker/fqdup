@@ -161,12 +161,39 @@ fqdup damage -i INPUT [options]
   --library-type auto|ds|ss  Override library-type auto-detection (default: auto)
   --mask-threshold FLOAT     Mask positions where excess P(deam) > T (default: 0.05)
   --tsv FILE                 Write per-position frequency table as TSV
+  --json FILE                Write full damage profile as JSON
 ```
 
 Prints a human-readable report: library type with BIC scores, d_max/lambda per end,
 per-position deamination frequencies, and the positions that exceed the mask threshold.
 Use the output to decide whether `--damage-auto` is warranted, verify the library-type
 call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
+
+The `--json` output includes the complete machine-readable profile: deamination
+estimates (`d_max_5prime`, `d_max_combined`, `d_metamatch`), per-position CT/GA
+arrays, 8-oxoG asymmetry (`s_oxog`), depurination enrichment, and BIC scores for
+library-type classification. `d_metamatch` is a channel-B anchored blended estimate
+calibrated against metaDMG; achieves r=0.818 on clean DS samples (DART wiki: r=0.81).
+
+Library-type classification returns `unknown` when no damage signal is detectable
+(BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
+call — downstream `fqdup derep` treats `unknown` as DS for masking purposes.
+
+### `fqdup gen`
+
+Synthetic FASTQ generator with configurable damage patterns, for testing and
+benchmarking.
+
+```
+fqdup gen [options]
+
+  -o FILE                    Output FASTQ (default: stdout)
+  -n N                       Number of reads to generate (default: 10000)
+  --damage-dmax FLOAT        C→T damage amplitude (default: 0)
+  --damage-lambda FLOAT      Damage decay rate (default: 0.3)
+  --library-type ds|ss       Library type for damage model (default: ds)
+  --seed N                   Random seed for reproducibility
+```
 
 ### `fqdup extend`
 
