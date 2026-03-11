@@ -99,6 +99,7 @@ add_executable(fqdup
     src/derep.cpp
     src/damage.cpp
     src/damage_profile.cpp
+    src/gen.cpp
     src/fastq_io_backend.cpp
     src/logger.cpp
 )
