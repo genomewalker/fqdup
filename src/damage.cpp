@@ -711,6 +711,20 @@ int damage_main(int argc, char** argv) {
         }
         j << "]\n";
         j << "  },\n";
+        j << "  \"interior_ct_cluster\": {\n";
+        j << "    \"short_asym_log2oe\": " << std::setprecision(6) << dp.interior_ct_cluster_short_asym_log2oe << ",\n";
+        j << "    \"short_log2oe\": " << dp.interior_ct_cluster_short_log2oe << ",\n";
+        j << "    \"short_z\": " << dp.interior_ct_cluster_short_z << ",\n";
+        j << "    \"short_obs\": " << dp.interior_ct_cluster_short_obs << ",\n";
+        j << "    \"short_exp\": " << dp.interior_ct_cluster_short_exp << ",\n";
+        j << "    \"reads_used\": " << dp.interior_ct_cluster_reads_used << ",\n";
+        j << "    \"sep_log2oe\": [";
+        for (int i = 0; i < 10; ++i) {
+            j << std::setprecision(6) << dp.interior_ct_cluster_sep_log2oe[i];
+            if (i < 9) j << ",";
+        }
+        j << "]\n";
+        j << "  },\n";
         j << "  \"depurination\": {\n";
         j << "    \"detected\": " << (dp.depurination_detected ? "true" : "false") << ",\n";
         j << "    \"enrichment_5prime\": " << std::setprecision(6) << dp.purine_enrichment_5prime << ",\n";
