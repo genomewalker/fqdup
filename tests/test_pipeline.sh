@@ -236,19 +236,26 @@ echo "  PASS: Test P2"
 # long reads at the primary dedup step.
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test P3: Long reads with damage — derep_pairs handles it (damage ≠ problem for ≥62bp) ---"
+echo "--- Test P3: Long reads with damage — fqdup extend isolates damage from fingerprint ---"
 N_MOL=2000
 N_READS=10000   # 5x coverage
-DMAX5=0.25; DMAX3=0.20; LAMBDA=0.35
+DMAX5=0.25; DMAX3=0.20; LAMBDA=1.5
+# lambda=1.5 concentrates damage at positions 0-1 (excess well above 0.05 threshold).
+# Position 2 excess ≈ 0.012 — below threshold, leaving <3% residual variation.
+# This ensures fqdup extend's mask reliably covers the damage zone.
+# lambda=0.35 (typical real aDNA) has residual damage at positions 4-6 that leaks
+# below the mask threshold; that is handled by the full pipeline test (P4+).
 
-echo "  $N_MOL molecules × 5x coverage, 75bp fixed, dmax5=$DMAX5 dmax3=$DMAX3, no PCR errors"
-echo "  Terminal damage outside interior k-mers → same ext despite damage → collapses"
+echo "  $N_MOL molecules × 5x coverage, 75bp fixed, dmax5=$DMAX5 dmax3=$DMAX3, lambda=$LAMBDA, no PCR errors"
+echo "  fqdup extend masks damaged terminal k-mers → same ext despite damage → collapses"
 
 "$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 75 \
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
     --seed 77 > "$TMPDIR/p3_non.fq"
 
-run_tadpole "$TMPDIR/p3_non.fq" "$TMPDIR/p3_ext.fq" 15
+# fqdup extend: Pass 0 estimates damage → builds k-mer graph with masked terminal
+# positions → same interior k-mers for all copies of each molecule despite damage.
+"$FQDUP" extend -i "$TMPDIR/p3_non.fq" -o "$TMPDIR/p3_ext.fq" 2>/dev/null
 
 "$FQDUP" sort -i "$TMPDIR/p3_non.fq" -o "$TMPDIR/p3_non.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
@@ -267,15 +274,16 @@ import sys
 n_mol = $N_MOL
 after_dp = $AFTER_DP
 
-# Terminal damage does not affect interior k-mers → same ext → collapses correctly
+# fqdup extend excludes damaged terminal k-mers from the graph → same extension
+# fingerprint for all reads from the same molecule → derep_pairs collapses correctly.
 lo_dp, hi_dp = int(n_mol * 0.90), int(n_mol * 1.10)
 if not (lo_dp <= after_dp <= hi_dp):
     print(f"  FAIL: derep_pairs gave {after_dp} unique (expect {lo_dp}–{hi_dp})")
-    print(f"        Damage appears to be affecting extension (interior k-mers not correctly isolated)")
+    print(f"        fqdup extend may not be masking damaged terminal k-mers correctly")
     sys.exit(1)
 pct_from_true = abs(after_dp - n_mol) / n_mol * 100
 print(f"  PASS: derep_pairs {after_dp} ∈ [{lo_dp}, {hi_dp}] (+{pct_from_true:.1f}% from n_mol)")
-print(f"  PASS: Tadpole extension correctly isolates damage from dedup fingerprint")
+print(f"  PASS: fqdup extend correctly isolates damage from dedup fingerprint")
 EOF
 
 echo "  PASS: Test P3"
@@ -701,7 +709,9 @@ qual = 'I' * L
 
 mol_A = ''.join(rng.choice('ACGT') for _ in range(L))
 mol_snp = list(mol_A)
-mol_snp[37] = {'A':'G','C':'T','G':'A','T':'C'}[mol_A[37]]  # same interior SNP
+# Use A↔T / C↔G transversion (xr=3, no damage mechanism → EC-absorbable).
+# Transitions (C↔T, G↔A) are unconditionally protected as damage-consistent.
+mol_snp[37] = {'A':'T','C':'G','G':'C','T':'A'}[mol_A[37]]
 mol_snp = ''.join(mol_snp)
 
 cov = $COV

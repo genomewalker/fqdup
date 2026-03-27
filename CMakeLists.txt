@@ -154,8 +154,44 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh)
                      $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh)
+    add_test(NAME io_failures
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_math_invariants.sh)
+    add_test(NAME math_invariants
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_math_invariants.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backends.sh)
+    add_test(NAME backends
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backends.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh)
     add_test(NAME extend_dmgcor
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh
                      $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_genome_frags>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage.sh)
+    add_test(NAME damage
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage.sh
+                     $<TARGET_FILE:fqdup>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh)
+    add_test(NAME errcor
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh
+                     $<TARGET_FILE:fqdup>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh)
+    add_test(NAME pipeline
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 endif()

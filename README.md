@@ -1,22 +1,22 @@
 # fqdup
 
-FASTQ deduplication for paired-end ancient DNA libraries, with damage-aware
-hashing and PCR error correction.
+FASTQ deduplication for ancient DNA libraries, with damage-aware hashing and
+PCR error correction.
 
 ---
 
 Ancient DNA deamination turns one original molecule into a cloud of C→T/G→A
-sequence variants, so exact-sequence dedup splits true duplicates and inflates
-unique read counts. `fqdup` collapses those damage variants into a single cluster
-with damage-aware hashing, then optionally merges PCR-error variants with a fast
-mismatch-tolerant search, so downstream complexity metrics reflect molecules,
-not damage patterns.
+sequence variants. Exact-sequence dedup splits those true duplicates and inflates
+unique read counts. `fqdup` collapses damage variants into a single cluster with
+damage-aware hashing, then removes PCR-error variants with a fast
+mismatch-tolerant search. Downstream complexity metrics reflect molecules, not
+damage patterns.
 
 ## How it works
 
-`fqdup` runs four steps in order, each targeting a distinct layer of the
-duplication problem. An optional diagnostic command, `fqdup damage`, can be
-run beforehand to inspect the damage profile and verify library-type detection.
+`fqdup` runs four steps in order. An optional diagnostic command, `fqdup damage`,
+can be run beforehand to inspect the damage profile and verify library-type
+detection.
 
 **0. `fqdup damage` (optional diagnostic)**: standalone multi-threaded damage
 profiler. Scans the input reads and reports d_max, lambda, background rate, and
@@ -39,32 +39,33 @@ branches.
 **2. `fqdup sort`**: sort both input files by read ID. Required by both
 dedup steps.
 
-**3. `fqdup derep_pairs`**: structural deduplication of paired reads.
-Uses the `fqdup extend`-assembled sequence as the cluster fingerprint rather
-than the raw merged read. Short aDNA fragments that share a merged-read core
-often diverge in the assembled extension, so false collisions between different
-molecules are greatly reduced. The representative kept per cluster is the pair
-with the longest merged read.
+**3. `fqdup derep_pairs`**: structural deduplication using two files for the same
+reads: the original merged reads (`-n`) and their `fqdup extend`-assembled
+counterparts (`-e`). The extended sequence is used as the cluster fingerprint.
+Short aDNA fragments that share a merged-read core typically diverge in their
+extensions, reducing false collisions. The representative kept per cluster is the
+entry with the longest merged read. This step is not about R1/R2 paired-end
+sequencing; its input is single-end merged reads from `fastp --merge`.
 
 **4. `fqdup derep`**: biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
 
-- **PCR error correction (Phase 3, default: on).** After the index is built,
-  a 3-way pigeonhole Hamming search finds clusters with low count that differ
-  from a high-count cluster by exactly one interior substitution. These are PCR
-  copying errors and are removed. Crucially, C↔T and G↔A mismatches are *never*
-  absorbed, they are indistinguishable from damage signal and are always kept.
+- **PCR error correction (Phase 3, default: on).** A 3-way pigeonhole Hamming
+  search finds low-count clusters that differ from a high-count cluster by
+  exactly one interior substitution. These are removed as PCR copying errors.
+  C↔T and G↔A mismatches are never absorbed; they are indistinguishable from
+  damage signal and are always kept.
 
 - **Damage-aware hashing (default: off).** When enabled with `--damage-auto`,
   terminal positions where the observed C→T or G→A rate exceeds a threshold are
-  replaced with a neutral byte before hashing, collapsing reads that differ only
-  by deamination into the same cluster. Library type (double-stranded vs
-  single-stranded) is detected automatically via a 7-model BIC competition;
-  override with `--library-type ds|ss`. **Use with caution:** if downstream
-  damage analysis (DART, mapDamage) runs on the fqdup output, this distorts
-  per-position damage frequencies because only the most-damaged representative
-  is retained. Enable it when accurate unique-molecule counting matters more
-  than downstream damage estimation.
+  replaced with a neutral byte before hashing. Reads that differ only by
+  deamination collapse into the same cluster. Library type is detected
+  automatically via a 7-model BIC competition; override with
+  `--library-type ds|ss`. If downstream damage analysis (DART, mapDamage) will
+  run on the fqdup output, leave this off: only the most-damaged representative
+  is retained per cluster, which distorts per-position frequencies. Enable it
+  when accurate unique-molecule counting matters more than downstream damage
+  estimation.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
 error correction is the only relevant step, `--no-damage` is already the
@@ -84,7 +85,7 @@ fqdup extend -i merged.fq.gz -o extended.fq.gz
 fqdup sort -i merged.fq.gz   -o merged.sorted.fq.gz   --max-memory 64G --fast
 fqdup sort -i extended.fq.gz -o extended.sorted.fq.gz --max-memory 64G --fast
 
-# 3. Paired dedup: one representative pair per cluster
+# 3. Structural dedup: one representative per cluster, using extended reads as fingerprint
 fqdup derep_pairs \
   -n merged.sorted.fq.gz \
   -e extended.sorted.fq.gz \
@@ -303,13 +304,15 @@ required.
 #### PCR error correction: Phase 3 (default: on)
 
 ```
-  --no-error-correct      Disable Phase 3
-  --error-correct         Explicitly enable (already default)
-  --errcor-ratio  FLOAT   count(parent) / count(child) threshold (default: 50)
-  --errcor-max-count INT  Only absorb clusters with count ≤ N (default: 5)
-  --errcor-bucket-cap INT Max pair-key bucket size (default: 64)
+  --no-error-correct           Disable Phase 3
+  --error-correct              Explicitly enable (already default)
+  --errcor-mode capture|shotgun  Coverage regime (default: shotgun)
+  --errcor-min-parent    INT   Min count to index as parent (default: 3)
+  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)
+  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 2/1)
+  --errcor-bucket-cap    INT   Max pair-key bucket size (default: 64)
 
-  PCR model (for adaptive thresholds):
+  PCR model (for D_eff log estimate only, does not affect absorption):
   --pcr-cycles      INT   Number of PCR cycles
   --pcr-efficiency  FLOAT Amplification efficiency per cycle, 0–1 (default: 1.0)
   --pcr-error-rate  FLOAT Sub/base/doubling, Q5: 5.3e-7 (default),

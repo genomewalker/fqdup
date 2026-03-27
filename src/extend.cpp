@@ -894,7 +894,7 @@ void ExtendEngine::pass1_build_graph() {
     for (int t = 0; t < nt; ++t) workers.emplace_back(build_worker);
 
     int64_t n_reads = 0;
-    auto reader = make_fastq_reader(in_path_);
+    auto reader = make_fastq_reader(in_path_, static_cast<size_t>(cfg_.n_threads));
     for (;;) {
         int slot;
         {
@@ -992,7 +992,7 @@ void ExtendEngine::pass2_extend_write() {
     // ── Reader thread ────────────────────────────────────────────────────────
     auto reader_fn = [&]() {
         uint64_t next_batch_id = 0;
-        auto reader = make_fastq_reader(in_path_);
+        auto reader = make_fastq_reader(in_path_, static_cast<size_t>(cfg_.n_threads));
         std::shared_ptr<Chunk> chunk;
 
         for (;;) {
@@ -1160,6 +1160,32 @@ void ExtendEngine::pass2_extend_write() {
                     const ExtOut&      o   = c.outs[i];
                     const int L = static_cast<int>(rec.seq.size());
 
+                    // Compute how many terminal positions are masked for this read.
+                    // The original read's damaged bases at those positions vary between
+                    // reads from the same molecule.  Replacing C/T (5') with \x01 and
+                    // G/A (3') with \x02 makes the fingerprint identical for all copies,
+                    // so derep_pairs can collapse them correctly.
+                    int mask5 = 0, mask3 = 0;
+                    if (profile_.enabled) {
+                        while (mask5 < L && mask5 < DamageProfile::MASK_POSITIONS
+                               && profile_.mask_pos[mask5]) ++mask5;
+                        while (mask3 < L - mask5 && mask3 < DamageProfile::MASK_POSITIONS
+                               && profile_.mask_pos[mask3]) ++mask3;
+                    }
+
+                    // Neutralize damage-masked positions in a sequence buffer.
+                    // left_off: offset of the original read within the output buffer.
+                    auto neutralize = [&](std::string& seq, int left_off) {
+                        for (int p = 0; p < mask5; ++p) {
+                            char& b = seq[left_off + p];
+                            if (b == 'C' || b == 'T' || b == 'c' || b == 't') b = '\x01';
+                        }
+                        for (int p = 0; p < mask3; ++p) {
+                            char& b = seq[left_off + L - mask3 + p];
+                            if (b == 'G' || b == 'A' || b == 'g' || b == 'a') b = '\x02';
+                        }
+                    };
+
                     if (o.left_len > 0 || o.right_len > 0) {
                         ++local_ext;
                         local_ext5 += o.left_len;
@@ -1177,6 +1203,11 @@ void ExtendEngine::pass2_extend_write() {
                         std::memset(out_rec.qual.data(),                  '#',                o.left_len);
                         std::memcpy(out_rec.qual.data() + o.left_len,     rec.qual.data(),    L);
                         std::memset(out_rec.qual.data() + o.left_len + L, '#',                o.right_len);
+                        neutralize(out_rec.seq, o.left_len);
+                        fqw.write(out_rec);
+                    } else if (mask5 > 0 || mask3 > 0) {
+                        FastqRecord out_rec = rec;
+                        neutralize(out_rec.seq, 0);
                         fqw.write(out_rec);
                     } else {
                         fqw.write(rec);
@@ -1291,7 +1322,9 @@ int extend_main(int argc, char** argv) {
         } else if (arg == "-k" && i + 1 < argc) {
             cfg.k = std::stoi(argv[++i]);
         } else if (arg == "--min-count" && i + 1 < argc) {
-            cfg.min_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+            long v = std::stol(argv[++i]);
+            if (v < 1) { std::cerr << "Error: --min-count must be >= 1, got " << v << "\n"; return 1; }
+            cfg.min_count = static_cast<uint32_t>(v);
         } else if (arg == "--max-extend" && i + 1 < argc) {
             cfg.max_extend = std::stoi(argv[++i]);
         } else if (arg == "--no-damage") {
@@ -1351,6 +1384,14 @@ int extend_main(int argc, char** argv) {
     }
     if (cfg.max_extend < 1 || cfg.max_extend > 255) {
         std::cerr << "Error: --max-extend must be in [1, 255]\n";
+        return 1;
+    }
+    if (cfg.n_threads < 1) {
+        std::cerr << "Error: --threads must be >= 1\n";
+        return 1;
+    }
+    if (cfg.mask_threshold <= 0.0 || cfg.mask_threshold >= 1.0) {
+        std::cerr << "Error: --mask-threshold must be in (0, 1), got " << cfg.mask_threshold << "\n";
         return 1;
     }
     if ((cfg.mask_5_override >= 0) != (cfg.mask_3_override >= 0)) {
