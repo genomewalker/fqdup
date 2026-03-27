@@ -117,7 +117,7 @@ duplication, that is about 5.6 M entries, roughly 220 MB.
 the merged-read output of `derep_pairs`) and runs up to four phases depending
 on which options are active.
 
-**Pass 0** (with `--damage-auto`) scans all reads to estimate the ancient DNA
+**Pass 0** (with `--collapse-damage`) scans all reads to estimate the ancient DNA
 damage model. It measures the T/(T+C) frequency at each of the first 15 5'-end
 positions and the A/(A+G) frequency at the corresponding 3'-end positions.
 Background rates come from the middle third of each read. A coverage-weighted

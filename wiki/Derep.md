@@ -27,10 +27,10 @@ sequences are identical.
 
 `fqdup derep` runs in up to four stages:
 
-**Pass 0: damage estimation** (only with `--damage-auto`)
+**Pass 0: damage estimation** (only with `--collapse-damage`)
 Scans all reads to fit an exponential decay model of terminal deamination
 (same model as [[Damage-Aware-Deduplication]]). Identifies which positions
-exceed the mask threshold. Skipped if `--no-damage` (default) or manual
+exceed the mask threshold. Skipped if `--collapse-damage` is not given (default), or manual
 parameters are supplied.
 
 **Pass 1: index construction**
@@ -66,12 +66,11 @@ Optional:
   --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```
 
-### Damage-aware hashing (default: off)
+### Damage variant collapsing (default: off)
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--damage-auto` | Estimate damage from data (Pass 0) | off |
-| `--no-damage` | Explicitly disable | **default** |
+| `--collapse-damage` | Estimate damage from data (Pass 0) | off |
 | `--damage-dmax FLOAT` | d_max for both ends (manual) | - |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | - |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | - |
@@ -83,7 +82,7 @@ Optional:
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
 
 Run `fqdup damage -i FILE` first to inspect d_max and which positions would
-be masked before committing to `--damage-auto`. See [[Damage]].
+be masked before committing to `--collapse-damage`. See [[Damage]].
 
 ### PCR error correction (default: on)
 
@@ -135,8 +134,8 @@ On sample `a88af16f35`, 5.58 M reads in, 91 bp mean length,
 | Mode | Unique clusters | Wall time |
 |------|----------------|-----------|
 | Standard (exact hash, EC on) | 3,531,821 | ~22 s |
-| `--damage-auto` only | 3,511,607 | ~31 s |
-| `--damage-auto --error-correct` | 3,510,151 | ~33 s |
+| `--collapse-damage` only | 3,511,607 | ~31 s |
+| `--collapse-damage --error-correct` | 3,510,151 | ~33 s |
 
 Across 31 ancient DNA libraries (2.97 B reads total) run in the full paired
 pipeline, `fqdup derep` absorbed a further 8.6% of reads beyond what
