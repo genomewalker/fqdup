@@ -2,17 +2,21 @@
 
 ## Purpose
 
-`fqdup derep_pairs` is the structural deduplication step for paired reads.
-It deduplicates using the `fqdup extend`-assembled sequence as the cluster
-fingerprint rather than the raw merged read.
+`fqdup derep_pairs` is the structural deduplication step. Despite the name,
+it has nothing to do with R1/R2 paired-end sequencing. Its input is already
+collapsed single-end reads from `fastp --merge`; "pairs" here refers to the
+two-file input: the original merged reads (`-n`) and their
+`fqdup extend`-assembled counterparts (`-e`), one extended and one non-extended
+file per read.
 
-Using the extended sequence as fingerprint reduces false collisions: two
-different molecules that happen to share a short merged-read sequence will
-typically diverge in their assembly-extended versions. Conversely, PCR
-duplicates that differ only because one was captured in a slightly shifted
-window extend to the same flanking sequence and collapse correctly.
+The extended sequence is used as the cluster fingerprint rather than the raw
+merged read. Two different molecules that happen to share a short merged-read
+core will typically diverge in their assembly-extended versions, reducing false
+collisions. Conversely, PCR duplicates that differ only because one was captured
+in a slightly shifted window extend to the same flanking sequence and collapse
+correctly.
 
-The representative kept per cluster is the pair with the **longest merged
+The representative kept per cluster is the entry with the **longest merged
 read**, preserving the most original ancient DNA sequence for downstream
 analysis.
 
@@ -26,15 +30,15 @@ correction. Those are handled by the subsequent `fqdup derep` step.
 `fqdup derep_pairs` is a two-pass streaming algorithm.
 
 **Pass 1: index construction**
-Both sorted files are streamed in lockstep. For each pair, the canonical hash
+Both sorted files are streamed in lockstep. For each record, the canonical hash
 of the **extended** read is computed: `min(XXH3_128(ext), XXH3_128(revcomp(ext)))`.
 The index stores `{record_offset, count, merged_len}`, ~40 bytes per unique
-pair. When the same extended hash appears again, the count is incremented; if
-the new merged read is longer than the stored representative, the representative
-is updated.
+cluster. When the same extended hash appears again, the count is incremented;
+if the new merged read is longer than the stored representative, the
+representative is updated.
 
 **Pass 2: output**
-Both files are re-streamed. For each pair, if this is the representative
+Both files are re-streamed. For each record, if this is the representative
 (longest merged read of its cluster), it is written to both output files.
 
 ---

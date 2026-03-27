@@ -225,7 +225,10 @@ public:
     explicit FastqReader(const std::string& path)
         : path_(path), gzfp_(nullptr), record_count_(0) {
 
-        gzfp_ = gzopen(path.c_str(), "rb");
+        if (path == "-" || path == "/dev/stdin")
+            gzfp_ = gzdopen(fileno(stdin), "rb");
+        else
+            gzfp_ = gzopen(path.c_str(), "rb");
         if (!gzfp_)
             throw std::runtime_error("Cannot open file: " + path);
         gzbuffer(gzfp_, GZBUF_SIZE);
@@ -312,10 +315,38 @@ public:
     }
 
     ~FastqWriter() {
-        if (gzfp_) gzclose(gzfp_);
+        try { close(); }
+        catch (const std::exception& e) {
+            std::cerr << "Fatal: " << e.what() << "\n";
+            std::exit(1);
+        }
+        catch (...) {
+            std::cerr << "Fatal: unknown error closing output\n";
+            std::exit(1);
+        }
+    }
+
+    void close() {
+        if (closed_) return;
+        closed_ = true;
+        if (gzfp_) {
+            if (gzclose(gzfp_) != Z_OK)
+                throw std::runtime_error("gzclose failed writing " + path_);
+            gzfp_ = nullptr;
+        }
 #ifdef HAVE_BGZF
-        if (bgzfp_) bgzf_close(bgzfp_);
+        if (bgzfp_) {
+            if (bgzf_close(bgzfp_) < 0)
+                throw std::runtime_error("bgzf_close failed writing " + path_);
+            bgzfp_ = nullptr;
+        }
 #endif
+        if (plain_out_.is_open()) {
+            plain_out_.flush();
+            plain_out_.close();
+            if (plain_out_.fail())
+                throw std::runtime_error("close failed writing " + path_);
+        }
     }
 
     void write(const FastqRecord& rec) {
@@ -323,7 +354,7 @@ public:
         if (bgzfp_) {
             auto bw = [&](const void* d, size_t n) {
                 if (bgzf_write(bgzfp_, d, n) < 0)
-                    throw std::runtime_error("bgzf_write failed");
+                    throw std::runtime_error("bgzf_write failed writing " + path_);
             };
             bw(rec.header.data(), rec.header.size()); bw("\n", 1);
             bw(rec.seq.data(),    rec.seq.size());    bw("\n", 1);
@@ -342,12 +373,15 @@ public:
                        << rec.seq    << '\n'
                        << rec.plus   << '\n'
                        << rec.qual   << '\n';
+            if (!plain_out_.good())
+                throw std::runtime_error("write failed writing " + path_);
         }
     }
 
 private:
     std::string   path_;
     bool          compress_;
+    bool          closed_ = false;
     gzFile        gzfp_;
 #ifdef HAVE_BGZF
     BGZF*         bgzfp_;

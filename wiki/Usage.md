@@ -64,7 +64,7 @@ available cores.
 
 Sort both files by read ID, as above.
 
-### Step 3: paired structural deduplication
+### Step 3: structural deduplication (extended + merged reads)
 
 ```bash
 fqdup derep_pairs \
@@ -80,9 +80,13 @@ fqdup derep_pairs \
 read reduces false collisions: two different molecules that happen to share a
 short merged sequence will typically diverge in the assembled extension.
 
-The representative kept per cluster is the pair with the longest **merged**
+The representative kept per cluster is the entry with the longest **merged**
 read, preserving the most original ancient DNA sequence. The `-c` flag writes
 per-cluster statistics to a gzipped TSV.
+
+Note: `derep_pairs` is not about R1/R2 paired-end reads. Its input is
+already single-end merged reads from `fastp --merge`; `-n` and `-e` are the
+same reads in two forms (non-extended and extended), not two sequencing mates.
 
 For a 25.8 M-pair library, this step typically finishes in about 25 seconds
 and reduces to around 5.6 M unique pairs.
@@ -91,8 +95,8 @@ and reduces to around 5.6 M unique pairs.
 
 ```bash
 fqdup derep \
-  -i nonext.deduped.fq.gz \
-  -o nonext.final.fq.gz \
+  -i merged.deduped.fq.gz \
+  -o merged.final.fq.gz \
   -c clusters_derep.tsv.gz
 ```
 
@@ -250,11 +254,13 @@ See [[Damage]] for full output description and typical workflow.
 | `--damage-lambda3 FLOAT` | Decay constant for 3' end | - |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
-| `--pcr-cycles INT` | PCR cycles; if omitted, D_eff is estimated from duplication ratio | 0 (auto) |
+| `--pcr-cycles INT` | PCR cycles for D_eff log estimate | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
-| `--pcr-error-rate FLOAT` | Sub/base/doubling (Q5=5.3e-7, Taq=1.5e-4) | 5.3e-7 |
+| `--pcr-error-rate FLOAT` | Sub/base/doubling for log estimate | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | **on** |
 | `--no-error-correct` | Disable Phase 3 PCR error correction | - |
-| `--errcor-ratio FLOAT` | count(parent)/count(child) threshold | 50.0 |
-| `--errcor-max-count INT` | Children must have count ≤ N | 5 |
+| `--errcor-mode capture\|shotgun` | Coverage regime | shotgun |
+| `--errcor-min-parent INT` | Min count to index as parent | 3 |
+| `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
+| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 (capture), 1 (shotgun) |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |

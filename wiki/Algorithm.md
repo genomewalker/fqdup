@@ -113,9 +113,9 @@ duplication, that is about 5.6 M entries, roughly 220 MB.
 
 ## fqdup derep
 
-`derep` takes a single sorted FASTQ, in the standard pipeline, the merged
-read output of `derep_pairs`, and runs up to four phases depending on which
-options are active.
+`derep` takes a single sorted FASTQ (either directly from `fqdup sort` or
+the merged-read output of `derep_pairs`) and runs up to four phases depending
+on which options are active.
 
 **Pass 0** (with `--damage-auto`) scans all reads to estimate the ancient DNA
 damage model. It measures the T/(T+C) frequency at each of the first 15 5'-end

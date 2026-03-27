@@ -26,16 +26,20 @@ static DamageProfile estimate_damage_impl(
     int      reads_scanned = 0;
     int      typical_len   = 0;
     int64_t  record_pos    = 0;
+    int64_t  len_sum       = 0;
 
     while (reader.read(rec)) {
         record_pos++;
         if (max_reads > 0 && record_pos > max_reads) break;
         int L = static_cast<int>(rec.seq.size());
         if (L < 30) continue;
-        if (L > typical_len) typical_len = L;
+        len_sum += L;
         dart::FrameSelector::update_sample_profile(dart_profile, rec.seq);
         reads_scanned++;
     }
+
+    if (reads_scanned > 0)
+        typical_len = static_cast<int>(len_sum / reads_scanned);
 
     dart::FrameSelector::finalize_sample_profile(dart_profile);
 
