@@ -43,5 +43,8 @@ public:
 };
 
 // Factory: returns the best available backend (rapidgzip > ISA-L > zlib).
-// Implemented in src/fastq_io_backend.cpp — the only TU that includes rapidgzip.
-std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path);
+// threads: decompression thread budget for rapidgzip (0 = auto from hardware_concurrency).
+// Callers that already have worker pools should pass their own thread count to avoid
+// oversubscription. Implemented in src/fastq_io_backend.cpp.
+std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
+                                                    size_t threads = 0);

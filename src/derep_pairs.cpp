@@ -128,8 +128,8 @@ private:
     }
 
     void pass1(const std::string& ext_path, const std::string& non_path) {
-        auto ext_reader = make_fastq_reader(ext_path);
-        auto non_reader = make_fastq_reader(non_path);
+        auto ext_reader = make_fastq_reader(ext_path, 1);
+        auto non_reader = make_fastq_reader(non_path, 1);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 
@@ -181,13 +181,11 @@ private:
         gzFile cluster_gz = nullptr;
         if (write_clusters_ && !cluster_path.empty()) {
             cluster_gz = gzopen(cluster_path.c_str(), "wb6");
-            if (cluster_gz) {
-                gzbuffer(cluster_gz, GZBUF_SIZE);
-                if (gzprintf(cluster_gz,
-                             "hash\text_len\tpair_count\tnon_len\n") < 0)
-                    throw std::runtime_error(
-                        "gzprintf failed while writing cluster header");
-            }
+            if (!cluster_gz)
+                throw std::runtime_error("Cannot open cluster file: " + cluster_path);
+            gzbuffer(cluster_gz, GZBUF_SIZE);
+            if (gzprintf(cluster_gz, "hash\text_len\tpair_count\tnon_len\n") < 0)
+                throw std::runtime_error("gzprintf failed while writing cluster header");
         }
 
         ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
@@ -196,8 +194,8 @@ private:
             records_to_write[entry.record_index] = fingerprint;
         const size_t n_to_write = records_to_write.size();
 
-        auto ext_reader = make_fastq_reader(ext_path);
-        auto non_reader = make_fastq_reader(non_path);
+        auto ext_reader = make_fastq_reader(ext_path, 1);
+        auto non_reader = make_fastq_reader(non_path, 1);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
         size_t written = 0;
@@ -235,7 +233,8 @@ private:
             record_idx++;
         }
 
-        if (cluster_gz) gzclose(cluster_gz);
+        if (cluster_gz && gzclose(cluster_gz) != Z_OK)
+            throw std::runtime_error("gzclose failed writing cluster file");
         std::cerr << "\r";
         log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }

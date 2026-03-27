@@ -5,11 +5,10 @@ DNA deduplication: post-mortem deamination. PCR copying errors are covered in
 [[PCR-Error-Correction]]. Both are handled by `fqdup derep`; see [[Home]] for
 how they fit together.
 
-In the standard pipeline, `derep` receives **fastp-merged reads** that have
-already been deduplicated by `derep_pairs` against their `fqdup extend`-assembled
-counterparts. The input sequences are therefore the original collapsed R1+R2
-molecules, the sequences on which the damage signal is present and should
-be modelled.
+`derep` operates on fastp-merged reads: the original collapsed R1+R2 molecules
+on which the damage signal is present and should be modelled. In the full
+paired pipeline these reads arrive from `derep_pairs`; `derep` can also be
+run directly on sorted merged reads without a preceding `derep_pairs` step.
 
 ---
 
@@ -137,8 +136,9 @@ with symmetric damage).
 
 ## Effect on cluster counts
 
-Benchmarked on sample `a88af16f35`, 25.8 M fastp-merged read pairs, 91 bp
-mean length, `d_max_5 ≈ 0.193`, `lambda_5 ≈ 0.25`:
+Benchmarked on sample `a88af16f35`, 5.58 M merged reads input to `derep`
+(from a 25.8 M read-pair library after `derep_pairs`), 91 bp mean length,
+`d_max_5 ≈ 0.193`, `lambda_5 ≈ 0.25`:
 
 | Step | Unique clusters | Change |
 |------|----------------|--------|

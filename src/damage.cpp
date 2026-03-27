@@ -211,6 +211,7 @@ int damage_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    bool        run_oxog      = true;
     dart::SampleDamageProfile::LibraryType forced_lib =
         dart::SampleDamageProfile::LibraryType::UNKNOWN;
 
@@ -237,6 +238,8 @@ int damage_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--no-oxog") {
+            run_oxog = false;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -252,6 +255,10 @@ int damage_main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
+    if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
+        std::cerr << "Error: --mask-threshold must be in (0, 1), got " << mask_threshold << "\n";
+        return 1;
+    }
 
     // ---- set up workers ------------------------------------------------
     // Queue depth = 2 * n_threads so the producer stays ahead without OOM.
@@ -264,7 +271,7 @@ int damage_main(int argc, char** argv) {
 
     // ---- producer: stream FASTQ into batches ---------------------------
     try {
-        auto reader = make_fastq_reader(in_path);
+        auto reader = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         std::vector<std::string> batch;
         batch.reserve(BATCH_SZ);
@@ -312,7 +319,7 @@ int damage_main(int argc, char** argv) {
     double S_oxog = 0.0, SE_oxog = 0.0;
     bool has_oxog_score = false;
 
-    if (dp.d_max_5prime > 0.01f) {
+    if (run_oxog && dp.d_max_5prime > 0.01f) {
         WorkQueue queue2(2 * n_threads);
         std::vector<OxogWorkerState> ox_states(n_threads);
         std::vector<std::thread> workers2;
@@ -321,7 +328,7 @@ int damage_main(int argc, char** argv) {
             workers2.emplace_back(oxog_worker, std::ref(queue2),
                                    std::ref(ox_states[t]), std::cref(dp), is_ss);
         try {
-            auto reader2 = make_fastq_reader(in_path);
+            auto reader2 = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
             FastqRecord rec;
             std::vector<std::string> batch;
             batch.reserve(BATCH_SZ);
@@ -657,6 +664,18 @@ int damage_main(int argc, char** argv) {
         j << "      \"cov_terminal_noncpg\": "  << dp.cov_ct5_noncpg_like_terminal << ",\n";
         j << "      \"effcov_terminal_cpg\": "  << dp.effcov_ct5_cpg_like_terminal    << ",\n";
         j << "      \"effcov_terminal_noncpg\": " << dp.effcov_ct5_noncpg_like_terminal << "\n";
+        j << "    },\n";
+        // Experimental: upstream-context-aware deamination (AC, CC, GC, TC)
+        j << "    \"context_deamination\": {\n";
+        j << "      \"dmax_AC\": " << nan_or(dp.dmax_ct5_by_upstream[dart::SampleDamageProfile::CTX_AC]) << ",\n";
+        j << "      \"dmax_CC\": " << nan_or(dp.dmax_ct5_by_upstream[dart::SampleDamageProfile::CTX_CC]) << ",\n";
+        j << "      \"dmax_GC\": " << nan_or(dp.dmax_ct5_by_upstream[dart::SampleDamageProfile::CTX_GC]) << ",\n";
+        j << "      \"dmax_TC\": " << nan_or(dp.dmax_ct5_by_upstream[dart::SampleDamageProfile::CTX_TC]) << ",\n";
+        j << "      \"dipyr_contrast\": " << nan_or(dp.dipyr_contrast) << ",\n";
+        j << "      \"cpg_contrast\": " << nan_or(dp.cpg_contrast) << ",\n";
+        j << "      \"heterogeneity_chi2\": " << std::setprecision(2) << dp.context_heterogeneity_chi2 << ",\n";
+        j << "      \"heterogeneity_p\": " << std::setprecision(4) << dp.context_heterogeneity_p << ",\n";
+        j << "      \"heterogeneity_detected\": " << (dp.context_heterogeneity_detected ? "true" : "false") << "\n";
         j << "    },\n";
         j << "    \"per_pos_5prime_ct\": [";
         for (int p = 0; p < N_POS; ++p) {

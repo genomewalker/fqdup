@@ -51,12 +51,21 @@ struct DamageProfile {
     double dmg_3(int p) const { return d_max_3prime * std::exp(-lambda_3prime * p); }
 
     double expected_mismatches(int L) const {
+        // d_max and the exponential model are defined on the conditional T/(T+C)
+        // scale: dmg_5(p) is the excess deamination rate among C/T bases only.
+        // The per-position mismatch probability between two reads is therefore
+        // dmg × (1-dmg) × f_C, where f_C = 1-background is the C fraction within
+        // the T+C pool (background = T/(T+C) at undamaged positions). Without this
+        // factor the expectation is inflated by ~1/(1-background) ≈ 2× for typical
+        // aDNA base composition. The same factor applies to the 3' G→A channel by
+        // complement symmetry (G fraction in A+G pool ≈ 1-background).
+        const double f_suscep = 1.0 - background;
         double e = 0.0;
         for (int p = 0; p < L; ++p) {
             double d5 = dmg_5(p);
             double d3 = dmg_3(L - 1 - p);
-            e += 2.0 * d5 * (1.0 - d5);
-            e += 2.0 * d3 * (1.0 - d3);
+            e += 2.0 * d5 * (1.0 - d5) * f_suscep;
+            e += 2.0 * d3 * (1.0 - d3) * f_suscep;
         }
         e += 2.0 * L * pcr_error_rate;
         return e;
