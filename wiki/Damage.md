@@ -4,9 +4,9 @@
 
 `fqdup damage` profiles ancient DNA deamination damage and computes the
 per-position mask that would be applied by `fqdup extend` and `fqdup derep
---damage-auto`. It is a standalone diagnostic command, run it before the
+--collapse-damage`. It is a standalone diagnostic command, run it before the
 full pipeline to inspect the damage profile, verify that library-type
-auto-detection is correct, and decide whether `--damage-auto` is warranted.
+auto-detection is correct, and decide whether `--collapse-damage` is warranted.
 
 ---
 
@@ -105,7 +105,7 @@ Fields:
 - **terminal shift / z-score**, Observed minus background T/(T+C) or A/(A+G) at the terminal positions; the z-score indicates significance.
 - **d_max / lambda / bg**, Exponential decay parameters for each end, and the combined d_max (the larger of the two, used as the aggregate damage indicator).
 - **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libdart-damage classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
-- **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --damage-auto`.
+- **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --collapse-damage`.
 - **Per-position table**, Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
 
 ### TSV output (`--tsv`)
@@ -124,7 +124,7 @@ pos	end5	freq5	end3	freq3	mask	cov5	cov3
 ## Typical workflow
 
 Run `fqdup damage` first to inspect the profile before committing to
-`--damage-auto`:
+`--collapse-damage`:
 
 ```bash
 fqdup damage -i merged.fq.gz --tsv damage_profile.tsv
@@ -133,7 +133,7 @@ fqdup damage -i merged.fq.gz --tsv damage_profile.tsv
 Then use the output to decide:
 
 1. **d_max_5 < 0.02 and d_max_3 < 0.02**, no meaningful damage; skip
-   `--damage-auto` in `fqdup derep` entirely.
+   `--collapse-damage` in `fqdup derep` entirely.
 
 2. **Library type looks wrong**, override with `--library-type ds|ss` in
    `fqdup damage` first to confirm, then pass the same flag to `fqdup extend`

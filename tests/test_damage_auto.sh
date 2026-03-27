@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_damage_auto.sh — Validates --damage-auto estimation and damage vs PCR separation.
+# test_damage_auto.sh — Validates --collapse-damage estimation and damage vs PCR separation.
 #
 # Tests:
 #   A. d_max estimation accuracy
@@ -30,7 +30,7 @@ DMAX5=0.25; DMAX3=0.20; LAMBDA=0.35
 TOL=0.08
 N_MOL=10000
 
-echo "=== fqdup --damage-auto tests ==="
+echo "=== fqdup --collapse-damage tests ==="
 
 # ---------------------------------------------------------------------------
 # Test A: d_max estimation accuracy
@@ -46,7 +46,7 @@ echo "  True: dmax5=$DMAX5  dmax3=$DMAX3  lambda=$LAMBDA"
 "$FQDUP" sort -i "$TMPDIR/est.fq" -o "$TMPDIR/est.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
 "$FQDUP" derep -i "$TMPDIR/est.sorted.fq" -o /dev/null \
-    --damage-auto 2>"$TMPDIR/est.log"
+    --collapse-damage 2>"$TMPDIR/est.log"
 
 EST5=$(grep "5'-end: d_max=" "$TMPDIR/est.log" | sed 's/.*d_max=\([^ ]*\) .*/\1/')
 EST3=$(grep "3'-end: d_max=" "$TMPDIR/est.log" | sed 's/.*d_max=\([^ ]*\) .*/\1/')
@@ -85,7 +85,7 @@ echo "  $N_MOL molecules × 2 independently-damaged copies"
 "$FQDUP" sort -i "$TMPDIR/dup.fq" -o "$TMPDIR/dup.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
 "$FQDUP" derep -i "$TMPDIR/dup.sorted.fq" -o "$TMPDIR/dup.out.fq" \
-    --damage-auto 2>"$TMPDIR/dup.log"
+    --collapse-damage 2>"$TMPDIR/dup.log"
 
 UNIQUE_B=$(grep -c '^@' "$TMPDIR/dup.out.fq")
 echo "  Unique reads: $UNIQUE_B / $((N_MOL * 2)) input reads"
@@ -250,12 +250,12 @@ echo "  PASS: Test D"
 #
 # Two groups of molecules with a real C/T SNP at position 0 — no ancient damage.
 # The DART estimator sees T/(T+C) ≈ 50% at pos 0 (= background), so excess ≈ 0%
-# and mask_pos[0] stays false.  --damage-auto must NOT merge the two alleles.
+# and mask_pos[0] stays false.  --collapse-damage must NOT merge the two alleles.
 #
 # Design:
 #   2000 molecules, each emitted twice: once with C at pos 0, once with T at pos 0.
 #   Same random interior (pos 1–74) → genuine C/T polymorphism, not damage.
-#   Sort → derep --damage-auto.
+#   Sort → derep --collapse-damage.
 #   Assert: unique ≥ 0.99 × 4000  (both alleles kept separate).
 # ---------------------------------------------------------------------------
 echo ""
@@ -281,7 +281,7 @@ PYEOF
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
 "$FQDUP" derep -i "$TMPDIR/snp.sorted.fq" -o "$TMPDIR/snp.out.fq" \
-    --damage-auto 2>"$TMPDIR/snp.log"
+    --collapse-damage 2>"$TMPDIR/snp.log"
 
 UNIQUE_E=$(grep -c '^@' "$TMPDIR/snp.out.fq")
 echo "  Unique reads: $UNIQUE_E / $((N_MOL_E * 2)) input reads"
