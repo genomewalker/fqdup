@@ -66,10 +66,10 @@ echo "--- M3: masking monotonicity (more mask → fewer or equal unique) ---"
     --max-memory 128M -t "$TMPDIR" 2>/dev/null
 
 U_NODMG=$("$FQDUP" derep -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_nodmg.fq" \
-    --no-damage --no-error-correct 2>/dev/null && \
+    --no-error-correct 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m3_nodmg.fq")
 U_DMG=$("$FQDUP" derep -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_dmg.fq" \
-    --damage-auto --no-error-correct 2>/dev/null && \
+    --collapse-damage --no-error-correct 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m3_dmg.fq")
 
 python3 - <<EOF
@@ -78,7 +78,7 @@ no_dmg, dmg = $U_NODMG, $U_DMG
 if dmg > no_dmg:
     print(f"  FAIL: masking increased unique count ({no_dmg} → {dmg})")
     sys.exit(1)
-print(f"  PASS: --damage-auto {no_dmg} → {dmg} unique (damage masking reduces or holds)")
+print(f"  PASS: --collapse-damage {no_dmg} → {dmg} unique (damage masking reduces or holds)")
 EOF
 
 # ---------------------------------------------------------------------------

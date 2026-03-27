@@ -63,7 +63,7 @@ If not, it is absorbed as a PCR copying error.
 Phase 3 includes a special case for C↔T and G↔A mismatches at positions
 immediately adjacent to the damage zone (`--mask-threshold` edge). These
 positions are not masked (their excess deamination rate is below the threshold)
-but they still carry real ancient DNA signal. When `--damage-auto` is active,
+but they still carry real ancient DNA signal. When `--collapse-damage` is active,
 such mismatches bypass the SNP veto and are always absorbed — they are treated
 as residual deamination artefacts rather than true SNPs.
 
@@ -242,7 +242,7 @@ entirely in memory on the index built during Pass 1.
 
 ### Batch run: 31 ancient DNA libraries
 
-All libraries processed with `--damage-auto --error-correct`, Q5 defaults
+All libraries processed with `--collapse-damage --error-correct`, Q5 defaults
 (φ = 5.3×10⁻⁷), D_eff estimated automatically from duplication ratio.
 
 **Input is post-`derep_pairs`** (`*.derep.non.fq.gz`): fastp-merged reads whose
