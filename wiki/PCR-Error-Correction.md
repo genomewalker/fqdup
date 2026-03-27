@@ -6,12 +6,12 @@ DNA deduplication: PCR copying errors. Post-mortem deamination is covered in
 handles terminal variation, Phase 3 handles interior variation. See [[Home]]
 for the full picture.
 
-In the standard pipeline, `derep` receives the **merged read output of
-`derep_pairs`**, reads that were collapsed from R1+R2 by fastp and then
-deduplicated against their `fqdup extend`-assembled counterparts. Most PCR
-duplicates have already been removed at that stage; `derep`'s Phase 3 targets
-the residual PCR errors that survived because they happened to produce divergent
-extensions (and were therefore treated as distinct pairs by `derep_pairs`).
+`derep` can be run directly on sorted merged reads or after `derep_pairs` in
+the full paired pipeline. When following `derep_pairs`, most PCR duplicates
+have already been removed; Phase 3 targets the residual errors that survived
+because they produced divergent extensions (and were therefore treated as
+distinct pairs by `derep_pairs`). When run directly, Phase 3 operates on the
+complete amplification depth.
 
 ---
 
@@ -37,47 +37,54 @@ cluster is almost never a distinct biological molecule.
 ## Approach
 
 Phase 3 runs entirely in memory on the deduplication index built during Pass 1
-- no additional file I/O. It classifies clusters as **parents** (count above
-`--errcor-max-count`, default 5) and **children** (count at or below that
-threshold). A child is absorbed into a parent when:
+— no additional file I/O. It classifies clusters as **parents** (count above
+`--errcor-min-parent`, default 3) and **children** (count at or below that
+threshold). For each child, Phase 3 finds all Hamming-distance-1 neighbours
+among parents. A child is absorbed into its highest-count parent unless the
+**SNP veto** fires.
 
-1. Their sequences differ by at most one substitution **outside** the damage zone
-2. The parent's count is at least `--errcor-ratio` × the child's count (default 50×)
-3. The single mismatch (if any) is **not** a damage-consistent substitution (see below)
+The SNP veto protects a child when the mismatch appears recurrently across
+multiple reads at the same position in the same parent:
 
----
+```
+snp_veto = (sig_count ≥ --errcor-snp-min-count)
+        AND (sig_count / parent_count ≥ --errcor-snp-threshold)
+```
 
-## Damage substitution protection
-
-The damage zone exclusion skips positions already flagged by the masking model,
-but sub-threshold positions still carry real C→T and G→A signal. And oxidative
-damage (8-oxoG, Channel C in DART) produces G→T transversions uniformly across
-the entire read, no position-based masking can protect those.
-
-Phase 3 therefore applies a substitution-type filter: a child is **never**
-absorbed if the single mismatch is associated with a known DNA damage mechanism,
-regardless of its position:
-
-| Substitution | Damage mechanism |
-|---|---|
-| C↔T | Ancient deamination (5′ C→T) |
-| G↔A | Ancient deamination (3′ G→A, complementary strand) |
-| G↔T | Oxidative 8-oxoG (uniform across read) |
-| C↔A | Oxidative 8-oxoG (complementary strand) |
-
-Only **A↔T** and **C↔G** mismatches, the two transversion pairs with no known
-DNA damage mechanism, are eligible for absorption. In practice this protects
-73% of what a naive Phase 3 would absorb on an ancient DNA library with
-d_max ≈ 0.10 (sample a88af16f35, see benchmarks below).
+`sig_count` is the weighted count of all child clusters carrying the same
+`(position, alt_base)` mismatch relative to this parent. If the mismatch
+appears consistently enough to be a true biological variant, the child is kept.
+If not, it is absorbed as a PCR copying error.
 
 ---
 
-## PCR error model and adaptive thresholds
+## Damage-zone handling
+
+Phase 3 includes a special case for C↔T and G↔A mismatches at positions
+immediately adjacent to the damage zone (`--mask-threshold` edge). These
+positions are not masked (their excess deamination rate is below the threshold)
+but they still carry real ancient DNA signal. When `--damage-auto` is active,
+such mismatches bypass the SNP veto and are always absorbed — they are treated
+as residual deamination artefacts rather than true SNPs.
+
+This bypass applies only to C↔T and G↔A at the damage-zone edge. Mismatches
+elsewhere, including G↔T and C↔A from oxidative damage (8-oxoG), rely entirely
+on the SNP veto for protection. A G→T lesion that appears in only a small
+fraction of reads relative to the parent count will not reach the SNP veto
+threshold and will be absorbed.
+
+---
+
+## PCR error model (logging only)
+
+Phase 3 does not use the PCR error rate to gate absorption decisions; the SNP
+veto threshold alone determines whether a child is kept. The PCR model is used
+only to compute an expected error rate that is printed in the log, providing
+context for interpreting the number of absorptions.
 
 ### Error rate formula
 
-Following Potapov & Ong 2017, the total substitution error probability per
-base position over a full PCR run is:
+Following Potapov & Ong 2017:
 
 ```
 ε_total = φ × D_eff
@@ -89,9 +96,24 @@ where:
   E     = per-cycle efficiency (0–1; 1.0 = ideal doubling)
 ```
 
-The effective doublings formula follows directly from PCR kinetics: if each
-cycle amplifies a fraction E of molecules, after n cycles the copy number is
-(1+E)ⁿ, giving log₂((1+E)ⁿ) = n × log₂(1+E) effective doublings.
+**When `--pcr-cycles` is not given**, D_eff is estimated from the observed
+duplication ratio after Pass 1:
+
+```
+D_eff_estimated = log₂(total_reads / unique_reads)
+```
+
+This estimate is logged:
+
+```
+Phase 3: D_eff=2.21 estimated from duplication ratio 25000000/5600000
+  (use --pcr-cycles for explicit value)
+```
+
+**Caveat when running after `derep_pairs`:** most PCR duplicates are already
+removed before `derep` sees the data, so D_eff estimated here is much lower
+than the true library D_eff. This affects only the log message; absorption
+decisions are unaffected.
 
 ### Polymerase error rates (Potapov & Ong 2017)
 
@@ -107,78 +129,11 @@ All values from Table 3, Potapov & Ong (2017), DOI: 10.1371/journal.pone.0169774
 ### Thermocycling deamination
 
 A separate, polymerase-independent source of C→T changes during PCR is
-heat-induced cytosine deamination. Potapov & Ong (2017) measured this directly
-using mock thermocycling without polymerase and found approximately
-2.3×10⁻⁵ C→T events per base over 16 cycles, i.e. roughly **1.4×10⁻⁶ per
-base per cycle**, of which ~97% were C→T transitions. Because these arise from
-heat damage rather than polymerase misincorporation, they are biologically
-indistinguishable from ancient deamination and are correctly protected by the
-damage substitution filter (C↔T → not absorbed).
-
-### Adaptive child ceiling
-
-The static `--errcor-max-count 5` is calibrated for parents with
-~10,000 reads. For a parent with count P, the expected count of a cluster
-arising from a specific PCR error (a particular 1-substitution variant) is,
-under the equal-rates substitution model:
-
-```
-E[count_child] = P × φ × D_eff / 3
-```
-
-The /3 term reflects the equal-rates assumption: at any given base, each of
-the three alternative bases is equally likely to be substituted in (Potapov &
-Ong 2017 note that true substitution spectra show transition/transversion bias,
-so this is a first-order approximation). When `--pcr-cycles` is specified,
-fqdup computes this per parent and raises the effective child ceiling
-accordingly:
-
-```
-effective_max(P) = max(--errcor-max-count, ⌈P × φ × D_eff / 3⌉)
-```
-
-The global pre-filter (for efficiency) uses the observed maximum parent count.
-
-**When `--pcr-cycles` is not given**, fqdup estimates D_eff automatically from the
-observed duplication ratio after Pass 1:
-
-```
-D_eff_estimated = log₂(total_reads / unique_reads)
-```
-
-This follows directly from PCR kinetics: mean copies per starting molecule after n
-cycles with efficiency E is (1+E)ⁿ, so total/unique ≈ (1+E)ⁿ and
-D_eff = log₂((1+E)ⁿ) = log₂(total/unique). The estimate is logged:
-
-```
-Phase 3: D_eff=2.21 estimated from duplication ratio 25000000/5600000
-  (use --pcr-cycles for explicit value)
-```
-
-**Caveat when running after `derep_pairs`:** most PCR duplicates are already
-removed before `derep` sees the data. The residual duplication that remains
-comes from PCR copies whose `fqdup extend` assemblies diverged slightly -
-`derep_pairs` treated them as distinct molecules; `derep` collapses them on the original
-merged sequence. Because most amplification has already been collapsed, D_eff
-estimated here is much lower than the true PCR D_eff, making the adaptive
-ceiling conservative. For typical aDNA libraries this does not matter, parent
-counts are low enough that the static `--errcor-max-count` dominates regardless.
-For mitochondrial-enriched or high-depth modern libraries, supply `--pcr-cycles`
-explicitly for an accurate adaptive ceiling.
-
-**Example (Q5, 30 cycles, E=1.0):**
-
-| Parent count | E[count_child] | effective_max |
-|---|---|---|
-| 1,000 | 0.005 | 5 (static) |
-| 10,000 | 0.053 | 5 (static) |
-| 100,000 | 0.53 | 5 (static) |
-| 1,000,000 | 5.3 | 6 |
-| 10,000,000 | 53 | 53 |
-
-For ancient DNA libraries, parent counts rarely exceed 10,000 per cluster, so
-the static threshold dominates. For mitochondrial DNA or highly amplified
-modern libraries, `--pcr-cycles` becomes important.
+heat-induced cytosine deamination. Potapov & Ong (2017) measured approximately
+2.3×10⁻⁵ C→T events per base over 16 cycles (~1.4×10⁻⁶ per base per cycle,
+~97% C→T transitions). These are biologically indistinguishable from ancient
+deamination; the damage-zone bypass (see above) handles them at the terminal
+positions where they concentrate.
 
 ---
 
@@ -242,38 +197,45 @@ practice Phase 3 completes in 1–3 seconds for 5M sequences.
 
 ## Parameters
 
-`--errcor-ratio` (default 50) controls how large the count gap must be. A ratio
-of 50 means a count=1 child needs a count≥50 parent. Raise it (100–200) if
-your library contains genuine rare variants at low coverage, such as in
-single-cell or low-input sequencing.
+`--errcor-min-parent INT` (default 3) — sequences with count above this are
+indexed as parents and treated as potential absorption targets. Sequences with
+count at or below this are children (candidate PCR errors). Raise this if your
+library contains genuine low-count molecules (e.g. single-cell, UMI-tagged).
 
-`--errcor-max-count` (default 5) sets the static child ceiling. This is always
-a hard lower bound; with `--pcr-cycles` the effective ceiling may be higher for
-large parents (see adaptive thresholds above).
+`--errcor-snp-threshold FLOAT` (default 0.20) — SNP veto ratio: if the
+weighted count of reads carrying the same `(position, alt_base)` mismatch
+relative to the parent is at least this fraction of the parent count, the child
+is protected as a potential true SNP. Lower values absorb more aggressively;
+raise to 0.30–0.50 for libraries with genuine heterozygosity or rare variants.
 
-`--errcor-bucket-cap` (default 64) prevents low-complexity regions, poly-A
-stretches, microsatellites, from producing enormous bucket collisions in the
+`--errcor-snp-min-count INT` (default 2 in capture mode, 1 in shotgun mode) —
+minimum absolute `sig_count` required for SNP veto. In shotgun mode this is
+lowered to 1 automatically so singletons can still be protected by the ratio
+test rather than always being absorbed.
+
+`--errcor-mode capture|shotgun` (default: shotgun) — coverage regime:
+- `shotgun`: conservative — `snp_min_count=1`, Phase B3 disabled. Safe for
+  low-coverage shotgun sequencing where genuine molecules may appear only once.
+- `capture`: aggressive — `snp_min_count=2`, Phase B3 (small-cluster iterative
+  pass) enabled. Use for deep-coverage capture libraries where singletons are
+  almost always PCR errors.
+
+`--errcor-bucket-cap INT` (default 64) — prevents low-complexity regions
+(poly-A, microsatellites) from producing enormous bucket collisions in the
 pair-hash index.
 
-`--pcr-cycles`, `--pcr-efficiency`, `--pcr-error-rate` (default Q5: 5.3e-7)
-enable adaptive thresholds. Without `--pcr-cycles`, the PCR model is used only
-for the expected-mismatch log line; the static `--errcor-max-count` applies.
+`--pcr-error-rate FLOAT` (default Q5: 5.3e-7), `--pcr-cycles INT`,
+`--pcr-efficiency FLOAT` — parameterise the PCR error model used for the
+logged D_eff estimate. These values do not affect absorption decisions.
 
 ---
 
 ## Benchmarks
 
-### Damage filter: single library
+### Single library
 
-Sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length, Q5 library):
-
-| Mode | Absorbed | Output sequences |
-|------|----------|-----------------|
-| `--error-correct` (naive, no damage protection) | 5,335 | 3,506,272 |
-| `--error-correct` (with damage substitution filter) | 1,456 | 3,510,151 |
-
-73% of what the naive version absorbed were C↔T or G↔A, real damage signal,
-not PCR errors. The 1,456 absorptions are A↔T and C↔G transversions only.
+Sample `a88af16f35` (5.58 M reads input to `derep`, 91 bp mean length, Q5 library,
+post-`derep_pairs`):
 
 Phase 3 adds approximately 2 seconds to a 31-second `derep` run. It operates
 entirely in memory on the index built during Pass 1.

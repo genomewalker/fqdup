@@ -68,7 +68,8 @@ void log_impl(const std::string& level, const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    struct tm tm_buf;
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime_r(&t, &tm_buf));
     // Include a stage label when available to make logs stage-specific
     std::string stage_label;
     if (g_stage_counter) {
@@ -125,7 +126,8 @@ void log_progress(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    struct tm tm_buf;
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime_r(&t, &tm_buf));
     std::string line = std::string("[") + buf + "] INFO: " + safe_msg;
     if (interactive) {
         std::lock_guard<std::mutex> lk(g_log_mutex);

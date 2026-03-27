@@ -1,6 +1,6 @@
 # fqdup
 
-FASTQ deduplication for paired-end ancient DNA libraries.
+FASTQ deduplication for ancient DNA libraries.
 
 ---
 

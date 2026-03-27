@@ -331,10 +331,12 @@ static int packed_hamming(const uint8_t* pa, const uint8_t* pb,
 //   xr=1 (01b): G↔T (10^11) or C↔A (01^00) — 8-oxoG, protect in damage mode
 //   xr=2 (10b): G↔A (10^00) or C↔T (01^11) — deamination, protect in damage mode
 //   xr=3 (11b): A↔T or C↔G — transversions, never damage
-static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool protect_damage) {
-    if (!protect_damage) return false;  // non-damage mode: all subs are absorbable PCR errors
+static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool /*protect_damage*/) {
     uint8_t xr = a ^ b;
-    return (xr == 1u || xr == 2u);     // damage mode: protect G↔T/C↔A (8-oxoG) + G↔A/C↔T (deamination)
+    // G↔T/C↔A (xr=1): 8-oxoG oxidative damage — always protect.
+    // G↔A/C↔T (xr=2): ancient deamination — always protect.
+    // A↔T/C↔G (xr=3): no known damage mechanism — absorbable PCR errors.
+    return (xr == 1u || xr == 2u);
 }
 
 // Scan interior region [k5, k5+ilen) of two 2-bit packed sequences.
@@ -1118,9 +1120,9 @@ private:
                 extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
 
                 // Try direct comparison (same canonical orientation).
-                // protect_deamination=false: the SNP veto handles all recurrent
-                // substitutions (true SNPs), so we do not need a deamination guard here.
-                MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, false);
+                // Protect damage-consistent substitutions (C↔T, G↔A, G↔T, C↔A) when
+                // damage mode is active; packed_find_mismatch returns false for those.
+                MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
                     mismatches.push_back({pid, cid, mm.position, mm.base_b, mm.base_a});
                     stats.children_found++;
@@ -1130,7 +1132,7 @@ private:
                 // If found, convert position/base to child's canonical frame:
                 //   canonical_pos = ilen - 1 - mm.position
                 //   canonical_alt = mm.base_b ^ 3  (complement)
-                mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, false);
+                mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
                     uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
                     mismatches.push_back({pid, cid, cpos,
@@ -1179,24 +1181,15 @@ private:
             size_t parent_end = i;
 
             // Accumulate sig_count per (pos, alt_base) for SNP detection.
-            // Key: mismatch_pos * 4 + alt_base. Entries already sorted by (pos, alt).
-            std::vector<std::pair<uint32_t, uint64_t>> pos_alt_counts;
+            // Key: mismatch_pos * 4 + alt_base. Use unordered_map for O(1) lookup
+            // per child instead of the previous O(m) linear scan.
+            std::unordered_map<uint32_t, uint64_t> pos_alt_counts;
             pos_alt_counts.reserve(parent_end - parent_start);
 
-            {
-                size_t j = parent_start;
-                while (j < parent_end) {
-                    uint16_t cur_pos = mismatches[j].mismatch_pos;
-                    uint8_t  cur_alt = mismatches[j].alt_base;
-                    uint32_t key     = static_cast<uint32_t>(cur_pos) * 4 + cur_alt;
-                    uint64_t weight  = 0;
-                    while (j < parent_end && mismatches[j].mismatch_pos == cur_pos &&
-                           mismatches[j].alt_base == cur_alt) {
-                        weight += id_count[mismatches[j].child_id];
-                        ++j;
-                    }
-                    pos_alt_counts.push_back({key, weight});
-                }
+            for (size_t j = parent_start; j < parent_end; ++j) {
+                uint32_t key = static_cast<uint32_t>(mismatches[j].mismatch_pos) * 4
+                               + mismatches[j].alt_base;
+                pos_alt_counts[key] += id_count[mismatches[j].child_id];
             }
 
             // For each child, decide: SNP-protected or absorb
@@ -1205,11 +1198,10 @@ private:
                 const ChildMismatch& cm = mismatches[j];
                 uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4 + cm.alt_base;
 
-                // Find sig_count for this (pos, alt)
+                // O(1) sig_count lookup
                 uint64_t sig = 0;
-                for (const auto& [k, w] : pos_alt_counts) {
-                    if (k == key) { sig = w; break; }
-                }
+                auto it = pos_alt_counts.find(key);
+                if (it != pos_alt_counts.end()) sig = it->second;
 
                 // Damage-aware bypass: C↔T / G↔A (xr=2) mismatches at interior
                 // positions adjacent to the damage zone are residual deamination,
@@ -1374,11 +1366,14 @@ private:
 
                 if (best_root == UINT32_MAX) { b3_no_large_root++; continue; }
 
-                // Damage-aware SNP veto bypass for H=1 pairs: re-examine the
-                // single mismatch between this small sequence and best_root.
-                // C↔T / G↔A (xr=2) at near-edge interior positions is residual
-                // deamination damage, not a genuine SNP.
-                bool damage_bypass_b3 = false;
+                // Damage-aware handling for H=1 pairs: re-examine the single mismatch
+                // between this small sequence and best_root.
+                // C↔T / G↔A (xr=2) at near-edge interior positions: residual deamination,
+                //   bypass SNP veto to force absorption.
+                // G↔T / C↔A (xr=1): oxidative 8-oxoG, uniform across read,
+                //   protect unconditionally (SNP veto always fires).
+                bool damage_bypass_b3  = false;  // force absorb near-edge deamination
+                bool damage_protect_b3 = false;  // protect oxidative subs from absorption
                 if (profile_.enabled) {
                     extract_packed_part(arena_.data(best_root), lay.k5, lay.ilen, pi_buf);
                     int hd_check = packed_hamming(pi_buf, ci_full, 0, lay.ilen, 2);
@@ -1395,16 +1390,18 @@ private:
                                               (mm.position < kDamageEdgeMargin ||
                                                static_cast<int>(mm.position) >=
                                                    lay.ilen - kDamageEdgeMargin);
+                            damage_protect_b3 = (xr == 1u);
                         }
                     }
                 }
 
                 // SNP veto: sig = count of this small sequence.
                 uint64_t sig = id_count[cid];
-                bool snp_veto = !damage_bypass_b3 &&
-                                (sig >= errcor_.snp_min_count) &&
-                                (static_cast<double>(sig) >= errcor_.snp_threshold *
-                                                              static_cast<double>(best_count));
+                bool snp_veto = damage_protect_b3 ||
+                                (!damage_bypass_b3 &&
+                                 (sig >= errcor_.snp_min_count) &&
+                                 (static_cast<double>(sig) >= errcor_.snp_threshold *
+                                                              static_cast<double>(best_count)));
                 if (snp_veto) {
                     b3_snp_protected++;
                     stats.snp_protected++;
@@ -1446,12 +1443,11 @@ private:
         gzFile cluster_gz = nullptr;
         if (write_clusters_ && !cluster_path.empty()) {
             cluster_gz = gzopen(cluster_path.c_str(), "wb6");
-            if (cluster_gz) {
-                gzbuffer(cluster_gz, GZBUF_SIZE);
-                if (gzprintf(cluster_gz, "hash\tseq_len\tcount\n") < 0)
-                    throw std::runtime_error(
-                        "gzprintf failed while writing cluster header");
-            }
+            if (!cluster_gz)
+                throw std::runtime_error("Cannot open cluster file: " + cluster_path);
+            gzbuffer(cluster_gz, GZBUF_SIZE);
+            if (gzprintf(cluster_gz, "hash\tseq_len\tcount\n") < 0)
+                throw std::runtime_error("gzprintf failed while writing cluster header");
         }
 
         struct WriteEntry {
@@ -1518,7 +1514,8 @@ private:
             record_idx++;
         }
 
-        if (cluster_gz) gzclose(cluster_gz);
+        if (cluster_gz && gzclose(cluster_gz) != Z_OK)
+            throw std::runtime_error("gzclose failed writing cluster file");
         std::cerr << "\r";
         log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }
@@ -1674,13 +1671,19 @@ int derep_main(int argc, char** argv) {
         } else if (arg == "--no-error-correct") {
             errcor.enabled = false;
         } else if (arg == "--errcor-min-parent" && i + 1 < argc) {
-            errcor.min_parent_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+            long v = std::stol(argv[++i]);
+            if (v < 0) { std::cerr << "Error: --errcor-min-parent must be >= 0, got " << v << "\n"; return 1; }
+            errcor.min_parent_count = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-threshold" && i + 1 < argc) {
             errcor.snp_threshold = std::stod(argv[++i]);
         } else if (arg == "--errcor-snp-min-count" && i + 1 < argc) {
-            errcor.snp_min_count = static_cast<uint32_t>(std::stoul(argv[++i]));
+            long v = std::stol(argv[++i]);
+            if (v < 0) { std::cerr << "Error: --errcor-snp-min-count must be >= 0, got " << v << "\n"; return 1; }
+            errcor.snp_min_count = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
-            errcor.bucket_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
+            long v = std::stol(argv[++i]);
+            if (v < 1) { std::cerr << "Error: --errcor-bucket-cap must be >= 1, got " << v << "\n"; return 1; }
+            errcor.bucket_cap = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-mode" && i + 1 < argc) {
             std::string m(argv[++i]);
             if      (m == "capture") errcor.mode = ErrCorParams::Mode::Capture;
@@ -1752,6 +1755,20 @@ int derep_main(int argc, char** argv) {
     if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
         std::cerr << "Error: --mask-threshold must be in (0, 1), got "
                   << mask_threshold << "\n";
+        return 1;
+    }
+    if (errcor.snp_threshold < 0.0 || errcor.snp_threshold > 1.0) {
+        std::cerr << "Error: --errcor-snp-threshold must be in [0, 1], got "
+                  << errcor.snp_threshold << "\n";
+        return 1;
+    }
+    // damage_dmax sentinel is -1.0 (not set); only validate explicitly-set values (> -0.5)
+    if (damage_dmax5 > -0.5 && (damage_dmax5 < 0.0 || damage_dmax5 > 1.0)) {
+        std::cerr << "Error: --damage-dmax5 must be in [0, 1], got " << damage_dmax5 << "\n";
+        return 1;
+    }
+    if (damage_dmax3 > -0.5 && (damage_dmax3 < 0.0 || damage_dmax3 > 1.0)) {
+        std::cerr << "Error: --damage-dmax3 must be in [0, 1], got " << damage_dmax3 << "\n";
         return 1;
     }
     if (damage_dmax5 > 1.0 || damage_dmax3 > 1.0) {

@@ -28,6 +28,14 @@
 #include <vector>
 #include <zlib.h>
 
+#ifdef HAVE_ISAL
+#include <isa-l/igzip_lib.h>
+#endif
+
+#ifdef HAVE_BGZF
+#include <htslib/bgzf.h>
+#endif
+
 #include "fqdup/fastq_types.hpp"  // FastqRecord, FastqReaderBase, make_fastq_reader
 #include "fqdup/logger.hpp"
 
@@ -110,20 +118,6 @@ static size_t parse_memory_size(const std::string& str) {
     return value;
 }
 
-static std::string shell_escape_path(const std::string& path) {
-    std::string escaped;
-    escaped.reserve(path.size() + 2);
-    escaped.push_back('\'');
-    for (char c : path) {
-        if (c == '\'') {
-            escaped += "'\\''";
-        } else {
-            escaped.push_back(c);
-        }
-    }
-    escaped.push_back('\'');
-    return escaped;
-}
 
 // String arena - single large allocation for all string data in a chunk
 // Eliminates millions of individual malloc calls and fragmentation
@@ -365,54 +359,202 @@ private:
 
 
 class FastqWriter {
+    static constexpr size_t OUT_BUF_SIZE = 4 * 1024 * 1024;  // 4 MB output buffer
 public:
-    FastqWriter(const std::string& path, bool compress) : compress_(compress) {
+    FastqWriter(const std::string& path, bool compress, int n_threads = 1) : compress_(compress) {
         if (compress_) {
+#ifdef HAVE_BGZF
+            if (n_threads > 1) {
+                bgzfp_ = bgzf_open(path.c_str(), "w");
+                if (!bgzfp_) throw std::runtime_error("Cannot open: " + path);
+                bgzf_mt(bgzfp_, n_threads, 0);
+                return;
+            }
+#endif
+#ifdef HAVE_ISAL
+            fp_ = fopen(path.c_str(), "wb");
+            if (!fp_) throw std::runtime_error("Cannot open: " + path);
+            out_buf_.resize(OUT_BUF_SIZE);
+            level_buf_.resize(ISAL_DEF_LVL1_DEFAULT);
+            isal_deflate_init(&stream_);
+            stream_.level          = 1;
+            stream_.level_buf      = level_buf_.data();
+            stream_.level_buf_size = static_cast<uint32_t>(level_buf_.size());
+            stream_.next_out       = out_buf_.data();
+            stream_.avail_out      = static_cast<uint32_t>(out_buf_.size());
+            isal_gzip_header gz_hdr;
+            isal_gzip_header_init(&gz_hdr);
+            isal_write_gzip_header(&stream_, &gz_hdr);
+            flush_isal_buf();
+#else
             gzfp_ = gzopen(path.c_str(), "wb6");
             if (!gzfp_) throw std::runtime_error("Cannot open: " + path);
             gzbuffer(gzfp_, GZBUF_SIZE);
+#endif
         } else {
             out_.open(path);
             if (!out_.good()) throw std::runtime_error("Cannot open: " + path);
         }
     }
-    ~FastqWriter() { if (gzfp_) gzclose(gzfp_); }
 
-    // Write FastqRecord (std::string - for merge phase)
-    void write(const FastqRecord& rec) {
-        if (compress_) {
-            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                         rec.header.c_str(), rec.seq.c_str(),
-                         rec.plus.c_str(), rec.qual.c_str()) < 0) {
-                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
-            }
-        } else {
-            out_ << rec.header << '\n' << rec.seq << '\n'
-                 << rec.plus << '\n' << rec.qual << '\n';
+    ~FastqWriter() {
+        try { close(); }
+        catch (const std::exception& e) {
+            std::cerr << "Fatal: " << e.what() << "\n";
+            std::exit(1);
+        }
+        catch (...) {
+            std::cerr << "Fatal: unknown error closing output\n";
+            std::exit(1);
         }
     }
 
-    // Write FastqRecordArena (raw pointers - for chunk writing)
+    void close() {
+        if (closed_) return;
+        closed_ = true;
+#ifdef HAVE_BGZF
+        if (bgzfp_) {
+            if (bgzf_close(bgzfp_) < 0)
+                throw std::runtime_error("bgzf_close failed");
+            bgzfp_ = nullptr;
+            return;
+        }
+#endif
+#ifdef HAVE_ISAL
+        if (fp_) {
+            stream_.end_of_stream = 1;
+            stream_.next_in  = nullptr;
+            stream_.avail_in = 0;
+            bool done = false;
+            while (!done) {
+                isal_deflate(&stream_);
+                done = (stream_.avail_out > 0);
+                flush_isal_buf();
+            }
+            if (fclose(fp_) != 0)
+                throw std::runtime_error("fclose failed writing compressed output");
+            fp_ = nullptr;
+            return;
+        }
+#endif
+        if (gzfp_) {
+            if (gzclose(gzfp_) != Z_OK)
+                throw std::runtime_error("gzclose failed");
+            gzfp_ = nullptr;
+        }
+        if (out_.is_open()) {
+            out_.flush();
+            out_.close();
+            if (out_.fail())
+                throw std::runtime_error("close failed writing plain output");
+        }
+    }
+
+    void write(const FastqRecord& rec) {
+#ifdef HAVE_BGZF
+        if (bgzfp_) {
+            auto bw = [&](const void* d, size_t n) {
+                if (bgzf_write(bgzfp_, d, n) < 0)
+                    throw std::runtime_error("bgzf_write failed");
+            };
+            bw(rec.header.data(), rec.header.size()); bw("\n", 1);
+            bw(rec.seq.data(),    rec.seq.size());    bw("\n", 1);
+            bw(rec.plus.data(),   rec.plus.size());   bw("\n", 1);
+            bw(rec.qual.data(),   rec.qual.size());   bw("\n", 1);
+            return;
+        }
+#endif
+#ifdef HAVE_ISAL
+        if (fp_) {
+            isal_write(rec.header.data(), rec.header.size()); isal_write("\n", 1);
+            isal_write(rec.seq.data(),    rec.seq.size());    isal_write("\n", 1);
+            isal_write(rec.plus.data(),   rec.plus.size());   isal_write("\n", 1);
+            isal_write(rec.qual.data(),   rec.qual.size());   isal_write("\n", 1);
+            return;
+        }
+#endif
+        if (compress_) {
+            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
+                         rec.header.c_str(), rec.seq.c_str(),
+                         rec.plus.c_str(), rec.qual.c_str()) < 0)
+                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
+        } else {
+            out_ << rec.header << '\n' << rec.seq << '\n'
+                 << rec.plus << '\n' << rec.qual << '\n';
+            if (!out_.good()) throw std::runtime_error("write failed writing plain output");
+        }
+    }
+
     void write(const FastqRecordArena& rec) {
+#ifdef HAVE_BGZF
+        if (bgzfp_) {
+            auto bw = [&](const void* d, size_t n) {
+                if (bgzf_write(bgzfp_, d, n) < 0)
+                    throw std::runtime_error("bgzf_write failed");
+            };
+            bw(rec.header, rec.header_len); bw("\n", 1);
+            bw(rec.seq,    rec.seq_len);    bw("\n", 1);
+            bw(rec.plus,   rec.plus_len);   bw("\n", 1);
+            bw(rec.qual,   rec.qual_len);   bw("\n", 1);
+            return;
+        }
+#endif
+#ifdef HAVE_ISAL
+        if (fp_) {
+            isal_write(rec.header, rec.header_len); isal_write("\n", 1);
+            isal_write(rec.seq,    rec.seq_len);    isal_write("\n", 1);
+            isal_write(rec.plus,   rec.plus_len);   isal_write("\n", 1);
+            isal_write(rec.qual,   rec.qual_len);   isal_write("\n", 1);
+            return;
+        }
+#endif
         if (compress_) {
             if (gzprintf(gzfp_, "%.*s\n%.*s\n%.*s\n%.*s\n",
                          (int)rec.header_len, rec.header,
                          (int)rec.seq_len, rec.seq,
                          (int)rec.plus_len, rec.plus,
-                         (int)rec.qual_len, rec.qual) < 0) {
+                         (int)rec.qual_len, rec.qual) < 0)
                 throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
-            }
         } else {
             out_.write(rec.header, rec.header_len) << '\n';
             out_.write(rec.seq, rec.seq_len) << '\n';
             out_.write(rec.plus, rec.plus_len) << '\n';
             out_.write(rec.qual, rec.qual_len) << '\n';
+            if (!out_.good()) throw std::runtime_error("write failed writing plain output");
         }
     }
 
 private:
-    bool compress_;
-    gzFile gzfp_ = nullptr;
+#ifdef HAVE_ISAL
+    void isal_write(const char* data, size_t len) {
+        stream_.next_in  = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(data));
+        stream_.avail_in = static_cast<uint32_t>(len);
+        while (stream_.avail_in > 0) {
+            if (stream_.avail_out == 0) flush_isal_buf();
+            isal_deflate(&stream_);
+        }
+    }
+
+    void flush_isal_buf() {
+        size_t n = out_buf_.size() - stream_.avail_out;
+        if (n == 0) return;
+        if (fwrite(out_buf_.data(), 1, n, fp_) != n)
+            throw std::runtime_error("fwrite failed writing compressed output");
+        stream_.next_out  = out_buf_.data();
+        stream_.avail_out = static_cast<uint32_t>(out_buf_.size());
+    }
+
+    FILE*             fp_ = nullptr;
+    isal_zstream      stream_{};
+    std::vector<uint8_t> out_buf_;
+    std::vector<uint8_t> level_buf_;
+#endif
+#ifdef HAVE_BGZF
+    BGZF*         bgzfp_ = nullptr;
+#endif
+    bool          compress_;
+    bool          closed_ = false;
+    gzFile        gzfp_ = nullptr;
     std::ofstream out_;
 };
 
@@ -601,6 +743,13 @@ public:
         log_info("Decompression: " + std::string(
 #ifdef HAVE_ISAL
             "ISA-L (hardware-accelerated)"
+#else
+            "zlib"
+#endif
+        ));
+        log_info("Compression: " + std::string(
+#ifdef HAVE_ISAL
+            "ISA-L igzip (hardware-accelerated)"
 #else
             "zlib"
 #endif
@@ -967,13 +1116,20 @@ private:
 
 
     void merge_chunks(const std::string& output) {
+        bool compress = (output.size() > 3 && output.substr(output.size() - 3) == ".gz");
         if (sorted_files_.size() == 1) {
-            if (std::rename(sorted_files_[0].c_str(), output.c_str()) != 0) {
-                throw std::runtime_error("rename failed from " + sorted_files_[0] + " to " + output +
-                                         ": " + std::strerror(errno));
+            if (!compress) {
+                // Plain output: rename the uncompressed temp file directly.
+                if (std::rename(sorted_files_[0].c_str(), output.c_str()) != 0) {
+                    throw std::runtime_error("rename failed from " + sorted_files_[0] +
+                                             " to " + output + ": " + std::strerror(errno));
+                }
+                sorted_files_.clear();
+                return;
             }
-            sorted_files_.clear();
-            return;
+            // Compressed output: must compress through FastqWriter — renaming a plain
+            // temp file to .gz would produce a silently corrupt (non-gzip) file.
+            // Fall through to the merge path with one reader, which handles compression.
         }
 
         // Temp files are always uncompressed .fq — make_fastq_reader detects plain text.
@@ -982,22 +1138,37 @@ private:
             readers.push_back(make_fastq_reader(f));
         }
 
-        // Use lambda comparator to avoid static member in local struct
-        auto compare_records = [this](const FastqRecord& a, const FastqRecord& b) -> bool {
-            if (natural_order_) {
-                return NaturalOrderComparator()(a, b);
-            } else {
-                return trim_id(a.header) < trim_id(b.header);
-            }
+        // Precompute sort keys at read time so comparisons are O(1).
+        // For natural order, store (prefix, numeric_suffix) parsed once per record.
+        struct NatKey { std::string prefix; uint64_t suffix; bool has_suffix; };
+        auto make_nat_key = [](const std::string& header) -> NatKey {
+            std::string id = std::string(trim_id(header));
+            size_t i = id.size();
+            while (i > 0 && static_cast<unsigned>(id[i-1] - '0') <= 9u) --i;
+            uint64_t suf = 0;
+            for (size_t p = i; p < id.size(); ++p)
+                suf = suf * 10u + static_cast<unsigned>(id[p] - '0');
+            return {id.substr(0, i), suf, i < id.size()};
         };
 
         struct MergeEntry {
             FastqRecord record;
-            size_t idx;
+            size_t      idx;
+            std::string sort_key;   // lexicographic path
+            NatKey      nat_key;    // natural-order path
         };
 
-        auto compare_entries = [&compare_records](const MergeEntry& a, const MergeEntry& b) -> bool {
-            return compare_records(b.record, a.record);  // Inverted for min-heap
+        auto compare_entries = [this](const MergeEntry& a, const MergeEntry& b) -> bool {
+            // Inverted for min-heap
+            if (natural_order_) {
+                const NatKey& ka = b.nat_key; const NatKey& kb = a.nat_key;
+                if (ka.prefix != kb.prefix) return ka.prefix < kb.prefix;
+                if (!ka.has_suffix && !kb.has_suffix) return false;
+                if (!ka.has_suffix) return true;
+                if (!kb.has_suffix) return false;
+                return ka.suffix < kb.suffix;
+            }
+            return b.sort_key < a.sort_key;
         };
 
         std::priority_queue<MergeEntry, std::vector<MergeEntry>, decltype(compare_entries)> pq(compare_entries);
@@ -1005,51 +1176,31 @@ private:
         for (size_t i = 0; i < readers.size(); ++i) {
             MergeEntry e;
             e.idx = i;
-            if (readers[i]->read(e.record)) pq.push(std::move(e));
+            if (readers[i]->read(e.record)) {
+                e.sort_key = std::string(trim_id(e.record.header));
+                if (natural_order_) e.nat_key = make_nat_key(e.record.header);
+                pq.push(std::move(e));
+            }
         }
 
-        bool compress = (output.size() > 3 && output.substr(output.size() - 3) == ".gz");
-
-        // For compressed output, try to use pigz for parallel compression
-        FILE* pigz_pipe = nullptr;
-        if (compress) {
-            // Try to use pigz with multiple threads for faster compression
-            std::string pigz_cmd = "pigz -c -p " + std::to_string(threads_) + " > " + shell_escape_path(output) + " 2>/dev/null";
-            pigz_pipe = popen(pigz_cmd.c_str(), "w");
-        }
-
-        // Fall back to FastqWriter if pigz not available or uncompressed output
-        std::unique_ptr<FastqWriter> writer;
-        if (!pigz_pipe) {
-            writer = std::make_unique<FastqWriter>(output, compress);
-        }
+        FastqWriter writer(output, compress, threads_);
 
         size_t merged = 0;
         while (!pq.empty()) {
             MergeEntry e = pq.top();
             pq.pop();
 
-            if (pigz_pipe) {
-                // Write directly to pigz pipe
-                fprintf(pigz_pipe, "%s\n%s\n%s\n%s\n",
-                       e.record.header.c_str(), e.record.seq.c_str(),
-                       e.record.plus.c_str(), e.record.qual.c_str());
-            } else {
-                writer->write(e.record);
-            }
+            writer.write(e.record);
             merged++;
 
-            if (readers[e.idx]->read(e.record)) pq.push(std::move(e));
+            if (readers[e.idx]->read(e.record)) {
+                e.sort_key = std::string(trim_id(e.record.header));
+                if (natural_order_) e.nat_key = make_nat_key(e.record.header);
+                pq.push(std::move(e));
+            }
 
             if ((merged % 1000000) == 0) {
                 std::cerr << "\r[Phase 2] Merged " << merged << " reads" << std::flush;
-            }
-        }
-
-        if (pigz_pipe) {
-            int rc = pclose(pigz_pipe);
-            if (rc != 0) {
-                throw std::runtime_error("pclose failed for pigz writer pipe with status " + std::to_string(rc));
             }
         }
 

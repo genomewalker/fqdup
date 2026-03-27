@@ -27,9 +27,16 @@ public:
 
     bool read(FastqRecord& rec) override {
         if (!readline(rec.header)) return false;
-        if (!readline(rec.seq))    return false;
-        if (!readline(rec.plus))   return false;
-        if (!readline(rec.qual))   return false;
+        if (!readline(rec.seq))
+            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" +
+                                     rec.header + "' (record " +
+                                     std::to_string(record_count_ + 1) + ")");
+        if (!readline(rec.plus))
+            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence in record " +
+                                     std::to_string(record_count_ + 1));
+        if (!readline(rec.qual))
+            throw std::runtime_error("Truncated FASTQ: missing quality line in record " +
+                                     std::to_string(record_count_ + 1));
         record_count_++;
         return true;
     }
@@ -70,7 +77,7 @@ private:
 }  // anonymous namespace
 
 static bool is_gzip(const std::string& path) {
-    if (path == "/dev/stdin" || path == "-") return false;  // can't peek; gzopen handles both
+    if (path == "/dev/stdin" || path == "-") return false;  // stdin: FastqReader uses gzdopen(fileno(stdin))
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
     unsigned char magic[2] = {0, 0};
@@ -80,10 +87,11 @@ static bool is_gzip(const std::string& path) {
     return gz;
 }
 
-std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path) {
+std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
+                                                    size_t threads) {
     if (is_gzip(path)) {
 #ifdef HAVE_RAPIDGZIP
-        return std::make_unique<FastqReaderRapidgzip>(path);
+        return std::make_unique<FastqReaderRapidgzip>(path, threads);
 #elif defined(HAVE_ISAL)
         return std::make_unique<FastqReaderIgzip>(path);
 #endif
