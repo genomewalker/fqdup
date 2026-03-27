@@ -214,22 +214,6 @@ Library-type classification returns `unknown` when no damage signal is detectabl
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
 call — downstream `fqdup derep` treats `unknown` as DS for masking purposes.
 
-### `fqdup gen`
-
-Synthetic FASTQ generator with configurable damage patterns, for testing and
-benchmarking.
-
-```
-fqdup gen [options]
-
-  -o FILE                    Output FASTQ (default: stdout)
-  -n N                       Number of reads to generate (default: 10000)
-  --damage-dmax FLOAT        C→T damage amplitude (default: 0)
-  --damage-lambda FLOAT      Damage decay rate (default: 0.3)
-  --library-type ds|ss       Library type for damage model (default: ds)
-  --seed N                   Random seed for reproducibility
-```
-
 ### `fqdup extend`
 
 ```
