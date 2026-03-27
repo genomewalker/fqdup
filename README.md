@@ -61,11 +61,19 @@ Two mechanisms, both on by default:
   replaced with a neutral byte before hashing. Reads that differ only by
   deamination collapse into the same cluster. Library type is detected
   automatically via a 7-model BIC competition; override with
-  `--library-type ds|ss`. If downstream damage analysis (DART, mapDamage) will
-  run on the fqdup output, leave this off: only the most-damaged representative
-  is retained per cluster, which distorts per-position frequencies. Enable it
-  when accurate unique-molecule counting matters more than downstream damage
-  estimation.
+  `--library-type ds|ss`.
+
+  **Leave this off if you plan to run metaDMG or mapDamage on the fqdup output.**
+  Here is why: metaDMG and mapDamage estimate damage by counting C→T and G→A
+  events across all reads at every position. They need to see both the damaged
+  copies of a molecule (e.g. T at position 1) and the undamaged copies (C at
+  position 1) to compute reliable per-position frequencies. When
+  `--damage-auto` is on, fqdup collapses all copies of the same molecule into
+  one representative regardless of their damage state, so downstream tools only
+  see one read per molecule instead of all sequenced copies. The C→T signal at
+  each position is then much weaker or absent, and the damage estimates become
+  unreliable. Enable `--damage-auto` only when you need an accurate
+  unique-molecule count and are not running downstream damage analysis.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
 error correction is the only relevant step, `--no-damage` is already the
