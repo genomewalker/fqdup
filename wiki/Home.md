@@ -131,7 +131,7 @@ fqdup derep_pairs \
   -o-ext  extended.deduped.fq.gz
 
 # Biological dedup: PCR error correction (on by default)
-# Add --damage-auto only if NOT running DART/mapDamage on this output
+# Add --collapse-damage only if NOT running DART/mapDamage on this output
 fqdup derep \
   -i merged.deduped.fq.gz \
   -o merged.final.fq.gz

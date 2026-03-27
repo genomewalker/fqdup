@@ -91,7 +91,7 @@ same reads in two forms (non-extended and extended), not two sequencing mates.
 For a 25.8 M-pair library, this step typically finishes in about 25 seconds
 and reduces to around 5.6 M unique pairs.
 
-### Step 4: single-file damage-aware deduplication
+### Step 4: single-file biological deduplication
 
 ```bash
 fqdup derep \
@@ -103,10 +103,10 @@ fqdup derep \
 PCR error correction is **on by default**. Damage-aware hashing is **off by
 default**, if you run DART or mapDamage on the fqdup output, enabling it would
 distort per-position damage frequencies (only the most-damaged representative is
-retained per cluster). Enable with `--damage-auto` only when accurate
+retained per cluster). Enable with `--collapse-damage` only when accurate
 unique-molecule counting matters more than downstream damage estimation.
 
-When `--damage-auto` is given, Pass 0 scans all reads and logs the estimated
+When `--collapse-damage` is given, Pass 0 scans all reads and logs the estimated
 damage parameters before deduplication starts:
 
 ```
@@ -126,7 +126,7 @@ that differs from a high-count cluster (≥ 50× its count) by exactly one
 substitution outside the damage zone is absorbed as a PCR copying error.
 C↔T and G↔A mismatches are never absorbed.
 
-On the 5.6 M-read input with `--damage-auto` enabled, the full run completes
+On the 5.6 M-read input with `--collapse-damage` enabled, the full run completes
 in about 33 seconds and reduces to roughly 3.5 M unique clusters.
 
 ---
@@ -244,8 +244,7 @@ See [[Damage]] for full output description and typical workflow.
 | `-o FILE` | Output FASTQ | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--damage-auto` | Estimate damage parameters from data (Pass 0) | off |
-| `--no-damage` | Explicitly disable damage estimation | **default** |
+| `--collapse-damage` | Collapse damage variants into one cluster per molecule | off |
 | `--damage-dmax FLOAT` | d_max for both ends (manual model) | - |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | - |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | - |

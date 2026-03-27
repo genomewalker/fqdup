@@ -22,7 +22,7 @@ detection.
 profiler. Scans the input reads and reports d_max, lambda, background rate, and
 per-position C→T/G→A frequencies. Classifies the library as double-stranded or
 single-stranded via a 7-model BIC competition before fitting. Run this before the
-full pipeline to confirm that `--damage-auto` is warranted, check the mask
+full pipeline to confirm that `--collapse-damage` is warranted, check the mask
 threshold, or obtain parameters for manual `--damage-dmax`/`--damage-lambda`
 overrides. It does not modify reads.
 
@@ -56,7 +56,7 @@ Two mechanisms, both on by default:
   C↔T and G↔A mismatches are never absorbed; they are indistinguishable from
   damage signal and are always kept.
 
-- **Damage-aware hashing (default: off).** When enabled with `--damage-auto`,
+- **Damage variant collapsing (default: off).** When enabled with `--collapse-damage`,
   terminal positions where the observed C→T or G→A rate exceeds a threshold are
   replaced with a neutral byte before hashing. Reads that differ only by
   deamination collapse into the same cluster. Library type is detected
@@ -75,18 +75,18 @@ Two mechanisms, both on by default:
   read_5  TGCATGA...   <- deaminated at pos 1
   ```
 
-  Without `--damage-auto`, all 5 reads are passed to metaDMG or mapDamage.
+  Without `--collapse-damage`, all 5 reads are passed to metaDMG or mapDamage.
   At position 1 they count T=3, C=2, giving a C→T frequency of 0.60 — a
   clear damage signal.
 
-  With `--damage-auto`, fqdup recognises that these differ only at a
+  With `--collapse-damage`, fqdup recognises that these differ only at a
   deaminated terminal position and collapses all 5 into one representative
   (whichever read ID sorted first). Downstream tools see a single read. At
   position 1 they count either T=1 or C=1. The frequency is either 0 or 1 for
   that one molecule, and across the library the per-position frequencies are
   unreliable because coverage is reduced to 1x per molecule.
 
-  Enable `--damage-auto` only when you need an accurate unique-molecule count
+  Enable `--collapse-damage` only when you need an accurate unique-molecule count
   and are not running downstream damage analysis.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
@@ -120,7 +120,7 @@ fqdup derep \
   -o merged.final.fq.gz
 
 # Optional: also enable damage-aware hashing (only if NOT running DART/mapDamage downstream)
-# fqdup derep -i merged.deduped.fq.gz -o merged.final.fq.gz --damage-auto
+# fqdup derep -i merged.deduped.fq.gz -o merged.final.fq.gz --collapse-damage
 ```
 
 ### Non-aDNA (modern DNA)
@@ -128,7 +128,7 @@ fqdup derep \
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
 fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz \
-  --no-damage --no-error-correct
+  --no-error-correct
 ```
 
 ---
@@ -189,7 +189,7 @@ fqdup damage -i INPUT [options]
 
 Prints a human-readable report: library type with BIC scores, d_max/lambda per end,
 per-position deamination frequencies, and the positions that exceed the mask threshold.
-Use the output to decide whether `--damage-auto` is warranted, verify the library-type
+Use the output to decide whether `--collapse-damage` is warranted, verify the library-type
 call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
 
 The `--json` output includes the complete machine-readable profile:
@@ -299,15 +299,14 @@ Optional:
   --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```
 
-PCR error correction is **on by default**. Damage-aware hashing is **off by
-default**, enable it with `--damage-auto` only when downstream tools do not
+PCR error correction is **on by default**. Damage variant collapsing is **off by
+default**, use `--collapse-damage` only when downstream tools do not
 run damage analysis on the fqdup output.
 
-#### Damage-aware hashing (default: off)
+#### Damage variant collapsing (default: off)
 
 ```
-  --damage-auto             Enable damage estimation and masking (Pass 0)
-  --no-damage               Explicitly disable (already default)
+  --collapse-damage             Enable damage estimation and masking (Pass 0)
   --damage-dmax   FLOAT     d_max for both 5' and 3' ends (manual model)
   --damage-dmax5  FLOAT     d_max for 5' end only
   --damage-dmax3  FLOAT     d_max for 3' end only
@@ -418,7 +417,7 @@ fqdup extend:      [Pass 0] damage estimation (samples 500k reads)
 fqdup sort:        chunk ingestion → parallel sort → k-way merge
 fqdup derep_pairs: [Pass 1] stream (ext + non) → build index
                    [Pass 2] stream again → write representative pairs
-fqdup derep:       [Pass 0] stride-sample → fit damage model (--damage-auto)
+fqdup derep:       [Pass 0] stride-sample → fit damage model (--collapse-damage)
                    [Pass 1] stream → build index with damage masking
                    [Phase 3] 3-way pigeonhole PCR error correction
                    [Pass 2] stream → write unique representatives

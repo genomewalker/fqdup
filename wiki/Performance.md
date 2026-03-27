@@ -15,11 +15,11 @@ at each stage (the `-n` / output file of `derep_pairs`).
 |------|----------------|-----------|
 | `derep_pairs` (25.8 M merged reads in) | 5,582,073 | ~25 s |
 | `derep` standard (exact hash) | 3,531,821 | ~22 s |
-| `derep --damage-auto` | 3,511,607 | ~31 s |
-| `derep --damage-auto --error-correct` | 3,510,151 | ~33 s |
+| `derep --collapse-damage` | 3,511,607 | ~31 s |
+| `derep --collapse-damage --error-correct` | 3,510,151 | ~33 s |
 
 - `derep_pairs` reduces 25.8 M merged reads to 5.58 M unique (78.4% structural dedup)
-- `derep --damage-auto` merges a further 20,214 clusters split by terminal
+- `derep --collapse-damage` merges a further 20,214 clusters split by terminal
   deamination (−0.6% vs standard)
 - `--error-correct` absorbs 1,456 PCR-error clusters (−0.04% vs damage-auto only;
   C↔T and G↔A mismatches are protected as potential damage signal)

@@ -49,7 +49,7 @@ cause sequence differences between them.
 
 ---
 
-## Automatic estimation (`--damage-auto`)
+## Automatic estimation (`--collapse-damage`)
 
 Pass 0 scans all reads before deduplication begins. For each read, `fqdup`
 tallies the T/(T+C) frequency at each of the first 15 positions from the 5' end,
@@ -144,8 +144,8 @@ Benchmarked on sample `a88af16f35`, 5.58 M merged reads input to `derep`
 |------|----------------|--------|
 | `derep_pairs` output (merged reads in) | 5,582,073 | - |
 | `derep` standard (exact hash) | 3,531,821 | - |
-| `derep --damage-auto` | 3,511,607 | −20,214 (−0.6%) |
-| `derep --damage-auto --error-correct` | 3,510,151 | −21,670 (−0.6%) |
+| `derep --collapse-damage` | 3,511,607 | −20,214 (−0.6%) |
+| `derep --collapse-damage --error-correct` | 3,510,151 | −21,670 (−0.6%) |
 
 Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
 correction (with damage substitution protection) absorbed a further 1,456

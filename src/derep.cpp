@@ -1607,9 +1607,11 @@ static void print_usage(const char* prog) {
         << "                                    Default; safe for low-coverage shotgun data\n"
         << "                           capture: aggressive EC (snp_min_count=2, B3 enabled)\n"
         << "                                    For PCR-amplified libraries (aDNA capture)\n"
-        << "\nAncient DNA damage-aware deduplication (OFF by default):\n"
-        << "  --damage-auto            Enable damage estimation and masking (Pass 0)\n"
-        << "  --no-damage              Explicitly disable (already default)\n"
+        << "\nAncient DNA damage variant collapsing (OFF by default):\n"
+        << "  --collapse-damage        Collapse reads that differ only by terminal\n"
+        << "                           deamination into one cluster (Pass 0 estimation)\n"
+        << "                           WARNING: distorts per-position damage frequencies.\n"
+        << "                           Do NOT use if running metaDMG or mapDamage downstream.\n"
         << "  --library-type TYPE      Library prep: auto (default), ds, ss\n"
         << "                           auto = DART infers from data; ds/ss = override\n"
         << "  --damage-dmax  FLOAT     Set d_max for both 5' and 3' ends manually\n"
@@ -1702,11 +1704,8 @@ int derep_main(int argc, char** argv) {
             else if (lt == "auto")
                 forced_library_type = dart::SampleDamageProfile::LibraryType::UNKNOWN;
             else { std::cerr << "Error: Unknown --library-type: " << lt << " (use auto, ds, ss)\n"; return 1; }
-        } else if (arg == "--damage-auto") {
+        } else if (arg == "--collapse-damage") {
             damage_auto = true;
-        } else if (arg == "--no-damage") {
-            damage_auto = false;
-            damage_dmax5 = damage_dmax3 = -1.0;  // clear any earlier manual values
         } else if (arg == "--damage-dmax" && i + 1 < argc) {
             damage_dmax5 = damage_dmax3 = std::stod(argv[++i]);
         } else if (arg == "--damage-dmax5" && i + 1 < argc) {
@@ -1787,7 +1786,7 @@ int derep_main(int argc, char** argv) {
     if (!cluster_path.empty())
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
-    log_info("Damage-aware mode: " + std::string(damage_auto ? "auto (--damage-auto)" :
+    log_info("Damage variant collapsing: " + std::string(damage_auto ? "on (--collapse-damage)" :
              (damage_dmax5 >= 0.0 ? "manual" : "disabled (default)")));
     log_info("PCR error correction: " + std::string(errcor.enabled ? "enabled (default)" : "disabled (--no-error-correct)"));
 

@@ -11,7 +11,7 @@
 #
 #   Reads < 62bp: too short for reliable Tadpole extension → returned unchanged
 #   (ext_seq == non_seq).  Damaged duplicates of short reads are NOT collapsed
-#   at derep_pairs → residual for derep --damage-auto.
+#   at derep_pairs → residual for derep --collapse-damage.
 #
 # Tests:
 #   P1. Basic pipeline correctness (no damage, no errors, 75bp fixed)
@@ -32,7 +32,7 @@
 #   P4. Short read difficulty — damage IS a problem for reads < 62bp
 #       2000 molecules × 5x, variable length (mean=50, sd=15 → many < 62bp)
 #       Short reads: no ext → damaged dups not collapsed at derep_pairs → residual
-#       Assert: derep --damage-auto gives meaningfully lower unique than --no-damage
+#       Assert: derep --collapse-damage gives meaningfully lower unique than --no-damage
 #
 #   P5. PCR library (variable length, damage + PCR errors, realistic aDNA)
 #       500 molecules × 10x, variable length (mean=65, sd=15), dmax5=0.25, pcr-rate=0.003
@@ -294,7 +294,7 @@ echo "  PASS: Test P3"
 # Variable length (mean=50bp, sd=15) → substantial fraction < 62bp.
 # Short reads get no Tadpole extension → ext_seq == non_seq.
 # Damaged duplicates of short reads appear distinct to derep_pairs → residual.
-# derep --damage-auto collapses them; --no-damage leaves them inflated.
+# derep --collapse-damage collapses them; --no-damage leaves them inflated.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test P4: Short read difficulty — damage IS a problem for reads < 62bp ---"
@@ -304,7 +304,7 @@ DMAX5=0.25; DMAX3=0.20; LAMBDA=0.35
 
 echo "  $N_MOL molecules × 5x coverage, variable length (mean=50bp, sd=15), dmax5=$DMAX5 dmax3=$DMAX3"
 echo "  Many reads < 62bp → no ext → damaged dups not collapsed at derep_pairs"
-echo "  derep --damage-auto handles short-read residuals"
+echo "  derep --collapse-damage handles short-read residuals"
 
 "$GEN" --n-unique $N_MOL --n-reads $N_READS --read-len 50 --len-sd 15 \
     --min-len 30 --max-len 150 \
@@ -328,14 +328,14 @@ run_tadpole "$TMPDIR/p4_non.fq" "$TMPDIR/p4_ext.fq" 15
 
 # Treatment: damage-aware masking
 "$FQDUP" derep -i "$TMPDIR/p4_dp_non.fq" -o "$TMPDIR/p4_dmg.fq" \
-    --damage-auto --no-error-correct 2>"$TMPDIR/p4_dmg.log"
+    --collapse-damage --no-error-correct 2>"$TMPDIR/p4_dmg.log"
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p4_dp_non.fq" || true)
 AFTER_NODMG=$(grep -c '^@' "$TMPDIR/p4_nodmg.fq" || true)
 AFTER_DMG=$(grep -c '^@' "$TMPDIR/p4_dmg.fq" || true)
 echo "  After derep_pairs: $AFTER_DP"
 echo "  After derep no-damage: $AFTER_NODMG"
-echo "  After derep --damage-auto: $AFTER_DMG  |  True: $N_MOL"
+echo "  After derep --collapse-damage: $AFTER_DMG  |  True: $N_MOL"
 grep -E "d_max=|Masked positions:" "$TMPDIR/p4_dmg.log" 2>/dev/null | head -3 | sed 's/^/  /' || true
 
 python3 - <<EOF
@@ -344,7 +344,7 @@ n_mol = $N_MOL
 after_dp, no_dmg, dmg = $AFTER_DP, $AFTER_NODMG, $AFTER_DMG
 
 if dmg >= no_dmg:
-    print(f"  FAIL: --damage-auto gave no improvement ({dmg} >= {no_dmg})")
+    print(f"  FAIL: --collapse-damage gave no improvement ({dmg} >= {no_dmg})")
     sys.exit(1)
 improvement = no_dmg - dmg
 pct = improvement / no_dmg * 100
@@ -370,7 +370,7 @@ echo "  PASS: Test P4"
 #
 # 500 molecules × 10x, variable length (mean=65bp, sd=15), dmax5=0.25, pcr-rate=0.003
 # Interior PCR errors → different ext → pass derep_pairs → derep collapses exact-match
-# Short damaged reads → no ext → residual → derep --damage-auto
+# Short damaged reads → no ext → residual → derep --collapse-damage
 # Assert: full treatment (damage-auto) beats baseline (no masking)
 # ---------------------------------------------------------------------------
 echo ""
@@ -405,7 +405,7 @@ run_tadpole "$TMPDIR/p5_non.fq" "$TMPDIR/p5_ext.fq" 15
 
 # Treatment: damage masking
 "$FQDUP" derep -i "$TMPDIR/p5_dp_non.fq" -o "$TMPDIR/p5_dmg.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p5_dp_non.fq" || true)
 AFTER_BASE=$(grep -c '^@' "$TMPDIR/p5_base.fq" || true)
@@ -447,7 +447,7 @@ echo "  PASS: Test P5"
 #
 # 300 molecules × 30x, variable length (mean=65bp, sd=15), dmax5=0.30, dmax3=0.25.
 # At 30x the pipeline must efficiently collapse duplicates (≥90% overall dedup).
-# derep --damage-auto must further reduce from derep_pairs alone.
+# derep --collapse-damage must further reduce from derep_pairs alone.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test P6: Capture library (30x, high damage, variable length) ---"
@@ -475,7 +475,7 @@ run_tadpole "$TMPDIR/p6_non.fq" "$TMPDIR/p6_ext.fq" 15
     -o-non "$TMPDIR/p6_dp_non.fq" -o-ext "$TMPDIR/p6_dp_ext.fq" 2>/dev/null
 
 "$FQDUP" derep -i "$TMPDIR/p6_dp_non.fq" -o "$TMPDIR/p6_final.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p6_dp_non.fq" || true)
 AFTER_FINAL=$(grep -c '^@' "$TMPDIR/p6_final.fq" || true)
@@ -501,7 +501,7 @@ if final >= after_dp:
     print(f"  FAIL: derep (damage-auto) did not reduce from derep_pairs ({final} >= {after_dp})")
     sys.exit(1)
 step2_reduction = (after_dp - final) / after_dp * 100
-print(f"  PASS: derep --damage-auto removed {step2_reduction:.1f}% of derep_pairs residuals")
+print(f"  PASS: derep --collapse-damage removed {step2_reduction:.1f}% of derep_pairs residuals")
 EOF
 
 echo "  PASS: Test P6"
@@ -817,7 +817,7 @@ run_tadpole "$TMPDIR/p10_non.fq" "$TMPDIR/p10_ext.fq" 25
 
 # Without extension: derep alone on variable-length copies (expect inflation)
 "$FQDUP" derep -i "$TMPDIR/p10_non.sorted.fq" -o "$TMPDIR/p10_noext.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 
 # With extension: derep_pairs fingerprint → derep residuals
 "$FQDUP" derep_pairs \
@@ -825,7 +825,7 @@ run_tadpole "$TMPDIR/p10_non.fq" "$TMPDIR/p10_ext.fq" 25
     -o-non "$TMPDIR/p10_dp_non.fq" -o-ext "$TMPDIR/p10_dp_ext.fq" 2>/dev/null
 
 "$FQDUP" derep -i "$TMPDIR/p10_dp_non.fq" -o "$TMPDIR/p10_final.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 
 NOEXT=$(grep -c '^@' "$TMPDIR/p10_noext.fq" || true)
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p10_dp_non.fq" || true)

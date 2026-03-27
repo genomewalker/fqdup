@@ -59,9 +59,9 @@ echo "  PASS: plain and .gz sorted outputs are sequence-identical"
 echo ""
 echo "--- B2: derep plain vs gzip input → same unique sequences ---"
 "$FQDUP" derep -i "$TMPDIR/sorted.fq" -o "$TMPDIR/b2_plain.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 "$FQDUP" derep -i "$TMPDIR/sorted.fq.gz" -o "$TMPDIR/b2_gz.fq" \
-    --damage-auto --no-error-correct 2>/dev/null
+    --collapse-damage --no-error-correct 2>/dev/null
 
 awk 'NR%4==2' "$TMPDIR/b2_plain.fq" | sort > "$TMPDIR/b2_plain_seqs.txt"
 awk 'NR%4==2' "$TMPDIR/b2_gz.fq"    | sort > "$TMPDIR/b2_gz_seqs.txt"
