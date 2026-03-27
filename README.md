@@ -64,16 +64,30 @@ Two mechanisms, both on by default:
   `--library-type ds|ss`.
 
   **Leave this off if you plan to run metaDMG or mapDamage on the fqdup output.**
-  Here is why: metaDMG and mapDamage estimate damage by counting C→T and G→A
-  events across all reads at every position. They need to see both the damaged
-  copies of a molecule (e.g. T at position 1) and the undamaged copies (C at
-  position 1) to compute reliable per-position frequencies. When
-  `--damage-auto` is on, fqdup collapses all copies of the same molecule into
-  one representative regardless of their damage state, so downstream tools only
-  see one read per molecule instead of all sequenced copies. The C→T signal at
-  each position is then much weaker or absent, and the damage estimates become
-  unreliable. Enable `--damage-auto` only when you need an accurate
-  unique-molecule count and are not running downstream damage analysis.
+  Here is why. Say one molecule was sequenced 5 times and 3 of those reads
+  picked up a C→T at position 1:
+
+  ```
+  read_1  TGCATGA...   <- deaminated at pos 1
+  read_2  CGCATGA...   <- undamaged
+  read_3  TGCATGA...   <- deaminated at pos 1
+  read_4  CGCATGA...   <- undamaged
+  read_5  TGCATGA...   <- deaminated at pos 1
+  ```
+
+  Without `--damage-auto`, all 5 reads are passed to metaDMG or mapDamage.
+  At position 1 they count T=3, C=2, giving a C→T frequency of 0.60 — a
+  clear damage signal.
+
+  With `--damage-auto`, fqdup recognises that these differ only at a
+  deaminated terminal position and collapses all 5 into one representative
+  (whichever read ID sorted first). Downstream tools see a single read. At
+  position 1 they count either T=1 or C=1. The frequency is either 0 or 1 for
+  that one molecule, and across the library the per-position frequencies are
+  unreliable because coverage is reduced to 1x per molecule.
+
+  Enable `--damage-auto` only when you need an accurate unique-molecule count
+  and are not running downstream damage analysis.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
 error correction is the only relevant step, `--no-damage` is already the
