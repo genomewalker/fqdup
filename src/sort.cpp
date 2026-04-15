@@ -757,6 +757,19 @@ public:
         log_info("Phase 1: Creating sorted chunks (" + std::to_string(threads_) + " writer threads)");
         create_chunks(input);
 
+        // Sort chunk files by chunk ID for deterministic merge order regardless of
+        // which writer thread finished first.
+        std::sort(sorted_files_.begin(), sorted_files_.end(),
+            [](const std::string& a, const std::string& b) {
+                auto extract_id = [](const std::string& s) -> size_t {
+                    auto p = s.rfind("chunk_");
+                    auto q = s.find(".sorted", p);
+                    if (p == std::string::npos || q == std::string::npos) return 0;
+                    return std::stoul(s.substr(p + 6, q - p - 6));
+                };
+                return extract_id(a) < extract_id(b);
+            });
+
         log_info("Phase 2: Merging " + std::to_string(sorted_files_.size()) + " sorted chunks");
         merge_chunks(output);
     }
@@ -1076,7 +1089,8 @@ private:
                     suf = suf * 10u + static_cast<unsigned>(id[p] - '0');
                 keys.push_back({id.substr(0, i), suf, i < id.size()});
             }
-            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
+            // stable_sort: equal-key reads keep their original input order → deterministic output
+            std::stable_sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
                 const NatKey& ka = keys[a]; const NatKey& kb = keys[b];
                 if (ka.prefix != kb.prefix) return ka.prefix < kb.prefix;
                 if (!ka.has_suffix && !kb.has_suffix) return false;
@@ -1090,7 +1104,8 @@ private:
             keys.reserve(N);
             for (const auto& r : chunk.records)
                 keys.push_back(trim_id(r.get_header()));
-            std::sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
+            // stable_sort: equal-key reads keep their original input order → deterministic output
+            std::stable_sort(indices.begin(), indices.end(), [&keys](uint32_t a, uint32_t b) {
                 return keys[a] < keys[b];
             });
         }
@@ -1159,16 +1174,20 @@ private:
         };
 
         auto compare_entries = [this](const MergeEntry& a, const MergeEntry& b) -> bool {
-            // Inverted for min-heap
+            // Inverted for min-heap. Tie-break by chunk index (idx) ensures that equal-key
+            // reads from different chunks always emerge in chunk order → deterministic output
+            // regardless of which writer thread finished first.
             if (natural_order_) {
                 const NatKey& ka = b.nat_key; const NatKey& kb = a.nat_key;
                 if (ka.prefix != kb.prefix) return ka.prefix < kb.prefix;
-                if (!ka.has_suffix && !kb.has_suffix) return false;
+                if (!ka.has_suffix && !kb.has_suffix) return b.idx < a.idx;
                 if (!ka.has_suffix) return true;
                 if (!kb.has_suffix) return false;
-                return ka.suffix < kb.suffix;
+                if (ka.suffix != kb.suffix) return ka.suffix < kb.suffix;
+                return b.idx < a.idx;
             }
-            return b.sort_key < a.sort_key;
+            if (b.sort_key != a.sort_key) return b.sort_key < a.sort_key;
+            return b.idx < a.idx;
         };
 
         std::priority_queue<MergeEntry, std::vector<MergeEntry>, decltype(compare_entries)> pq(compare_entries);
