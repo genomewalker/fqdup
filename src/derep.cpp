@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <zlib.h>
 
@@ -62,9 +63,11 @@ namespace {
 
 struct ErrCorParams {
     bool     enabled          = false;
-    uint32_t min_parent_count = 3;    // sequences with count > this are indexed as parents
+    uint32_t min_parent_count = 3;    // B3 grafting boundary: roots need acc_count >= this to absorb small clusters
     double   snp_threshold    = 0.20; // sig_count_weighted/parent_count >= this → SNP protection
     uint32_t snp_min_count    = 2;    // absolute minimum sig_count for SNP veto
+    uint32_t snp_low_cov_cutoff = 10;   // parent count below which adaptive threshold applies
+    double   snp_low_cov_factor = 1.75; // snp_threshold multiplier when parent_count < cutoff
     uint32_t bucket_cap       = 64;
     double   pcr_phi          = 5.3e-7;
     double   pcr_rate         = 0.0;  // still estimated for logging but no longer gates absorption
@@ -110,6 +113,10 @@ struct Phase3Stats {
             log_info("  Avg cand/child     : " +
                      std::to_string(static_cast<double>(total_candidates)/children_scanned));
         log_info("  Bucket cap fires   : " + std::to_string(cap_fires));
+        if (cap_fires > 0)
+            log_warn("Phase 3: " + std::to_string(cap_fires) +
+                     " bucket cap fire(s) — some PCR error candidates were not evaluated. "
+                     "Consider increasing --errcor-bucket-cap (current cap applied at index build).");
     }
 };
 
@@ -331,11 +338,13 @@ static int packed_hamming(const uint8_t* pa, const uint8_t* pb,
 //   xr=1 (01b): G↔T (10^11) or C↔A (01^00) — 8-oxoG, protect in damage mode
 //   xr=2 (10b): G↔A (10^00) or C↔T (01^11) — deamination, protect in damage mode
 //   xr=3 (11b): A↔T or C↔G — transversions, never damage
-static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool /*protect_damage*/) {
+static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool /*protect_deamination*/) {
+    // C↔T (xr=2) and G↔A/C↔A/G↔T (xr=1) are the defining aDNA damage signatures.
+    // They are ALWAYS protected from error-correction absorption regardless of whether
+    // --collapse-damage is active: even without explicit damage mode these substitutions
+    // are too suspicious to absorb (could be genuine variants or undetected damage).
+    // A↔T / C↔G (xr=3): transversions — no known damage mechanism, always absorbable.
     uint8_t xr = a ^ b;
-    // G↔T/C↔A (xr=1): 8-oxoG oxidative damage — always protect.
-    // G↔A/C↔T (xr=2): ancient deamination — always protect.
-    // A↔T/C↔G (xr=3): no known damage mechanism — absorbable PCR errors.
     return (xr == 1u || xr == 2u);
 }
 
@@ -629,9 +638,13 @@ class DerepEngine {
 public:
     DerepEngine(bool use_revcomp, bool write_clusters,
                 const DamageProfile& profile = DamageProfile{},
-                const ErrCorParams& errcor = ErrCorParams{})
+                const ErrCorParams& errcor = ErrCorParams{},
+                bool errcor_mode_explicit = false,
+                bool bucket_cap_explicit = false)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
+          errcor_mode_explicit_(errcor_mode_explicit),
+          bucket_cap_explicit_(bucket_cap_explicit),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     void process(const std::string& in_path,
@@ -698,6 +711,25 @@ public:
             // A singleton vs a 50× parent has sig/parent=2% → absorbed (PCR error).
             if (errcor_.mode == ErrCorParams::Mode::Shotgun) {
                 errcor_.snp_min_count = std::min(errcor_.snp_min_count, 1u);
+            }
+
+            // Issue 1: warn if shotgun mode was not explicitly set but data looks like capture.
+            if (!errcor_mode_explicit_ && errcor_.mode == ErrCorParams::Mode::Shotgun
+                    && index_.size() > 0) {
+                double mean_cluster = static_cast<double>(total_reads_) /
+                                      static_cast<double>(index_.size());
+                if (mean_cluster > 5.0)
+                    log_warn("Mean cluster count is " +
+                             std::to_string(mean_cluster).substr(0, 5) +
+                             " — this may be target capture data. "
+                             "Consider --errcor-mode capture for better PCR error correction.");
+            }
+
+            // Issue 4: raise bucket_cap default for capture mode so high-coverage loci
+            // are not silently under-corrected.
+            if (errcor_.mode == ErrCorParams::Mode::Capture && !bucket_cap_explicit_) {
+                errcor_.bucket_cap = 256;
+                log_info("Phase 3: bucket_cap raised to 256 for capture mode");
             }
 
             log_info("Phase 3: parent-centric mismatch pattern detection");
@@ -886,8 +918,12 @@ private:
         is_error_.assign(N, false);
 
         std::vector<uint64_t> id_count(N, 0);
-        for (const auto& [fp, entry] : index_)
+        // Reverse map: seq_id → IndexEntry* for representative propagation during absorption.
+        std::vector<IndexEntry*> seq_entry(N, nullptr);
+        for (auto& [fp, entry] : index_) {
             id_count[entry.seq_id] = entry.count;
+            seq_entry[entry.seq_id] = &entry;
+        }
 
         // Accumulated mass per cluster: starts as Pass-1 count, grows as children
         // are absorbed.  Used for B3 boundary check only — the SNP veto still uses
@@ -904,6 +940,11 @@ private:
         // C↔T / G↔A mismatches (xr=2) at these positions are treated as damage
         // variants and bypass the SNP veto, rather than being protected as SNPs.
         constexpr int kDamageEdgeMargin = 5;
+        // Minimum interior length for a meaningful 3-way pigeonhole split.
+        // Below this, splits degenerate (parts of 0-4 bp) and the hash keys
+        // become unreliable, risking false absorptions.
+        constexpr int kMinInteriorLen = 15;
+        uint64_t short_interior_skipped = 0;
 
         struct InteriorLayout {
             int  k5 = 0, ilen = 0, s0 = 0, s1 = 0, s2 = 0;
@@ -945,7 +986,7 @@ private:
             if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
             const auto& lay = get_layout(L);
-            if (lay.ilen < 3) continue;
+            if (lay.ilen < kMinInteriorLen) continue;
 
             auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
@@ -1021,13 +1062,17 @@ private:
         std::vector<ChildMismatch> mismatches;
         mismatches.reserve(std::min(static_cast<size_t>(N) * 2, static_cast<size_t>(1 << 24)));
 
+        // Pre-allocated candidate buffer: 6 queries × bucket_cap (3 canonical + 3 RC pair tags).
+        // Sized here so raising bucket_cap (e.g. in capture mode) does not silently overflow.
+        std::vector<uint32_t> cand_storage(6u * errcor_.bucket_cap);
+
         for (uint32_t cid = 0; cid < N; ++cid) {
             if (is_error_[cid]) continue;
             if (!arena_.is_eligible(cid)) continue;
 
             int L = arena_.length(cid);
             const auto& lay = get_layout(L);
-            if (lay.ilen < 3) continue;
+            if (lay.ilen < kMinInteriorLen) { short_interior_skipped++; continue; }
 
             auto shard_it = shards.find(lay.ilen);
             if (shard_it == shards.end()) continue;
@@ -1077,10 +1122,10 @@ private:
             stats.children_scanned++;
 
             // Collect unique parent candidates — query both canonical and RC hash keys.
-            uint32_t cand_buf[384];  // 2×192: canonical + RC queries
+            uint32_t* cand_buf = cand_storage.data();
             uint32_t n_cands = 0;
             auto collect = [&](uint32_t pid) {
-                if (n_cands < 384) cand_buf[n_cands++] = pid;
+                if (n_cands < static_cast<uint32_t>(cand_storage.size())) cand_buf[n_cands++] = pid;
             };
 
             auto tq0 = clk::now();
@@ -1212,9 +1257,11 @@ private:
                                       cm.mismatch_pos >=
                                           static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin));
 
+                double eff_snp_threshold = errcor_.snp_threshold *
+                    (parent_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
                 bool snp_veto = !damage_bypass &&
                                 (sig >= errcor_.snp_min_count) &&
-                                (static_cast<double>(sig) >= errcor_.snp_threshold *
+                                (static_cast<double>(sig) >= eff_snp_threshold *
                                                               static_cast<double>(parent_count));
 
                 if (snp_veto) {
@@ -1223,7 +1270,14 @@ private:
                     if (!is_error_[cm.child_id]) {
                         is_error_[cm.child_id] = true;
                         parent_chain[cm.child_id] = eff_pid;  // track chain for rerouting descendants
-                        acc_count[eff_pid] += id_count[cm.child_id];  // accumulate mass
+                        acc_count[eff_pid] += acc_count[cm.child_id];  // propagate accumulated mass (incl. child's absorbed descendants)
+                        acc_count[cm.child_id] = 0;  // zero to prevent double-counting if re-traversed
+                        // Propagate representative: adopt child's record if it has stronger damage signal.
+                        if (seq_entry[cm.child_id] && seq_entry[eff_pid] &&
+                            seq_entry[cm.child_id]->damage_score > seq_entry[eff_pid]->damage_score) {
+                            seq_entry[eff_pid]->record_index = seq_entry[cm.child_id]->record_index;
+                            seq_entry[eff_pid]->damage_score = seq_entry[cm.child_id]->damage_score;
+                        }
                         stats.absorbed++;
                         errcor_absorbed_++;
                     }
@@ -1265,6 +1319,10 @@ private:
                           return id_count[a] > id_count[b];
                       });
 
+            // Pre-allocated candidate buffer: 12 queries × bucket_cap
+            // (6 canonical + 6 RC: pair tags 0-2 + single tags 3-5).
+            std::vector<uint32_t> cand_storage_b3(12u * errcor_.bucket_cap);
+
             uint64_t b3_new;
             do {
             b3_new = 0;
@@ -1275,7 +1333,7 @@ private:
 
                 int L = arena_.length(cid);
                 const auto& lay = get_layout(L);
-                if (lay.ilen < 3) continue;
+                if (lay.ilen < kMinInteriorLen) continue;
 
                 auto shard_it = shards.find(lay.ilen);
                 if (shard_it == shards.end()) continue;
@@ -1310,10 +1368,10 @@ private:
 
                 // Query H=1 (pair tags 0-2) and H=2 cross-partition (single tags 3-5).
                 // Both canonical and RC orientations.
-                uint32_t cand_buf[768];
+                uint32_t* cand_buf = cand_storage_b3.data();
                 uint32_t n_cands = 0;
                 auto collect_b3 = [&](uint32_t pid) {
-                    if (n_cands < 768) cand_buf[n_cands++] = pid;
+                    if (n_cands < static_cast<uint32_t>(cand_storage_b3.size())) cand_buf[n_cands++] = pid;
                 };
                 auto& sh = shard_it->second;
                 sh.pi[0].query(pair_key(h0,  h1,  0, lay.ilen), collect_b3);
@@ -1333,9 +1391,13 @@ private:
                 n_cands = static_cast<uint32_t>(
                     std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
 
-                // Pick the largest-count verified H=1 root with count ≥ boundary.
-                uint32_t best_root  = UINT32_MAX;
-                uint64_t best_count = 0;   // original Pass-1 count of best root (selection + SNP veto)
+                // Pick the largest accumulated-count verified H≤2 root with acc_count ≥ boundary.
+                // Selection ranks by acc_count (current cluster mass after B2/B3 absorptions).
+                // SNP veto uses id_count (original Pass-1 count) to keep the threshold calibrated
+                // against pre-absorption counts and avoid self-reinforcing threshold drift.
+                uint32_t best_root      = UINT32_MAX;
+                uint64_t best_acc_count = 0;   // accumulated count for root selection
+                uint64_t best_id_count  = 0;   // original Pass-1 count for SNP veto calibration
                 for (uint32_t ci = 0; ci < n_cands; ++ci) {
                     uint32_t pid = cand_buf[ci];
                     if (pid == cid) continue;
@@ -1348,8 +1410,8 @@ private:
                     // matching SWARM's OTU mass criterion for fastidious grafting.
                     if (acc_count[eff_pid] < boundary) continue;
 
-                    uint64_t root_count = id_count[eff_pid];  // original count for selection/SNP veto
-                    if (root_count <= best_count) continue;
+                    uint64_t root_acc = acc_count[eff_pid];
+                    if (root_acc <= best_acc_count) continue;
 
                     // Verify H≤2 by Hamming (canonical then RC orientation).
                     // Phase B3 absorbs small sequences into large clusters via H=2
@@ -1360,8 +1422,9 @@ private:
                         hd = packed_hamming(pi_buf, crc_full, 0, lay.ilen, 2);
                     if (hd == 0 || hd > 2) continue;
 
-                    best_count = root_count;
-                    best_root  = eff_pid;
+                    best_acc_count = root_acc;
+                    best_id_count  = id_count[eff_pid];
+                    best_root      = eff_pid;
                 }
 
                 if (best_root == UINT32_MAX) { b3_no_large_root++; continue; }
@@ -1397,18 +1460,27 @@ private:
 
                 // SNP veto: sig = count of this small sequence.
                 uint64_t sig = id_count[cid];
+                double eff_snp_threshold_b3 = errcor_.snp_threshold *
+                    (best_id_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
                 bool snp_veto = damage_protect_b3 ||
                                 (!damage_bypass_b3 &&
                                  (sig >= errcor_.snp_min_count) &&
-                                 (static_cast<double>(sig) >= errcor_.snp_threshold *
-                                                              static_cast<double>(best_count)));
+                                 (static_cast<double>(sig) >= eff_snp_threshold_b3 *
+                                                              static_cast<double>(best_id_count)));
                 if (snp_veto) {
                     b3_snp_protected++;
                     stats.snp_protected++;
                 } else {
                     is_error_[cid] = true;
                     parent_chain[cid] = best_root;
-                    acc_count[best_root] += id_count[cid];  // accumulate mass for next iteration
+                    acc_count[best_root] += acc_count[cid];  // propagate accumulated mass (incl. cid's absorbed descendants)
+                    acc_count[cid] = 0;  // zero to prevent double-counting across B3 iterations
+                    // Propagate representative: adopt child's record if it has stronger damage signal.
+                    if (seq_entry[cid] && seq_entry[best_root] &&
+                        seq_entry[cid]->damage_score > seq_entry[best_root]->damage_score) {
+                        seq_entry[best_root]->record_index = seq_entry[cid]->record_index;
+                        seq_entry[best_root]->damage_score = seq_entry[cid]->damage_score;
+                    }
                     b3_new++;
                     b3_absorbed++;
                     errcor_absorbed_++;
@@ -1426,7 +1498,29 @@ private:
             log_info("Phase 3 B3: skipped (shotgun mode — small clusters treated as genuine molecules)");
         }
 
+        // Write accumulated cluster counts back into the index so pass2() and the
+        // cluster TSV reflect absorbed PCR error reads, not just the original
+        // representative count.  acc_count is a local — must be written back before
+        // phase3_error_correct() returns.
+        for (auto& [fp, entry] : index_) {
+            if (entry.seq_id < static_cast<uint32_t>(acc_count.size()) &&
+                !is_error_[entry.seq_id])
+                entry.count = acc_count[entry.seq_id];
+        }
+
         stats.log();
+        if (short_interior_skipped > 0) {
+            double pct = 100.0 * static_cast<double>(short_interior_skipped) /
+                         static_cast<double>(N);
+            log_info("Phase 3: " + std::to_string(short_interior_skipped) +
+                     " reads skipped (interior < " + std::to_string(kMinInteriorLen) +
+                     " bp after damage masking, " +
+                     std::to_string(pct).substr(0, 4) + "%)");
+            if (pct > 10.0)
+                log_warn("Over 10% of reads have interiors too short for Phase 3 error correction "
+                         "after damage masking. Consider reducing --mask-threshold or "
+                         "adjusting damage zone parameters.");
+        }
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
                  " PCR error sequences (directed-ascent + small-cluster pass, snp_threshold=" +
                  std::to_string(errcor_.snp_threshold) +
@@ -1557,6 +1651,8 @@ private:
     bool write_clusters_;
     DamageProfile profile_;
     ErrCorParams  errcor_;
+    bool errcor_mode_explicit_;
+    bool bucket_cap_explicit_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
 
@@ -1598,10 +1694,12 @@ static void print_usage(const char* prog) {
         << "\nPCR error correction (Phase 3 — ON by default):\n"
         << "  --no-error-correct           Disable PCR error duplicate removal\n"
         << "  --error-correct              Explicitly enable (already default)\n"
-        << "  --errcor-min-parent INT      Min count to be indexed as parent (default: 3)\n"
+        << "  --errcor-min-parent INT      Min cluster count for B3 grafting root eligibility (default: 3)\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 2 capture, 1 shotgun)\n"
-        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64)\n"
+        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64 shotgun, 256 capture)\n"
+        << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
+        << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
         << "  --errcor-mode capture|shotgun  Coverage regime (default: shotgun)\n"
         << "                           shotgun: conservative EC (snp_min_count=1, B3 disabled)\n"
         << "                                    Default; safe for low-coverage shotgun data\n"
@@ -1638,7 +1736,9 @@ int derep_main(int argc, char** argv) {
     bool use_revcomp = true;
 
     ErrCorParams errcor;
-    errcor.enabled = true;   // default on: aDNA primary use case
+    errcor.enabled = true;
+    bool errcor_mode_explicit = false;
+    bool bucket_cap_explicit  = false;   // default on: aDNA primary use case
 
     bool   damage_auto    = false;  // default off: damage-aware hashing distorts
                                     // downstream damage analysis (e.g. DART) when
@@ -1686,6 +1786,13 @@ int derep_main(int argc, char** argv) {
             long v = std::stol(argv[++i]);
             if (v < 1) { std::cerr << "Error: --errcor-bucket-cap must be >= 1, got " << v << "\n"; return 1; }
             errcor.bucket_cap = static_cast<uint32_t>(v);
+            bucket_cap_explicit = true;
+        } else if (arg == "--errcor-snp-cutoff" && i + 1 < argc) {
+            long v = std::stol(argv[++i]);
+            if (v < 1) { std::cerr << "Error: --errcor-snp-cutoff must be >= 1, got " << v << "\n"; return 1; }
+            errcor.snp_low_cov_cutoff = static_cast<uint32_t>(v);
+        } else if (arg == "--errcor-snp-factor" && i + 1 < argc) {
+            errcor.snp_low_cov_factor = std::stod(argv[++i]);
         } else if (arg == "--errcor-mode" && i + 1 < argc) {
             std::string m(argv[++i]);
             if      (m == "capture") errcor.mode = ErrCorParams::Mode::Capture;
@@ -1695,6 +1802,7 @@ int derep_main(int argc, char** argv) {
                           << " (use capture, shotgun)\n";
                 return 1;
             }
+            errcor_mode_explicit = true;
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
             if (lt == "ss" || lt == "single-stranded")
@@ -1833,7 +1941,8 @@ int derep_main(int argc, char** argv) {
                      "Use --no-error-correct to disable.");
         }
 
-        DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor);
+        DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
+                           errcor_mode_explicit, bucket_cap_explicit);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

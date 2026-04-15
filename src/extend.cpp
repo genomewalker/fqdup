@@ -316,13 +316,39 @@ struct ShardedKmerTable {
         }
     }
 
+    // LSB radix sort for uint64_t using 8-bit digits.
+    // n_passes: number of byte-passes — ceil((2k + N_FLAG_BITS) / 8).
+    // After the call, sorted data is in `in`; `out` is a same-sized scratch buffer.
+    // 3-5x faster than std::sort on large arrays where memory bandwidth dominates.
+    static void radix_sort_u64(std::vector<uint64_t>& in, std::vector<uint64_t>& out,
+                               int n_passes) {
+        const size_t n = in.size();
+        out.resize(n);
+        uint32_t cnt[256];
+        for (int pass = 0; pass < n_passes; ++pass) {
+            const int shift = pass * 8;
+            std::memset(cnt, 0, sizeof(cnt));
+            for (size_t i = 0; i < n; ++i) ++cnt[(in[i] >> shift) & 0xFFu];
+            uint32_t sum = 0;
+            for (int b = 0; b < 256; ++b) { uint32_t c = cnt[b]; cnt[b] = sum; sum += c; }
+            for (size_t i = 0; i < n; ++i) out[cnt[(in[i] >> shift) & 0xFFu]++] = in[i];
+            // Swap contents: sorted result moves into `in` for the next pass.
+            // std::swap on vectors is O(1) — swaps internal pointer/size/capacity only.
+            std::swap(in, out);
+        }
+        // Invariant: after every pass the result lands in `in` (caller's first arg).
+    }
+
     // Sort each shard's raw[] by packed uint64_t (= sort by canon), reduce
     // consecutive same-canon items into FlatEntry[], then free raw[].
     // Parallel over n_threads disjoint shard ranges.  Call once after all
     // batch_append() calls complete.
     void finalize(int n_threads) {
-        const int nt  = std::max(1, n_threads);
-        const int per = (N + nt - 1) / nt;
+        const int nt      = std::max(1, n_threads);
+        const int per     = (N + nt - 1) / nt;
+        // Radix passes needed: ceil((2k + 7 flag bits) / 8).  Skips zero high bytes for
+        // small k (e.g. k=17 → 6 passes instead of 8), saving ~25% sort work.
+        const int n_passes = (key_bits_ + N_FLAG_BITS + 7) / 8;
 
         std::vector<std::thread> workers;
         workers.reserve(nt);
@@ -330,16 +356,20 @@ struct ShardedKmerTable {
             const int lo = t * per;
             const int hi = std::min(lo + per, N);
             if (lo >= N) break;
-            workers.emplace_back([this, lo, hi]() {
+            workers.emplace_back([this, lo, hi, n_passes]() {
+                std::vector<uint64_t> tmp;  // per-thread scratch; reused across shards
                 for (int i = lo; i < hi; ++i) {
                     Shard& s = shards[i];
                     if (s.raw.empty()) continue;
 
-                    // Sort by packed uint64_t — equivalent to sorting by canon (high bits).
-                    std::sort(s.raw.begin(), s.raw.end());
+                    // Radix sort — result ends up in s.raw; tmp is scratch.
+                    // Peak extra RAM per thread: sizeof(uint64_t) * largest_shard_size.
+                    radix_sort_u64(s.raw, tmp, n_passes);
 
                     // Reduce: group consecutive same-canon observations into FlatEntry.
-                    s.flat.reserve(s.raw.size());  // upper bound; shrink_to_fit after
+                    // Reserve raw/4: typical aDNA is 4-10× coverage so unique k-mers ≈
+                    // raw/coverage.  push_back handles any under-estimate via doubling.
+                    s.flat.reserve(s.raw.size() / 4);
                     uint64_t prev_canon = ~0ULL;
                     for (const uint64_t p : s.raw) {
                         const uint64_t canon  = p >> N_FLAG_BITS;
@@ -470,7 +500,7 @@ struct ShardedKmerTable {
         }
 #endif
 
-        // Binary search fallback (before build_bbhash, or with --no-bbhash).
+        // Binary search fallback (default; BBHash path enabled with --bbhash).
         if (s.flat.empty()) return nullptr;
 
         const uint32_t bucket = static_cast<uint32_t>(canon >> prefix_shift_);
@@ -648,7 +678,10 @@ struct ExtendConfig {
     int      max_extend      = 100;  // Tadpole production uses el=er=100
     int      min_qual        = 20;
     bool     no_damage       = false;
-    bool     no_bbhash       = false; // skip BBHash build; use binary search (for benchmarking)
+    bool     use_bbhash      = false; // opt-in: build BBHash MPHF after finalize().
+                                      // Saves ~6 GB RAM at DS4 scale but is slower than the
+                                      // default prefix-indexed binary search for all tested
+                                      // dataset sizes.  Enable with --bbhash when RAM is tight.
     int      mask_5_override = -1;   // >= 0: use directly, skip Pass 0
     int      mask_3_override = -1;
     double   mask_threshold  = 0.05;
@@ -1267,7 +1300,7 @@ int ExtendEngine::run() {
     const size_t n_entries = table_.size();
     log_info("extend: finalized — " + std::to_string(n_entries) + " entries, memory released");
 #ifdef HAVE_BBHASH
-    if (!cfg_.no_bbhash) {
+    if (cfg_.use_bbhash) {
         log_info("extend: building BBHash MPHF for O(1) pass2 lookup...");
         table_.build_bbhash(cfg_.n_threads);
         log_info("extend: BBHash ready — " + std::to_string(n_entries) + " entries");
@@ -1294,7 +1327,8 @@ static void extend_usage(const char* prog) {
         << "  --min-count INT             Min edge support to extend (default: 2)\n"
         << "  --max-extend INT            Max bases added per side (default: 100)\n"
         << "  --no-damage                 Skip damage estimation, no masking\n"
-        << "  --no-bbhash                 Skip BBHash MPHF build; use binary search (benchmarking)\n"
+        << "  --bbhash                    Build BBHash MPHF for O(1) lookup; saves ~6 GB RAM at\n"
+           << "                              DS4 scale but is slower for most datasets (default: off)\n"
         << "  --mask-5 INT                Override 5' mask length; must pair with --mask-3\n"
         << "  --mask-3 INT                Override 3' mask length; must pair with --mask-5\n"
         << "  --mask-threshold FLOAT      Excess damage threshold (default: 0.05)\n"
@@ -1329,8 +1363,8 @@ int extend_main(int argc, char** argv) {
             cfg.max_extend = std::stoi(argv[++i]);
         } else if (arg == "--no-damage") {
             cfg.no_damage = true;
-        } else if (arg == "--no-bbhash") {
-            cfg.no_bbhash = true;
+        } else if (arg == "--bbhash") {
+            cfg.use_bbhash = true;
         } else if (arg == "--mask-5" && i + 1 < argc) {
             cfg.mask_5_override = std::stoi(argv[++i]);
         } else if (arg == "--mask-3" && i + 1 < argc) {
