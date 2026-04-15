@@ -95,8 +95,12 @@ appear only once.
 
 **KMC3-in-RAM approach.** K-mer observations are accumulated into sharded
 append buffers (2^12 shards). After all reads are processed, each shard is
-sorted and reduced in-place (counting unique k-mers). A per-shard prefix index
-(2^12 bucket directory) reduces binary search depth from 19 to 7 during Pass 2.
+sorted using an LSB radix sort (8-bit digits, ceil((2k+7)/8) passes — 3–5×
+faster than `std::sort` on large uint64_t arrays) and reduced in-place
+(counting unique k-mers). A per-shard prefix index (2^12 bucket directory)
+reduces binary search depth from 19 to 7 during Pass 2 (default). BBHash MPHF
+lookup is available via `--bbhash` but is slower for all tested dataset sizes
+due to cache-miss overhead; use it only when RAM is critically constrained.
 
 Memory model (DS4, 198 M reads, k=17):
 - Accumulation: 6.7 B observations × 8 bytes, demand-paged
@@ -154,6 +158,9 @@ K-mer graph:
   --max-extend N         Maximum bases added per side (default: 100)
   --threads N            Worker threads (default: all CPU cores)
   --min-qual N           Exclude bases below this Phred quality (default: 20)
+  --bbhash               Use BBHash MPHF for k-mer lookup instead of binary
+                         search; saves ~6 GB RAM at DS4 scale but is slower
+                         for most datasets (default: off)
 
 Damage handling:
   --library-type TYPE    Library type for damage model: auto|ds|ss (default: auto)
