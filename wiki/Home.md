@@ -14,14 +14,14 @@ DNA, but ancient DNA has two properties that break this assumption.
 deaminate to uracil over time, producing C→T substitutions at the 5' end and
 G→A substitutions at the 3' end (the complement on the reverse strand). The
 rate is highest at the terminal positions and decays exponentially toward the
-interior. Two reads from the same original molecule may therefore differ at
-position 1, one carrying the original C, the other carrying a deaminated T -
-and an exact-match deduplicator counts them as distinct. The true unique molecule
-count is inflated.
+interior. Two reads from different original ancient molecules at the same genomic locus
+may therefore differ at position 1 — one molecule was deaminated at that site,
+the other was not — and an exact-match deduplicator counts them as distinct.
+The true unique molecule count is inflated.
 
 **PCR errors.** Library amplification introduces substitution errors at a low
 but nonzero rate (~10⁻⁷ per base per doubling for high-fidelity polymerases).
-A molecule amplified 30 cycles has thousands of copies; a single early copying
+A molecule amplified 30 cycles has ~10⁹ copies (2³⁰); a single early copying
 error propagates into a cluster of slightly-wrong copies. These clusters tend
 to have low read counts relative to the correct sequence, but they survive
 exact-match deduplication as apparent unique molecules.
