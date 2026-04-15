@@ -67,11 +67,13 @@ but they still carry real ancient DNA signal. When `--collapse-damage` is active
 such mismatches bypass the SNP veto and are always absorbed — they are treated
 as residual deamination artefacts rather than true SNPs.
 
-This bypass applies only to C↔T and G↔A at the damage-zone edge. Mismatches
-elsewhere, including G↔T and C↔A from oxidative damage (8-oxoG), rely entirely
-on the SNP veto for protection. A G→T lesion that appears in only a small
-fraction of reads relative to the parent count will not reach the SNP veto
-threshold and will be absorbed.
+This bypass applies only to C↔T and G↔A at the damage-zone edge.
+
+G↔T and C↔A mismatches (consistent with 8-oxoG oxidative damage) are also
+unconditionally protected from absorption by `is_damage_sub` — they are never
+treated as PCR errors regardless of position, count, or whether
+`--collapse-damage` is active. Only A↔T and C↔G transversions can be absorbed
+by Phase 3.
 
 ---
 
