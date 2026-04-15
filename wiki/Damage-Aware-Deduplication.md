@@ -20,9 +20,13 @@ to uracil over time, producing C→T substitutions at the 5' terminus. The same
 process on the complementary strand appears as G→A at the 3' terminus. Both
 signals decay exponentially from the ends toward the read interior.
 
-When two reads come from the same original molecule but one carries a deaminated
-C→T at position 1, exact-match deduplication treats them as different fragments.
-The unique molecule count is inflated by however many molecules were sequenced
+When two reads come from different original ancient molecules at the same genomic
+locus — one deaminated at the 5' terminus, one not — exact-match deduplication
+treats them as different fragments. Deamination is a post-mortem chemical
+modification fixed in the ancient template before library preparation; every PCR
+copy of a deaminated molecule carries the C→T change, so reads with and without
+the substitution at the same position must come from distinct original molecules.
+The unique molecule count is inflated by however many locus-copies were sequenced
 both with and without terminal damage, which in a heavily-amplified library
 can be substantial.
 
@@ -149,8 +153,9 @@ Benchmarked on sample `a88af16f35`, 5.58 M merged reads input to `derep`
 
 Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
 correction (with damage substitution protection) absorbed a further 1,456
-PCR-error clusters, only A↔T and C↔G mismatches are eligible; C↔T and G↔A
-are protected as potential damage signal.
+PCR-error clusters. Only A↔T and C↔G transversions are eligible for absorption;
+C↔T and G↔A (deamination) and G↔T and C↔A (8-oxoG oxidative damage) are all
+protected as potential ancient DNA damage signal.
 
 ---
 
