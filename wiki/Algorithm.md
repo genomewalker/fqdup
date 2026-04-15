@@ -28,11 +28,16 @@ Key properties of the graph:
 - **Minimum count filter**: k-mers with edge support below `--min-count`
   (default 2) are discarded after counting.
 - **KMC3-in-RAM approach**: k-mer observations are accumulated in sharded
-  append buffers, then sorted and reduced in place. On DS4 (198 M reads):
-  6.7 B observations × 8 bytes demand-paged during accumulation; after
-  finalize: 1.644 B distinct k-mers × 16 bytes = 26 GB. Peak RSS 41 GB.
+  append buffers, then sorted and reduced in place. Sorting uses an LSB
+  radix sort (8-bit digits, ceil((2k+7)/8) passes) — 3–5× faster than
+  `std::sort` for large uint64_t arrays where memory bandwidth dominates.
+  On DS4 (198 M reads): 6.7 B observations × 8 bytes demand-paged during
+  accumulation; after finalize: 1.644 B distinct k-mers × 16 bytes = 26 GB.
+  Peak RSS 41 GB.
 - **Per-shard prefix index**: 2^12 bucket directory reduces binary search
-  depth from 19 to 7 during Pass 2 lookups.
+  depth from 19 to 7 during Pass 2 lookups (default). BBHash MPHF lookup
+  is available via `--bbhash` but is slower for typical dataset sizes due
+  to cache-miss overhead; use it only when RAM is critically constrained.
 
 **Pass 2: extension and output.** Extends each read via a 3-stage pipeline:
 reader → work queue → N worker threads → done queue → writer with reorder
