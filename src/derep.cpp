@@ -7,7 +7,7 @@
 // Strategy:
 //   Pass 0 (optional): Estimate ancient DNA damage parameters from input
 //   Pass 1: Stream input, build hash → position index with damage masking
-//   Phase 3 (optional): PCR error correction via 3-way pigeonhole Hamming search
+//   Phase 3 (optional): PCR error correction via 4-way pigeonhole H≤2 Hamming search
 //   Pass 2: Stream again, write representative unique records
 //
 // Memory: ~16 bytes per input record + seq arena if --error-correct is used.
@@ -63,7 +63,7 @@ namespace {
 
 struct ErrCorParams {
     bool     enabled          = false;
-    uint32_t min_parent_count = 3;    // B3 grafting boundary: roots need acc_count >= this to absorb small clusters
+    uint32_t min_parent_count = 3;
     double   snp_threshold    = 0.20; // sig_count_weighted/parent_count >= this → SNP protection
     uint32_t snp_min_count    = 2;    // absolute minimum sig_count for SNP veto
     uint32_t snp_low_cov_cutoff = 10;   // parent count below which adaptive threshold applies
@@ -71,15 +71,7 @@ struct ErrCorParams {
     uint32_t bucket_cap       = 64;
     double   pcr_phi          = 5.3e-7;
     double   pcr_rate         = 0.0;  // still estimated for logging but no longer gates absorption
-    // Coverage regime — controls Phase 3 aggressiveness.
-    //   shotgun (default): conservative EC — snp_min_count=1 (singletons protected by ratio
-    //            test), Phase B3 disabled.  Safe for low-coverage shotgun sequencing where
-    //            genuine molecules may appear only 1-2×.  Primary use case.
-    //   capture: aggressive EC — snp_min_count=2, Phase B3 enabled.  Use for PCR-amplified
-    //            libraries (aDNA capture, targeted sequencing) where molecules appear 10-100×.
-    // No auto-detection: D_eff from Pass 1 is biased by PCR errors and damage variants,
-    // making threshold-based regime inference unreliable.  Set explicitly via --errcor-mode.
-    enum class Mode { Capture, Shotgun } mode = Mode::Shotgun;
+    uint32_t max_h2_count     = 2;    // H=2 absorption only when child count ≤ this
 };
 
 struct Phase3Stats {
@@ -137,14 +129,14 @@ struct IndexEntry {
 // ============================================================================
 // Phase 3: PCR Error Correction data structures
 //
-// Count-stratified 3-way pigeonhole neighbor finding for edit-distance-1
-// detection.  Reads with count <= max_count that have a neighbour with
-// count >= ratio × their own count are classified as PCR error duplicates.
+// Count-stratified 4-way pigeonhole neighbor finding for H≤2 detection.
+// Reads with count <= max_count that have a neighbour with count >= ratio ×
+// their own count are classified as PCR error duplicates.
 //
-// 3-way pigeonhole: split interior [k5, L-k3) into three parts p0, p1, p2.
-// If Hamming(child, parent) == 1 inside the interior, at least two of the
-// three parts match exactly.  We index all three (matched-pair) combinations
-// so any 1-error variant is found by exactly one lookup.
+// 4-way pigeonhole: split interior [k5, L-k3) into four parts p0, p1, p2, p3.
+// If Hamming(child, parent) ≤ 2 inside the interior, at least 2 of the 4
+// parts match exactly.  We index all C(4,2)=6 pair combinations so any
+// 1- or 2-error variant is found by at least one lookup.
 // ============================================================================
 
 // 2-bit base helpers — defined before SeqArena which uses them.
@@ -278,10 +270,11 @@ struct FlatPairIndex {
     }
 };
 
-static inline void split3_lens(int ilen, int& s0, int& s1, int& s2) {
-    s0 = ilen / 3;
-    s1 = (ilen * 2) / 3 - s0;
-    s2 = ilen - s0 - s1;
+static inline void split4_lens(int ilen, int& s0, int& s1, int& s2, int& s3) {
+    s0 = ilen / 4;
+    s1 = ilen * 2 / 4 - s0;
+    s2 = ilen * 3 / 4 - s0 - s1;
+    s3 = ilen - s0 - s1 - s2;
 }
 
 static inline uint64_t splitmix64(uint64_t x) {
@@ -301,13 +294,6 @@ static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
                       ^ static_cast<uint64_t>(ilen));
 }
 
-// Key for single-part (H=2 cross-partition) lookup.
-// stag ∈ {0,1,2}: index of the part that matches exactly.
-// Tags 3-5 are reserved for these and do not collide with pair_key (tags 0-2).
-static inline uint64_t single_key(uint64_t h, int stag, int ilen) {
-    return splitmix64(h ^ (static_cast<uint64_t>(stag + 3) << 56)
-                        ^ static_cast<uint64_t>(ilen));
-}
 
 // Count Hamming mismatches between packed interiors [k5, k5+ilen).
 // Returns the count, stopping at max_mm+1 (early exit if exceeded).
@@ -447,15 +433,72 @@ static MismatchInfo packed_find_mismatch(const uint8_t* pa, const uint8_t* pb,
     return {true, mm_pos, mm_a, mm_b};
 }
 
+// Returns up to 2 mismatches between packed interiors [k5, k5+ilen).
+// No damage filtering — caller is responsible.
+// r.count == 3 means more than 2 mismatches (rejected).
+struct MismatchInfo2 {
+    int     count;
+    uint16_t pos[2];
+    uint8_t  base_a[2];  // parent's 2-bit base
+    uint8_t  base_b[2];  // child's 2-bit base
+};
+
+static MismatchInfo2 packed_find_mismatches2(const uint8_t* pa, const uint8_t* pb,
+                                              int k5, int ilen) {
+    MismatchInfo2 r{};
+    for (int i = 0; i < ilen; ) {
+        int pos    = k5 + i;
+        int byte_i = pos >> 2;
+        int bit_i  = pos & 3;
+        if (bit_i == 0 && i + 4 <= ilen) {
+            uint8_t diff = pa[byte_i] ^ pb[byte_i];
+            if (diff) {
+                int nm = __builtin_popcount((diff | (diff >> 1)) & 0x55u);
+                if (r.count + nm > 2) return {3, {}, {}, {}};
+                for (int lane = 0; lane < 4; ++lane) {
+                    int sh = 6 - 2 * lane;
+                    uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
+                    uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
+                    if (ba != bb) {
+                        r.pos[r.count]    = static_cast<uint16_t>(i + lane);
+                        r.base_a[r.count] = ba;
+                        r.base_b[r.count] = bb;
+                        r.count++;
+                    }
+                }
+            }
+            i += 4;
+        } else {
+            uint8_t sh = static_cast<uint8_t>(6 - 2 * bit_i);
+            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
+            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
+            if (ba != bb) {
+                if (r.count >= 2) return {3, {}, {}, {}};
+                r.pos[r.count]    = static_cast<uint16_t>(i);
+                r.base_a[r.count] = ba;
+                r.base_b[r.count] = bb;
+                r.count++;
+            }
+            ++i;
+        }
+    }
+    return r;
+}
+
 // ── ChildMismatch record ────────────────────────────────────────────────────
 struct ChildMismatch {
     uint32_t parent_id;
     uint32_t child_id;
-    uint16_t mismatch_pos;  // interior-relative position (0-based)
-    uint8_t  alt_base;      // child's 2-bit base
-    uint8_t  parent_base;   // parent's 2-bit base
-};  // 12 bytes
-static_assert(sizeof(ChildMismatch) == 12, "ChildMismatch must be 12 bytes");
+    uint16_t mismatch_pos;   // first mismatch (interior-relative, 0-based)
+    uint8_t  alt_base;       // child's 2-bit base (first mismatch)
+    uint8_t  parent_base;    // parent's 2-bit base (first mismatch)
+    uint16_t mismatch_pos2;  // second mismatch (only used when hamming==2)
+    uint8_t  alt_base2;      // child's 2-bit base (second mismatch)
+    uint8_t  parent_base2;   // parent's 2-bit base (second mismatch)
+    uint8_t  hamming;        // 1 or 2
+    uint8_t  _pad[3];
+};  // 20 bytes
+static_assert(sizeof(ChildMismatch) == 20, "ChildMismatch must be 20 bytes");
 
 // Extract bases [start, start+count) from 2-bit packed data into dst[],
 // byte-normalized (first base at MSB of dst[0], trailing bits zeroed).
@@ -639,11 +682,10 @@ public:
     DerepEngine(bool use_revcomp, bool write_clusters,
                 const DamageProfile& profile = DamageProfile{},
                 const ErrCorParams& errcor = ErrCorParams{},
-                bool errcor_mode_explicit = false,
+                bool /*errcor_mode_explicit*/ = false,
                 bool bucket_cap_explicit = false)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
-          errcor_mode_explicit_(errcor_mode_explicit),
           bucket_cap_explicit_(bucket_cap_explicit),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
@@ -691,45 +733,6 @@ public:
                          std::to_string(total_reads_) + "/" +
                          std::to_string(index_.size()) +
                          " (use --pcr-cycles for explicit value)");
-            }
-
-            // Log the active coverage regime.
-            // Users select via --errcor-mode capture (default) or --errcor-mode shotgun.
-            // No auto-detection: D_eff from Pass 1 is biased downward by PCR errors and
-            // damage variants, making threshold-based detection unreliable.
-            {
-                const char* regime = (errcor_.mode == ErrCorParams::Mode::Shotgun)
-                                     ? "shotgun" : "capture";
-                log_info(std::string("Phase 3 regime: ") + regime +
-                         " (use --errcor-mode to change)");
-            }
-
-            // Shotgun mode: lower snp_min_count to 1 so singletons can be protected
-            // by the ratio test (sig/parent ≥ snp_threshold) rather than always being
-            // absorbed.  A singleton (count=1) vs a 3× parent has sig/parent=33% which
-            // exceeds the 20% threshold → SNP veto fires → singleton preserved.
-            // A singleton vs a 50× parent has sig/parent=2% → absorbed (PCR error).
-            if (errcor_.mode == ErrCorParams::Mode::Shotgun) {
-                errcor_.snp_min_count = std::min(errcor_.snp_min_count, 1u);
-            }
-
-            // Issue 1: warn if shotgun mode was not explicitly set but data looks like capture.
-            if (!errcor_mode_explicit_ && errcor_.mode == ErrCorParams::Mode::Shotgun
-                    && index_.size() > 0) {
-                double mean_cluster = static_cast<double>(total_reads_) /
-                                      static_cast<double>(index_.size());
-                if (mean_cluster > 5.0)
-                    log_warn("Mean cluster count is " +
-                             std::to_string(mean_cluster).substr(0, 5) +
-                             " — this may be target capture data. "
-                             "Consider --errcor-mode capture for better PCR error correction.");
-            }
-
-            // Issue 4: raise bucket_cap default for capture mode so high-coverage loci
-            // are not silently under-corrected.
-            if (errcor_.mode == ErrCorParams::Mode::Capture && !bucket_cap_explicit_) {
-                errcor_.bucket_cap = 256;
-                log_info("Phase 3: bucket_cap raised to 256 for capture mode");
             }
 
             log_info("Phase 3: parent-centric mismatch pattern detection");
@@ -943,12 +946,14 @@ private:
         // Minimum interior length for a meaningful 3-way pigeonhole split.
         // Below this, splits degenerate (parts of 0-4 bp) and the hash keys
         // become unreliable, risking false absorptions.
-        constexpr int kMinInteriorLen = 15;
+        constexpr int kMinInteriorLen = 20;
         uint64_t short_interior_skipped = 0;
 
         struct InteriorLayout {
-            int  k5 = 0, ilen = 0, s0 = 0, s1 = 0, s2 = 0;
-            int  nb0 = 0, nb1 = 0, nb2 = 0, nbytes = 0;
+            int  k5 = 0, ilen = 0;
+            int  s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            int  nb0 = 0, nb1 = 0, nb2 = 0, nb3 = 0;
+            int  nbytes = 0;
             bool ready = false;
         };
         std::vector<InteriorLayout> layout_cache(65536);
@@ -958,12 +963,13 @@ private:
                 auto [k5, k3] = damage_zone_bounds(L, profile_);
                 lay.k5   = k5;
                 lay.ilen = std::max(0, L - k5 - k3);
-                if (lay.ilen >= 3) {
-                    split3_lens(lay.ilen, lay.s0, lay.s1, lay.s2);
+                if (lay.ilen >= kMinInteriorLen) {
+                    split4_lens(lay.ilen, lay.s0, lay.s1, lay.s2, lay.s3);
                     lay.nb0    = (lay.s0 + 3) / 4;
                     lay.nb1    = (lay.s1 + 3) / 4;
                     lay.nb2    = (lay.s2 + 3) / 4;
-                    lay.nbytes = lay.nb0 + lay.nb1 + lay.nb2;
+                    lay.nb3    = (lay.s3 + 3) / 4;
+                    lay.nbytes = lay.nb0 + lay.nb1 + lay.nb2 + lay.nb3;
                 }
                 lay.ready = true;
             }
@@ -975,8 +981,11 @@ private:
 
         // ── Phase A: index parents (count > min_parent_count) ──────────────
         struct BuildEntry { uint64_t key; uint32_t id; };
-        // Tags 0-2: pair-hash (H=1 search, used by B1+B3).
-        // Tags 3-5: single-hash (H=2 cross-partition, used by B3 only).
+        // Tags 0-5: pair-hash for all C(4,2)=6 combinations of 4 parts.
+        // 4-way pigeonhole: if H(child,parent)≤2, at least 2 of 4 parts match →
+        // one of the 6 pair-keys fires.  Covers both H=1 and H=2.
+        static constexpr int kPairA[6] = {0, 0, 0, 1, 1, 2};
+        static constexpr int kPairB[6] = {1, 2, 3, 2, 3, 3};
         ska::flat_hash_map<int, std::array<std::vector<BuildEntry>, 6>> build_map;
         build_map.reserve(64);
         struct LenShard { std::array<FlatPairIndex, 6> pi; };
@@ -992,22 +1001,26 @@ private:
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
                 scratch.resize(lay.nbytes);
             const uint8_t* psrc = arena_.data(id);
-            extract_packed_part(psrc, lay.k5,                    lay.s0, scratch.data());
-            extract_packed_part(psrc, lay.k5 + lay.s0,           lay.s1, scratch.data() + lay.nb0);
-            extract_packed_part(psrc, lay.k5 + lay.s0 + lay.s1, lay.s2, scratch.data() + lay.nb0 + lay.nb1);
-            uint64_t h0 = XXH3_64bits(scratch.data(),                     lay.nb0);
-            uint64_t h1 = XXH3_64bits(scratch.data() + lay.nb0,           lay.nb1);
-            uint64_t h2 = XXH3_64bits(scratch.data() + lay.nb0 + lay.nb1, lay.nb2);
+            int starts[4] = {lay.k5,
+                             lay.k5 + lay.s0,
+                             lay.k5 + lay.s0 + lay.s1,
+                             lay.k5 + lay.s0 + lay.s1 + lay.s2};
+            int sizes[4]  = {lay.s0, lay.s1, lay.s2, lay.s3};
+            int nbs[4]    = {lay.nb0, lay.nb1, lay.nb2, lay.nb3};
+            uint8_t* parts[4] = {scratch.data(),
+                                 scratch.data() + lay.nb0,
+                                 scratch.data() + lay.nb0 + lay.nb1,
+                                 scratch.data() + lay.nb0 + lay.nb1 + lay.nb2};
+            for (int p = 0; p < 4; ++p)
+                extract_packed_part(psrc, starts[p], sizes[p], parts[p]);
+            uint64_t h[4];
+            for (int p = 0; p < 4; ++p)
+                h[p] = XXH3_64bits(parts[p], nbs[p]);
             auto t1 = clk::now();
 
             auto& entries = build_map[lay.ilen];
-            entries[0].push_back({pair_key(h0, h1, 0, lay.ilen), id});
-            entries[1].push_back({pair_key(h0, h2, 1, lay.ilen), id});
-            entries[2].push_back({pair_key(h1, h2, 2, lay.ilen), id});
-            // Single-part keys for H=2 cross-partition: tag k = matching part k.
-            entries[3].push_back({single_key(h0, 0, lay.ilen), id});
-            entries[4].push_back({single_key(h1, 1, lay.ilen), id});
-            entries[5].push_back({single_key(h2, 2, lay.ilen), id});
+            for (int t = 0; t < 6; ++t)
+                entries[t].push_back({pair_key(h[kPairA[t]], h[kPairB[t]], t, lay.ilen), id});
             auto t2 = clk::now();
 
             stats.decode_hash_parent_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1064,7 +1077,7 @@ private:
 
         // Pre-allocated candidate buffer: 6 queries × bucket_cap (3 canonical + 3 RC pair tags).
         // Sized here so raising bucket_cap (e.g. in capture mode) does not silently overflow.
-        std::vector<uint32_t> cand_storage(6u * errcor_.bucket_cap);
+        std::vector<uint32_t> cand_storage(12u * errcor_.bucket_cap);
 
         for (uint32_t cid = 0; cid < N; ++cid) {
             if (is_error_[cid]) continue;
@@ -1079,11 +1092,11 @@ private:
 
             auto t0 = clk::now();
             // Scratch layout (per child):
-            //   [0 .. nb_3part)               : ci_parts  (3-part canonical, for h0/h1/h2)
-            //   [nb_3part .. nb_3part+nf)     : ci_full   (full canonical interior)
-            //   [nb_3part+nf .. nb_3part+2nf) : crc_full  (RC of ci_full)
-            //   [nb_3part+2nf .. 2*nb_3part+2nf) : crc_parts (3-part RC, for rh0/rh1/rh2)
-            //   [2*nb_3part+2nf .. 2*nb_3part+3nf) : pi_buf (parent, per candidate)
+            //   [0 .. nbytes)               : ci_parts  (4-part canonical, nb0+nb1+nb2+nb3 bytes)
+            //   [nbytes .. nbytes+nf)       : ci_full   (full canonical interior)
+            //   [nbytes+nf .. nbytes+2nf)   : crc_full  (RC of ci_full)
+            //   [nbytes+2nf .. 2*nbytes+2nf): crc_parts (4-part RC, nb0+nb1+nb2+nb3 bytes)
+            //   [2*nbytes+2nf .. 2*nbytes+3nf): pi_buf  (parent, per candidate)
             int nf = (lay.ilen + 3) / 4;
             size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 3 * nf);
             if (scratch.size() < total_scratch)
@@ -1095,27 +1108,36 @@ private:
             uint8_t* pi_buf    = crc_parts + lay.nbytes;
 
             const uint8_t* psrc_c = arena_.data(cid);
-            // 3-part extraction for canonical hash keys
-            extract_packed_part(psrc_c, lay.k5,                    lay.s0, ci_parts);
-            extract_packed_part(psrc_c, lay.k5 + lay.s0,           lay.s1, ci_parts + lay.nb0);
-            extract_packed_part(psrc_c, lay.k5 + lay.s0 + lay.s1, lay.s2, ci_parts + lay.nb0 + lay.nb1);
-            uint64_t h0 = XXH3_64bits(ci_parts,                     lay.nb0);
-            uint64_t h1 = XXH3_64bits(ci_parts + lay.nb0,           lay.nb1);
-            uint64_t h2 = XXH3_64bits(ci_parts + lay.nb0 + lay.nb1, lay.nb2);
+            int starts[4] = {lay.k5,
+                             lay.k5 + lay.s0,
+                             lay.k5 + lay.s0 + lay.s1,
+                             lay.k5 + lay.s0 + lay.s1 + lay.s2};
+            int sizes[4]  = {lay.s0, lay.s1, lay.s2, lay.s3};
+            int nbs[4]    = {lay.nb0, lay.nb1, lay.nb2, lay.nb3};
+            uint8_t* ci_p[4] = {ci_parts,
+                                ci_parts + lay.nb0,
+                                ci_parts + lay.nb0 + lay.nb1,
+                                ci_parts + lay.nb0 + lay.nb1 + lay.nb2};
+            for (int p = 0; p < 4; ++p)
+                extract_packed_part(psrc_c, starts[p], sizes[p], ci_p[p]);
+            uint64_t h[4], rh[4];
+            for (int p = 0; p < 4; ++p) h[p] = XXH3_64bits(ci_p[p], nbs[p]);
 
-            // Full contiguous interior for comparison and RC computation.
             extract_packed_part(psrc_c, lay.k5, lay.ilen, ci_full);
 
             // RC of full interior for orientation-aware comparison and RC hash keys.
             // A 1-base change can flip which orientation produces the smaller canonical hash,
             // so parent and child may be stored in opposite orientations in the arena.
             compute_interior_rc(ci_full, lay.ilen, crc_full);
-            extract_packed_part(crc_full, 0,               lay.s0, crc_parts);
-            extract_packed_part(crc_full, lay.s0,          lay.s1, crc_parts + lay.nb0);
-            extract_packed_part(crc_full, lay.s0 + lay.s1, lay.s2, crc_parts + lay.nb0 + lay.nb1);
-            uint64_t rh0 = XXH3_64bits(crc_parts,                     lay.nb0);
-            uint64_t rh1 = XXH3_64bits(crc_parts + lay.nb0,           lay.nb1);
-            uint64_t rh2 = XXH3_64bits(crc_parts + lay.nb0 + lay.nb1, lay.nb2);
+
+            int rc_starts[4] = {0, lay.s0, lay.s0+lay.s1, lay.s0+lay.s1+lay.s2};
+            uint8_t* crc_p[4] = {crc_parts,
+                                 crc_parts + lay.nb0,
+                                 crc_parts + lay.nb0 + lay.nb1,
+                                 crc_parts + lay.nb0 + lay.nb1 + lay.nb2};
+            for (int p = 0; p < 4; ++p)
+                extract_packed_part(crc_full, rc_starts[p], sizes[p], crc_p[p]);
+            for (int p = 0; p < 4; ++p) rh[p] = XXH3_64bits(crc_p[p], nbs[p]);
             auto t1 = clk::now();
             stats.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -1130,12 +1152,10 @@ private:
 
             auto tq0 = clk::now();
             auto& sh = shard_it->second;
-            sh.pi[0].query(pair_key(h0,  h1,  0, lay.ilen), collect);
-            sh.pi[1].query(pair_key(h0,  h2,  1, lay.ilen), collect);
-            sh.pi[2].query(pair_key(h1,  h2,  2, lay.ilen), collect);
-            sh.pi[0].query(pair_key(rh0, rh1, 0, lay.ilen), collect);
-            sh.pi[1].query(pair_key(rh0, rh2, 1, lay.ilen), collect);
-            sh.pi[2].query(pair_key(rh1, rh2, 2, lay.ilen), collect);
+            for (int t = 0; t < 6; ++t) {
+                sh.pi[t].query(pair_key(h[kPairA[t]],  h[kPairB[t]],  t, lay.ilen), collect);
+                sh.pi[t].query(pair_key(rh[kPairA[t]], rh[kPairB[t]], t, lay.ilen), collect);
+            }
             auto tq1 = clk::now();
             stats.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
 
@@ -1164,26 +1184,54 @@ private:
                 // Extract parent's full interior for comparison.
                 extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
 
-                // Try direct comparison (same canonical orientation).
-                // Protect damage-consistent substitutions (C↔T, G↔A, G↔T, C↔A) when
-                // damage mode is active; packed_find_mismatch returns false for those.
+                // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
-                    mismatches.push_back({pid, cid, mm.position, mm.base_b, mm.base_a});
+                    mismatches.push_back({pid, cid, mm.position, mm.base_b, mm.base_a,
+                                          0, 0, 0, 1, {}});
                     stats.children_found++;
                     continue;
                 }
-                // Try RC comparison: parent vs RC of child.
-                // If found, convert position/base to child's canonical frame:
-                //   canonical_pos = ilen - 1 - mm.position
-                //   canonical_alt = mm.base_b ^ 3  (complement)
+                // Try RC comparison (H=1)
                 mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
                     uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
                     mismatches.push_back({pid, cid, cpos,
                                           static_cast<uint8_t>(mm.base_b ^ 0x3u),
-                                          static_cast<uint8_t>(mm.base_a ^ 0x3u)});
+                                          static_cast<uint8_t>(mm.base_a ^ 0x3u),
+                                          0, 0, 0, 1, {}});
                     stats.children_found++;
+                    continue;
+                }
+                // H=2 path: only for reads with count ≤ max_h2_count.
+                // Both mismatches must be non-damage transversions (A↔T or C↔G, xr==3).
+                if (id_count[cid] <= errcor_.max_h2_count) {
+                    MismatchInfo2 mm2 = packed_find_mismatches2(pi_buf, ci_full, 0, lay.ilen);
+                    if (mm2.count == 2 &&
+                        !is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false) &&
+                        !is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false)) {
+                        mismatches.push_back({pid, cid,
+                                              mm2.pos[0], mm2.base_b[0], mm2.base_a[0],
+                                              mm2.pos[1], mm2.base_b[1], mm2.base_a[1],
+                                              2, {}});
+                        stats.children_found++;
+                        continue;
+                    }
+                    mm2 = packed_find_mismatches2(pi_buf, crc_full, 0, lay.ilen);
+                    if (mm2.count == 2 &&
+                        !is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false) &&
+                        !is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false)) {
+                        // Convert RC positions/bases to child canonical frame
+                        uint16_t p0 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[0]);
+                        uint16_t p1 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[1]);
+                        mismatches.push_back({pid, cid,
+                                              p0, static_cast<uint8_t>(mm2.base_b[0] ^ 0x3u),
+                                                  static_cast<uint8_t>(mm2.base_a[0] ^ 0x3u),
+                                              p1, static_cast<uint8_t>(mm2.base_b[1] ^ 0x3u),
+                                                  static_cast<uint8_t>(mm2.base_a[1] ^ 0x3u),
+                                              2, {}});
+                        stats.children_found++;
+                    }
                 }
             }
             stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
@@ -1235,6 +1283,11 @@ private:
                 uint32_t key = static_cast<uint32_t>(mismatches[j].mismatch_pos) * 4
                                + mismatches[j].alt_base;
                 pos_alt_counts[key] += id_count[mismatches[j].child_id];
+                if (mismatches[j].hamming == 2) {
+                    uint32_t key2 = static_cast<uint32_t>(mismatches[j].mismatch_pos2) * 4
+                                    + mismatches[j].alt_base2;
+                    pos_alt_counts[key2] += id_count[mismatches[j].child_id];
+                }
             }
 
             // For each child, decide: SNP-protected or absorb
@@ -1247,6 +1300,40 @@ private:
                 uint64_t sig = 0;
                 auto it = pos_alt_counts.find(key);
                 if (it != pos_alt_counts.end()) sig = it->second;
+
+                // H=2 path: both mismatches already verified non-damage in B1.
+                // SNP veto: protect if either mismatch position has population support.
+                if (cm.hamming == 2) {
+                    uint32_t key2 = static_cast<uint32_t>(cm.mismatch_pos2) * 4 + cm.alt_base2;
+                    uint64_t sig2 = 0;
+                    auto it2 = pos_alt_counts.find(key2);
+                    if (it2 != pos_alt_counts.end()) sig2 = it2->second;
+
+                    double eff_snp = errcor_.snp_threshold *
+                        (parent_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
+                    bool snp_veto_h2 = (sig  >= errcor_.snp_min_count &&
+                                        static_cast<double>(sig)  >= eff_snp * static_cast<double>(parent_count)) ||
+                                       (sig2 >= errcor_.snp_min_count &&
+                                        static_cast<double>(sig2) >= eff_snp * static_cast<double>(parent_count));
+                    if (snp_veto_h2) {
+                        stats.snp_protected++;
+                    } else {
+                        if (!is_error_[cm.child_id]) {
+                            is_error_[cm.child_id] = true;
+                            parent_chain[cm.child_id] = eff_pid;
+                            acc_count[eff_pid] += acc_count[cm.child_id];
+                            acc_count[cm.child_id] = 0;
+                            if (seq_entry[cm.child_id] && seq_entry[eff_pid] &&
+                                seq_entry[cm.child_id]->damage_score > seq_entry[eff_pid]->damage_score) {
+                                seq_entry[eff_pid]->record_index = seq_entry[cm.child_id]->record_index;
+                                seq_entry[eff_pid]->damage_score = seq_entry[cm.child_id]->damage_score;
+                            }
+                            stats.absorbed++;
+                            errcor_absorbed_++;
+                        }
+                    }
+                    continue;  // skip the H=1 block below
+                }
 
                 // Damage-aware bypass: C↔T / G↔A (xr=2) mismatches at interior
                 // positions adjacent to the damage zone are residual deamination,
@@ -1285,219 +1372,6 @@ private:
             }
         }
 
-        // ── Phase B3: small-cluster second-pass (iterates to convergence) ────
-        // After directed ascent (B2), scan remaining sequences with count <
-        // boundary.  For each, query ALL H≤2 neighbors with no direction
-        // filter; absorb into the largest reachable root whose count ≥ boundary.
-        //
-        // Iterates until no new absorptions occur.  Each pass resolves one
-        // "hop" further along chains of singletons: A(1)→B(1)→T(30) takes two
-        // passes if A is processed before B in pass 1 (B not yet absorbed).
-        //
-        // SNP veto: sig = count of the small sequence itself.
-        //   sig/root_count >= snp_threshold → protect as potential low-coverage SNP.
-        //
-        // Skipped in shotgun mode: at low coverage, small clusters are genuine
-        // molecules, not PCR artefacts.  Directed ascent (B2) alone is used,
-        // with snp_min_count=1 so singletons are protected by the ratio test.
-        if (errcor_.mode != ErrCorParams::Mode::Shotgun) {
-            const uint64_t boundary = static_cast<uint64_t>(errcor_.min_parent_count);
-            uint64_t b3_absorbed = 0, b3_snp_protected = 0, b3_no_large_root = 0;
-            uint64_t b3_passes = 0;
-
-            // Collect small unabsorbed sequences sorted count-descending (count=2
-            // before count=1) so higher-count sequences anchor chains first.
-            std::vector<uint32_t> small_ids;
-            small_ids.reserve(N / 4);
-            for (uint32_t id = 0; id < N; ++id) {
-                if (!is_error_[id] && arena_.is_eligible(id) &&
-                    id_count[id] < boundary)
-                    small_ids.push_back(id);
-            }
-            std::sort(small_ids.begin(), small_ids.end(),
-                      [&id_count](uint32_t a, uint32_t b) {
-                          return id_count[a] > id_count[b];
-                      });
-
-            // Pre-allocated candidate buffer: 12 queries × bucket_cap
-            // (6 canonical + 6 RC: pair tags 0-2 + single tags 3-5).
-            std::vector<uint32_t> cand_storage_b3(12u * errcor_.bucket_cap);
-
-            uint64_t b3_new;
-            do {
-            b3_new = 0;
-            b3_no_large_root = 0;
-
-            for (uint32_t cid : small_ids) {
-                if (is_error_[cid]) continue;
-
-                int L = arena_.length(cid);
-                const auto& lay = get_layout(L);
-                if (lay.ilen < kMinInteriorLen) continue;
-
-                auto shard_it = shards.find(lay.ilen);
-                if (shard_it == shards.end()) continue;
-
-                // Same 5-buffer scratch layout as Phase B1.
-                int nf = (lay.ilen + 3) / 4;
-                size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 3 * nf);
-                if (scratch.size() < total_scratch)
-                    scratch.resize(total_scratch);
-                uint8_t* ci_parts  = scratch.data();
-                uint8_t* ci_full   = ci_parts  + lay.nbytes;
-                uint8_t* crc_full  = ci_full   + nf;
-                uint8_t* crc_parts = crc_full  + nf;
-                uint8_t* pi_buf    = crc_parts + lay.nbytes;
-
-                const uint8_t* psrc_c = arena_.data(cid);
-                extract_packed_part(psrc_c, lay.k5,                    lay.s0, ci_parts);
-                extract_packed_part(psrc_c, lay.k5 + lay.s0,           lay.s1, ci_parts + lay.nb0);
-                extract_packed_part(psrc_c, lay.k5 + lay.s0 + lay.s1, lay.s2, ci_parts + lay.nb0 + lay.nb1);
-                uint64_t h0 = XXH3_64bits(ci_parts,                     lay.nb0);
-                uint64_t h1 = XXH3_64bits(ci_parts + lay.nb0,           lay.nb1);
-                uint64_t h2 = XXH3_64bits(ci_parts + lay.nb0 + lay.nb1, lay.nb2);
-
-                extract_packed_part(psrc_c, lay.k5, lay.ilen, ci_full);
-                compute_interior_rc(ci_full, lay.ilen, crc_full);
-                extract_packed_part(crc_full, 0,               lay.s0, crc_parts);
-                extract_packed_part(crc_full, lay.s0,          lay.s1, crc_parts + lay.nb0);
-                extract_packed_part(crc_full, lay.s0 + lay.s1, lay.s2, crc_parts + lay.nb0 + lay.nb1);
-                uint64_t rh0 = XXH3_64bits(crc_parts,                     lay.nb0);
-                uint64_t rh1 = XXH3_64bits(crc_parts + lay.nb0,           lay.nb1);
-                uint64_t rh2 = XXH3_64bits(crc_parts + lay.nb0 + lay.nb1, lay.nb2);
-
-                // Query H=1 (pair tags 0-2) and H=2 cross-partition (single tags 3-5).
-                // Both canonical and RC orientations.
-                uint32_t* cand_buf = cand_storage_b3.data();
-                uint32_t n_cands = 0;
-                auto collect_b3 = [&](uint32_t pid) {
-                    if (n_cands < static_cast<uint32_t>(cand_storage_b3.size())) cand_buf[n_cands++] = pid;
-                };
-                auto& sh = shard_it->second;
-                sh.pi[0].query(pair_key(h0,  h1,  0, lay.ilen), collect_b3);
-                sh.pi[1].query(pair_key(h0,  h2,  1, lay.ilen), collect_b3);
-                sh.pi[2].query(pair_key(h1,  h2,  2, lay.ilen), collect_b3);
-                sh.pi[3].query(single_key(h0,  0, lay.ilen),    collect_b3);
-                sh.pi[4].query(single_key(h1,  1, lay.ilen),    collect_b3);
-                sh.pi[5].query(single_key(h2,  2, lay.ilen),    collect_b3);
-                sh.pi[0].query(pair_key(rh0, rh1, 0, lay.ilen), collect_b3);
-                sh.pi[1].query(pair_key(rh0, rh2, 1, lay.ilen), collect_b3);
-                sh.pi[2].query(pair_key(rh1, rh2, 2, lay.ilen), collect_b3);
-                sh.pi[3].query(single_key(rh0, 0, lay.ilen),    collect_b3);
-                sh.pi[4].query(single_key(rh1, 1, lay.ilen),    collect_b3);
-                sh.pi[5].query(single_key(rh2, 2, lay.ilen),    collect_b3);
-
-                std::sort(cand_buf, cand_buf + n_cands);
-                n_cands = static_cast<uint32_t>(
-                    std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
-
-                // Pick the largest accumulated-count verified H≤2 root with acc_count ≥ boundary.
-                // Selection ranks by acc_count (current cluster mass after B2/B3 absorptions).
-                // SNP veto uses id_count (original Pass-1 count) to keep the threshold calibrated
-                // against pre-absorption counts and avoid self-reinforcing threshold drift.
-                uint32_t best_root      = UINT32_MAX;
-                uint64_t best_acc_count = 0;   // accumulated count for root selection
-                uint64_t best_id_count  = 0;   // original Pass-1 count for SNP veto calibration
-                for (uint32_t ci = 0; ci < n_cands; ++ci) {
-                    uint32_t pid = cand_buf[ci];
-                    if (pid == cid) continue;
-                    if (!arena_.is_eligible(pid)) continue;
-                    if (arena_.length(pid) != static_cast<uint16_t>(L)) continue;
-
-                    uint32_t eff_pid  = is_error_[pid] ? find_root_chain(pid) : pid;
-                    if (eff_pid == cid) continue;  // pid already absorbed into cid — skip self
-                    // Boundary check uses accumulated mass (includes absorbed children),
-                    // matching SWARM's OTU mass criterion for fastidious grafting.
-                    if (acc_count[eff_pid] < boundary) continue;
-
-                    uint64_t root_acc = acc_count[eff_pid];
-                    if (root_acc <= best_acc_count) continue;
-
-                    // Verify H≤2 by Hamming (canonical then RC orientation).
-                    // Phase B3 absorbs small sequences into large clusters via H=2
-                    // connections (matching SWARM's fastidious d+1=2 grafting pass).
-                    extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
-                    int hd = packed_hamming(pi_buf, ci_full, 0, lay.ilen, 2);
-                    if (hd == 0 || hd > 2)
-                        hd = packed_hamming(pi_buf, crc_full, 0, lay.ilen, 2);
-                    if (hd == 0 || hd > 2) continue;
-
-                    best_acc_count = root_acc;
-                    best_id_count  = id_count[eff_pid];
-                    best_root      = eff_pid;
-                }
-
-                if (best_root == UINT32_MAX) { b3_no_large_root++; continue; }
-
-                // Damage-aware handling for H=1 pairs: re-examine the single mismatch
-                // between this small sequence and best_root.
-                // C↔T / G↔A (xr=2) at near-edge interior positions: residual deamination,
-                //   bypass SNP veto to force absorption.
-                // G↔T / C↔A (xr=1): oxidative 8-oxoG, uniform across read,
-                //   protect unconditionally (SNP veto always fires).
-                bool damage_bypass_b3  = false;  // force absorb near-edge deamination
-                bool damage_protect_b3 = false;  // protect oxidative subs from absorption
-                if (profile_.enabled) {
-                    extract_packed_part(arena_.data(best_root), lay.k5, lay.ilen, pi_buf);
-                    int hd_check = packed_hamming(pi_buf, ci_full, 0, lay.ilen, 2);
-                    const uint8_t* ci_cmp = ci_full;
-                    if (hd_check == 0 || hd_check > 2) {
-                        hd_check = packed_hamming(pi_buf, crc_full, 0, lay.ilen, 2);
-                        ci_cmp = crc_full;
-                    }
-                    if (hd_check == 1) {
-                        MismatchInfo mm = packed_find_mismatch(pi_buf, ci_cmp, 0, lay.ilen, false);
-                        if (mm.found) {
-                            uint8_t xr = mm.base_a ^ mm.base_b;
-                            damage_bypass_b3 = (xr == 2u) &&
-                                              (mm.position < kDamageEdgeMargin ||
-                                               static_cast<int>(mm.position) >=
-                                                   lay.ilen - kDamageEdgeMargin);
-                            damage_protect_b3 = (xr == 1u);
-                        }
-                    }
-                }
-
-                // SNP veto: sig = count of this small sequence.
-                uint64_t sig = id_count[cid];
-                double eff_snp_threshold_b3 = errcor_.snp_threshold *
-                    (best_id_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
-                bool snp_veto = damage_protect_b3 ||
-                                (!damage_bypass_b3 &&
-                                 (sig >= errcor_.snp_min_count) &&
-                                 (static_cast<double>(sig) >= eff_snp_threshold_b3 *
-                                                              static_cast<double>(best_id_count)));
-                if (snp_veto) {
-                    b3_snp_protected++;
-                    stats.snp_protected++;
-                } else {
-                    is_error_[cid] = true;
-                    parent_chain[cid] = best_root;
-                    acc_count[best_root] += acc_count[cid];  // propagate accumulated mass (incl. cid's absorbed descendants)
-                    acc_count[cid] = 0;  // zero to prevent double-counting across B3 iterations
-                    // Propagate representative: adopt child's record if it has stronger damage signal.
-                    if (seq_entry[cid] && seq_entry[best_root] &&
-                        seq_entry[cid]->damage_score > seq_entry[best_root]->damage_score) {
-                        seq_entry[best_root]->record_index = seq_entry[cid]->record_index;
-                        seq_entry[best_root]->damage_score = seq_entry[cid]->damage_score;
-                    }
-                    b3_new++;
-                    b3_absorbed++;
-                    errcor_absorbed_++;
-                }
-            }
-            b3_passes++;
-            } while (b3_new > 0);
-
-            log_info("Phase 3 B3: small-cluster pass (" + std::to_string(b3_passes) +
-                     " iter): absorbed=" + std::to_string(b3_absorbed) +
-                     " snp_protected=" + std::to_string(b3_snp_protected) +
-                     " no_large_neighbor=" + std::to_string(b3_no_large_root) +
-                     " (boundary=" + std::to_string(boundary) + ")");
-        } else {
-            log_info("Phase 3 B3: skipped (shotgun mode — small clusters treated as genuine molecules)");
-        }
-
         // Write accumulated cluster counts back into the index so pass2() and the
         // cluster TSV reflect absorbed PCR error reads, not just the original
         // representative count.  acc_count is a local — must be written back before
@@ -1522,9 +1396,8 @@ private:
                          "adjusting damage zone parameters.");
         }
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
-                 " PCR error sequences (directed-ascent + small-cluster pass, snp_threshold=" +
-                 std::to_string(errcor_.snp_threshold) +
-                 ", snp_min_count=" + std::to_string(errcor_.snp_min_count) + ")");
+                 " sequences (H=1 directed-ascent + H=2 direct-detection, snp_threshold=" +
+                 std::to_string(errcor_.snp_threshold) + ")");
     }
 
     void pass2(const std::string& in_path,
@@ -1651,7 +1524,6 @@ private:
     bool write_clusters_;
     DamageProfile profile_;
     ErrCorParams  errcor_;
-    bool errcor_mode_explicit_;
     bool bucket_cap_explicit_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
@@ -1697,14 +1569,9 @@ static void print_usage(const char* prog) {
         << "  --errcor-min-parent INT      Min cluster count for B3 grafting root eligibility (default: 3)\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 2 capture, 1 shotgun)\n"
-        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64 shotgun, 256 capture)\n"
+        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64)\n"
         << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
-        << "  --errcor-mode capture|shotgun  Coverage regime (default: shotgun)\n"
-        << "                           shotgun: conservative EC (snp_min_count=1, B3 disabled)\n"
-        << "                                    Default; safe for low-coverage shotgun data\n"
-        << "                           capture: aggressive EC (snp_min_count=2, B3 enabled)\n"
-        << "                                    For PCR-amplified libraries (aDNA capture)\n"
         << "\nAncient DNA damage variant collapsing (OFF by default):\n"
         << "  --collapse-damage        Collapse reads that differ only by terminal\n"
         << "                           deamination into one cluster (Pass 0 estimation)\n"
@@ -1737,7 +1604,6 @@ int derep_main(int argc, char** argv) {
 
     ErrCorParams errcor;
     errcor.enabled = true;
-    bool errcor_mode_explicit = false;
     bool bucket_cap_explicit  = false;   // default on: aDNA primary use case
 
     bool   damage_auto    = false;  // default off: damage-aware hashing distorts
@@ -1793,16 +1659,6 @@ int derep_main(int argc, char** argv) {
             errcor.snp_low_cov_cutoff = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-factor" && i + 1 < argc) {
             errcor.snp_low_cov_factor = std::stod(argv[++i]);
-        } else if (arg == "--errcor-mode" && i + 1 < argc) {
-            std::string m(argv[++i]);
-            if      (m == "capture") errcor.mode = ErrCorParams::Mode::Capture;
-            else if (m == "shotgun") errcor.mode = ErrCorParams::Mode::Shotgun;
-            else {
-                std::cerr << "Error: Unknown --errcor-mode: " << m
-                          << " (use capture, shotgun)\n";
-                return 1;
-            }
-            errcor_mode_explicit = true;
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
             if (lt == "ss" || lt == "single-stranded")
@@ -1942,7 +1798,7 @@ int derep_main(int argc, char** argv) {
         }
 
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
-                           errcor_mode_explicit, bucket_cap_explicit);
+                           false, bucket_cap_explicit);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
