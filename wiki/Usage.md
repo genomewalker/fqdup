@@ -258,8 +258,8 @@ See [[Damage]] for full output description and typical workflow.
 | `--pcr-error-rate FLOAT` | Sub/base/doubling for log estimate | 5.3e-7 |
 | `--error-correct` | Enable Phase 3 PCR error correction | **on** |
 | `--no-error-correct` | Disable Phase 3 PCR error correction | - |
-| `--errcor-mode capture\|shotgun` | Coverage regime | shotgun |
 | `--errcor-min-parent INT` | Min count to index as parent | 3 |
+| `--errcor-max-h2-count INT` | Max child count eligible for H=2 absorption | 2 |
 | `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
-| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 (capture), 1 (shotgun) |
+| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |

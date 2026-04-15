@@ -39,9 +39,17 @@ cluster is almost never a distinct biological molecule.
 Phase 3 runs entirely in memory on the deduplication index built during Pass 1
 — no additional file I/O. It classifies clusters as **parents** (count above
 `--errcor-min-parent`, default 3) and **children** (count at or below that
-threshold). For each child, Phase 3 finds all Hamming-distance-1 neighbours
-among parents. A child is absorbed into its highest-count parent unless the
-**SNP veto** fires.
+threshold). For each child, Phase 3 finds all neighbours within Hamming
+distance ≤ 2 among parents and absorbs them unless the **SNP veto** fires.
+
+Two absorption paths:
+
+- **H=1**: any single non-damage interior substitution. Applies to all children
+  regardless of count.
+- **H=2**: two non-damage interior substitutions (both must be A↔T or C↔G
+  transversions). Only applies to children with count ≤ `--errcor-max-h2-count`
+  (default 2). This catches double-error reads from chimera formation, nick
+  translation, or clustered oxidative damage that escape H=1 detection.
 
 The SNP veto protects a child when the mismatch appears recurrently across
 multiple reads at the same position in the same parent:
@@ -52,9 +60,9 @@ snp_veto = (sig_count ≥ --errcor-snp-min-count)
 ```
 
 `sig_count` is the weighted count of all child clusters carrying the same
-`(position, alt_base)` mismatch relative to this parent. If the mismatch
-appears consistently enough to be a true biological variant, the child is kept.
-If not, it is absorbed as a PCR copying error.
+`(position, alt_base)` mismatch relative to this parent. For H=2 children the
+SNP veto is applied independently to both mismatch positions — the child is
+protected if either position has population support above the threshold.
 
 ---
 
@@ -139,61 +147,59 @@ positions where they concentrate.
 
 ---
 
-## The 3-way pigeonhole algorithm
+## The 4-way pigeonhole algorithm
 
-Finding all pairs of sequences that differ by at most one substitution is
+Finding all pairs of sequences that differ by at most two substitutions is
 O(n²) with naive pairwise comparison. Phase 3 uses a pigeonhole argument to
 reduce this to effectively O(n).
 
 ### Principle
 
-Divide the interior region into three equal parts. If two sequences of the same
-length differ by **exactly one** substitution, that substitution falls in one
-of the three parts, so the other two parts must be identical. Three hash
-indexes, each covering a different pair of parts, are sufficient to find every
-Hamming-distance-1 neighbour:
+Divide the interior region into four equal parts. If two sequences of the same
+length differ by **at most two** substitutions, at most two parts contain
+mismatches, so at least two parts are identical. Index all C(4,2) = 6 pair
+combinations of parts — one of the six pair-keys must fire:
 
 ```
-interior: [─── part 0 ─── | ─── part 1 ─── | ─── part 2 ───]
+interior: [─ part 0 ─ | ─ part 1 ─ | ─ part 2 ─ | ─ part 3 ─]
 
-mismatch in part 0 → parts 1 and 2 identical → detected by index (1,2)
-mismatch in part 1 → parts 0 and 2 identical → detected by index (0,2)
-mismatch in part 2 → parts 0 and 1 identical → detected by index (0,1)
-exact match (H=0)  → all three indexes fire
+H=1: mismatch in part k → the other 3 parts all match → 3 pair-keys fire
+H=2: mismatches in parts j,k → the other 2 parts match → index (j̄,k̄) fires
+H=0: all 6 pair-keys fire
 ```
 
-### Worked example
+The 6 indexes cover all pairs: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3).
 
-Interior (15 bp):
+### Worked example — H=2
 
-```
-Position:  0  1  2  3  4  |  5  6  7  8  9  | 10 11 12 13 14
-Parent:    A  C  G  A  A  |  C  G  A  A  C  |  G  A  A  T  G
-Child:     A  C  G  A  A  |  C  G  T  A  C  |  G  A  A  T  G
-                                    ^ mismatch at pos 7 (A→T, part 1)
-```
-
-Hash the three parts:
+Interior (20 bp):
 
 ```
-Parent:  h0 = hash(ACGAA)   h1 = hash(CGAAC)   h2 = hash(GAATG)
-Child:   h0 = hash(ACGAA)   h1 = hash(CGTAC)   h2 = hash(GAATG)
-              ↑ same              ↑ different        ↑ same
+Position:  0  1  2  3  4 | 5  6  7  8  9 | 10 11 12 13 14 | 15 16 17 18 19
+Parent:    A  C  G  A  A | C  G  A  A  C |  G  A  A  T  G |  C  T  A  G  C
+Child:     A  C  G  A  A | C  G  T  A  C |  G  A  A  T  G |  C  T  A  G  C
+                                   ^ pos 7 (A→T)     part 2 and 3 identical
 ```
 
-The pair-key `(h0, h2)` is identical for parent and child, index (0,2) fires.
-The candidate is retrieved and the exact Hamming check confirms one mismatch.
-A→T is not a damage substitution, so the child is absorbed.
+Wait — one mismatch, so H=1 path fires via any of the 3 pair-keys that
+exclude part 1. For a true H=2 example:
 
-If the mismatch were C→T instead (e.g. position 9: C→T), the same index would
-fire, but `is_damage_sub('C','T')` returns true and the child is **kept**.
+```
+Child2:    A  C  G  A  A | C  G  T  A  C |  G  A  A  T  G |  C  T  G  G  C
+                                   ^ pos 7 (A→T)              ^ pos 17 (A→G)
+           part 0 same      part 1 differs   part 2 same       part 3 differs
+```
+
+Parts 0 and 2 are identical → pair-key index (0,2) fires → candidate retrieved
+→ Hamming check finds 2 mismatches → both are A↔T / A↔G (xr=3 transversions,
+non-damage) → child2 count ≤ max_h2_count → absorbed.
 
 ### Complexity
 
-Building the three indexes is O(n_parents). Each child queries three buckets -
-O(1) per bucket under the assumption of few collisions. The full character-level
-Hamming check runs only on the small set of candidates returned per child. In
-practice Phase 3 completes in 1–3 seconds for 5M sequences.
+Building the 6 indexes is O(n_parents). Each child queries 12 buckets (6 pair
+combinations × 2 orientations) — O(1) per bucket. The exact Hamming check runs
+only on the small candidate set. In practice Phase 3 completes in 1–3 seconds
+for 5 M sequences.
 
 ---
 
@@ -210,17 +216,15 @@ relative to the parent is at least this fraction of the parent count, the child
 is protected as a potential true SNP. Lower values absorb more aggressively;
 raise to 0.30–0.50 for libraries with genuine heterozygosity or rare variants.
 
-`--errcor-snp-min-count INT` (default 2 in capture mode, 1 in shotgun mode) —
-minimum absolute `sig_count` required for SNP veto. In shotgun mode this is
-lowered to 1 automatically so singletons can still be protected by the ratio
-test rather than always being absorbed.
+`--errcor-snp-min-count INT` (default 2) — minimum absolute `sig_count`
+required for the SNP veto to fire. Raise to 3–5 for libraries where genuine
+rare variants are expected at low absolute count.
 
-`--errcor-mode capture|shotgun` (default: shotgun) — coverage regime:
-- `shotgun`: conservative — `snp_min_count=1`, Phase B3 disabled. Safe for
-  low-coverage shotgun sequencing where genuine molecules may appear only once.
-- `capture`: aggressive — `snp_min_count=2`, Phase B3 (small-cluster iterative
-  pass) enabled. Use for deep-coverage capture libraries where singletons are
-  almost always PCR errors.
+`--errcor-max-h2-count INT` (default 2) — H=2 absorption (double-error reads)
+is only attempted for children with read count ≤ this value. The expected count
+of a genuine double-PCR-error is ~φ² × D_eff² × parent_count, which is
+astronomically small; a read appearing 3+ times at H=2 from a parent is almost
+certainly a real variant, chimera at elevated frequency, or genuine molecule.
 
 `--errcor-bucket-cap INT` (default 64) — prevents low-complexity regions
 (poly-A, microsatellites) from producing enormous bucket collisions in the

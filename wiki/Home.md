@@ -106,7 +106,7 @@ them on the original merged sequence.
 | [[Damage]] | fqdup damage: standalone damage profiler, inspect d_max, library type, mask positions |
 | [[Algorithm]] | Internal mechanics of sort, derep_pairs, and derep |
 | [[Damage-Aware-Deduplication]] | The deamination model, empirical masking, and symmetry |
-| [[PCR-Error-Correction]] | Phase 3: 3-way pigeonhole Hamming search |
+| [[PCR-Error-Correction]] | Phase 3: 4-way pigeonhole H≤2 Hamming search |
 | [[Performance]] | Benchmarks and memory usage |
 
 ---
