@@ -145,7 +145,7 @@ error correction is on by default).
 **Phase 3** (PCR error correction, on by default) runs entirely in memory on the index. It
 finds child clusters (count ≤ 5) that differ from a parent cluster (count ≥ 50×
 the child's) by exactly one interior substitution and marks them as PCR errors.
-See [[PCR-Error-Correction]] for how the 3-way pigeonhole search works.
+See [[PCR-Error-Correction]] for how the 4-way pigeonhole H≤2 search works.
 
 **Pass 2** streams the input again and writes each read whose record position
 is the representative of a non-absorbed cluster.
