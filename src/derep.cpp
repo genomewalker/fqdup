@@ -63,9 +63,8 @@ namespace {
 
 struct ErrCorParams {
     bool     enabled          = false;
-    uint32_t min_parent_count = 3;
     double   snp_threshold    = 0.20; // sig_count_weighted/parent_count >= this → SNP protection
-    uint32_t snp_min_count    = 2;    // absolute minimum sig_count for SNP veto
+    uint32_t snp_min_count    = 1;    // absolute minimum sig_count for SNP veto on strict-dominance edges
     uint32_t snp_low_cov_cutoff = 10;   // parent count below which adaptive threshold applies
     double   snp_low_cov_factor = 1.75; // snp_threshold multiplier when parent_count < cutoff
     uint32_t bucket_cap       = 64;
@@ -1267,6 +1266,11 @@ private:
             uint32_t eff_pid = pid;
             if (is_error_[pid]) eff_pid = find_root_chain(pid);
             uint64_t parent_count = id_count[eff_pid];
+            // SNP veto denominator uses pid's original count: sig was accumulated from
+            // pid's children, so the correct ratio is sig/pid_count, not sig/eff_pid_count.
+            // Using eff_pid's inflated count deflates the ratio and causes over-absorption
+            // of real SNPs that cluster under an absorbed intermediate parent.
+            uint64_t veto_count = id_count[pid];
 
             // Collect all children for this parent
             size_t parent_start = i;
@@ -1310,11 +1314,14 @@ private:
                     if (it2 != pos_alt_counts.end()) sig2 = it2->second;
 
                     double eff_snp = errcor_.snp_threshold *
-                        (parent_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
-                    bool snp_veto_h2 = (sig  >= errcor_.snp_min_count &&
-                                        static_cast<double>(sig)  >= eff_snp * static_cast<double>(parent_count)) ||
-                                       (sig2 >= errcor_.snp_min_count &&
-                                        static_cast<double>(sig2) >= eff_snp * static_cast<double>(parent_count));
+                        (veto_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
+                    // On strict-dominance edges relax snp_min_count to 1; keep 2 on equal-count
+                    // edges where singleton-vs-singleton false protection is a real risk.
+                    uint32_t eff_min_count = (parent_count > id_count[cm.child_id]) ? 1u : errcor_.snp_min_count;
+                    bool snp_veto_h2 = (sig  >= eff_min_count &&
+                                        static_cast<double>(sig)  >= eff_snp * static_cast<double>(veto_count)) ||
+                                       (sig2 >= eff_min_count &&
+                                        static_cast<double>(sig2) >= eff_snp * static_cast<double>(veto_count));
                     if (snp_veto_h2) {
                         stats.snp_protected++;
                     } else {
@@ -1345,11 +1352,14 @@ private:
                                           static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin));
 
                 double eff_snp_threshold = errcor_.snp_threshold *
-                    (parent_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
-                bool snp_veto = !damage_bypass &&
-                                (sig >= errcor_.snp_min_count) &&
+                    (veto_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
+                // On strict-dominance edges relax snp_min_count to 1.
+                // damage_bypass mismatches are still absorbed unless population support is strong
+                // enough (sig >= 1 AND ratio >= threshold) indicating a real SNP at the margin.
+                uint32_t eff_min_count = (parent_count > id_count[cm.child_id]) ? 1u : errcor_.snp_min_count;
+                bool snp_veto = (sig >= (damage_bypass ? 1u : eff_min_count)) &&
                                 (static_cast<double>(sig) >= eff_snp_threshold *
-                                                              static_cast<double>(parent_count));
+                                                              static_cast<double>(veto_count));
 
                 if (snp_veto) {
                     stats.snp_protected++;
@@ -1500,8 +1510,8 @@ private:
         if (errcor_.enabled) {
             size_t output = n_unique_clusters_;
             log_info("PCR error sequences removed: " + std::to_string(errcor_absorbed_) +
-                     " (min_parent=" + std::to_string(errcor_.min_parent_count) +
-                     ", snp_threshold=" + std::to_string(errcor_.snp_threshold) + ")");
+                     " (snp_threshold=" + std::to_string(errcor_.snp_threshold) +
+                     ", snp_min_count=" + std::to_string(errcor_.snp_min_count) + ")");
             log_info("Output sequences: " + std::to_string(output));
             if (n_unique_clusters_ + errcor_absorbed_ > 0) {
                 double ecr = 100.0 * errcor_absorbed_ / (n_unique_clusters_ + errcor_absorbed_);
@@ -1566,9 +1576,9 @@ static void print_usage(const char* prog) {
         << "\nPCR error correction (Phase 3 — ON by default):\n"
         << "  --no-error-correct           Disable PCR error duplicate removal\n"
         << "  --error-correct              Explicitly enable (already default)\n"
-        << "  --errcor-min-parent INT      Min cluster count for B3 grafting root eligibility (default: 3)\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
-        << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 2 capture, 1 shotgun)\n"
+        << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)\n"
+        << "                               On equal-count edges this is raised to 2 automatically.\n"
         << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64)\n"
         << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
@@ -1638,10 +1648,6 @@ int derep_main(int argc, char** argv) {
             errcor.enabled = true;
         } else if (arg == "--no-error-correct") {
             errcor.enabled = false;
-        } else if (arg == "--errcor-min-parent" && i + 1 < argc) {
-            long v = std::stol(argv[++i]);
-            if (v < 0) { std::cerr << "Error: --errcor-min-parent must be >= 0, got " << v << "\n"; return 1; }
-            errcor.min_parent_count = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-threshold" && i + 1 < argc) {
             errcor.snp_threshold = std::stod(argv[++i]);
         } else if (arg == "--errcor-snp-min-count" && i + 1 < argc) {
