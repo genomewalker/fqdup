@@ -22,7 +22,7 @@ static void usage(const char* prog) {
               << "  extend      Extend merged reads via self-referential k-mer graph\n"
               << "  derep_pairs Deduplicate sorted paired-end FASTQ (structural dedup)\n"
               << "  derep       Deduplicate sorted single-file FASTQ (damage + error correction)\n"
-              << "  damage      Profile deamination damage and compute position mask\n"
+              << "  profile     Profile deamination damage and library QC\n"
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
               << "\nTypical workflow:\n"
@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
     if (sub == "extend")      return extend_main(argc - 1, argv + 1);
     if (sub == "derep_pairs") return derep_pairs_main(argc - 1, argv + 1);
     if (sub == "derep")       return derep_main(argc - 1, argv + 1);
-    if (sub == "damage")      return damage_main(argc - 1, argv + 1);
+    if (sub == "profile") return damage_main(argc - 1, argv + 1);
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {

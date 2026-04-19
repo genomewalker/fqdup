@@ -30,7 +30,7 @@ static void print_usage(const char* prog) {
         << "  --read-len N               Fixed read length (default: 60)\n"
         << "  --gc FLOAT                 GC content fraction (default: 0.45)\n"
         << "\nMixture:\n"
-        << "  --f-ancient FLOAT          Fraction of ancient reads (default: 0.70)\n"
+        << "  --f-damaged FLOAT          Fraction of ancient reads (default: 0.70)\n"
         << "  --lib-type ds|ss           Library type (default: ds)\n"
         << "\nDeamination (Channel A):\n"
         << "  --dmg5-max FLOAT           5' C→T amplitude at pos 0 (default: 0.18)\n"
@@ -56,7 +56,7 @@ int gen_main(int argc, char** argv) {
     uint64_t    seed         = 1;
     int         read_len     = 60;
     double      gc           = 0.45;
-    double      f_ancient    = 0.70;
+    double      f_damaged    = 0.70;
     bool        is_ss        = false;
     double      dmg5_max     = 0.18;
     double      dmg5_lam     = 0.35;
@@ -89,7 +89,7 @@ int gen_main(int argc, char** argv) {
         else if (arg == "--seed")                  seed          = std::stoull(next_str());
         else if (arg == "--read-len")              read_len      = std::stoi(next_str());
         else if (arg == "--gc")                    gc            = std::stod(next_str());
-        else if (arg == "--f-ancient")             f_ancient     = std::stod(next_str());
+        else if (arg == "--f-damaged")             f_damaged     = std::stod(next_str());
         else if (arg == "--lib-type") {
             std::string lt = next_str();
             if (lt == "ss" || lt == "single-stranded") is_ss = true;
@@ -135,7 +135,7 @@ int gen_main(int argc, char** argv) {
         return true;
     };
     if (!check01(gc,         "--gc"))         return 1;
-    if (!check01(f_ancient,  "--f-ancient"))  return 1;
+    if (!check01(f_damaged,  "--f-damaged"))  return 1;
     if (!check01(bg_ct,      "--bg-ct"))      return 1;
     if (!check01(bg_ga,      "--bg-ga"))      return 1;
     if (!check01(oxog_p_gt,  "--oxog"))       return 1;
@@ -207,7 +207,7 @@ int gen_main(int argc, char** argv) {
     char header_buf[64];
 
     for (uint64_t r = 0; r < n_reads; ++r) {
-        bool ancient = (U(rng) < f_ancient);
+        bool damaged = (U(rng) < f_damaged);
 
         // Generate IID sequence
         for (int i = 0; i < read_len; ++i) {
@@ -219,7 +219,7 @@ int gen_main(int argc, char** argv) {
         }
 
         // Depurination: with probability depur_p, replace pyrimidine at pos 0 with purine
-        if (ancient && depur_p > 0.0 && (seq[0] == 'C' || seq[0] == 'T')) {
+        if (damaged && depur_p > 0.0 && (seq[0] == 'C' || seq[0] == 'T')) {
             if (U(rng) < depur_p)
                 seq[0] = (U(rng) < p_depur_to_a) ? 'A' : 'G';
         }
@@ -231,15 +231,15 @@ int gen_main(int argc, char** argv) {
 
             if (seq[i] == 'C') {
                 if (U(rng) < bg_ct) { seq[i] = 'T'; continue; }
-                if (ancient && dmg5_max > 0.0 && U(rng) < dmg5_max * std::exp(-dmg5_lam * d5))
+                if (damaged && dmg5_max > 0.0 && U(rng) < dmg5_max * std::exp(-dmg5_lam * d5))
                     { seq[i] = 'T'; continue; }
-                if (ancient && is_ss && dmg3_ct_max > 0.0 && U(rng) < dmg3_ct_max * std::exp(-dmg3_ct_lam * d3))
+                if (damaged && is_ss && dmg3_ct_max > 0.0 && U(rng) < dmg3_ct_max * std::exp(-dmg3_ct_lam * d3))
                     { seq[i] = 'T'; continue; }
             } else if (seq[i] == 'G') {
                 if (U(rng) < bg_ga) { seq[i] = 'A'; continue; }
-                if (ancient && dmg3_ga_max > 0.0 && U(rng) < dmg3_ga_max * std::exp(-dmg3_ga_lam * d3))
+                if (damaged && dmg3_ga_max > 0.0 && U(rng) < dmg3_ga_max * std::exp(-dmg3_ga_lam * d3))
                     { seq[i] = 'A'; continue; }
-                if (ancient && oxog_p_gt > 0.0 && U(rng) < oxog_p_gt)
+                if (damaged && oxog_p_gt > 0.0 && U(rng) < oxog_p_gt)
                     { seq[i] = 'T'; continue; }
             }
         }
@@ -247,7 +247,7 @@ int gen_main(int argc, char** argv) {
         // Write FASTQ record
         int hlen = std::snprintf(header_buf, sizeof(header_buf),
                                  "@SYN:%llu:%s\n", (unsigned long long)r,
-                                 ancient ? "ancient" : "modern");
+                                 damaged ? "damaged" : "undamaged");
         write_buf(header_buf, hlen);
         write_buf(seq.c_str(), read_len);
         write_buf("\n+\n", 3);
@@ -264,7 +264,7 @@ int gen_main(int argc, char** argv) {
     }
 
     std::cout << "Generated " << n_reads << " reads → " << out_path << "\n"
-              << "  f_ancient=" << f_ancient
+              << "  f_damaged=" << f_damaged
               << "  lib=" << (is_ss ? "ss" : "ds")
               << "  d5_max=" << dmg5_max << "  lambda=" << dmg5_lam
               << "  d3_ga_max=" << dmg3_ga_max
