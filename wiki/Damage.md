@@ -35,8 +35,8 @@ streams the FASTQ into batches of 8,192 sequences; N worker threads each
 own their own `SampleDamageProfile` (no locking). After all reads are
 processed, the per-thread profiles are merged and finalized in a single call.
 
-The profiling and finalization logic is provided by DART's
-[libdart-damage](https://github.com/genomewalker/libdart-damage). It measures
+The profiling and finalization logic is provided by
+[libtaph](https://github.com/genomewalker/libtaph). It measures
 four biological channels per position:
 
 - **5' C→T**, T/(T+C) at positions 0–14 from the 5' end
@@ -104,7 +104,7 @@ Fields:
 - **fit**, Amplitude and ΔBIC for each of the four biological channels.
 - **terminal shift / z-score**, Observed minus background T/(T+C) or A/(A+G) at the terminal positions; the z-score indicates significance.
 - **d_max / lambda / bg**, Exponential decay parameters for each end, and the combined d_max (the larger of the two, used as the aggregate damage indicator).
-- **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libdart-damage classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
+- **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libtaph classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
 - **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --collapse-damage`.
 - **Per-position table**, Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
 
