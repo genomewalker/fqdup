@@ -75,15 +75,14 @@ FetchContent_MakeAvailable(librapidarchive)
 # libtaph — taphonomy estimation library (deamination, 8-oxoG, PCR, length/GC,
 # mixture model). Provides taph::FrameSelector::{update,finalize}_sample_profile
 # and SampleDamageProfile with d_max_combined, all channels, GC bins.
-# FetchContent name kept as libdart_damage until GitHub repo rename propagates.
 FetchContent_Declare(
-    libdart_damage
-    GIT_REPOSITORY https://github.com/genomewalker/libdart-damage.git
+    libtaph
+    GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
     GIT_TAG        main
     GIT_SHALLOW    TRUE
     UPDATE_DISCONNECTED TRUE
 )
-FetchContent_MakeAvailable(libdart_damage)
+FetchContent_MakeAvailable(libtaph)
 
 # BBHash (header-only MPHF — O(1) pass2 lookup for extend, ~3.7 bits/key)
 FetchContent_Declare(
