@@ -58,7 +58,11 @@ FetchContent_MakeAvailable(flat_hash_map)
 # Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
 set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_WITH_ISAL   OFF CACHE BOOL "" FORCE)
+if(ISAL_INCLUDE_DIR AND ISAL_LIB)
+    set(LIBRAPIDARCHIVE_WITH_ISAL ON  CACHE BOOL "" FORCE)
+else()
+    set(LIBRAPIDARCHIVE_WITH_ISAL OFF CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(
     librapidarchive
     GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
@@ -68,9 +72,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
-# libdart-damage — DART's full damage estimation pipeline as a shared library.
-# Provides dart::FrameSelector::{update,finalize}_sample_profile and
-# SampleDamageProfile with d_max_combined (mixture model), all channels, GC bins.
+# libtaph — taphonomy estimation library (deamination, 8-oxoG, PCR, length/GC,
+# mixture model). Provides taph::FrameSelector::{update,finalize}_sample_profile
+# and SampleDamageProfile with d_max_combined, all channels, GC bins.
+# FetchContent name kept as libdart_damage until GitHub repo rename propagates.
 FetchContent_Declare(
     libdart_damage
     GIT_REPOSITORY https://github.com/genomewalker/libdart-damage.git
@@ -115,7 +120,7 @@ target_link_libraries(fqdup PRIVATE
     Threads::Threads
     ${XXHASH_LIB}
     rapidgzip::rapidgzip
-    dart-damage
+    taph
 )
 target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP HAVE_BBHASH)
 
