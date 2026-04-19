@@ -686,8 +686,8 @@ struct ExtendConfig {
     int      mask_3_override = -1;
     double   mask_threshold  = 0.05;
     int64_t  damage_sample   = 500000;  // 0 = full scan; default samples 500k reads
-    dart::SampleDamageProfile::LibraryType library_type =
-        dart::SampleDamageProfile::LibraryType::UNKNOWN;
+    taph::SampleDamageProfile::LibraryType library_type =
+        taph::SampleDamageProfile::LibraryType::UNKNOWN;
     int      n_threads       = 1;
 };
 
@@ -1378,9 +1378,9 @@ int extend_main(int argc, char** argv) {
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
             if (lt == "ss" || lt == "single-stranded")
-                cfg.library_type = dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
+                cfg.library_type = taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
             else if (lt == "ds" || lt == "double-stranded")
-                cfg.library_type = dart::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+                cfg.library_type = taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
             else if (lt != "auto") {
                 std::cerr << "Error: unknown --library-type: " << lt << "\n";
                 return 1;

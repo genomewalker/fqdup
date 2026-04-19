@@ -28,7 +28,7 @@
 #include <vector>
 #include <zlib.h>
 
-#include "dart/frame_selector_decl.hpp"
+#include "taph/frame_selector_decl.hpp"
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -1619,8 +1619,8 @@ int derep_main(int argc, char** argv) {
     bool   damage_auto    = false;  // default off: damage-aware hashing distorts
                                     // downstream damage analysis (e.g. DART) when
                                     // run on fqdup output. Use --damage-auto explicitly.
-    dart::SampleDamageProfile::LibraryType forced_library_type =
-        dart::SampleDamageProfile::LibraryType::UNKNOWN;  // auto-detect by default
+    taph::SampleDamageProfile::LibraryType forced_library_type =
+        taph::SampleDamageProfile::LibraryType::UNKNOWN;  // auto-detect by default
     double damage_dmax5   = -1.0;
     double damage_dmax3   = -1.0;
     double damage_lambda5 = 0.5;
@@ -1668,11 +1668,11 @@ int derep_main(int argc, char** argv) {
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
             if (lt == "ss" || lt == "single-stranded")
-                forced_library_type = dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
+                forced_library_type = taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
             else if (lt == "ds" || lt == "double-stranded")
-                forced_library_type = dart::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+                forced_library_type = taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
             else if (lt == "auto")
-                forced_library_type = dart::SampleDamageProfile::LibraryType::UNKNOWN;
+                forced_library_type = taph::SampleDamageProfile::LibraryType::UNKNOWN;
             else { std::cerr << "Error: Unknown --library-type: " << lt << " (use auto, ds, ss)\n"; return 1; }
         } else if (arg == "--collapse-damage") {
             damage_auto = true;
@@ -1793,7 +1793,7 @@ int derep_main(int argc, char** argv) {
             profile.pcr_error_rate = pcr_total_rate;
             profile.enabled       = (damage_dmax5 > 0.0);
             profile.ss_mode       = (forced_library_type ==
-                                     dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+                                     taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
             profile.populate_mask_from_model();
             profile.print_info(/*typical_read_length=*/0);
         }
