@@ -12,6 +12,7 @@
 #include "fqdup/damage_profile.hpp"
 
 #include "taph/frame_selector_decl.hpp"
+#include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
 
 #include <sstream>
@@ -358,61 +359,13 @@ int damage_main(int argc, char** argv) {
     // Single-threaded; only needs hexamer_count_5prime / n_hexamers_*.
     // Cost: <5s on any file. Result: clip_stubs populated before full pass.
     static constexpr int64_t PRE_SCAN_READS = 500000;
-    struct HexRatio { double log2fc; int idx; };
-    std::vector<HexRatio> hex_enriched;
-    bool flag_hex_artifact = false;
-    std::vector<std::string> clip_stubs;
-    std::vector<std::string> clip3_stubs;
-    bool adapter_clipped  = false;
-    bool adapter3_clipped = false;
 
-    auto decode_hex = [](int code) -> std::array<char,7> {
-        const char bases[] = "ACGT";
-        std::array<char,7> s{}; s[6] = '\0';
-        for (int i = 5; i >= 0; --i) { s[i] = bases[code & 3]; code >>= 2; }
-        return s;
-    };
-
-    auto encode_hex_at = [](const std::string& s, int pos) -> int {
-        int code = 0;
-        for (int i = pos; i < pos + 6; ++i) {
-            int b;
-            switch (std::toupper(static_cast<unsigned char>(s[i]))) {
-                case 'A': b = 0; break; case 'C': b = 1; break;
-                case 'G': b = 2; break; case 'T': b = 3; break;
-                default: return -1;
-            }
-            code = (code << 2) | b;
-        }
-        return code;
-    };
-
-    auto compute_hex_enriched = [&](const taph::SampleDamageProfile& src) {
-        hex_enriched.clear();
-        flag_hex_artifact = false;
-        double tot_t = static_cast<double>(src.n_hexamers_5prime);
-        double tot_i = static_cast<double>(src.n_hexamers_interior);
-        if (tot_t > 0 && tot_i > 0) {
-            for (int i = 0; i < 4096; ++i) {
-                double t = src.hexamer_count_5prime[i];
-                double q = src.hexamer_count_interior[i];
-                if (t < 20.0 || q < 20.0) continue;
-                double lfc = std::log2((t/tot_t + 1e-12) / (q/tot_i + 1e-12));
-                if (lfc > 0.5) hex_enriched.push_back({lfc, i});
-            }
-            std::sort(hex_enriched.begin(), hex_enriched.end(),
-                      [](const HexRatio& a, const HexRatio& b){ return a.log2fc > b.log2fc; });
-        }
-        if (!hex_enriched.empty()) {
-            auto top = decode_hex(hex_enriched[0].idx);
-            if (top[0] != 'T' && hex_enriched[0].log2fc > 1.5)
-                flag_hex_artifact = true;
-        }
-    };
+    taph::AdapterStubs stubs;
 
     {
         WorkerState scan_state;
         std::array<uint32_t, 4096> hex3_terminal{};
+        uint64_t n_hex3 = 0;
         auto reader_pre = make_fastq_reader(in_path, 1);
         FastqRecord rec;
         int64_t n = 0;
@@ -421,51 +374,12 @@ int damage_main(int argc, char** argv) {
             if (L < LSD_L_MIN) continue;
             taph::FrameSelector::update_sample_profile(scan_state.profile, rec.seq);
             if (L >= 12) {
-                int code = encode_hex_at(rec.seq, L - 6);
-                if (code >= 0) ++hex3_terminal[code];
+                int code = taph::encode_hex_at(rec.seq, L - 6);
+                if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
             }
             ++n;
         }
-
-        // 5' enrichment → clip_stubs (cap at 5 to avoid cascade over-clipping)
-        compute_hex_enriched(scan_state.profile);
-        if (flag_hex_artifact) {
-            for (const auto& hr : hex_enriched) {
-                if ((int)clip_stubs.size() >= 5) break;
-                auto s = decode_hex(hr.idx);
-                if (s[0] != 'T' && hr.log2fc > 3.0)
-                    clip_stubs.push_back(std::string(s.data(), 6));
-            }
-            if (!clip_stubs.empty()) adapter_clipped = true;
-        }
-
-        // 3' enrichment: only when 5' adapter stubs were found (same library prep issue)
-        // Avoids false-positive 3' clipping on SS libraries where 3' enrichment is G→A signal
-        if (adapter_clipped) {
-                double tot_t3 = 0.0;
-                for (uint32_t v : hex3_terminal) tot_t3 += v;
-                double tot_i = static_cast<double>(scan_state.profile.n_hexamers_interior);
-                if (tot_t3 > 0 && tot_i > 0) {
-                    std::vector<HexRatio> hex3_enriched;
-                    for (int i = 0; i < 4096; ++i) {
-                        double t = hex3_terminal[i];
-                        double q = scan_state.profile.hexamer_count_interior[i];
-                        if (t < 20.0 || q < 20.0) continue;
-                        double lfc = std::log2((t / tot_t3 + 1e-12) / (q / tot_i + 1e-12));
-                        if (lfc > 3.0) hex3_enriched.push_back({lfc, i});
-                    }
-                    std::sort(hex3_enriched.begin(), hex3_enriched.end(),
-                              [](const HexRatio& a, const HexRatio& b){ return a.log2fc > b.log2fc; });
-                    for (const auto& hr : hex3_enriched) {
-                        if ((int)clip3_stubs.size() >= 5) break;
-                        auto s = decode_hex(hr.idx);
-                        // last base 'A' excluded: G→A deamination enriches A at genuine 3' termini
-                        if (s[5] != 'A')
-                            clip3_stubs.push_back(std::string(s.data(), 6));
-                    }
-                    if (!clip3_stubs.empty()) adapter3_clipped = true;
-                }
-        }
+        stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     }
 
     // ---- full pass: profile (with optional 5' clip) --------------------
@@ -474,10 +388,10 @@ int damage_main(int argc, char** argv) {
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
     for (int t = 0; t < n_threads; ++t) {
-        if (adapter_clipped || adapter3_clipped)
+        if (stubs.adapter_clipped || stubs.adapter3_clipped)
             workers.emplace_back(clip_worker_fn, std::ref(queue),
                                  std::ref(states[t]),
-                                 std::cref(clip_stubs), std::cref(clip3_stubs));
+                                 std::cref(stubs.stubs5), std::cref(stubs.stubs3));
         else
             workers.emplace_back(worker_fn, std::ref(queue), std::ref(states[t]));
     }
@@ -527,8 +441,11 @@ int damage_main(int argc, char** argv) {
     dp.forced_library_type = forced_lib;  // ensure forced_lib survives merge
     taph::FrameSelector::finalize_sample_profile(dp);
 
-    // Recompute hex_enriched from final (possibly clipped) dp for JSON output.
-    compute_hex_enriched(dp);
+    // Recompute top enriched hexamers from final (possibly clipped) dp for JSON output.
+    stubs.top_enriched = taph::compute_hex_enriched_5prime(dp);
+    stubs.flag_hex_artifact = !stubs.top_enriched.empty()
+        && stubs.top_enriched[0].log2fc > 1.5
+        && !stubs.top_enriched[0].damage_consistent;
 
     const bool is_ss = (dp.library_type == taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
 
@@ -638,97 +555,22 @@ int damage_main(int argc, char** argv) {
         if (w_dor > 0) D_oriented /= w_dor;
     }
 
-    // ---- Score test for G→T Chargaff excess (8-oxoG, no pass needed) --------
-    // For each of 16 xGx contexts (prev × nxt):
-    //   observed T/(T+G) vs Chargaff null A/(A+C) at reverse-complement context.
-    // z ~ N(0,1) under H0 of no G→T excess; positive z = G→T enrichment.
-    // Accumulates both 5' and 3' interior spectra for maximum power.
+    // ---- Score tests: oxog interior, depurination, damage mask (→ libtaph) ----
     {
-        static constexpr int RC4[4] = {3, 2, 1, 0};  // A(0)↔T(3), C(1)↔G(2)
-        double sc = 0.0, vr = 0.0;
-        for (const auto* tri : {&dp.tri_5prime_interior, &dp.tri_3prime_interior}) {
-            for (int p = 0; p < 4; ++p) {
-                for (int n = 0; n < 4; ++n) {
-                    double k  = (*tri)[p*16 + 3*4 + n];   // T at (p,T,n)
-                    double g  = (*tri)[p*16 + 2*4 + n];   // G at (p,G,n)
-                    double nt = k + g;
-                    if (nt < 10.0) continue;
-                    int rp = RC4[n], rn = RC4[p];          // rc context = (rc(n),?,rc(p))
-                    double a_rc = (*tri)[rp*16 + 0*4 + rn];
-                    double c_rc = (*tri)[rp*16 + 1*4 + rn];
-                    double ca   = a_rc + c_rc;
-                    if (ca < 10.0) continue;
-                    double theta = a_rc / ca;
-                    sc += k - nt * theta;
-                    vr += nt * theta * (1.0 - theta);
-                }
-            }
-        }
-        if (vr > 0.0) {
-            oxog_score_z = sc / std::sqrt(vr);
-            oxog_score_p = 0.5 * std::erfc(oxog_score_z / std::sqrt(2.0));
-        }
+        auto oxog_r = taph::compute_oxog_interior_score(dp);
+        oxog_score_z = oxog_r.z;
+        oxog_score_p = oxog_r.p;
     }
+    auto depur = taph::compute_depur_score(dp, is_ss);
+    depur_score_z_5    = depur.z5;
+    depur_score_z_3    = depur.z3;
+    depur_score_z      = depur.z;
+    depur_score_p      = depur.p;
+    depur_ctrl_shift_5 = depur.shift5;
+    depur_ctrl_shift_3 = depur.shift3;
 
-    // ---- Score test: terminal purine enrichment (depurination proxy) ----
-    // Uses libdart ctrl_z values which test within-purine/pyrimidine ratios at pos 0:
-    //   5': A/(A+G) terminal vs interior — immune to C→T deamination
-    //   3': T/(T+C) terminal vs interior — complement of 5' signal for DS
-    // For DS: conjunction test (min z / max p) avoids assuming 5'/3' independence.
-    // For SS: 3' T/(T+C) is the deamination channel, not a depurination control — skip it.
-    {
-        depur_score_z_5    = static_cast<double>(dp.ctrl_z_5prime);
-        depur_ctrl_shift_5 = static_cast<double>(dp.purine_enrichment_5prime);
-        depur_ctrl_shift_3 = static_cast<double>(dp.purine_enrichment_3prime);
-
-        double p5 = 0.5 * std::erfc(depur_score_z_5 / std::sqrt(2.0));
-
-        if (!is_ss) {
-            depur_score_z_3 = static_cast<double>(dp.ctrl_z_3prime);
-            double p3 = 0.5 * std::erfc(depur_score_z_3 / std::sqrt(2.0));
-            depur_score_z = std::min(depur_score_z_5, depur_score_z_3);
-            depur_score_p = std::max(p5, p3);
-        } else {
-            depur_score_z_3 = std::numeric_limits<double>::quiet_NaN();
-            depur_score_z   = depur_score_z_5;
-            depur_score_p   = p5;
-        }
-    }
-
-    // ---- compute per-position mask -------------------------------------
-    // After finalize_sample_profile():
-    //   t_freq_5prime[p]  = T/(T+C) frequency (already normalised)
-    //   a_freq_3prime[p]  = A/(A+G) frequency (already normalised)
-    //   t_freq_3prime[p]  = raw T count at 3'  (NOT normalised)
-    const double bg_5  = dp.fit_baseline_5prime;
-    const double bg_3  = dp.fit_baseline_3prime;
-    const double bg_tc = dp.baseline_t_freq /
-                         (dp.baseline_t_freq + dp.baseline_c_freq + 1e-9);
-
-    bool mask_pos[N_POS] = {};
-    for (int p = 0; p < N_POS; ++p) {
-        double excess_5 = 0.0, excess_3 = 0.0;
-        if (dp.tc_total_5prime[p] >= MIN_COV)
-            excess_5 = dp.t_freq_5prime[p] - bg_5;
-        if (is_ss) {
-            if (dp.tc_total_3prime[p] >= MIN_COV)
-                excess_3 = dp.t_freq_3prime[p] / dp.tc_total_3prime[p] - bg_tc;
-        } else {
-            if (dp.ag_total_3prime[p] >= MIN_COV)
-                excess_3 = dp.a_freq_3prime[p] - bg_3;
-        }
-        mask_pos[p] = (excess_5 > mask_threshold) || (excess_3 > mask_threshold);
-    }
-
-    int n_masked = 0;
-    std::string masked_str;
-    for (int p = 0; p < N_POS; ++p) {
-        if (mask_pos[p]) {
-            if (n_masked) masked_str += ',';
-            masked_str += std::to_string(p);
-            ++n_masked;
-        }
-    }
+    auto dmask = taph::compute_damage_mask(dp, is_ss, mask_threshold,
+                                           static_cast<int>(MIN_COV));
 
     // ---- comma-formatted integer helper --------------------------------
     auto fmt_count = [](int64_t n) {
@@ -800,10 +642,10 @@ int damage_main(int argc, char** argv) {
 
     std::cout << "5'-end   d_max=" << std::fixed << std::setprecision(4) << dp.d_max_5prime
               << "  lambda=" << std::setprecision(3) << dp.lambda_5prime
-              << "  bg=" << std::setprecision(4) << bg_5 << "\n";
+              << "  bg=" << std::setprecision(4) << dp.fit_baseline_5prime << "\n";
     std::cout << "3'-end   d_max=" << std::fixed << std::setprecision(4) << dp.d_max_3prime
               << "  lambda=" << std::setprecision(3) << dp.lambda_3prime
-              << "  bg=" << std::setprecision(4) << bg_3 << "\n";
+              << "  bg=" << std::setprecision(4) << dp.fit_baseline_3prime << "\n";
     std::cout << "combined d_max=" << std::fixed << std::setprecision(4) << dp.d_max_combined
               << "  (source=" << dp.d_max_source_str() << ")";
     if (dp.mixture_converged) std::cout << " [mixture]";
@@ -812,8 +654,8 @@ int damage_main(int argc, char** argv) {
     std::cout << "\n\n";
 
     std::cout << "Mask threshold: " << mask_threshold << " → "
-              << n_masked << " position" << (n_masked != 1 ? "s" : "") << " masked";
-    if (n_masked) std::cout << " (pos " << masked_str << ")";
+              << dmask.n_masked << " position" << (dmask.n_masked != 1 ? "s" : "") << " masked";
+    if (dmask.n_masked) std::cout << " (pos " << dmask.masked_str << ")";
     std::cout << "\n\n";
 
     // ---- complement asymmetry (8-oxoG QC) ---------------------------------
@@ -889,7 +731,7 @@ int damage_main(int argc, char** argv) {
                   << "  " << freq5_ga
                   << "  " << freq3
                   << "  " << freq5_gt;
-        if (mask_pos[p]) std::cout << "  *";
+        if (dmask.pos[p]) std::cout << "  *";
         std::cout << "\n";
     }
 
@@ -961,7 +803,7 @@ int damage_main(int argc, char** argv) {
                 << "\t5prime\t" << std::fixed << std::setprecision(6) << freq5
                 << "\t3prime\t" << freq3
                 << "\t" << freq5_gt
-                << "\t" << (mask_pos[p] ? "1" : "0")
+                << "\t" << (dmask.pos[p] ? "1" : "0")
                 << "\t" << static_cast<int64_t>(cov5)
                 << "\t" << static_cast<int64_t>(cov3)
                 << "\t" << static_cast<int64_t>(cov5_gt)
@@ -971,44 +813,24 @@ int damage_main(int argc, char** argv) {
     }
 
     // ---- Pre-compute calibrated score statistics used across JSON sections ----
-    // CpG damage z: log2(CpG-like / non-CpG-like d_max) / SE(log2 ratio).
-    double cpg_score_z = 0.0, cpg_score_p = 1.0;
-    if (!std::isnan(dp.log2_cpg_ratio)) {
-        double ecpg  = static_cast<double>(dp.effcov_ct5_cpg_like_terminal);
-        double encpg = static_cast<double>(dp.effcov_ct5_noncpg_like_terminal);
-        double se = std::sqrt(1.0 / (ecpg + 1.0) + 1.0 / (encpg + 1.0));
-        if (se > 1e-9) {
-            cpg_score_z = static_cast<double>(dp.log2_cpg_ratio) / se;
-            cpg_score_p = std::erfc(std::abs(cpg_score_z) / std::sqrt(2.0));
+    auto cpg_score  = taph::compute_cpg_score(dp);
+    double cpg_score_z = cpg_score.z, cpg_score_p = cpg_score.p;
+
+    auto hex_stats  = taph::compute_hex_stats(dp);
+    double hex_shift_g = hex_stats.shift_g;
+    double hex_shift_z = hex_stats.shift_z;
+    double hex_shift_p = hex_stats.shift_p;
+
+    // Short-read spike fraction (used by QC flags + JSON).
+    double short_read_frac = -1.0;
+    if (!lsd.bins.empty()) {
+        uint64_t short_reads = 0, total_len_reads = 0;
+        for (const auto& lb : lsd.bins) {
+            total_len_reads += lb.n_reads;
+            if (lb.length_hi <= 50) short_reads += lb.n_reads;
         }
-    }
-    // Hexamer G-test: multinomial composition shift test (terminal vs interior).
-    // Result feeds both library_qc JSON and preservation qc_risk_z.
-    double hex_shift_g = 0.0, hex_shift_z = 0.0, hex_shift_p = 1.0;
-    {
-        double tot_t = static_cast<double>(dp.n_hexamers_5prime);
-        double tot_i = static_cast<double>(dp.n_hexamers_interior);
-        if (tot_t > 0 && tot_i > 0) {
-            double N_hex = tot_t + tot_i;
-            double G_stat = 0.0;
-            int k_eff = 0;
-            for (int i = 0; i < 4096; ++i) {
-                double c = static_cast<double>(dp.hexamer_count_5prime[i]);
-                double d = static_cast<double>(dp.hexamer_count_interior[i]);
-                if (c + d < 5.0) continue;
-                double Ec = tot_t * (c + d) / N_hex;
-                double Ed = tot_i * (c + d) / N_hex;
-                if (c > 0) G_stat += 2.0 * c * std::log(c / Ec);
-                if (d > 0) G_stat += 2.0 * d * std::log(d / Ed);
-                ++k_eff;
-            }
-            hex_shift_g = G_stat;
-            if (k_eff > 1) {
-                double df = static_cast<double>(k_eff - 1);
-                hex_shift_z = (G_stat - df) / std::sqrt(2.0 * df);
-                hex_shift_p = 0.5 * std::erfc(hex_shift_z / std::sqrt(2.0));
-            }
-        }
+        if (total_len_reads > 0)
+            short_read_frac = static_cast<double>(short_reads) / total_len_reads;
     }
 
     // ---- optional JSON -------------------------------------------------
@@ -1285,50 +1107,13 @@ int damage_main(int argc, char** argv) {
             j << "    \"oxog_score_p\": " << std::setprecision(6) << oxog_score_p << ",\n";
         }
         {
-            // oxog_trinuc_cosine: cosine similarity of per-context G→T Score residuals
-            // to an empirical 8-oxoG spectral reference profile (high-oxoG aDNA contexts).
-            static constexpr double OXOG_REF[16] = {
-                0.0512, 0.0388, 0.0257, 0.0601,
-                0.0788, 0.0621, 0.0302, 0.1124,
-                0.0389, 0.0296, 0.0198, 0.0453,
-                0.0863, 0.0682, 0.0388, 0.1138,
-            };
-            static constexpr int RC4b[4] = {3, 2, 1, 0};
-            double v[16] = {};
-            int n_ctx = 0;
-            for (const auto* tri : {&dp.tri_5prime_interior, &dp.tri_3prime_interior}) {
-                for (int p = 0; p < 4; ++p) {
-                    for (int n = 0; n < 4; ++n) {
-                        double k  = static_cast<double>((*tri)[p*16 + 3*4 + n]);
-                        double g  = static_cast<double>((*tri)[p*16 + 2*4 + n]);
-                        double nt = k + g;
-                        if (nt < 10.0) continue;
-                        int rp = RC4b[n], rn = RC4b[p];
-                        double a_rc = static_cast<double>((*tri)[rp*16 + 0*4 + rn]);
-                        double c_rc = static_cast<double>((*tri)[rp*16 + 1*4 + rn]);
-                        double ca = a_rc + c_rc;
-                        if (ca < 10.0) continue;
-                        double theta = a_rc / ca;
-                        v[p*4 + n] += std::max(0.0, k - nt * theta);
-                        ++n_ctx;
-                    }
-                }
-            }
-            double dot = 0.0, nv = 0.0, nr = 0.0;
-            for (int i = 0; i < 16; ++i) {
-                dot += v[i] * OXOG_REF[i];
-                nv  += v[i] * v[i];
-                nr  += OXOG_REF[i] * OXOG_REF[i];
-            }
-            double cosine = (nv > 1e-30 && nr > 0)
-                ? dot / (std::sqrt(nv) * std::sqrt(nr))
-                : std::numeric_limits<double>::quiet_NaN();
-            oxog_trinuc_cosine = cosine;
-            if (std::isnan(cosine))
+            auto otr = taph::compute_oxog_trinuc(dp);
+            oxog_trinuc_cosine = otr.cosine;
+            if (std::isnan(otr.cosine))
                 j << "    \"oxog_trinuc_cosine\": null,\n";
             else
-                j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << cosine << ",\n";
-            j << "    \"oxog_trinuc_n_context\": " << n_ctx << "\n";
+                j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
+            j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << "\n";
         }
         j << "  },\n";
         j << "  \"interior_ct_cluster\": {\n";
@@ -1393,11 +1178,12 @@ int damage_main(int argc, char** argv) {
             emit_arr("tri_3prime_interior", dp.tri_3prime_interior, false);
             j << "  },\n";
         }
-        // hex_enriched, flag_hex_artifact, decode_hex computed before clip pass above.
+        auto pres = taph::compute_preservation_summary(dp, is_ss,
+            stubs.adapter_clipped, stubs.flag_hex_artifact,
+            cpg_score_z, oxog_score_z, oxog_trinuc_cosine, hex_shift_p);
 
         j << "  \"preservation\": {\n";
         j << "    \"score\": " << std::setprecision(6) << dp.preservation_score << ",\n";
-        // label emitted below, derived from authenticity_eff
         j << "    \"evidence\": " << dp.preservation_evidence << ",\n";
         j << "    \"reliability\": " << dp.preservation_reliability << ",\n";
         j << "    \"f5\": " << dp.preservation_f5 << ",\n";
@@ -1405,217 +1191,37 @@ int damage_main(int argc, char** argv) {
         j << "    \"f_coh\": " << dp.preservation_f_coh << ",\n";
         j << "    \"f_cpg\": " << dp.preservation_f_cpg << ",\n";
         {
-            auto clamp01 = [](double x) -> double { return std::clamp(x, 0.0, 1.0); };
-            auto sat = [](double x, double half_sat) -> double {
-                x = std::max(0.0, x);
-                return x / (x + half_sat);
-            };
-            auto z_evidence = [](double z, double scale = 8.0) -> double {
-                return 1.0 - std::exp(-std::max(0.0, z) / scale);
-            };
-            auto p_evidence = [](double p) -> double {
-                if (std::isnan(p)) return 0.0;
-                p = std::clamp(p, 1e-300, 1.0);
-                double x = -std::log10(p);
-                return x / (x + 3.0);
-            };
-
-            // authenticity_eff: pi_ancient is the primary signal when the mixture model
-            // is identifiable (pi < 1 → discriminable components). At full saturation
-            // (pi ≈ 1, non-identifiable) fall back to d_max-weighted formula.
-            // CpG ratio excluded: anti-correlated with MAP_damage on validation data.
-            //
-            // Hexamer-corrected d5: when non-damage-consistent hexamers dominate 5' pos0
-            // (adapter remnant), the C→T rate at pos0 is suppressed. Extrapolate the
-            // decay curve back to pos0: d5_corr = d5 * exp(λ × fit_offset).
-            // Only for DS — in SS, authentic damage is at d3 not d5.
-            double d5_raw = static_cast<double>(dp.d_max_5prime);
-            double d5_corr = d5_raw;
-            if (!is_ss && !adapter_clipped && flag_hex_artifact && dp.position_0_artifact_5prime
-                    && dp.lambda_5prime > 0.0f && dp.fit_offset_5prime >= 1) {
-                d5_corr = std::min(d5_raw * std::exp(static_cast<double>(dp.lambda_5prime)
-                                                      * dp.fit_offset_5prime), 0.50);
-            }
-            double a5 = sat(d5_corr, 0.05);
-            double a3 = sat(static_cast<double>(dp.d_max_3prime), 0.05);
-            double w5 = is_ss ? 1.0 : 2.0, w3 = is_ss ? 1.0 : 0.5;
-            double authenticity_eff;
-            if (dp.mixture_converged) {
-                // Use pi_ancient for all converged samples; non-identifiable cases
-                // (pi ≈ 1) still provide discriminating spread via small residual variance.
-                double pi = clamp01(static_cast<double>(dp.mixture_pi_ancient));
-                authenticity_eff = clamp01(0.20 * a5 + 0.80 * pi);
-            } else {
-                authenticity_eff = clamp01((w5*a5 + w3*a3) / (w5 + w3));
-            }
-            // Keep mix_term + wcpg for authenticity_evidence (statistical support signal)
-            double mix_term = 0.0, wmix = 0.0;
-            if (dp.mixture_converged && dp.mixture_identifiable) {
-                mix_term = sat(static_cast<double>(dp.mixture_d_ancient), 0.05) *
-                           clamp01(static_cast<double>(dp.mixture_pi_ancient));
-                wmix = 1.0;
-            }
-            double cpg_cov = static_cast<double>(dp.effcov_ct5_cpg_like_terminal) +
-                             static_cast<double>(dp.effcov_ct5_noncpg_like_terminal);
-            double wcpg = cpg_cov / (cpg_cov + 2000.0);
-
-            // authenticity_evidence: z-based support from terminal signals.
-            // For DS: 3' GA signal (terminal_z_3prime) is a reliable second channel.
-            // For SS: 3' end is often inverted (adapter artifact) or uses the same
-            // channel as 5'; don't include it as an independent term.
-            double z5e = z_evidence(static_cast<double>(dp.terminal_z_5prime));
-            double z3e = is_ss ? 0.0 : z_evidence(static_cast<double>(dp.terminal_z_3prime));
-            // mix_e: evidence scales with actual damage magnitude, not just fit status.
-            double mix_e = 0.0;
-            if (dp.mixture_converged && dp.mixture_identifiable) {
-                mix_e = mix_term;  // sat(d_ancient,0.05) * clamp01(pi_ancient)
-            } else if (dp.mixture_converged) {
-                double mix_mag = sat(static_cast<double>(dp.mixture_d_ancient), 0.05) *
-                                 clamp01(static_cast<double>(dp.mixture_pi_ancient));
-                mix_e = 0.5 * mix_mag;
-            }
-            double cpg_e = wcpg * z_evidence(std::max(0.0, cpg_score_z), 5.0);
-            // Denominator mirrors numerator weights: z5(1) + z3(DS only) + mix(if converged) + wcpg.
-            double wmix_e = dp.mixture_converged ? 1.0 : 0.0;
-            double auth_n_terms = 1.0 + (is_ss ? 0.0 : 1.0) + wmix_e + wcpg;
-            double authenticity_evidence = (auth_n_terms > 1e-9)
-                ? clamp01((z5e + z3e + mix_e + cpg_e) / auth_n_terms)
-                : 0.0;
-
-            // oxidation_eff / oxidation_evidence
-            // ox_shape: trinuc spectral confirmation of 8-oxoG context-specificity.
-            // NaN = no trinuc data → treat as 0 (no spectral confirmation), not 1.
-            bool has_trinuc = !std::isnan(oxog_trinuc_cosine);
-            // Softened ramp: onset 0.65, saturation 0.85. Old cliff at 0.75 was
-            // inside the real oxoG range (~0.75–0.95).
-            double ox_shape = has_trinuc
-                ? clamp01((oxog_trinuc_cosine - 0.65) / 0.20)
-                : 0.0;
-            double oxidation_eff = clamp01(sat(static_cast<double>(dp.ox_d_max), 0.02) *
-                                           (has_trinuc ? ox_shape : 1.0));
-            // Gate Score test on GT fit (ox_d_max > 0.01) and DS only.
-            double oz = (!is_ss && static_cast<double>(dp.ox_d_max) > 0.01) ? oxog_score_z : 0.0;
-            // Multiply evidence by ox_shape: when spectral match fails, both eff and
-            // evidence collapse together. NaN-trinuc falls back to z-only.
-            double oxidation_evidence = has_trinuc
-                ? clamp01(ox_shape * 0.5 * (z_evidence(oz) + 1.0))
-                : clamp01(z_evidence(oz));
-
-            // qc_risk_eff / qc_evidence
-            // position_0_artifact at high damage is genuine aDNA terminal signal, not adapter
-            double d5_eff = static_cast<double>(dp.d_max_5prime);
-            double d3_eff = static_cast<double>(dp.d_max_3prime);
-            // For SS libraries the read 5' is the adapter side; low d5 is expected and
-            // position0_artifact_5prime there is adapter chemistry, not a QC failure.
-            // Authentic deamination in SS accumulates at d3 (original 5' end).
-            bool adapter_5 = (dp.fit_offset_5prime > 1) ||
-                             (dp.position_0_artifact_5prime && d5_eff < 0.05 && !is_ss);
-            bool adapter_3 = (dp.fit_offset_3prime > 1) ||
-                             (dp.position_0_artifact_3prime && d3_eff < 0.05);
-            // hexamer TC excess: discount proportional to the damage-bearing terminus.
-            // For SS, authentic signal is at d3; using d5 would under-discount.
-            double sig_eff = is_ss ? d3_eff : d5_eff;
-            double hex_dam_disc = sat(sig_eff, 0.05);
-            double qhex  = sat(std::abs(static_cast<double>(dp.hexamer_excess_tc)), 0.05)
-                           * (1.0 - hex_dam_disc);
-            double qart  = dp.damage_artifact ? 1.0 : 0.0;
-            double qadapt = (adapter_5 || adapter_3) ? 1.0 : 0.0;
-            double qc_risk_eff = clamp01((2.0*qhex + qart + qadapt) / 4.0);
-            // qc_evidence: require both significance AND effect size; p_evidence alone
-            // saturates at large N even for trivial hexamer bias.
-            double hex_ev = qhex * p_evidence(hex_shift_p);
-            double qc_evidence = clamp01(std::max({hex_ev, qart, qadapt * 0.75}));
-
-            auto auth_label = [](double ae) -> const char* {
-                if (ae < 0.10) return "modern-like";
-                if (ae < 0.30) return "weak";
-                if (ae < 0.55) return "moderate";
-                return "ancient";
-            };
-            j << "    \"authenticity_eff\": " << std::setprecision(6) << authenticity_eff << ",\n";
-            j << "    \"authenticity_evidence\": " << authenticity_evidence << ",\n";
-            if (d5_corr != d5_raw)
-                j << "    \"d5_hexamer_corrected\": " << d5_corr << ",\n";
-            j << "    \"oxidation_eff\": " << oxidation_eff << ",\n";
-            j << "    \"oxidation_evidence\": " << oxidation_evidence << ",\n";
-            j << "    \"qc_risk_eff\": " << qc_risk_eff << ",\n";
-            j << "    \"qc_evidence\": " << qc_evidence << ",\n";
-            j << "    \"label\": \"" << auth_label(authenticity_eff) << "\"\n";
+            j << "    \"authenticity_eff\": " << std::setprecision(6) << pres.authenticity_eff << ",\n";
+            j << "    \"authenticity_evidence\": " << pres.authenticity_evidence << ",\n";
+            if (pres.d5_was_corrected)
+                j << "    \"d5_hexamer_corrected\": " << pres.d5_hexamer_corrected << ",\n";
+            j << "    \"oxidation_eff\": " << pres.oxidation_eff << ",\n";
+            j << "    \"oxidation_evidence\": " << pres.oxidation_evidence << ",\n";
+            j << "    \"qc_risk_eff\": " << pres.qc_risk_eff << ",\n";
+            j << "    \"qc_evidence\": " << pres.qc_evidence << ",\n";
+            j << "    \"label\": \"" << pres.label << "\"\n";
         }
         j << "  },\n";
         {
-            // Hexamer Shannon entropy and Jensen-Shannon divergence (terminal vs interior).
-            // Entropy < 4.5 bits (out of max log2(4096)=12) flags composition bias.
-            // JSD > 0.05 flags terminal-specific composition shift (adapter remnant, soft-clip).
-            double h_term = 0.0, h_int = 0.0, h_mix = 0.0;
-            double tot_term = static_cast<double>(dp.n_hexamers_5prime);
-            double tot_int  = static_cast<double>(dp.n_hexamers_interior);
-            if (tot_term > 0 && tot_int > 0) {
-                for (int i = 0; i < 4096; ++i) {
-                    double p = dp.hexamer_count_5prime[i]  / tot_term;
-                    double q = dp.hexamer_count_interior[i] / tot_int;
-                    double m = 0.5 * (p + q);
-                    if (p > 0) h_term -= p * std::log2(p);
-                    if (q > 0) h_int  -= q * std::log2(q);
-                    if (m > 0) h_mix  -= m * std::log2(m);
-                }
-            }
-            double jsd = h_mix - 0.5 * (h_term + h_int);
-
-            bool flag_adapter_5 = dp.fit_offset_5prime > 1 || dp.position_0_artifact_5prime;
-            bool flag_adapter_3 = dp.fit_offset_3prime > 1 || dp.position_0_artifact_3prime;
-            bool flag_hex_bias  = tot_term > 0 && h_term < 4.5;
-            bool flag_hex_shift = tot_term > 0 && tot_int > 0 && jsd > 0.05;
-            bool flag_depurin   = dp.depurination_detected;
-            // ds library with strong 5' signal but no detectable 3' G→A:
-            // either extreme fragmentation (3' terminal bases lost to overlap), adapter
-            // trimming into the insert, or a protocol issue. Not a scoring bug — the
-            // formula correctly suppresses f_coh, but the cause should be flagged.
-            bool flag_ds_3p_absent = !is_ss
-                && dp.d_max_5prime > 0.05f
-                && dp.d_max_3prime < 0.03f;
-
-            // Inward-displaced G→A: pos0 depleted while pos1-3 is elevated.
-            // Trimmer clipping the terminal base shifts the 3' peak inward so it
-            // disappears into background at pos0 but is visible at pos1-3.
-            bool flag_ga3_displaced = false;
-            if (!is_ss && dp.d_max_5prime > 0.05f) {
-                constexpr double MIN_GA = 100.0;
-                // Baseline from interior 3' positions (8-14, undamaged)
-                double bg_n = 0.0, bg_d = 0.0;
-                for (int p = 8; p < 15; ++p) {
-                    bg_n += dp.a_freq_3prime[p];
-                    bg_d += dp.ag_total_3prime[p];
-                }
-                double bg = (bg_d >= 500.0) ? bg_n / bg_d : 0.47;
-
-                double ga0 = (dp.ag_total_3prime[0] >= MIN_GA)
-                    ? dp.a_freq_3prime[0] / dp.ag_total_3prime[0] : -1.0;
-                double ga_peak = 0.0;
-                for (int p = 1; p <= 3; ++p) {
-                    if (dp.ag_total_3prime[p] >= MIN_GA)
-                        ga_peak = std::max(ga_peak,
-                                           dp.a_freq_3prime[p] / dp.ag_total_3prime[p]);
-                }
-                // Displaced: pos0 below baseline AND pos1-3 above baseline
-                if (ga0 >= 0.0)
-                    flag_ga3_displaced = ((ga0 - bg) < -0.02) && ((ga_peak - bg) > 0.02);
-            }
+            auto flags = taph::compute_library_qc_flags(dp, is_ss,
+                stubs.flag_hex_artifact,
+                hex_stats.jsd, hex_stats.entropy_terminal,
+                short_read_frac);
 
             j << "  \"library_qc\": {\n";
-            if (adapter_clipped) {
+            if (stubs.adapter_clipped) {
                 j << "    \"adapter_stubs_clipped\": [";
-                for (int i = 0; i < (int)clip_stubs.size(); ++i) {
+                for (int i = 0; i < (int)stubs.stubs5.size(); ++i) {
                     if (i > 0) j << ",";
-                    j << "\"" << clip_stubs[i] << "\"";
+                    j << "\"" << stubs.stubs5[i] << "\"";
                 }
                 j << "],\n";
             }
-            if (adapter3_clipped) {
+            if (stubs.adapter3_clipped) {
                 j << "    \"adapter_stubs_clipped_3prime\": [";
-                for (int i = 0; i < (int)clip3_stubs.size(); ++i) {
+                for (int i = 0; i < (int)stubs.stubs3.size(); ++i) {
                     if (i > 0) j << ",";
-                    j << "\"" << clip3_stubs[i] << "\"";
+                    j << "\"" << stubs.stubs3[i] << "\"";
                 }
                 j << "],\n";
             }
@@ -1623,9 +1229,9 @@ int damage_main(int argc, char** argv) {
             j << "    \"adapter_offset_3prime\": " << dp.fit_offset_3prime << ",\n";
             j << "    \"position0_artifact_5prime\": " << (dp.position_0_artifact_5prime ? "true" : "false") << ",\n";
             j << "    \"position0_artifact_3prime\": " << (dp.position_0_artifact_3prime ? "true" : "false") << ",\n";
-            j << "    \"hexamer_entropy_5prime\": " << std::setprecision(4) << h_term << ",\n";
-            j << "    \"hexamer_entropy_interior\": " << h_int << ",\n";
-            j << "    \"hexamer_terminal_interior_jsd\": " << jsd << ",\n";
+            j << "    \"hexamer_entropy_5prime\": " << std::setprecision(4) << hex_stats.entropy_terminal << ",\n";
+            j << "    \"hexamer_entropy_interior\": " << hex_stats.entropy_interior << ",\n";
+            j << "    \"hexamer_terminal_interior_jsd\": " << hex_stats.jsd << ",\n";
             j << "    \"hex_shift_g\": " << std::setprecision(4) << hex_shift_g << ",\n";
             j << "    \"hex_shift_z\": " << hex_shift_z << ",\n";
             j << "    \"hex_shift_p\": " << std::setprecision(6) << hex_shift_p << ",\n";
@@ -1636,19 +1242,17 @@ int damage_main(int argc, char** argv) {
             j << "    \"top_hexamers_5prime\": [";
             {
                 int n_out = 0;
-                for (const auto& hr : hex_enriched) {
+                for (const auto& hr : stubs.top_enriched) {
                     if (n_out >= 5) break;
-                    auto seq = decode_hex(hr.idx);
-                    bool dmg = (seq[0] == 'T');
+                    auto seq = taph::decode_hex(hr.idx);
                     if (n_out > 0) j << ",";
                     j << "{\"seq\":\"" << seq.data() << "\","
                       << "\"log2fc\":" << std::setprecision(3) << hr.log2fc << ","
-                      << "\"damage_consistent\":" << (dmg ? "true" : "false") << "}";
+                      << "\"damage_consistent\":" << (hr.damage_consistent ? "true" : "false") << "}";
                     ++n_out;
                 }
             }
             j << "],\n";
-            // Automatically identify adapter from top enriched non-T hexamer.
             {
                 static const std::pair<const char*, const char*> kAdapters[] = {
                     {"ACACTC", "TruSeq/P5"},
@@ -1659,7 +1263,7 @@ int damage_main(int argc, char** argv) {
                     {"TGGAAT", "TruSeq/R2"},
                     {"GCGAAT", "TruSeq/R2alt"},
                 };
-                std::string top_seq = clip_stubs.empty() ? "" : clip_stubs[0];
+                std::string top_seq = stubs.stubs5.empty() ? "" : stubs.stubs5[0];
                 if (!top_seq.empty()) {
                     const char* name = "unknown";
                     for (const auto& kv : kAdapters)
@@ -1669,20 +1273,6 @@ int damage_main(int argc, char** argv) {
                 }
             }
             j << "    \"depurination_detected\": " << (dp.depurination_detected ? "true" : "false") << ",\n";
-
-            // Short-read spike: fraction of reads in bins with length_hi <= 50.
-            // > 0.20 suggests adapter dimers or failed size-selection.
-            double short_read_frac = -1.0;
-            if (!lsd.bins.empty()) {
-                uint64_t short_reads = 0, total_len_reads = 0;
-                for (const auto& lb : lsd.bins) {
-                    total_len_reads += lb.n_reads;
-                    if (lb.length_hi <= 50) short_reads += lb.n_reads;
-                }
-                if (total_len_reads > 0)
-                    short_read_frac = static_cast<double>(short_reads) / total_len_reads;
-            }
-            bool flag_short_spike = short_read_frac > 0.20;
             j << "    \"short_read_frac\": " << std::setprecision(4)
               << (short_read_frac < 0 ? 0.0 : short_read_frac) << ",\n";
 
@@ -1693,15 +1283,15 @@ int damage_main(int argc, char** argv) {
                 j << "\"" << name << "\"";
                 first_flag = false;
             };
-            if (flag_adapter_5)    emit_flag("adapter_remnant_5prime");
-            if (flag_adapter_3)    emit_flag("adapter_remnant_3prime");
-            if (flag_hex_bias)     emit_flag("hexamer_composition_bias");
-            if (flag_hex_shift)    emit_flag("hexamer_terminal_shift");
-            if (flag_short_spike)  emit_flag("short_read_spike");
-            if (flag_depurin)      emit_flag("depurination");
-            if (flag_ds_3p_absent)    emit_flag("ds_3prime_signal_absent");
-            if (flag_ga3_displaced)   emit_flag("ga3_inward_displaced");
-            if (flag_hex_artifact)    emit_flag("hexamer_artifact_bias");
+            if (flags.adapter_remnant_5prime)   emit_flag("adapter_remnant_5prime");
+            if (flags.adapter_remnant_3prime)   emit_flag("adapter_remnant_3prime");
+            if (flags.hexamer_composition_bias) emit_flag("hexamer_composition_bias");
+            if (flags.hexamer_terminal_shift)   emit_flag("hexamer_terminal_shift");
+            if (flags.short_read_spike)         emit_flag("short_read_spike");
+            if (flags.depurination)             emit_flag("depurination");
+            if (flags.ds_3prime_signal_absent)  emit_flag("ds_3prime_signal_absent");
+            if (flags.ga3_inward_displaced)     emit_flag("ga3_inward_displaced");
+            if (flags.hexamer_artifact_bias)    emit_flag("hexamer_artifact_bias");
             j << "]\n";
             j << "  },\n";
         }
