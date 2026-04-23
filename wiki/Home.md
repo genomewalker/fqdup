@@ -41,8 +41,16 @@ source of false positives.
 observed deamination rate exceeds a threshold are replaced with a neutral byte.
 Two reads that differ only at a masked terminal position then produce the same
 hash and collapse into the same cluster. The mask is derived from the data
-itself (Pass 0) using the same exponential decay model as DART and mapDamage2.
-See [[Damage-Aware-Deduplication]].
+itself (Pass 0) by [libtaph](https://github.com/genomewalker/libtaph), which
+runs the same exponential decay model as DART and mapDamage2 together with a
+7-model BIC library-type classifier. fqdup consumes libtaph's finalized
+`SampleDamageProfile` and computes its own `mask_pos[]` from the finalized
+per-position frequencies and `--mask-threshold`; it does not re-implement the
+core terminal damage estimation or the library-type classifier. Length-stratified
+estimation and the context-aware C→T fit are available through libtaph and are
+exposed by the standalone `fqdup damage` subcommand, but the Pass 0 path used
+by `fqdup derep` and `fqdup extend` runs a single global fit. See
+[[Damage-Aware-Deduplication]].
 
 **PCR error correction.** After the deduplication index is built (Pass 1),
 Phase 3 identifies clusters with low read count that differ from a high-count
