@@ -55,19 +55,24 @@ cause sequence differences between them.
 
 ## Automatic estimation (`--collapse-damage`)
 
-Pass 0 scans all reads before deduplication begins. For each read, `fqdup`
-tallies the T/(T+C) frequency at each of the first 15 positions from the 5' end,
-and A/(A+G) from the 3' end. The background rate is taken from the middle third
-of the read, avoiding terminal damage and adapter composition bias, consistent
-with DART's approach.
+Pass 0 scans all reads before deduplication begins. The per-thread
+accumulation, background estimation, exponential fit, and library-type
+classification all run inside [libtaph](https://github.com/genomewalker/libtaph)
+via `taph::FrameSelector`; fqdup only owns the scan loop and the subsequent
+masking decision.
+
+For each read, libtaph tallies the T/(T+C) frequency at each of the first 15
+positions from the 5' end, and A/(A+G) from the 3' end. The background rate is
+taken from the middle third of the read, avoiding terminal damage and adapter
+composition bias, consistent with DART's approach.
 
 After scanning, a coverage-weighted ordinary least-squares fit in log-space
-(positions 1–9; position 0 is excluded because it can carry first-cycle or
+(positions 1-9; position 0 is excluded because it can carry first-cycle or
 ligation artifacts) gives the exponential parameters. Lambda is clamped to
-[0.05, 0.5]. The excess T/(T+C) at each position is divided by `(1 − bg)` -
-the C fraction of the T+C pool, to convert from raw frequency excess into
-estimated P(C→T) deamination rate, matching DART's convention and making
-`d_max` directly comparable to metaDMG output. The estimated parameters are
+[0.05, 0.5]. The excess T/(T+C) at each position is divided by `(1 - bg)`, the
+C fraction of the T+C pool, to convert from raw frequency excess into estimated
+P(C->T) deamination rate, matching DART's convention and making `d_max`
+directly comparable to metaDMG output. The estimated parameters are
 logged:
 
 ```
@@ -83,9 +88,9 @@ negligible and no masking is applied, standard exact hashing is used.
 
 ## Masking
 
-After fitting, `fqdup` records which positions actually exceeded the
-`--mask-threshold` (default 0.05) in the observed frequencies, not just which
-positions the fitted curve predicts. This empirical approach avoids over-masking
+After libtaph returns the finalized `SampleDamageProfile`, fqdup records which
+positions actually exceeded the `--mask-threshold` (default 0.05) in the
+observed frequencies, not just which positions the fitted curve predicts. This empirical approach avoids over-masking
 when OLS overestimates damage at lightly-affected positions. In practice, 1–3
 terminal positions per end are masked.
 
@@ -172,8 +177,8 @@ patterns:
   3' position from ligation artifacts, without the gradual 3' decay seen in DS.
 
 `fqdup extend` and `fqdup derep` both auto-detect library type through a
-7-model BIC competition (powered by DART's
-[libdart-damage](https://github.com/genomewalker/libdart-damage)) before
+7-model BIC competition (powered by
+[libtaph](https://github.com/genomewalker/libtaph)) before
 fitting the decay parameters. The models jointly evaluate four biological
 channels, 5' C→T, 3' G→A decay, 3' G→A spike at position 0, and 3' C→T
 (SS-original reads only). The winning model determines whether the damage
