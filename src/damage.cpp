@@ -1304,16 +1304,31 @@ int damage_main(int argc, char** argv) {
                 stubs.flag_hex_artifact);
             auto emit_score = [&](const char* name, float v, bool trailing) {
                 j << "    \"" << name << "\": ";
-                if (std::isnan(v)) j << "null";
-                else               j << std::setprecision(4) << v;
+                if (!std::isfinite(v)) j << "null";
+                else                    j << std::setprecision(4) << v;
                 j << (trailing ? ",\n" : "\n");
             };
             auto json_escape = [](const std::string& s) {
-                std::string out; out.reserve(s.size());
-                for (char c : s) {
-                    if (c == '"' || c == '\\') { out += '\\'; out += c; }
-                    else if (c == '\n')        { out += "\\n"; }
-                    else                        { out += c; }
+                std::string out; out.reserve(s.size() + 8);
+                static const char kHex[] = "0123456789abcdef";
+                for (unsigned char c : s) {
+                    switch (c) {
+                        case '"':  out += "\\\""; break;
+                        case '\\': out += "\\\\"; break;
+                        case '\b': out += "\\b";  break;
+                        case '\f': out += "\\f";  break;
+                        case '\n': out += "\\n";  break;
+                        case '\r': out += "\\r";  break;
+                        case '\t': out += "\\t";  break;
+                        default:
+                            if (c < 0x20) {
+                                out += "\\u00";
+                                out += kHex[(c >> 4) & 0xF];
+                                out += kHex[c & 0xF];
+                            } else {
+                                out += static_cast<char>(c);
+                            }
+                    }
                 }
                 return out;
             };
