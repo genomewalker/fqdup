@@ -236,7 +236,8 @@ struct LengthBinDamageProfile {
     // Reference-free trinucleotide spectrum (bulk, from libdart).
     // 64 contexts = prev*16 + mid*4 + next; A=0,C=1,G=2,T=3.
     // Terminal = read pos 1..4 from that end; interior = pos 10..14 (null baseline).
-    // Downstream Python reduces to a 32-channel SBS-like spectrum for COSMIC comparison.
+    // Downstream post-processing can contrast the terminal counters against
+    // their interior counterparts for reference-free context analysis.
     std::array<int64_t, 64> tri_5prime_terminal{};
     std::array<int64_t, 64> tri_5prime_interior{};
     std::array<int64_t, 64> tri_3prime_terminal{};
