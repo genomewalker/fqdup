@@ -1158,8 +1158,10 @@ int damage_main(int argc, char** argv) {
         // Reference-free trinucleotide spectrum (bulk, 64 contexts).
         // Index = prev*16 + mid*4 + next, A=0,C=1,G=2,T=3.
         // Terminal = read pos 1..4 from that end; interior = pos 10..14.
-        // Post-processing (Python) reduces these to a 32-channel SBS-like spectrum
-        // (C→T and G→T in 16 trinucleotide contexts each) for COSMIC comparison.
+        // Post-processing (e.g. in Python) can contrast the 5' and 3' terminal
+        // counters against their interior counterparts to produce a 32-entry
+        // terminal-minus-interior context contrast per end without any external
+        // reference panel or trained model.
         {
             auto emit_arr = [&](const char* name,
                                 const std::array<uint64_t, 64>& v,
@@ -1293,6 +1295,73 @@ int damage_main(int argc, char** argv) {
             if (flags.ga3_inward_displaced)     emit_flag("ga3_inward_displaced");
             if (flags.hexamer_artifact_bias)    emit_flag("hexamer_artifact_bias");
             j << "]\n";
+            j << "  },\n";
+        }
+        {
+            auto dcp = taph::compute_damage_context_profile(
+                dp, cpg_score_z, hex_shift_z,
+                stubs.adapter_clipped, stubs.adapter3_clipped,
+                stubs.flag_hex_artifact);
+            auto emit_score = [&](const char* name, float v, bool trailing) {
+                j << "    \"" << name << "\": ";
+                if (std::isnan(v)) j << "null";
+                else               j << std::setprecision(4) << v;
+                j << (trailing ? ",\n" : "\n");
+            };
+            auto json_escape = [](const std::string& s) {
+                std::string out; out.reserve(s.size());
+                for (char c : s) {
+                    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+                    else if (c == '\n')        { out += "\\n"; }
+                    else                        { out += c; }
+                }
+                return out;
+            };
+            j << "  \"damage_context_profile\": {\n";
+            j << "    \"method\": \"" << dcp.method << "\",\n";
+            j << "    \"reference_required\": "
+              << (dcp.reference_required ? "true" : "false") << ",\n";
+            j << "    \"alignment_required\": "
+              << (dcp.alignment_required ? "true" : "false") << ",\n";
+            j << "    \"dominant_process\": \""
+              << dcp.dominant_process_str << "\",\n";
+            j << "    \"interpretation\": \""
+              << json_escape(dcp.interpretation) << "\",\n";
+            emit_score("terminal_deamination_score",  dcp.terminal_deamination_score,  true);
+            emit_score("cpg_context_score",           dcp.cpg_context_score,           true);
+            emit_score("dipyrimidine_context_score",  dcp.dipyrimidine_context_score,  true);
+            emit_score("oxidative_context_score",     dcp.oxidative_context_score,     true);
+            emit_score("fragmentation_context_score", dcp.fragmentation_context_score, true);
+            emit_score("library_artifact_score",      dcp.library_artifact_score,      true);
+            j << "    \"evidence\": {\n";
+            j << "      \"d_max_5\": "           << std::setprecision(6) << dcp.evidence.d_max_5 << ",\n";
+            j << "      \"d_max_3\": "           << dcp.evidence.d_max_3 << ",\n";
+            j << "      \"lambda_5\": "          << dcp.evidence.lambda_5 << ",\n";
+            j << "      \"lambda_3\": "          << dcp.evidence.lambda_3 << ",\n";
+            j << "      \"log2_cpg_ratio\": "
+              << (std::isnan(dcp.evidence.log2_cpg_ratio) ? std::string("null")
+                  : std::to_string(dcp.evidence.log2_cpg_ratio)) << ",\n";
+            j << "      \"cpg_z\": "             << dcp.evidence.cpg_z << ",\n";
+            j << "      \"dipyr_contrast\": "
+              << (std::isnan(dcp.evidence.dipyr_contrast) ? std::string("null")
+                  : std::to_string(dcp.evidence.dipyr_contrast)) << ",\n";
+            j << "      \"ox_gt_asymmetry\": "   << dcp.evidence.ox_gt_asymmetry << ",\n";
+            j << "      \"s_oxog_mean\": "       << dcp.evidence.s_oxog_mean << ",\n";
+            j << "      \"s_oxog_max\": "        << dcp.evidence.s_oxog_max << ",\n";
+            j << "      \"purine_enrichment_5prime\": " << dcp.evidence.purine_enrichment_5prime << ",\n";
+            j << "      \"hex_shift_z\": "       << dcp.evidence.hex_shift_z << ",\n";
+            j << "      \"adapter_clipped\": "
+              << (dcp.evidence.adapter_clipped ? "true" : "false") << ",\n";
+            j << "      \"adapter3_clipped\": "
+              << (dcp.evidence.adapter3_clipped ? "true" : "false") << ",\n";
+            j << "      \"flag_hex_artifact\": "
+              << (dcp.evidence.flag_hex_artifact ? "true" : "false") << ",\n";
+            j << "      \"position_0_artifact_5prime\": "
+              << (dcp.evidence.position_0_artifact_5prime ? "true" : "false") << ",\n";
+            j << "      \"position_0_artifact_3prime\": "
+              << (dcp.evidence.position_0_artifact_3prime ? "true" : "false") << ",\n";
+            j << "      \"n_reads\": " << dcp.evidence.n_reads << "\n";
+            j << "    }\n";
             j << "  },\n";
         }
         j << "  \"bic\": {\n";
