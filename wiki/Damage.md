@@ -119,6 +119,34 @@ pos	end5	freq5	end3	freq3	mask	cov5	cov3
 
 `freq` values are −1 when coverage at that position is below 100 reads.
 
+### Damage-context profile (JSON only)
+
+The `--json` output includes a `damage_context_profile` block, a training-free, reference-free, alignment-free summary computed by libtaph's `compute_damage_context_profile`. Six scores in `[0, 1]` (or `null` when not evaluable) plus a deterministic `dominant_process` label:
+
+```json
+"damage_context_profile": {
+  "method": "training_free",
+  "reference_required": false,
+  "alignment_required": false,
+  "dominant_process": "cytosine_deamination",
+  "interpretation": "terminal C->T / G->A enrichment consistent with post-mortem cytosine deamination",
+  "terminal_deamination_score": 0.87,
+  "cpg_context_score": 0.42,
+  "dipyrimidine_context_score": 0.06,
+  "oxidative_context_score": 0.03,
+  "fragmentation_context_score": 0.31,
+  "library_artifact_score": 0.04,
+  "evidence": { "d_max_5": 0.193, "d_max_3": 0.040, "lambda_5": 0.246,
+                "log2_cpg_ratio": 0.38, "dipyr_contrast": 0.004,
+                "ox_gt_asymmetry": 0.012, "s_oxog_mean": 0.003,
+                "purine_enrichment_5prime": 0.021, "hex_shift_z": 1.2,
+                "adapter_clipped": false, "flag_hex_artifact": false,
+                "n_reads": 5582073 }
+}
+```
+
+The `dominant_process` label is one of `cytosine_deamination`, `cpg_enriched_deamination`, `dipyrimidine_biased`, `oxidative_like`, `fragmentation_bias`, `library_artifact_likely`, `low_damage`, or `none` (insufficient coverage). Rule order and the score formulas are documented in the libtaph methods page.
+
 ---
 
 ## Typical workflow
