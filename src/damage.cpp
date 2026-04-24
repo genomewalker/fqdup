@@ -1377,6 +1377,8 @@ int damage_main(int argc, char** argv) {
               << (dcp.evidence.position_0_artifact_5prime ? "true" : "false") << ",\n";
             j << "      \"position_0_artifact_3prime\": "
               << (dcp.evidence.position_0_artifact_3prime ? "true" : "false") << ",\n";
+            j << "      \"fit_offset_5prime\": " << dcp.evidence.fit_offset_5prime << ",\n";
+            j << "      \"fit_offset_3prime\": " << dcp.evidence.fit_offset_3prime << ",\n";
             j << "      \"n_reads\": " << dcp.evidence.n_reads << "\n";
             j << "    }\n";
             j << "  },\n";
