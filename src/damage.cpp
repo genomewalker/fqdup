@@ -1333,23 +1333,25 @@ int damage_main(int argc, char** argv) {
             emit_score("oxidative_context_score",     dcp.oxidative_context_score,     true);
             emit_score("fragmentation_context_score", dcp.fragmentation_context_score, true);
             emit_score("library_artifact_score",      dcp.library_artifact_score,      true);
+            auto emit_f = [&](const char* name, float v, bool trailing) {
+                j << "      \"" << name << "\": ";
+                if (std::isnan(v) || std::isinf(v)) j << "null";
+                else                                 j << std::setprecision(6) << v;
+                j << (trailing ? ",\n" : "\n");
+            };
             j << "    \"evidence\": {\n";
-            j << "      \"d_max_5\": "           << std::setprecision(6) << dcp.evidence.d_max_5 << ",\n";
-            j << "      \"d_max_3\": "           << dcp.evidence.d_max_3 << ",\n";
-            j << "      \"lambda_5\": "          << dcp.evidence.lambda_5 << ",\n";
-            j << "      \"lambda_3\": "          << dcp.evidence.lambda_3 << ",\n";
-            j << "      \"log2_cpg_ratio\": "
-              << (std::isnan(dcp.evidence.log2_cpg_ratio) ? std::string("null")
-                  : std::to_string(dcp.evidence.log2_cpg_ratio)) << ",\n";
-            j << "      \"cpg_z\": "             << dcp.evidence.cpg_z << ",\n";
-            j << "      \"dipyr_contrast\": "
-              << (std::isnan(dcp.evidence.dipyr_contrast) ? std::string("null")
-                  : std::to_string(dcp.evidence.dipyr_contrast)) << ",\n";
-            j << "      \"ox_gt_asymmetry\": "   << dcp.evidence.ox_gt_asymmetry << ",\n";
-            j << "      \"s_oxog_mean\": "       << dcp.evidence.s_oxog_mean << ",\n";
-            j << "      \"s_oxog_max\": "        << dcp.evidence.s_oxog_max << ",\n";
-            j << "      \"purine_enrichment_5prime\": " << dcp.evidence.purine_enrichment_5prime << ",\n";
-            j << "      \"hex_shift_z\": "       << dcp.evidence.hex_shift_z << ",\n";
+            emit_f("d_max_5",                  dcp.evidence.d_max_5,                  true);
+            emit_f("d_max_3",                  dcp.evidence.d_max_3,                  true);
+            emit_f("lambda_5",                 dcp.evidence.lambda_5,                 true);
+            emit_f("lambda_3",                 dcp.evidence.lambda_3,                 true);
+            emit_f("log2_cpg_ratio",           dcp.evidence.log2_cpg_ratio,           true);
+            emit_f("cpg_z",                    dcp.evidence.cpg_z,                    true);
+            emit_f("dipyr_contrast",           dcp.evidence.dipyr_contrast,           true);
+            emit_f("ox_gt_asymmetry",          dcp.evidence.ox_gt_asymmetry,          true);
+            emit_f("s_oxog_mean",              dcp.evidence.s_oxog_mean,              true);
+            emit_f("s_oxog_max",               dcp.evidence.s_oxog_max,               true);
+            emit_f("purine_enrichment_5prime", dcp.evidence.purine_enrichment_5prime, true);
+            emit_f("hex_shift_z",              dcp.evidence.hex_shift_z,              true);
             j << "      \"adapter_clipped\": "
               << (dcp.evidence.adapter_clipped ? "true" : "false") << ",\n";
             j << "      \"adapter3_clipped\": "
