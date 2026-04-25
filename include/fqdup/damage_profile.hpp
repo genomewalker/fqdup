@@ -70,7 +70,11 @@ struct DamageProfile {
     // apply_damage_mask() uses max(mask_pos[i], mask_pos[j]) semantics so that
     // position p from the 5' end and position p from the 3' end are treated
     // identically regardless of which strand is processed.
-    static constexpr int MASK_POSITIONS = 15;
+    // Upper bound on terminal positions tracked for damage masking.
+    // 32 covers extreme aDNA scenarios (very heavy deamination > 20 bp deep)
+    // while staying tiny in memory (~32 B per profile). All loops use this
+    // constant directly — bump and recompile to extend further.
+    static constexpr int MASK_POSITIONS = 32;
     bool mask_pos[MASK_POSITIONS] = {};
 
     // Populate mask_pos from the fitted exponential model.
@@ -86,6 +90,17 @@ struct DamageProfile {
     // Helpers retained for expected_mismatches() and informational logging only.
     double dmg_5(int p) const { return d_max_5prime * std::exp(-lambda_5prime * p); }
     double dmg_3(int p) const { return d_max_3prime * std::exp(-lambda_3prime * p); }
+
+    // P(damage-driven mismatch at pos) for a read of length L. Used by Phase 3
+    // LR scoring (T5.2) to weigh damage-channel mismatches. ss_mode applies
+    // C→T at both ends; ds_mode applies C→T at 5' and G→A at 3'. Caller is
+    // responsible for checking that the mismatch alt is in the damage channel.
+    double p_damage_at(int pos, int L) const {
+        if (!enabled || L <= 0) return 0.0;
+        double d5 = dmg_5(pos);
+        double d3 = dmg_3(L - 1 - pos);
+        return std::max(d5, d3);  // either end can drive damage at this position
+    }
 
     double expected_mismatches(int L) const {
         // d_max and the exponential model are defined on the conditional T/(T+C)
