@@ -621,6 +621,15 @@ int damage_main(int argc, char** argv) {
               << "  DS=" << dp.library_bic_ds
               << "  SS=" << dp.library_bic_ss
               << "  SS_full=" << dp.library_bic_mix << "\n";
+    if (dp.library_type_evaluable) {
+        std::cout << "  post p_ds=" << std::fixed << std::setprecision(3) << dp.library_p_ds
+                  << "  p_ss=" << dp.library_p_ss
+                  << "  p_bias=" << dp.library_p_bias
+                  << "  p_winner=" << dp.library_p_winner
+                  << (dp.library_p_winner < taph::SampleDamageProfile::kLibraryTypeConfidenceThreshold
+                          ? "  [low confidence]" : "")
+                  << "\n";
+    }
     std::cout << "  fit  CT5_amp=" << std::setprecision(4) << dp.libtype_amp_ct5
               << "  ΔBIC=" << std::setprecision(1) << dp.libtype_dbic_ct5
               << "  GA3_amp=" << dp.libtype_amp_ga3
@@ -858,6 +867,11 @@ int damage_main(int argc, char** argv) {
         j << "  \"library_type\": \"" << dp.library_type_str() << "\",\n";
         j << "  \"library_type_auto\": " << (dp.library_type_auto_detected ? "true" : "false") << ",\n";
         j << "  \"library_type_rescued\": " << (dp.library_type_rescued ? "true" : "false") << ",\n";
+        j << "  \"library_type_evaluable\": " << (dp.library_type_evaluable ? "true" : "false") << ",\n";
+        j << "  \"library_p_ds\": " << std::setprecision(6) << dp.library_p_ds << ",\n";
+        j << "  \"library_p_ss\": " << dp.library_p_ss << ",\n";
+        j << "  \"library_p_bias\": " << dp.library_p_bias << ",\n";
+        j << "  \"library_p_winner\": " << dp.library_p_winner << ",\n";
         const char* ds_str = (dp.damage_status == taph::SampleDamageProfile::DamageStatus::PRESENT) ? "present"
                            : (dp.damage_status == taph::SampleDamageProfile::DamageStatus::WEAK)    ? "weak"
                            : "absent";
@@ -1400,7 +1414,12 @@ int damage_main(int argc, char** argv) {
         j << "    \"ct5_amp\": " << std::setprecision(6) << dp.libtype_amp_ct5 << ",\n";
         j << "    \"ga3_amp\": " << dp.libtype_amp_ga3 << ",\n";
         j << "    \"ga0_amp\": " << dp.libtype_amp_ga0 << ",\n";
-        j << "    \"ct3_amp\": " << dp.libtype_amp_ct3 << "\n";
+        j << "    \"ct3_amp\": " << dp.libtype_amp_ct3 << ",\n";
+        j << "    \"p_ds\": " << dp.library_p_ds << ",\n";
+        j << "    \"p_ss\": " << dp.library_p_ss << ",\n";
+        j << "    \"p_bias\": " << dp.library_p_bias << ",\n";
+        j << "    \"p_winner\": " << dp.library_p_winner << ",\n";
+        j << "    \"evaluable\": " << (dp.library_type_evaluable ? "true" : "false") << "\n";
         j << "  }\n";
         j << "}\n";
         std::cout << "JSON written: " << json_path << "\n";
