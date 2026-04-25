@@ -1014,6 +1014,9 @@ private:
                     else             { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h2) ++stats.edge_lr_absorbed;
                     else           ++stats.edge_lr_protected;
+                    int ob = fqdup::errcor_emp::occ_bin(e.bundle_occ);
+                    if (absorb_h2) ++stats.edge_lr_absorbed_by_occ[ob];
+                    else           ++stats.edge_lr_protected_by_occ[ob];
                 } else {
                     absorb_h2 = !snp_veto_h2;
                     if (snp_veto_h2) ++stats.edge_legacy_veto;
@@ -1073,6 +1076,9 @@ private:
                     else          { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h1) ++stats.edge_lr_absorbed;
                     else           ++stats.edge_lr_protected;
+                    int ob = fqdup::errcor_emp::occ_bin(e.bundle_occ);
+                    if (absorb_h1) ++stats.edge_lr_absorbed_by_occ[ob];
+                    else           ++stats.edge_lr_protected_by_occ[ob];
                 } else {
                     absorb_h1 = !snp_veto;
                     if (snp_veto) ++stats.edge_legacy_veto;
