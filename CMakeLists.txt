@@ -10,6 +10,14 @@ include_directories(include)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 
+# zstd — required for .fqcl v2 per-block compression
+find_path(ZSTD_INCLUDE_DIR zstd.h)
+find_library(ZSTD_LIB NAMES zstd)
+if(NOT ZSTD_INCLUDE_DIR OR NOT ZSTD_LIB)
+    message(FATAL_ERROR "zstd not found. Install libzstd-dev or conda package 'zstd'")
+endif()
+message(STATUS "Found zstd: include=${ZSTD_INCLUDE_DIR} lib=${ZSTD_LIB}")
+
 # xxHash (XXH3) - required
 find_path(XXHASH_INCLUDE_DIR xxhash.h)
 find_library(XXHASH_LIB NAMES xxhash)
@@ -106,10 +114,13 @@ add_executable(fqdup
     src/gen.cpp
     src/fastq_io_backend.cpp
     src/logger.cpp
+    src/cluster_format.cpp
+    src/view.cpp
 )
 
 target_include_directories(fqdup PRIVATE
     ${XXHASH_INCLUDE_DIR}
+    ${ZSTD_INCLUDE_DIR}
     ${flat_hash_map_SOURCE_DIR}
     ${bbhash_SOURCE_DIR}
 )
@@ -118,6 +129,7 @@ target_link_libraries(fqdup PRIVATE
     ZLIB::ZLIB
     Threads::Threads
     ${XXHASH_LIB}
+    ${ZSTD_LIB}
     rapidgzip::rapidgzip
     taph
 )
@@ -146,6 +158,12 @@ target_compile_options(gen_synthetic PRIVATE -O2)
 
 add_executable(gen_genome_frags tests/gen_genome_frags.cpp)
 target_compile_options(gen_genome_frags PRIVATE -O2)
+
+add_executable(test_cluster_format tests/test_cluster_format.cpp src/cluster_format.cpp)
+target_include_directories(test_cluster_format PRIVATE include ${ZSTD_INCLUDE_DIR})
+target_link_libraries(test_cluster_format PRIVATE ${ZSTD_LIB})
+target_compile_options(test_cluster_format PRIVATE -O2)
+add_test(NAME cluster_format COMMAND test_cluster_format)
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
     add_test(NAME smoke
