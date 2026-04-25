@@ -63,8 +63,16 @@ static DamageProfile estimate_damage_impl(
     double background = (bg_5 + bg_3) / 2.0;
     double d_max_combined = dart_profile.d_max_combined;
 
-    const bool is_ss = (dart_profile.library_type ==
-                        taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+    bool is_ss = (dart_profile.library_type ==
+                  taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+    // Neutral fallback: when libtaph reports UNKNOWN (low confidence or
+    // unevaluable), pick the orientation with the higher posterior so the
+    // downstream binary ss_mode flag still does the least-biased thing.
+    if (dart_profile.library_type ==
+            taph::SampleDamageProfile::LibraryType::UNKNOWN &&
+        dart_profile.library_type_evaluable) {
+        is_ss = (dart_profile.library_p_ss > dart_profile.library_p_ds);
+    }
 
     DamageProfile profile;
     profile.d_max_5prime   = d_max_5;
@@ -566,8 +574,13 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         lb.cpg_contrast  = pr.cpg_contrast;
         lb.validated     = pr.damage_validated;
         lb.source        = pr.d_max_source_str();
-        const bool bin_is_ss = (pr.library_type ==
-                                taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+        bool bin_is_ss = (pr.library_type ==
+                          taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+        if (pr.library_type ==
+                taph::SampleDamageProfile::LibraryType::UNKNOWN &&
+            pr.library_type_evaluable) {
+            bin_is_ss = (pr.library_p_ss > pr.library_p_ds);
+        }
         lb.ss_mode = bin_is_ss;
         for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
             double cov5 = pr.tc_total_5prime[p];
