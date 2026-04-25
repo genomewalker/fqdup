@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <zlib.h>
@@ -45,632 +47,29 @@ extern "C" {
 }
 #endif
 
+#include "fqdup/lr_score.hpp"
+#include "fqdup/errcor_empirical.hpp"
+#include "fqdup/bundle_key.hpp"
+
 // fastq_common.hpp provides: FastqRecord, FastqReader, FastqReaderIgzip,
 // FastqWriter, SequenceFingerprint, SequenceFingerprintHash, canonical_hash,
 // revcomp, trim_id, shell_escape_path, GZBUF_SIZE — all in anonymous namespace.
+#include "fqdup/cluster_format.hpp"
 #include "fqdup/damage_profile.hpp"
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
 #include "flat_hash_map.hpp"
 
+#include "derep_detail/encoding.hpp"
+#include "derep_detail/packed_ops.hpp"
+#include "derep_detail/arena.hpp"
+#include "derep_detail/damage_keys.hpp"
+
 // All file-local types are in an anonymous namespace to give their member
 // functions internal linkage, avoiding ODR violations with other TUs.
 namespace {
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
-struct ErrCorParams {
-    bool     enabled          = false;
-    double   snp_threshold    = 0.20; // sig_count_weighted/parent_count >= this → SNP protection
-    uint32_t snp_min_count    = 1;    // absolute minimum sig_count for SNP veto on strict-dominance edges
-    uint32_t snp_low_cov_cutoff = 10;   // parent count below which adaptive threshold applies
-    double   snp_low_cov_factor = 1.75; // snp_threshold multiplier when parent_count < cutoff
-    uint32_t bucket_cap       = 64;
-    double   pcr_phi          = 5.3e-7;
-    double   pcr_rate         = 0.0;  // still estimated for logging but no longer gates absorption
-    uint32_t max_h2_count     = 2;    // H=2 absorption only when child count ≤ this
-};
-
-struct Phase3Stats {
-    double decode_hash_parent_ms = 0;
-    double insert_ms             = 0;
-    double decode_hash_child_ms  = 0;
-    double query_ms              = 0;
-    double check_ms              = 0;
-    uint64_t total_candidates    = 0;
-    uint64_t cap_fires           = 0;
-    uint64_t children_scanned    = 0;
-    uint64_t parents_indexed     = 0;
-    uint64_t children_found      = 0;  // H=1 child-parent pairs detected
-    uint64_t snp_protected       = 0;  // children not absorbed due to SNP veto
-    uint64_t absorbed            = 0;  // children absorbed as PCR errors
-    void log() const {
-        auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
-        log_info("Phase 3 timing:");
-        log_info("  Parent decode+hash : " + f(decode_hash_parent_ms));
-        log_info("  Parent insert      : " + f(insert_ms));
-        log_info("  Child decode+hash  : " + f(decode_hash_child_ms));
-        log_info("  Child query        : " + f(query_ms));
-        log_info("  Candidate check    : " + f(check_ms));
-        log_info("  Parents indexed    : " + std::to_string(parents_indexed));
-        log_info("  Children scanned   : " + std::to_string(children_scanned));
-        log_info("  Children found     : " + std::to_string(children_found));
-        log_info("  SNP protected      : " + std::to_string(snp_protected));
-        log_info("  Absorbed           : " + std::to_string(absorbed));
-        log_info("  Total candidates   : " + std::to_string(total_candidates));
-        if (children_scanned > 0)
-            log_info("  Avg cand/child     : " +
-                     std::to_string(static_cast<double>(total_candidates)/children_scanned));
-        log_info("  Bucket cap fires   : " + std::to_string(cap_fires));
-        if (cap_fires > 0)
-            log_warn("Phase 3: " + std::to_string(cap_fires) +
-                     " bucket cap fire(s) — some PCR error candidates were not evaluated. "
-                     "Consider increasing --errcor-bucket-cap (current cap applied at index build).");
-    }
-};
-
-// ============================================================================
-// Index entry — single-file version (no non_len; seq_id for error correction)
-// ============================================================================
-
-struct IndexEntry {
-    uint64_t record_index;  // sequential record number of the representative
-    uint64_t count;         // total reads in this cluster
-    uint32_t seq_id;        // index into SeqArena (populated when --error-correct)
-    uint8_t  damage_score;  // terminal C→T (5') + G→A (3') count of representative
-
-    IndexEntry() : record_index(0), count(1), seq_id(0), damage_score(0) {}
-    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0), damage_score(0) {}
-};
-
-// ============================================================================
-// Phase 3: PCR Error Correction data structures
-//
-// Count-stratified 4-way pigeonhole neighbor finding for H≤2 detection.
-// Reads with count <= max_count that have a neighbour with count >= ratio ×
-// their own count are classified as PCR error duplicates.
-//
-// 4-way pigeonhole: split interior [k5, L-k3) into four parts p0, p1, p2, p3.
-// If Hamming(child, parent) ≤ 2 inside the interior, at least 2 of the 4
-// parts match exactly.  We index all C(4,2)=6 pair combinations so any
-// 1- or 2-error variant is found by at least one lookup.
-// ============================================================================
-
-// 2-bit base helpers — defined before SeqArena which uses them.
-static constexpr uint8_t kDec2bit[4] = {'A', 'C', 'G', 'T'};
-static const std::array<uint8_t, 256> kEnc2bit = [] {
-    std::array<uint8_t, 256> lut{};
-    lut.fill(0xFFu);
-    lut[static_cast<uint8_t>('A')] = lut[static_cast<uint8_t>('a')] = 0u;
-    lut[static_cast<uint8_t>('C')] = lut[static_cast<uint8_t>('c')] = 1u;
-    lut[static_cast<uint8_t>('G')] = lut[static_cast<uint8_t>('g')] = 2u;
-    lut[static_cast<uint8_t>('T')] = lut[static_cast<uint8_t>('t')] = 3u;
-    return lut;
-}();
-
-static const std::array<std::array<uint8_t, 4>, 256> kDec4 = [] {
-    std::array<std::array<uint8_t, 4>, 256> lut{};
-    for (int v = 0; v < 256; ++v) {
-        lut[v][0] = kDec2bit[(v >> 6) & 0x3u];
-        lut[v][1] = kDec2bit[(v >> 4) & 0x3u];
-        lut[v][2] = kDec2bit[(v >> 2) & 0x3u];
-        lut[v][3] = kDec2bit[(v >> 0) & 0x3u];
-    }
-    return lut;
-}();
-
-// 2-bit packed sequence arena.  Reduces memory ~4× vs ASCII storage.
-// Non-ACGT bases (N etc.) are encoded as A=0 and the sequence is flagged
-// ineligible so Phase 3 skips it (avoids false PCR error absorptions).
-struct SeqArena {
-    std::vector<uint8_t>  packed;    // 2-bit data; (L+3)/4 bytes per sequence
-    std::vector<uint64_t> offsets;   // byte offset of each sequence start
-    std::vector<uint16_t> lengths;   // base lengths
-    std::vector<bool>     eligible;  // false when sequence contains non-ACGT
-
-    uint32_t append(const std::string& seq) {
-        if (seq.size() > 65535u)
-            throw std::runtime_error("Sequence too long for arena (>65535 bp)");
-        if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-            throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
-        uint32_t id    = static_cast<uint32_t>(offsets.size());
-        uint16_t L     = static_cast<uint16_t>(seq.size());
-        int      nbytes = (L + 3) / 4;
-        offsets.push_back(packed.size());
-        lengths.push_back(L);
-        packed.resize(packed.size() + nbytes, 0);
-        uint8_t* dst = packed.data() + offsets[id];
-        bool ok = true;
-        int i = 0, byte = 0;
-        while (i < L) {
-            uint8_t v = 0;
-            for (int lane = 0; lane < 4 && i < L; ++lane, ++i) {
-                uint8_t b = kEnc2bit[static_cast<uint8_t>(seq[i])];
-                if (b == 0xFFu) { ok = false; b = 0; }
-                v |= static_cast<uint8_t>(b << (6 - 2 * lane));
-            }
-            dst[byte++] = v;
-        }
-        eligible.push_back(ok);
-        return id;
-    }
-
-    uint32_t append_chars(const char* data_in, int L) {
-        if (L > 65535)
-            throw std::runtime_error("Sequence too long for arena (>65535 bp)");
-        if (offsets.size() >= static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-            throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
-        uint32_t id    = static_cast<uint32_t>(offsets.size());
-        int      nbytes = (L + 3) / 4;
-        offsets.push_back(packed.size());
-        lengths.push_back(static_cast<uint16_t>(L));
-        packed.resize(packed.size() + nbytes, 0);
-        uint8_t* dst = packed.data() + offsets[id];
-        bool ok = true;
-        int i = 0, byte = 0;
-        while (i < L) {
-            uint8_t v = 0;
-            for (int lane = 0; lane < 4 && i < L; ++lane, ++i) {
-                uint8_t b = kEnc2bit[static_cast<uint8_t>(data_in[i])];
-                if (b == 0xFFu) { ok = false; b = 0; }
-                v |= static_cast<uint8_t>(b << (6 - 2 * lane));
-            }
-            dst[byte++] = v;
-        }
-        eligible.push_back(ok);
-        return id;
-    }
-
-    const uint8_t* data(uint32_t id)        const { return packed.data() + offsets[id]; }
-    uint16_t       length(uint32_t id)      const { return lengths[id]; }
-    bool           is_eligible(uint32_t id) const { return eligible[id]; }
-    size_t         size()                   const { return offsets.size(); }
-
-    // Decode bases [start, start+count) to ASCII scratch buffer.
-    void decode_range(uint32_t id, int start, int count, uint8_t* out) const {
-        const uint8_t* p = data(id);
-        int i = 0;
-        int pos = start;
-
-        // Handle leading unaligned bases until we can decode full bytes.
-        while (i < count && (pos & 3) != 0) {
-            out[i++] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
-            ++pos;
-        }
-
-        while (i + 4 <= count) {
-            const auto& d = kDec4[p[pos >> 2]];
-            std::memcpy(out + i, d.data(), 4);
-            i += 4;
-            pos += 4;
-        }
-
-        while (i < count) {
-            out[i++] = kDec2bit[(p[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u];
-            ++pos;
-        }
-    }
-};
-
-struct FlatPairIndex {
-    std::vector<uint64_t> keys;
-    std::vector<uint32_t> offsets;
-    std::vector<uint32_t> ids;
-
-    template <typename F>
-    void query(uint64_t key, F&& fn) const {
-        auto it = std::lower_bound(keys.begin(), keys.end(), key);
-        if (it == keys.end() || *it != key) return;
-        size_t idx = static_cast<size_t>(it - keys.begin());
-        for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
-            fn(ids[i]);
-    }
-};
-
-static inline void split4_lens(int ilen, int& s0, int& s1, int& s2, int& s3) {
-    s0 = ilen / 4;
-    s1 = ilen * 2 / 4 - s0;
-    s2 = ilen * 3 / 4 - s0 - s1;
-    s3 = ilen - s0 - s1 - s2;
-}
-
-static inline uint64_t splitmix64(uint64_t x) {
-    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
-    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
-}
-
-static inline uint64_t rotl64(uint64_t x, int k) {
-    return (x << k) | (x >> (64 - k));
-}
-
-static inline uint64_t pair_key(uint64_t ha, uint64_t hb, int tag, int ilen) {
-    if (ha > hb) std::swap(ha, hb);
-    return splitmix64(ha ^ rotl64(hb, 23)
-                      ^ (static_cast<uint64_t>(tag) << 56)
-                      ^ static_cast<uint64_t>(ilen));
-}
-
-
-// Count Hamming mismatches between packed interiors [k5, k5+ilen).
-// Returns the count, stopping at max_mm+1 (early exit if exceeded).
-static int packed_hamming(const uint8_t* pa, const uint8_t* pb,
-                           int k5, int ilen, int max_mm) {
-    int mismatches = 0;
-    for (int i = 0; i < ilen && mismatches <= max_mm; ) {
-        int pos    = k5 + i;
-        int byte_i = pos >> 2;
-        int bit_i  = pos & 3;
-        if (bit_i == 0 && i + 4 <= ilen) {
-            uint8_t diff = pa[byte_i] ^ pb[byte_i];
-            if (diff) mismatches += __builtin_popcount((diff | (diff >> 1)) & 0x55u);
-            i += 4;
-        } else {
-            uint8_t sh = 6 - 2 * bit_i;
-            if (((pa[byte_i] >> sh) & 0x3u) != ((pb[byte_i] >> sh) & 0x3u)) ++mismatches;
-            ++i;
-        }
-    }
-    return mismatches;
-}
-
-// Returns true if the substitution a→b (or b→a) is damage-consistent
-// using 2-bit encoded values.
-//
-// XOR analysis (A=0,C=1,G=2,T=3):
-//   xr=1 (01b): G↔T (10^11) or C↔A (01^00) — 8-oxoG, protect in damage mode
-//   xr=2 (10b): G↔A (10^00) or C↔T (01^11) — deamination, protect in damage mode
-//   xr=3 (11b): A↔T or C↔G — transversions, never damage
-static bool is_damage_sub_packed(uint8_t a, uint8_t b, bool /*protect_deamination*/) {
-    // C↔T (xr=2) and G↔A/C↔A/G↔T (xr=1) are the defining aDNA damage signatures.
-    // They are ALWAYS protected from error-correction absorption regardless of whether
-    // --collapse-damage is active: even without explicit damage mode these substitutions
-    // are too suspicious to absorb (could be genuine variants or undetected damage).
-    // A↔T / C↔G (xr=3): transversions — no known damage mechanism, always absorbable.
-    uint8_t xr = a ^ b;
-    return (xr == 1u || xr == 2u);
-}
-
-// Scan interior region [k5, k5+ilen) of two 2-bit packed sequences.
-// Returns true if child should be absorbed by parent: exactly 1 interior
-// mismatch AND the substitution is NOT damage-consistent.
-// Fast path: full-byte XOR with 2-bit popcount via (x | x>>1) & 0x55.
-static bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
-                                  int k5, int ilen, bool protect_deamination) {
-    int mismatches = 0;
-    uint8_t mm_a = 0, mm_b = 0;
-
-    for (int i = 0; i < ilen; ) {
-        int pos   = k5 + i;
-        int byte_i = pos >> 2;
-        int bit_i  = pos & 3;
-
-        if (bit_i == 0 && i + 4 <= ilen) {
-            // Full aligned byte: check all 4 bases at once
-            uint8_t diff = pa[byte_i] ^ pb[byte_i];
-            if (diff) {
-                uint8_t any = (diff | (diff >> 1)) & 0x55u;
-                int byte_mismatches = __builtin_popcount(any);
-                mismatches += byte_mismatches;
-                if (mismatches > 1) return false;
-                if (byte_mismatches == 1) {
-                    uint8_t sh = static_cast<uint8_t>(__builtin_ctz(any));
-                    mm_a = (pa[byte_i] >> sh) & 0x3u;
-                    mm_b = (pb[byte_i] >> sh) & 0x3u;
-                }
-            }
-            i += 4;
-        } else {
-            // Partial byte: single base
-            uint8_t sh = 6 - 2 * bit_i;
-            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
-            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
-            if (ba != bb) {
-                if (++mismatches > 1) return false;
-                mm_a = ba; mm_b = bb;
-            }
-            ++i;
-        }
-    }
-    return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_deamination);
-}
-
-struct MismatchInfo {
-    bool     found;
-    uint16_t position;  // interior-relative position (0-based) of the single mismatch
-    uint8_t  base_a;    // parent's 2-bit base
-    uint8_t  base_b;    // child's 2-bit base
-};
-
-// Like packed_should_absorb but also returns position and bases of the single mismatch.
-// Returns {false,...} if mismatches != 1 or the substitution is damage-consistent.
-static MismatchInfo packed_find_mismatch(const uint8_t* pa, const uint8_t* pb,
-                                          int k5, int ilen, bool protect_deamination) {
-    int mismatches = 0;
-    uint8_t mm_a = 0, mm_b = 0;
-    uint16_t mm_pos = 0;
-
-    for (int i = 0; i < ilen; ) {
-        int pos    = k5 + i;
-        int byte_i = pos >> 2;
-        int bit_i  = pos & 3;
-
-        if (bit_i == 0 && i + 4 <= ilen) {
-            uint8_t diff = pa[byte_i] ^ pb[byte_i];
-            if (diff) {
-                uint8_t any = (diff | (diff >> 1)) & 0x55u;
-                int nm = __builtin_popcount(any);
-                mismatches += nm;
-                if (mismatches > 1) return {false, 0, 0, 0};
-                if (nm == 1) {
-                    uint8_t sh = static_cast<uint8_t>(__builtin_ctz(any));
-                    mm_a = (pa[byte_i] >> sh) & 0x3u;
-                    mm_b = (pb[byte_i] >> sh) & 0x3u;
-                    // sh is 0,2,4,6 bits from MSB side → offset within 4-base block
-                    // Bit position from MSB: bit 7=base0, bit 5=base1, bit 3=base2, bit 1=base3
-                    // sh=6→base0, sh=4→base1, sh=2→base2, sh=0→base3
-                    mm_pos = static_cast<uint16_t>(i + (3 - (sh >> 1)));
-                }
-            }
-            i += 4;
-        } else {
-            uint8_t sh = static_cast<uint8_t>(6 - 2 * bit_i);
-            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
-            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
-            if (ba != bb) {
-                if (++mismatches > 1) return {false, 0, 0, 0};
-                mm_a = ba; mm_b = bb;
-                mm_pos = static_cast<uint16_t>(i);
-            }
-            ++i;
-        }
-    }
-    if (mismatches != 1) return {false, 0, 0, 0};
-    if (is_damage_sub_packed(mm_a, mm_b, protect_deamination)) return {false, 0, 0, 0};
-    return {true, mm_pos, mm_a, mm_b};
-}
-
-// Returns up to 2 mismatches between packed interiors [k5, k5+ilen).
-// No damage filtering — caller is responsible.
-// r.count == 3 means more than 2 mismatches (rejected).
-struct MismatchInfo2 {
-    int     count;
-    uint16_t pos[2];
-    uint8_t  base_a[2];  // parent's 2-bit base
-    uint8_t  base_b[2];  // child's 2-bit base
-};
-
-static MismatchInfo2 packed_find_mismatches2(const uint8_t* pa, const uint8_t* pb,
-                                              int k5, int ilen) {
-    MismatchInfo2 r{};
-    for (int i = 0; i < ilen; ) {
-        int pos    = k5 + i;
-        int byte_i = pos >> 2;
-        int bit_i  = pos & 3;
-        if (bit_i == 0 && i + 4 <= ilen) {
-            uint8_t diff = pa[byte_i] ^ pb[byte_i];
-            if (diff) {
-                int nm = __builtin_popcount((diff | (diff >> 1)) & 0x55u);
-                if (r.count + nm > 2) return {3, {}, {}, {}};
-                for (int lane = 0; lane < 4; ++lane) {
-                    int sh = 6 - 2 * lane;
-                    uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
-                    uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
-                    if (ba != bb) {
-                        r.pos[r.count]    = static_cast<uint16_t>(i + lane);
-                        r.base_a[r.count] = ba;
-                        r.base_b[r.count] = bb;
-                        r.count++;
-                    }
-                }
-            }
-            i += 4;
-        } else {
-            uint8_t sh = static_cast<uint8_t>(6 - 2 * bit_i);
-            uint8_t ba = (pa[byte_i] >> sh) & 0x3u;
-            uint8_t bb = (pb[byte_i] >> sh) & 0x3u;
-            if (ba != bb) {
-                if (r.count >= 2) return {3, {}, {}, {}};
-                r.pos[r.count]    = static_cast<uint16_t>(i);
-                r.base_a[r.count] = ba;
-                r.base_b[r.count] = bb;
-                r.count++;
-            }
-            ++i;
-        }
-    }
-    return r;
-}
-
-// ── ChildMismatch record ────────────────────────────────────────────────────
-struct ChildMismatch {
-    uint32_t parent_id;
-    uint32_t child_id;
-    uint16_t mismatch_pos;   // first mismatch (interior-relative, 0-based)
-    uint8_t  alt_base;       // child's 2-bit base (first mismatch)
-    uint8_t  parent_base;    // parent's 2-bit base (first mismatch)
-    uint16_t mismatch_pos2;  // second mismatch (only used when hamming==2)
-    uint8_t  alt_base2;      // child's 2-bit base (second mismatch)
-    uint8_t  parent_base2;   // parent's 2-bit base (second mismatch)
-    uint8_t  hamming;        // 1 or 2
-    uint8_t  _pad[3];
-};  // 20 bytes
-static_assert(sizeof(ChildMismatch) == 20, "ChildMismatch must be 20 bytes");
-
-// Extract bases [start, start+count) from 2-bit packed data into dst[],
-// byte-normalized (first base at MSB of dst[0], trailing bits zeroed).
-// dst must have at least (count+3)/4 bytes.
-// Returns number of bytes written.
-static int extract_packed_part(const uint8_t* packed, int start, int count, uint8_t* dst) {
-    int nbytes = (count + 3) / 4;
-    int src_byte = start >> 2;
-    int src_shift = (start & 3) << 1;  // 0,2,4,6 bits into first src byte
-
-    if (src_shift == 0) {
-        std::memcpy(dst, packed + src_byte, nbytes);
-    } else {
-        int rshift = 8 - src_shift;
-        for (int i = 0; i < nbytes; ++i) {
-            dst[i] = static_cast<uint8_t>(
-                (packed[src_byte + i] << src_shift) |
-                (packed[src_byte + i + 1] >> rshift));
-        }
-    }
-    // Zero trailing unused bits in last byte
-    int used = count & 3;
-    if (used) dst[nbytes - 1] &= static_cast<uint8_t>(0xFFu << ((4 - used) << 1));
-    return nbytes;
-}
-
-// Compute reverse-complement of a pre-extracted packed interior buffer.
-// interior[] holds `ilen` bases packed MSB-first starting at bit offset 0.
-// Writes the RC into out[] (same size: (ilen+3)/4 bytes).
-// Complement: each 2-bit base b → b^3 (A↔T=00↔11, C↔G=01↔10).
-static void compute_interior_rc(const uint8_t* interior, int ilen, uint8_t* out) {
-    int nbytes = (ilen + 3) / 4;
-    for (int i = 0; i < nbytes; ++i) out[i] = 0;
-    for (int i = 0; i < ilen; ++i) {
-        int src = ilen - 1 - i;
-        uint8_t base = (interior[src >> 2] >> (6 - 2 * (src & 3))) & 0x3u;
-        uint8_t comp = base ^ 0x3u;
-        out[i >> 2] |= static_cast<uint8_t>(comp << (6 - 2 * (i & 3)));
-    }
-}
-
-// ============================================================================
-// Ancient DNA Damage Model
-// DamageProfile struct and estimate_damage() are in damage_profile.hpp/.cpp
-// (shared with extend.cpp).  TU-specific helpers follow below.
-// ============================================================================
-
-// Replace damage-prone terminal bases with neutral bytes before hashing.
-//
-// Purpose: two reads from the same ancient DNA molecule can differ at terminal
-// positions due to cytosine deamination (C→T at the 5' end, G→A at the 3' end).
-// An exact-sequence hash would treat them as distinct — inflating unique cluster
-// counts. By replacing any C or T at a 5'-damaged position with \x01, and any
-// G or A at a 3'-damaged position with \x02, independently-deaminated copies of
-// the same molecule hash to the same value and collapse into a single cluster.
-//
-// Which positions are masked is determined by DamageProfile::mask_pos[], an
-// empirical array populated directly from observed per-position T/(T+C) and
-// A/(A+G) frequencies (see estimate_damage()). No exponential model is evaluated
-// at hash time — just an array lookup per position.
-//
-// Symmetry: mask_pos uses max(5'-signal, 3'-signal) semantics so that position p
-// from the 5' end and position p from the 3' end are treated identically. This
-// guarantees canonical_hash(seq) == canonical_hash(revcomp(seq)).
-//
-// scratch must point to a buffer of at least seq.size() bytes. Writes the
-// masked sequence into scratch without heap allocation.
-static void apply_damage_mask_inplace(const std::string& seq,
-                                      const DamageProfile& prof,
-                                      char* scratch) {
-    int L = static_cast<int>(seq.size());
-    std::memcpy(scratch, seq.data(), L);
-    for (int i = 0; i < L; ++i) {
-        char cu = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(scratch[i])));
-        bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
-        bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
-        if (prof.ss_mode) {
-            // SS: C→T at both ends. Mask the full Watson-Crick transition pair at every
-            // damage-zone position so that canonical_hash(seq)==canonical_hash(revcomp(seq)):
-            // forward C/T → \x01; revcomp of those positions has G/A → \x02.
-            if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) {
-                scratch[i] = '\x01';
-            } else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) {
-                scratch[i] = '\x02';
-            }
-        } else {
-            // DS: C→T at 5', G→A at 3'.
-            if (in_5zone && (cu == 'C' || cu == 'T')) {
-                scratch[i] = '\x01';
-            } else if (in_3zone && (cu == 'G' || cu == 'A')) {
-                scratch[i] = '\x02';
-            }
-        }
-    }
-}
-
-static std::pair<int,int> damage_zone_bounds(int L, const DamageProfile& prof) {
-    if (!prof.enabled) return {0, 0};
-    int k5 = 0;
-    while (k5 < L && k5 < DamageProfile::MASK_POSITIONS && prof.mask_pos[k5]) k5++;
-    int k3 = 0;
-    while (k3 < L - k5 && k3 < DamageProfile::MASK_POSITIONS && prof.mask_pos[k3]) k3++;
-    return {k5, k3};
-}
-
-// scratch1 and scratch2 must each be at least seq.size() bytes.
-// No heap allocation — uses caller-provided scratch buffers.
-static XXH128_hash_t damage_canonical_hash(const std::string& seq,
-                                           const DamageProfile& prof,
-                                           bool use_revcomp,
-                                           char* scratch1,
-                                           char* scratch2) {
-    int L = static_cast<int>(seq.size());
-    apply_damage_mask_inplace(seq, prof, scratch1);
-    XXH128_hash_t h1 = XXH3_128bits(scratch1, L);
-    if (!use_revcomp) return h1;
-
-    // Build revcomp+mask into scratch2 without allocating
-    for (int i = 0; i < L; ++i) {
-        unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-        switch (c) {
-            case 'A': case 'a': scratch2[i] = (c == 'A') ? 'T' : 't'; break;
-            case 'C': case 'c': scratch2[i] = (c == 'C') ? 'G' : 'g'; break;
-            case 'G': case 'g': scratch2[i] = (c == 'G') ? 'C' : 'c'; break;
-            case 'T': case 't': scratch2[i] = (c == 'T') ? 'A' : 'a'; break;
-            default:            scratch2[i] = 'N'; break;
-        }
-    }
-    for (int i = 0; i < L; ++i) {
-        char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2[i])));
-        bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
-        bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
-        if (prof.ss_mode) {
-            if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) scratch2[i] = '\x01';
-            else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) scratch2[i] = '\x02';
-        } else {
-            if (in_5zone && (cu == 'C' || cu == 'T')) scratch2[i] = '\x01';
-            else if (in_3zone && (cu == 'G' || cu == 'A')) scratch2[i] = '\x02';
-        }
-    }
-    XXH128_hash_t h2 = XXH3_128bits(scratch2, L);
-    // Canonical = lexicographically smaller of the two 128-bit hashes
-    if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
-        return h1;
-    return h2;
-}
-
-// Canonical hash without heap allocation for reverse-complement construction.
-// Matches fastq_common.hpp canonical_hash() behavior.
-static XXH128_hash_t canonical_hash_noalloc(const std::string& seq,
-                                            bool use_revcomp,
-                                            char* scratch) {
-    XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
-    if (!use_revcomp) return h1;
-
-    int L = static_cast<int>(seq.size());
-    for (int i = 0; i < L; ++i) {
-        unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-        switch (c) {
-            case 'A': case 'a': scratch[i] = (c == 'A') ? 'T' : 't'; break;
-            case 'C': case 'c': scratch[i] = (c == 'C') ? 'G' : 'g'; break;
-            case 'G': case 'g': scratch[i] = (c == 'G') ? 'C' : 'c'; break;
-            case 'T': case 't': scratch[i] = (c == 'T') ? 'A' : 'a'; break;
-            default:            scratch[i] = 'N'; break;
-        }
-    }
-    XXH128_hash_t h2 = XXH3_128bits(scratch, seq.size());
-    if (h1.high64 < h2.high64 || (h1.high64 == h2.high64 && h1.low64 <= h2.low64))
-        return h1;
-    return h2;
-}
-
+using namespace fqdup::derep_detail;
 
 // ============================================================================
 // DerepEngine — single-file two-pass deduplication
@@ -682,10 +81,14 @@ public:
                 const DamageProfile& profile = DamageProfile{},
                 const ErrCorParams& errcor = ErrCorParams{},
                 bool /*errcor_mode_explicit*/ = false,
-                bool bucket_cap_explicit = false)
+                bool bucket_cap_explicit = false,
+                std::string fqcl_path = "",
+                std::string input_fastq = "")
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
           bucket_cap_explicit_(bucket_cap_explicit),
+          fqcl_path_(std::move(fqcl_path)),
+          fqcl_input_fastq_(std::move(input_fastq)),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     void process(const std::string& in_path,
@@ -738,8 +141,9 @@ public:
             phase3_error_correct();
         }
 
-        // Free arena_ — only needed for phase3, not pass2.
-        { SeqArena empty; std::swap(arena_, empty); }
+        // Free arena_ + qual_arena_ — only needed for phase3, not pass2.
+        { SeqArena  empty; std::swap(arena_,      empty); }
+        { QualArena empty; std::swap(qual_arena_, empty); }
 
         // Return freed phase3 structures (build_map, shards, id_count, acc_count)
         // to the OS before pass2 allocates records_to_write.  Without this,
@@ -852,11 +256,14 @@ private:
                 if (errcor_.enabled) {
                     if (is_forward) {
                         it->second.seq_id = arena_.append(rec.seq);
+                        if (!rec.qual.empty()) qual_arena_.append(rec.qual);
+                        else                   qual_arena_.append_empty();
                     } else {
                         // Store in canonical orientation so Phase 3 comparisons are correct.
-                        // Compute the unmasked revcomp into rc_buf_.
+                        // Sequence: reverse-complement; quality: reverse only.
                         int L = static_cast<int>(rec.seq.size());
-                        if (rc_buf_.size() < static_cast<size_t>(L)) rc_buf_.resize(L);
+                        if (rc_buf_.size()  < static_cast<size_t>(L)) rc_buf_.resize(L);
+                        if (rc_qbuf_.size() < static_cast<size_t>(L)) rc_qbuf_.resize(L);
                         for (int i = 0; i < L; ++i) {
                             unsigned char c = static_cast<unsigned char>(rec.seq[L - 1 - i]);
                             switch (c) {
@@ -868,6 +275,12 @@ private:
                             }
                         }
                         it->second.seq_id = arena_.append_chars(rc_buf_.data(), L);
+                        if (!rec.qual.empty()) {
+                            for (int i = 0; i < L; ++i) rc_qbuf_[i] = rec.qual[L - 1 - i];
+                            qual_arena_.append_chars(rc_qbuf_.data(), L);
+                        } else {
+                            qual_arena_.append_empty();
+                        }
                     }
                 }
             } else {
@@ -909,6 +322,15 @@ private:
     //   sig_count_weighted >= snp_min_count AND
     //   sig_count_weighted / parent_count >= snp_threshold.
     void phase3_error_correct() {
+        if (errcor_.adj_len_probe && errcor_.legacy_veto)
+            log_warn("--errcor-adj-len: requires --errcor-lr-rule (legacy SNP veto has no indel notion); probe disabled.");
+        if (errcor_.adj_len_probe && !errcor_.legacy_veto && !fqcl_path_.empty())
+            log_warn("--errcor-adj-len + --cluster-format: indel-edge absorptions are NOT recorded in the .fqcl genealogy "
+                     "(ChildMismatch encodes substitutions only). Dedup output is correct, but the genealogy will under-report "
+                     "edges. Disable --errcor-adj-len if exact edge accounting is required.");
+        log_info(errcor_.legacy_veto
+                 ? "Phase 3 decision rule: legacy SNP veto"
+                 : "Phase 3 decision rule: LR threshold (lr_threshold=" + std::to_string(errcor_.lr_threshold) + " nats)");
         if (arena_.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("Phase 3: arena size exceeds uint32_t range");
         const uint32_t N = static_cast<uint32_t>(arena_.size());
@@ -916,6 +338,38 @@ private:
 
         // Trailing padding for safe extraction in extract_packed_part
         arena_.packed.push_back(0);
+
+        // T5.3: precompute bundle_key + bundle occupancy for LR prior. The
+        // bundle_key (start_kmer ⊕ end_kmer) is our reference-free locus
+        // proxy — clusters sharing a key landed at the same capture site, so
+        // a high-occupancy bundle is evidence that mismatches in this group
+        // could be PCR siblings rather than independent capture events.
+        std::vector<uint64_t> bundle_key_of(N, 0);
+        // For the LR prior we only need bundle occupancy (a count). The full
+        // member list is only needed by the T5.6 adj-len probe, which uses a
+        // separate length-agnostic map. Keep this one count-only — saves a
+        // vector header per bundle (~24 B × ~N/avg_occ on capture data).
+        ska::flat_hash_map<uint64_t, uint32_t> bundle_occ_map;
+        bundle_occ_map.reserve(N);
+        {
+            std::vector<uint8_t> dec;
+            std::vector<char>    asc;
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                int L = arena_.length(id);
+                if ((int)dec.size() < L) { dec.resize(L); asc.resize(L); }
+                arena_.decode_range(id, 0, L, dec.data());
+                for (int i = 0; i < L; ++i) asc[i] = static_cast<char>(dec[i]);
+                uint64_t k = fqdup::bundlekey::from_decoded(
+                    asc.data(), L, fqdup::bundlekey::kDefaultEndK);
+                bundle_key_of[id] = k;
+                ++bundle_occ_map[k];
+            }
+        }
+        auto bundle_occ_of = [&](uint32_t id) -> uint64_t {
+            auto it = bundle_occ_map.find(bundle_key_of[id]);
+            return it == bundle_occ_map.end() ? 1u : it->second;
+        };
 
         is_error_.assign(N, false);
 
@@ -946,6 +400,9 @@ private:
         // Below this, splits degenerate (parts of 0-4 bp) and the hash keys
         // become unreliable, risking false absorptions.
         constexpr int kMinInteriorLen = 20;
+        // Below this, even brute-force pairwise comparison is unsafe (random match
+        // probability for a single mismatch at length 7 is non-negligible).
+        constexpr int kBruteforceMinLen = 8;
         uint64_t short_interior_skipped = 0;
 
         struct InteriorLayout {
@@ -989,12 +446,21 @@ private:
         build_map.reserve(64);
         struct LenShard { std::array<FlatPairIndex, 6> pi; };
 
+        // Short-interior fallback: for ilen in [kBruteforceMinLen, kMinInteriorLen),
+        // pigeonhole splits degenerate. Index parents in same-length buckets and
+        // brute-force scan in B1 — slower per child but bounded by bucket size.
+        ska::flat_hash_map<int, std::vector<uint32_t>> short_parents;
+
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
             const auto& lay = get_layout(L);
-            if (lay.ilen < kMinInteriorLen) continue;
+            if (lay.ilen < kMinInteriorLen) {
+                if (lay.ilen >= kBruteforceMinLen)
+                    short_parents[lay.ilen].push_back(id);
+                continue;
+            }
 
             auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
@@ -1030,6 +496,16 @@ private:
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
                  " sequences (directed monotone ascent, all eligible)");
 
+        uint64_t n_short_parents = 0;
+        for (const auto& [ilen, v] : short_parents) n_short_parents += v.size();
+        stats.short_brute_parents = n_short_parents;
+        if (n_short_parents > 0)
+            log_info("Phase 3: short-interior fallback indexes " +
+                     std::to_string(n_short_parents) + " parents across " +
+                     std::to_string(short_parents.size()) + " length buckets [" +
+                     std::to_string(kBruteforceMinLen) + "," +
+                     std::to_string(kMinInteriorLen - 1) + "]");
+
         // Build CSR per shard per tag
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(build_map.size());
@@ -1047,8 +523,11 @@ private:
                     pi.keys.push_back(k);
                     uint32_t cnt = 0;
                     while (i < ev.size() && ev[i].key == k) {
-                        if (cnt < errcor_.bucket_cap) { pi.ids.push_back(ev[i].id); cnt++; }
-                        else { stats.cap_fires++; }
+                        if (errcor_.bucket_cap == 0 || cnt < errcor_.bucket_cap) {
+                            pi.ids.push_back(ev[i].id); cnt++;
+                        } else {
+                            stats.bucket_overflow_drops++;
+                        }
                         i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
@@ -1070,26 +549,120 @@ private:
         for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
         log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
-        // ── Phase B1: collect ChildMismatch records ─────────────────────────
-        std::vector<ChildMismatch> mismatches;
-        mismatches.reserve(std::min(static_cast<size_t>(N) * 2, static_cast<size_t>(1 << 24)));
+        // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
+        // Pre-warm layout_cache before workers start so it becomes read-only.
+        for (uint32_t id = 0; id < N; ++id) {
+            if (!arena_.is_eligible(id)) continue;
+            (void)get_layout(arena_.length(id));
+        }
 
-        // Pre-allocated candidate buffer: 6 queries × bucket_cap (3 canonical + 3 RC pair tags).
-        // Sized here so raising bucket_cap (e.g. in capture mode) does not silently overflow.
-        std::vector<uint32_t> cand_storage(12u * errcor_.bucket_cap);
+        unsigned n_threads = errcor_.threads;
+        if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
 
-        for (uint32_t cid = 0; cid < N; ++cid) {
-            if (is_error_[cid]) continue;
-            if (!arena_.is_eligible(cid)) continue;
+        struct B1LocalStats {
+            uint64_t children_scanned       = 0;
+            uint64_t total_candidates       = 0;
+            uint64_t children_found         = 0;
+            uint64_t short_interior_skipped = 0;
+            uint64_t short_brute_evaluated  = 0;
+            uint64_t short_brute_found      = 0;
+            uint64_t short_too_small_skipped = 0;
+            double   decode_hash_child_ms   = 0;
+            double   query_ms               = 0;
+            double   check_ms               = 0;
+        };
 
-            int L = arena_.length(cid);
-            const auto& lay = get_layout(L);
-            if (lay.ilen < kMinInteriorLen) { short_interior_skipped++; continue; }
+        std::vector<std::vector<ChildMismatch>> per_thread_mm(n_threads);
+        std::vector<B1LocalStats>              per_thread_stats(n_threads);
 
-            auto shard_it = shards.find(lay.ilen);
-            if (shard_it == shards.end()) continue;
+        constexpr uint32_t kChunkSize = 256;
+        const uint32_t n_chunks = (N + kChunkSize - 1) / kChunkSize;
+        std::atomic<uint32_t> next_chunk{0};
 
-            auto t0 = clk::now();
+        auto b1_worker = [&](unsigned tid) {
+            auto& local_mm = per_thread_mm[tid];
+            auto& ls       = per_thread_stats[tid];
+            local_mm.reserve(std::min(static_cast<size_t>(N) * 2 / n_threads + 1024,
+                                      static_cast<size_t>(1 << 22)));
+
+            std::vector<uint8_t>  scratch;
+            scratch.reserve(65535);
+            std::vector<uint32_t> cand_storage;
+            if (errcor_.bucket_cap > 0)
+                cand_storage.resize(12u * errcor_.bucket_cap);
+            else
+                cand_storage.reserve(256);
+
+            while (true) {
+                uint32_t chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (chunk >= n_chunks) break;
+                uint32_t cid_lo = chunk * kChunkSize;
+                uint32_t cid_hi = std::min(cid_lo + kChunkSize, N);
+
+                for (uint32_t cid = cid_lo; cid < cid_hi; ++cid) {
+                    if (is_error_[cid]) continue;
+                    if (!arena_.is_eligible(cid)) continue;
+
+                    int L = arena_.length(cid);
+                    const auto& lay = get_layout(L);
+                    if (lay.ilen < kMinInteriorLen) {
+                        ls.short_interior_skipped++;
+                        if (lay.ilen < kBruteforceMinLen) {
+                            ls.short_too_small_skipped++;
+                            continue;
+                        }
+                        // Brute-force same-length parent scan.
+                        auto sp_it = short_parents.find(lay.ilen);
+                        if (sp_it == short_parents.end()) continue;
+                        const auto& parents_vec = sp_it->second;
+
+                        int nf = (lay.ilen + 3) / 4;
+                        size_t need = static_cast<size_t>(3 * nf);
+                        if (scratch.size() < need) scratch.resize(need);
+                        uint8_t* ci_full_s  = scratch.data();
+                        uint8_t* crc_full_s = ci_full_s  + nf;
+                        uint8_t* pi_buf_s   = crc_full_s + nf;
+
+                        extract_packed_part(arena_.data(cid), lay.k5, lay.ilen, ci_full_s);
+                        compute_interior_rc(ci_full_s, lay.ilen, crc_full_s);
+
+                        ls.short_brute_evaluated++;
+                        for (uint32_t pid : parents_vec) {
+                            if (is_error_[pid]) continue;
+                            if (pid == cid) continue;
+                            if (id_count[pid] < id_count[cid]) continue;
+                            if (id_count[pid] == id_count[cid] && pid >= cid) continue;
+                            extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf_s);
+
+                            MismatchInfo mm = packed_find_mismatch(
+                                pi_buf_s, ci_full_s, 0, lay.ilen, profile_.enabled);
+                            if (mm.found) {
+                                local_mm.push_back({pid, cid, mm.position,
+                                                    mm.base_b, mm.base_a,
+                                                    0, 0, 0, 1, {}});
+                                ls.short_brute_found++;
+                                ls.children_found++;
+                                continue;
+                            }
+                            mm = packed_find_mismatch(
+                                pi_buf_s, crc_full_s, 0, lay.ilen, profile_.enabled);
+                            if (mm.found) {
+                                uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
+                                local_mm.push_back({pid, cid, cpos,
+                                    static_cast<uint8_t>(mm.base_b ^ 0x3u),
+                                    static_cast<uint8_t>(mm.base_a ^ 0x3u),
+                                    0, 0, 0, 1, {}});
+                                ls.short_brute_found++;
+                                ls.children_found++;
+                            }
+                        }
+                        continue;
+                    }
+
+                    auto shard_it = shards.find(lay.ilen);
+                    if (shard_it == shards.end()) continue;
+
+                    auto t0 = clk::now();
             // Scratch layout (per child):
             //   [0 .. nbytes)               : ci_parts  (4-part canonical, nb0+nb1+nb2+nb3 bytes)
             //   [nbytes .. nbytes+nf)       : ci_full   (full canonical interior)
@@ -1138,16 +711,24 @@ private:
                 extract_packed_part(crc_full, rc_starts[p], sizes[p], crc_p[p]);
             for (int p = 0; p < 4; ++p) rh[p] = XXH3_64bits(crc_p[p], nbs[p]);
             auto t1 = clk::now();
-            stats.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            ls.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-            stats.children_scanned++;
+            ls.children_scanned++;
 
             // Collect unique parent candidates — query both canonical and RC hash keys.
-            uint32_t* cand_buf = cand_storage.data();
+            // With bucket_cap=0 (default), the storage grows; with bucket_cap>0 it is
+            // pre-sized and any overflow is counted (paired with bucket_overflow_drops).
             uint32_t n_cands = 0;
+            const bool unbounded = (errcor_.bucket_cap == 0);
             auto collect = [&](uint32_t pid) {
-                if (n_cands < static_cast<uint32_t>(cand_storage.size())) cand_buf[n_cands++] = pid;
+                if (unbounded) {
+                    if (n_cands >= cand_storage.size()) cand_storage.resize(n_cands + 1);
+                    cand_storage[n_cands++] = pid;
+                } else if (n_cands < static_cast<uint32_t>(cand_storage.size())) {
+                    cand_storage[n_cands++] = pid;
+                }
             };
+            uint32_t* cand_buf = cand_storage.data();
 
             auto tq0 = clk::now();
             auto& sh = shard_it->second;
@@ -1156,12 +737,14 @@ private:
                 sh.pi[t].query(pair_key(rh[kPairA[t]], rh[kPairB[t]], t, lay.ilen), collect);
             }
             auto tq1 = clk::now();
-            stats.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+            ls.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
 
+            // Refresh: collect() may have reallocated cand_storage in unbounded mode.
+            cand_buf = cand_storage.data();
             std::sort(cand_buf, cand_buf + n_cands);
             n_cands = static_cast<uint32_t>(
                 std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
-            stats.total_candidates += n_cands;
+            ls.total_candidates += n_cands;
 
             auto tc0 = clk::now();
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
@@ -1186,20 +769,20 @@ private:
                 // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
-                    mismatches.push_back({pid, cid, mm.position, mm.base_b, mm.base_a,
+                    local_mm.push_back({pid, cid, mm.position, mm.base_b, mm.base_a,
                                           0, 0, 0, 1, {}});
-                    stats.children_found++;
+                    ls.children_found++;
                     continue;
                 }
                 // Try RC comparison (H=1)
                 mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, profile_.enabled);
                 if (mm.found) {
                     uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
-                    mismatches.push_back({pid, cid, cpos,
+                    local_mm.push_back({pid, cid, cpos,
                                           static_cast<uint8_t>(mm.base_b ^ 0x3u),
                                           static_cast<uint8_t>(mm.base_a ^ 0x3u),
                                           0, 0, 0, 1, {}});
-                    stats.children_found++;
+                    ls.children_found++;
                     continue;
                 }
                 // H=2 path: only for reads with count ≤ max_h2_count.
@@ -1209,11 +792,11 @@ private:
                     if (mm2.count == 2 &&
                         !is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false) &&
                         !is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false)) {
-                        mismatches.push_back({pid, cid,
+                        local_mm.push_back({pid, cid,
                                               mm2.pos[0], mm2.base_b[0], mm2.base_a[0],
                                               mm2.pos[1], mm2.base_b[1], mm2.base_a[1],
                                               2, {}});
-                        stats.children_found++;
+                        ls.children_found++;
                         continue;
                     }
                     mm2 = packed_find_mismatches2(pi_buf, crc_full, 0, lay.ilen);
@@ -1223,20 +806,57 @@ private:
                         // Convert RC positions/bases to child canonical frame
                         uint16_t p0 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[0]);
                         uint16_t p1 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[1]);
-                        mismatches.push_back({pid, cid,
+                        local_mm.push_back({pid, cid,
                                               p0, static_cast<uint8_t>(mm2.base_b[0] ^ 0x3u),
                                                   static_cast<uint8_t>(mm2.base_a[0] ^ 0x3u),
                                               p1, static_cast<uint8_t>(mm2.base_b[1] ^ 0x3u),
                                                   static_cast<uint8_t>(mm2.base_a[1] ^ 0x3u),
                                               2, {}});
-                        stats.children_found++;
+                        ls.children_found++;
                     }
                 }
             }
-            stats.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+            ls.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+                }  // end for cid in chunk
+            }  // end while chunk dispatcher
+        };  // end b1_worker
+
+        if (n_threads == 1) {
+            b1_worker(0);
+        } else {
+            std::vector<std::thread> ts;
+            ts.reserve(n_threads - 1);
+            for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(b1_worker, t);
+            b1_worker(0);
+            for (auto& th : ts) th.join();
         }
 
-        log_info("Phase 3 B1: found " + std::to_string(stats.children_found) +
+        // Merge per-thread state. B2 sorts mismatches deterministically, but
+        // we concat in tid order so the same -j N gives byte-identical output.
+        size_t total_mm = 0;
+        for (const auto& v : per_thread_mm) total_mm += v.size();
+        std::vector<ChildMismatch> mismatches;
+        mismatches.reserve(total_mm);
+        for (auto& v : per_thread_mm) {
+            mismatches.insert(mismatches.end(), v.begin(), v.end());
+            std::vector<ChildMismatch>().swap(v);
+        }
+        for (const auto& ls : per_thread_stats) {
+            stats.children_scanned       += ls.children_scanned;
+            stats.total_candidates       += ls.total_candidates;
+            stats.children_found         += ls.children_found;
+            stats.decode_hash_child_ms   += ls.decode_hash_child_ms;
+            stats.query_ms               += ls.query_ms;
+            stats.check_ms               += ls.check_ms;
+            short_interior_skipped       += ls.short_interior_skipped;
+            stats.short_brute_evaluated  += ls.short_brute_evaluated;
+            stats.short_brute_found      += ls.short_brute_found;
+            stats.short_too_small_skipped += ls.short_too_small_skipped;
+        }
+
+        log_info("Phase 3 B1: " + std::to_string(n_threads) + " thread" +
+                 (n_threads == 1 ? "" : "s") + ", found " +
+                 std::to_string(stats.children_found) +
                  " directed edges from " + std::to_string(stats.children_scanned) + " sequences scanned");
 
         // ── Phase B2: directed ascent — sort high-count parents first, apply SNP veto ──
@@ -1322,7 +942,41 @@ private:
                                         static_cast<double>(sig)  >= eff_snp * static_cast<double>(veto_count)) ||
                                        (sig2 >= eff_min_count &&
                                         static_cast<double>(sig2) >= eff_snp * static_cast<double>(veto_count));
-                    if (snp_veto_h2) {
+                    // T5.1/2/3: damage- and bundle-aware LR for H=2.
+                double lr_h2;
+                {
+                    const int L  = static_cast<int>(arena_.length(cm.child_id));
+                    const int k5 = get_layout(L).k5;
+                    uint16_t pos_full[2] = {
+                        static_cast<uint16_t>(cm.mismatch_pos  + k5),
+                        static_cast<uint16_t>(cm.mismatch_pos2 + k5)
+                    };
+                    uint8_t qbuf[2] = {
+                        qual_arena_.q_at(cm.child_id, pos_full[0]),
+                        qual_arena_.q_at(cm.child_id, pos_full[1])
+                    };
+                    double pdmg[2] = {
+                        ((cm.alt_base  ^ cm.parent_base ) == 2u) ? profile_.p_damage_at(pos_full[0], L) : 0.0,
+                        ((cm.alt_base2 ^ cm.parent_base2) == 2u) ? profile_.p_damage_at(pos_full[1], L) : 0.0
+                    };
+                    lr_h2 = fqdup::lr::compute_lr(qbuf, 2, pos_full, 2,
+                                                   bundle_occ_of(eff_pid), pdmg);
+                    if (snp_veto_h2) { stats.lr_sum_protected += lr_h2; ++stats.lr_n_protected; }
+                    else             { stats.lr_sum_absorbed  += lr_h2; ++stats.lr_n_absorbed;  }
+                }
+
+                // T5.4: decision rule. Legacy = SNP veto; default = LR threshold.
+                bool absorb_h2 = errcor_.legacy_veto ? !snp_veto_h2
+                                                     : (lr_h2 > errcor_.lr_threshold);
+                if (errcor_.legacy_veto) {
+                    if (snp_veto_h2) ++stats.edge_legacy_veto;
+                    else             ++stats.edge_legacy_absorb;
+                } else {
+                    if (absorb_h2) ++stats.edge_lr_absorbed;
+                    else           ++stats.edge_lr_protected;
+                }
+
+                if (!absorb_h2) {
                         stats.snp_protected++;
                     } else {
                         if (!is_error_[cm.child_id]) {
@@ -1337,6 +991,7 @@ private:
                             }
                             stats.absorbed++;
                             errcor_absorbed_++;
+                            if (!fqcl_path_.empty()) fqcl_mismatches_.push_back(cm);
                         }
                     }
                     continue;  // skip the H=1 block below
@@ -1360,8 +1015,35 @@ private:
                 bool snp_veto = (sig >= (damage_bypass ? 1u : eff_min_count)) &&
                                 (static_cast<double>(sig) >= eff_snp_threshold *
                                                               static_cast<double>(veto_count));
+                if (damage_bypass) ++stats.edge_damage_bypass;
 
-                if (snp_veto) {
+                // T5.1/2/3: damage- and bundle-aware LR for H=1.
+                double lr_h1;
+                {
+                    const int L  = static_cast<int>(arena_.length(cm.child_id));
+                    const int k5 = get_layout(L).k5;
+                    uint16_t pos_full = static_cast<uint16_t>(cm.mismatch_pos + k5);
+                    uint8_t  q        = qual_arena_.q_at(cm.child_id, pos_full);
+                    double   pd       = ((cm.alt_base ^ cm.parent_base) == 2u)
+                                        ? profile_.p_damage_at(pos_full, L) : 0.0;
+                    lr_h1 = fqdup::lr::compute_lr(&q, 1, &pos_full, 1,
+                                                   bundle_occ_of(eff_pid), &pd);
+                    if (snp_veto) { stats.lr_sum_protected += lr_h1; ++stats.lr_n_protected; }
+                    else          { stats.lr_sum_absorbed  += lr_h1; ++stats.lr_n_absorbed;  }
+                }
+
+                // T5.4: decision rule. Legacy = SNP veto; default = LR threshold.
+                bool absorb_h1 = errcor_.legacy_veto ? !snp_veto
+                                                     : (lr_h1 > errcor_.lr_threshold);
+                if (errcor_.legacy_veto) {
+                    if (snp_veto) ++stats.edge_legacy_veto;
+                    else          ++stats.edge_legacy_absorb;
+                } else {
+                    if (absorb_h1) ++stats.edge_lr_absorbed;
+                    else           ++stats.edge_lr_protected;
+                }
+
+                if (!absorb_h1) {
                     stats.snp_protected++;
                 } else {
                     if (!is_error_[cm.child_id]) {
@@ -1377,6 +1059,142 @@ private:
                         }
                         stats.absorbed++;
                         errcor_absorbed_++;
+                        if (!fqcl_path_.empty()) fqcl_mismatches_.push_back(cm);
+                    }
+                }
+            }
+        }
+
+        // ── T5.6: Adjacent-length (L±1) probe ──────────────────────────────
+        // Catches PCR siblings differing by a single insertion/deletion at any
+        // position (damage-truncated reads, polymerase slippage). Restricted to
+        // bundle members so candidate-set is locus-bounded — never N² over all
+        // sequences. Per-pair cost: O(L) banded check; absorbs only on exact
+        // 1-indel + 0-substitution match. LR rule applies as for H=1.
+        if (errcor_.adj_len_probe && !errcor_.legacy_veto) {
+            // Build a length-agnostic bundle map so L vs L±1 reads share keys.
+            // Only constructed when the probe is enabled — zero overhead off-path.
+            ska::flat_hash_map<uint64_t, std::vector<uint32_t>> adj_bundles;
+            adj_bundles.reserve(N);
+            {
+                std::vector<uint8_t> dec;
+                std::vector<char>    asc;
+                for (uint32_t id = 0; id < N; ++id) {
+                    if (!arena_.is_eligible(id)) continue;
+                    int L = arena_.length(id);
+                    if ((int)dec.size() < L) { dec.resize(L); asc.resize(L); }
+                    arena_.decode_range(id, 0, L, dec.data());
+                    for (int i = 0; i < L; ++i) asc[i] = static_cast<char>(dec[i]);
+                    uint64_t k = fqdup::bundlekey::from_decoded_no_len(
+                        asc.data(), L, fqdup::bundlekey::kDefaultEndK);
+                    adj_bundles[k].push_back(id);
+                }
+            }
+
+            // Per-bundle parent shortlist cap. On capture hotspots a bundle can
+            // hold hundreds of clusters; pairing all-vs-all is O(M²). We restrict
+            // candidate parents to the top-K members by id_count (the only ones
+            // that can plausibly absorb others), then test every potential child
+            // of adjacent length against those parents. Work is O(K·M_adj).
+            constexpr size_t kAdjLenParentCap = 16;
+
+            std::vector<uint8_t> abuf, bbuf;
+            for (auto& kv : adj_bundles) {
+                auto& members = kv.second;
+                if (members.size() < 2) continue;
+                std::vector<std::pair<int, uint32_t>> by_len;
+                by_len.reserve(members.size());
+                for (uint32_t mid : members)
+                    by_len.emplace_back(static_cast<int>(arena_.length(mid)), mid);
+                std::sort(by_len.begin(), by_len.end());
+                const size_t M = by_len.size();
+
+                // Build parent shortlist: top-K members by id_count.
+                std::vector<uint32_t> parents;
+                if (M <= kAdjLenParentCap) {
+                    parents.reserve(M);
+                    for (auto& p : by_len) parents.push_back(p.second);
+                } else {
+                    parents.reserve(M);
+                    for (auto& p : by_len) parents.push_back(p.second);
+                    std::partial_sort(
+                        parents.begin(),
+                        parents.begin() + kAdjLenParentCap,
+                        parents.end(),
+                        [&](uint32_t a, uint32_t b) {
+                            if (id_count[a] != id_count[b]) return id_count[a] > id_count[b];
+                            return a < b;  // stable tie-break for determinism
+                        });
+                    parents.resize(kAdjLenParentCap);
+                }
+                ska::flat_hash_set<uint32_t> parent_set(parents.begin(), parents.end());
+
+                for (size_t i = 0; i < M; ++i) {
+                    int Li = by_len[i].first;
+                    for (size_t j = i + 1; j < M; ++j) {
+                        int Lj = by_len[j].first;
+                        if (Lj - Li > 1) break;
+                        if (Lj - Li != 1) continue;  // only adjacent (skip same-length, handled by B2)
+                        // At least one side must be in the parent shortlist —
+                        // otherwise neither could plausibly be the absorber.
+                        if (!parent_set.count(by_len[i].second) &&
+                            !parent_set.count(by_len[j].second)) continue;
+                        uint32_t a_id = by_len[i].second;
+                        uint32_t b_id = by_len[j].second;  // longer
+                        ++stats.adj_len_evaluated;
+
+                        if ((int)abuf.size() < Li) abuf.resize(Li);
+                        if ((int)bbuf.size() < Lj) bbuf.resize(Lj);
+                        arena_.decode_range(a_id, 0, Li, abuf.data());
+                        arena_.decode_range(b_id, 0, Lj, bbuf.data());
+
+                        // Test: is `a` (shorter) exactly a 1-deletion of `b` (longer)?
+                        int d = 0;
+                        while (d < Li && bbuf[d] == abuf[d]) ++d;
+                        bool ok = true;
+                        for (int p = d; p < Li; ++p)
+                            if (bbuf[p + 1] != abuf[p]) { ok = false; break; }
+                        if (!ok) continue;
+                        ++stats.adj_len_matched;
+
+                        // Higher count wins parent role (matches B2 convention).
+                        uint32_t parent_id, child_id;
+                        if (id_count[a_id] >= id_count[b_id]) {
+                            parent_id = a_id; child_id = b_id;
+                        } else {
+                            parent_id = b_id; child_id = a_id;
+                        }
+                        if (is_error_[child_id]) continue;
+                        uint32_t eff_pid = parent_id;
+                        if (is_error_[eff_pid]) eff_pid = find_root_chain(eff_pid);
+
+                        // LR for indel: quality at indel pos in child, no damage prior.
+                        int      L_child = static_cast<int>(arena_.length(child_id));
+                        uint16_t pos16   = static_cast<uint16_t>(std::min(d, L_child - 1));
+                        uint8_t  q       = qual_arena_.q_at(child_id, pos16);
+                        double   pd      = 0.0;
+                        double   lr      = fqdup::lr::compute_lr(
+                            &q, 1, &pos16, 1, members.size(), &pd);
+                        if (lr <= errcor_.lr_threshold) {
+                            ++stats.adj_len_protected;
+                            continue;
+                        }
+
+                        is_error_[child_id] = true;
+                        parent_chain[child_id] = eff_pid;
+                        acc_count[eff_pid] += acc_count[child_id];
+                        acc_count[child_id] = 0;
+                        if (seq_entry[child_id] && seq_entry[eff_pid] &&
+                            seq_entry[child_id]->damage_score > seq_entry[eff_pid]->damage_score) {
+                            seq_entry[eff_pid]->record_index = seq_entry[child_id]->record_index;
+                            seq_entry[eff_pid]->damage_score = seq_entry[child_id]->damage_score;
+                        }
+                        ++stats.absorbed;
+                        ++errcor_absorbed_;
+                        ++stats.adj_len_absorbed;
+                        // No fqcl record: ChildMismatch encodes substitutions only.
+                        // The .fqcl genealogy will lack the indel edge but the
+                        // dedup output is correct (is_error_ drops the read).
                     }
                 }
             }
@@ -1393,21 +1211,178 @@ private:
         }
 
         stats.log();
+        // Persist for write_fqcl_ → metadata.
+        loss_bucket_overflow_drops_   = stats.bucket_overflow_drops;
+        loss_short_brute_evaluated_   = stats.short_brute_evaluated;
+        loss_short_brute_found_       = stats.short_brute_found;
+        loss_short_too_small_skipped_ = stats.short_too_small_skipped;
+        // Only the truly-unrecoverable (ilen < kBruteforceMinLen) reads remain a "loss".
+        loss_short_interior_skipped_ = stats.short_too_small_skipped;
         if (short_interior_skipped > 0) {
-            double pct = 100.0 * static_cast<double>(short_interior_skipped) /
-                         static_cast<double>(N);
+            double pct_short = 100.0 * static_cast<double>(short_interior_skipped) /
+                               static_cast<double>(N);
             log_info("Phase 3: " + std::to_string(short_interior_skipped) +
-                     " reads skipped (interior < " + std::to_string(kMinInteriorLen) +
-                     " bp after damage masking, " +
-                     std::to_string(pct).substr(0, 4) + "%)");
-            if (pct > 10.0)
-                log_warn("Over 10% of reads have interiors too short for Phase 3 error correction "
+                     " reads have interior < " + std::to_string(kMinInteriorLen) +
+                     " bp (" + std::to_string(pct_short).substr(0, 4) + "%); " +
+                     std::to_string(stats.short_brute_evaluated) + " ran brute-force fallback (" +
+                     std::to_string(stats.short_brute_found) + " edges), " +
+                     std::to_string(stats.short_too_small_skipped) +
+                     " unrecoverable (ilen < " + std::to_string(kBruteforceMinLen) + ")");
+            if (pct_short > 10.0)
+                log_warn("Over 10% of reads have interiors too short for the pigeonhole index "
                          "after damage masking. Consider reducing --mask-threshold or "
                          "adjusting damage zone parameters.");
         }
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
                  " sequences (H=1 directed-ascent + H=2 direct-detection, snp_threshold=" +
                  std::to_string(errcor_.snp_threshold) + ")");
+
+        if (!fqcl_path_.empty()) {
+            fqcl_parent_chain_ = std::move(parent_chain);
+            write_fqcl_(seq_entry);
+        }
+    }
+
+    // Build per-cluster genealogy and emit .fqcl. Must run BEFORE arena_ is freed.
+    void write_fqcl_(const std::vector<IndexEntry*>& seq_entry) {
+        namespace cf = fqdup::clusterfmt;
+
+        const uint32_t N = static_cast<uint32_t>(arena_.size());
+        auto find_root = [&](uint32_t id) -> uint32_t {
+            while (id < fqcl_parent_chain_.size() &&
+                   fqcl_parent_chain_[id] != UINT32_MAX) {
+                id = fqcl_parent_chain_[id];
+            }
+            return id;
+        };
+
+        // Group absorbed-edge mismatches by root cluster id, preserving order
+        // (sorted by parent count desc → topological).
+        std::unordered_map<uint32_t, std::vector<size_t>> per_root;
+        per_root.reserve(fqcl_mismatches_.size() / 2 + 1);
+        for (size_t i = 0; i < fqcl_mismatches_.size(); ++i) {
+            uint32_t r = find_root(fqcl_mismatches_[i].child_id);
+            per_root[r].push_back(i);
+        }
+
+        // Build cluster_id mapping over surviving roots: dense u64 in seq_id order.
+        cf::WriterMetadata meta;
+        meta.tool_version  = "0.1";
+        meta.input_fastq   = fqcl_input_fastq_;
+        meta.n_input_reads = total_reads_;
+        meta.library_type  = profile_.ss_mode ? "ss" : (profile_.enabled ? "ds" : "auto");
+        meta.d_max_5       = profile_.d_max_5prime;
+        meta.d_max_3       = profile_.d_max_3prime;
+        meta.lambda_5      = profile_.lambda_5prime;
+        meta.lambda_3      = profile_.lambda_3prime;
+        // Count mask positions actually used.
+        int mp5 = 0, mp3 = 0;
+        for (int p = 0; p < DamageProfile::MASK_POSITIONS; ++p)
+            if (profile_.mask_pos[p]) { mp5++; mp3++; }
+        meta.mask_pos_5 = mp5;
+        meta.mask_pos_3 = mp3;
+        meta.snp_threshold = errcor_.snp_threshold;
+        meta.snp_min_count = static_cast<int>(errcor_.snp_min_count);
+        meta.bucket_cap    = static_cast<int>(errcor_.bucket_cap);
+        meta.bucket_overflow_drops   = loss_bucket_overflow_drops_;
+        meta.short_interior_skipped  = loss_short_interior_skipped_;
+        meta.short_brute_evaluated   = loss_short_brute_evaluated_;
+        meta.short_brute_found       = loss_short_brute_found_;
+        meta.short_too_small_skipped = loss_short_too_small_skipped_;
+        // v2: singletons are always written (as tinyblocks) — never silently dropped.
+
+        cf::Writer writer(fqcl_path_, meta);
+
+        std::uint64_t cluster_id = 0;
+        cf::ClusterRecord rec;
+        for (uint32_t r = 0; r < N; ++r) {
+            if (is_error_[r]) continue;             // absorbed root
+            if (!seq_entry[r]) continue;            // no surviving entry pointer
+            const IndexEntry* e = seq_entry[r];
+
+            // v2: emit every surviving root, including pure singletons.
+            // Pure singletons travel as tinyblocks (zero edges, zero damage).
+            const uint16_t L      = arena_.length(r);
+            const int      nbytes = (L + 3) / 4;
+
+            rec.cluster_id     = cluster_id++;
+            rec.flags          = cf::kFlagHasMemberIds;
+            rec.n_members      = static_cast<uint32_t>(e->count);
+            rec.n_after_damage = static_cast<uint32_t>(e->count);
+            rec.parent_seq_len = L;
+            rec.parent_seq.assign(arena_.data(r), arena_.data(r) + nbytes);
+            rec.parent_qual.clear();
+            rec.edges.clear();
+            rec.member_ids.clear();
+            // Damage track left zero in v0.1; per-cluster terminal counts not yet tracked.
+            std::memset(rec.damage.term_5, 0, cf::kTermWindow);
+            std::memset(rec.damage.term_3, 0, cf::kTermWindow);
+
+            // Always record the root's seq_id as the first member (node 0 = root).
+            rec.member_ids.push_back(std::to_string(r));
+
+            auto it = per_root.find(r);
+            if (it != per_root.end()) {
+                // Mismatch positions are interior-relative; lift to full-read coords.
+                auto [k5_off, k3_off] = damage_zone_bounds(L, profile_);
+                (void)k3_off;
+                const uint16_t k5u = static_cast<uint16_t>(k5_off);
+
+                // Map seq_id → local node index. Node 0 = root.
+                std::unordered_map<uint32_t, uint32_t> node_of;
+                node_of.reserve(it->second.size() + 1);
+                node_of[r] = 0;
+
+                for (size_t midx : it->second) {
+                    const ChildMismatch& cm = fqcl_mismatches_[midx];
+                    auto pit = node_of.find(cm.parent_id);
+                    if (pit == node_of.end()) continue;  // orphan (shouldn't happen)
+                    uint32_t parent_node = pit->second;
+                    uint32_t child_node  = static_cast<uint32_t>(node_of.size());
+                    node_of[cm.child_id] = child_node;
+                    // Record the absorbed child's seq_id so callers can enumerate
+                    // every read that ended up under this root (singletons remain
+                    // implicit: any seq_id never listed in any cluster's member_ids
+                    // is a true unabsorbed singleton).
+                    rec.member_ids.push_back(std::to_string(cm.child_id));
+
+                    cf::Edge ed{};
+                    ed.from_node = parent_node;
+                    ed.to_node   = child_node;
+                    ed.pos       = static_cast<uint16_t>(cm.mismatch_pos + k5u);
+                    ed.from_base = cm.parent_base;
+                    ed.to_base   = cm.alt_base;
+                    ed.n_reads   = static_cast<uint32_t>(
+                        cm.child_id < fqcl_parent_chain_.size() ? 1u : 1u);
+                    rec.edges.push_back(ed);
+
+                    // H=2: emit a second edit hanging off the same child node.
+                    if (cm.hamming == 2) {
+                        uint32_t aux_node = static_cast<uint32_t>(node_of.size());
+                        cf::Edge ed2{};
+                        ed2.from_node = child_node;
+                        ed2.to_node   = aux_node;
+                        ed2.pos       = static_cast<uint16_t>(cm.mismatch_pos2 + k5u);
+                        ed2.from_base = cm.parent_base2;
+                        ed2.to_base   = cm.alt_base2;
+                        ed2.n_reads   = 1u;
+                        rec.edges.push_back(ed2);
+                        // aux_node has no real seq_id — leave it out of node_of.
+                    }
+                }
+            }
+
+            writer.write_cluster(rec);
+        }
+
+        writer.close();
+        log_info("Cluster-format file written: " + fqcl_path_ +
+                 " (" + std::to_string(writer.n_clusters()) + " clusters; "
+                 "singletons stored as tinyblocks)");
+
+        // Free temporaries.
+        std::vector<ChildMismatch>().swap(fqcl_mismatches_);
+        std::vector<uint32_t>().swap(fqcl_parent_chain_);
     }
 
     void pass2(const std::string& in_path,
@@ -1535,22 +1510,35 @@ private:
     DamageProfile profile_;
     ErrCorParams  errcor_;
     bool bucket_cap_explicit_;
+    std::string fqcl_path_;
+    std::string fqcl_input_fastq_;
+    std::vector<ChildMismatch> fqcl_mismatches_;
+    std::vector<uint32_t>      fqcl_parent_chain_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
 
     // Phase 3 error correction state (populated only when errcor_.enabled)
     SeqArena          arena_;
+    QualArena         qual_arena_;
     std::vector<bool> is_error_;
 
     // Reusable scratch buffers for allocation-free damage masking/hashing.
     // Grown lazily to max sequence length seen; never shrunk.
     mutable std::vector<char> scratch1_;
     mutable std::vector<char> scratch2_;
-    mutable std::vector<char> rc_buf_;  // unmasked revcomp for canonical arena storage
+    mutable std::vector<char> rc_buf_;   // unmasked revcomp for canonical arena storage
+    mutable std::vector<char> rc_qbuf_;  // reversed qual paired with rc_buf_
 
     uint64_t total_reads_;
     uint64_t errcor_absorbed_;
     size_t   n_unique_clusters_;  // saved before index_ is freed in pass2
+
+    // Loss counters surfaced into .fqcl metadata (T1.3, T1.2, T3.1).
+    uint64_t loss_bucket_overflow_drops_   = 0;
+    uint64_t loss_short_interior_skipped_  = 0;
+    uint64_t loss_short_brute_evaluated_   = 0;
+    uint64_t loss_short_brute_found_       = 0;
+    uint64_t loss_short_too_small_skipped_ = 0;
 };
 
 }  // anonymous namespace
@@ -1579,9 +1567,16 @@ static void print_usage(const char* prog) {
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)\n"
         << "                               On equal-count edges this is raised to 2 automatically.\n"
-        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 64)\n"
+        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited).\n"
+        << "                               Set >0 only as an OOM safety valve; any drops are\n"
+        << "                               counted and warned (Bucket overflow drops).\n"
         << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
+        << "  --errcor-threads INT         Phase 3 B1 worker threads (default: 1, 0 = hardware concurrency)\n"
+        << "  --errcor-lr-rule             Use LR-threshold decision rule (default: legacy SNP veto).\n"
+        << "  --errcor-lr-threshold FLOAT  LR (nats) threshold for absorption; implies --errcor-lr-rule (default: -7.0).\n"
+        << "  --errcor-legacy-veto         Force legacy SNP-veto rule (default; explicit override).\n"
+        << "  --errcor-adj-len             Enable adjacent-length (L±1) indel probe (requires --errcor-lr-rule).\n"
         << "\nAncient DNA damage variant collapsing (OFF by default):\n"
         << "  --collapse-damage        Collapse reads that differ only by terminal\n"
         << "                           deamination into one cluster (Pass 0 estimation)\n"
@@ -1609,7 +1604,7 @@ int derep_main(int argc, char** argv) {
         return 1;
     }
 
-    std::string in_path, out_path, cluster_path;
+    std::string in_path, out_path, cluster_path, fqcl_path;
     bool use_revcomp = true;
 
     ErrCorParams errcor;
@@ -1642,6 +1637,8 @@ int derep_main(int argc, char** argv) {
             out_path = argv[++i];
         } else if (arg == "-c" && i + 1 < argc) {
             cluster_path = argv[++i];
+        } else if (arg == "--cluster-format" && i + 1 < argc) {
+            fqcl_path = argv[++i];
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
         } else if (arg == "--error-correct") {
@@ -1656,7 +1653,7 @@ int derep_main(int argc, char** argv) {
             errcor.snp_min_count = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-bucket-cap" && i + 1 < argc) {
             long v = std::stol(argv[++i]);
-            if (v < 1) { std::cerr << "Error: --errcor-bucket-cap must be >= 1, got " << v << "\n"; return 1; }
+            if (v < 0) { std::cerr << "Error: --errcor-bucket-cap must be >= 0 (0 = unlimited), got " << v << "\n"; return 1; }
             errcor.bucket_cap = static_cast<uint32_t>(v);
             bucket_cap_explicit = true;
         } else if (arg == "--errcor-snp-cutoff" && i + 1 < argc) {
@@ -1665,6 +1662,19 @@ int derep_main(int argc, char** argv) {
             errcor.snp_low_cov_cutoff = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-factor" && i + 1 < argc) {
             errcor.snp_low_cov_factor = std::stod(argv[++i]);
+        } else if (arg == "--errcor-lr-threshold" && i + 1 < argc) {
+            errcor.lr_threshold = std::stod(argv[++i]);
+            errcor.legacy_veto  = false;   // explicit threshold ⇒ opt into LR rule
+        } else if (arg == "--errcor-lr-rule") {
+            errcor.legacy_veto = false;
+        } else if (arg == "--errcor-legacy-veto") {
+            errcor.legacy_veto = true;
+        } else if (arg == "--errcor-adj-len") {
+            errcor.adj_len_probe = true;
+        } else if (arg == "--errcor-threads" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 0) { std::cerr << "Error: --errcor-threads must be >= 0 (0 = auto), got " << v << "\n"; return 1; }
+            errcor.threads = static_cast<unsigned>(v);
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
             if (lt == "ss" || lt == "single-stranded")
@@ -1729,6 +1739,11 @@ int derep_main(int argc, char** argv) {
     if (errcor.snp_threshold < 0.0 || errcor.snp_threshold > 1.0) {
         std::cerr << "Error: --errcor-snp-threshold must be in [0, 1], got "
                   << errcor.snp_threshold << "\n";
+        return 1;
+    }
+    if (!std::isfinite(errcor.lr_threshold)) {
+        std::cerr << "Error: --errcor-lr-threshold must be finite, got "
+                  << errcor.lr_threshold << "\n";
         return 1;
     }
     // damage_dmax sentinel is -1.0 (not set); only validate explicitly-set values (> -0.5)
@@ -1803,8 +1818,12 @@ int derep_main(int argc, char** argv) {
                      "Use --no-error-correct to disable.");
         }
 
+        if (!fqcl_path.empty() && !errcor.enabled) {
+            log_warn("--cluster-format requires PCR error correction; ignoring (run without --no-error-correct).");
+            fqcl_path.clear();
+        }
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
-                           false, bucket_cap_explicit);
+                           false, bucket_cap_explicit, fqcl_path, in_path);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
