@@ -255,7 +255,9 @@ static void print_usage(const char* prog) {
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
-        << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n";
+        << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
+        << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
+        << "                             (default: 1000000; 0 = scan all reads)\n";
 }
 
 static LengthBinOptions parse_length_bins(const std::string& spec, bool& ok) {
@@ -300,6 +302,7 @@ int damage_main(int argc, char** argv) {
     std::string json_path;
     bool        run_oxog      = true;
     LengthBinOptions lb_opts = []{ bool ok; return parse_length_bins("auto", ok); }();
+    int64_t     adapter_scan_reads = 1'000'000;  // 0 = scan entire file
     taph::SampleDamageProfile::LibraryType forced_lib =
         taph::SampleDamageProfile::LibraryType::UNKNOWN;
 
@@ -328,6 +331,13 @@ int damage_main(int argc, char** argv) {
             json_path = argv[++i];
         } else if (arg == "--no-oxog") {
             run_oxog = false;
+        } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
+            long long v = std::stoll(argv[++i]);
+            if (v < 0) {
+                std::cerr << "Error: --adapter-scan-reads must be >= 0 (0 = scan all), got " << v << "\n";
+                return 1;
+            }
+            adapter_scan_reads = static_cast<int64_t>(v);
         } else if (arg == "--length-bins" && i + 1 < argc) {
             bool ok = true;
             lb_opts = parse_length_bins(argv[++i], ok);
@@ -355,10 +365,10 @@ int damage_main(int argc, char** argv) {
         return 1;
     }
 
-    // ---- pre-scan: first PRE_SCAN_READS reads to detect adapter stubs ----
+    // ---- pre-scan: adapter-stub detection on first --adapter-scan-reads reads ----
     // Single-threaded; only needs hexamer_count_5prime / n_hexamers_*.
-    // Cost: <5s on any file. Result: clip_stubs populated before full pass.
-    static constexpr int64_t PRE_SCAN_READS = 500000;
+    // 0 = unlimited (scan entire file). Default 1M ≈ a few seconds on aDNA inputs.
+    const int64_t pre_scan_reads = adapter_scan_reads;
 
     taph::AdapterStubs stubs;
 
@@ -369,7 +379,7 @@ int damage_main(int argc, char** argv) {
         auto reader_pre = make_fastq_reader(in_path, 1);
         FastqRecord rec;
         int64_t n = 0;
-        while (reader_pre->read(rec) && n < PRE_SCAN_READS) {
+        while (reader_pre->read(rec) && (pre_scan_reads == 0 || n < pre_scan_reads)) {
             int L = static_cast<int>(rec.seq.size());
             if (L < LSD_L_MIN) continue;
             taph::FrameSelector::update_sample_profile(scan_state.profile, rec.seq);
