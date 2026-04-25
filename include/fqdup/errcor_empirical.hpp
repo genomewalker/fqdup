@@ -218,15 +218,15 @@ inline double ErrCorEmpiricalModel::score(const EdgeCandidate& e) const {
 // Singleton-dominated occupancies favor PCR; recurring-dominated favor real.
 inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
                                       uint64_t total_distinct_bundles) {
-    std::array<uint64_t, kNumBins> n_obs{};
+    // ── Per-bin P(real | bin) from cross-bundle recurrence ─────────────────
+    // For each bin b, count the number of DISTINCT bundles in which a
+    // mismatch falling in that bin was observed. A signature that recurs
+    // across many independent bundles is evidence of a systematic real
+    // pattern (damage, sequencing bias, biological variant); a signature
+    // confined to few bundles is more consistent with random PCR error.
+    //   p_real_bin[b] = (n_bundles_b + α) / (total_distinct_bundles + α + β)
+    // Always in (0, 1) because n_bundles_b ≤ total_distinct_bundles.
     std::vector<std::unordered_set<uint64_t>> bundles_per_bin(kNumBins);
-
-    // Reduced-cell recurrence (subst × term) — used for the per-occ prior.
-    constexpr int kRedCells = kNumSubstClasses * kNumTermDistBins;
-    auto red_idx = [](int s, int t) { return s * kNumTermDistBins + t; };
-    std::vector<std::unordered_set<uint64_t>> bundles_per_red(kRedCells);
-
-    // Pass 1: accumulate.
     for (const auto& e : edges) {
         for (int i = 0; i < e.n_mm; ++i) {
             const auto& m = e.mm[i];
@@ -235,56 +235,66 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
             int t = term_dist_bin(m.pos, e.child_len);
             int o = occ_bin(e.bundle_occ);
             int d = m.damage_chan ? 1 : 0;
-            int b = bin_index(s, t, o, d);
-            n_obs[b]++;
-            bundles_per_bin[b].insert(e.bundle_key);
-            bundles_per_red[red_idx(s, t)].insert(e.bundle_key);
+            bundles_per_bin[bin_index(s, t, o, d)].insert(e.bundle_key);
         }
-    }
-
-    // Global rate from total recurrences across all bins.
-    uint64_t total_n_obs = 0, total_n_bundles_sum = 0;
-    for (int b = 0; b < kNumBins; ++b) {
-        total_n_obs += n_obs[b];
-        total_n_bundles_sum += bundles_per_bin[b].size();
     }
     double denom = static_cast<double>(total_distinct_bundles) + kBetaA + kBetaB;
     if (denom <= 0) denom = 1.0;
-    p_real_global = (static_cast<double>(total_n_bundles_sum) + kBetaA) / denom;
-    if (p_real_global < kPRealFloor) p_real_global = kPRealFloor;
-
-    // Per-bin shrunk rate.
     for (int b = 0; b < kNumBins; ++b) {
         double nb = static_cast<double>(bundles_per_bin[b].size());
-        p_real_bin[b] = (nb + kBetaA) / denom;
+        double v = (nb + kBetaA) / denom;
+        if (v < kPRealFloor)        v = kPRealFloor;
+        if (v > 1.0 - kPRealFloor)  v = 1.0 - kPRealFloor;
+        p_real_bin[b] = v;
     }
+    // Global fallback = pure Beta prior mean (used only for unset bins).
+    p_real_global = kBetaA / (kBetaA + kBetaB);
 
-    // Per-occ-bin π_pcr/π_real from singleton-vs-recurring split.
-    std::array<uint64_t, kNumOccBins> n_singleton{}, n_recurring{};
-    for (const auto& e : edges) {
-        bool any_recurring = false;
-        for (int i = 0; i < e.n_mm; ++i) {
-            const auto& m = e.mm[i];
-            int s = subst_class(m.parent_2b, m.alt_2b);
-            if (s < 0) continue;
-            int t = term_dist_bin(m.pos, e.child_len);
-            if (bundles_per_red[red_idx(s, t)].size() >= 2) {
-                any_recurring = true;
-                break;
+    // ── Per-occ-bin log(π_pcr / π_real) from within-bundle recurrence ──────
+    // PCR amplification produces FAMILIES of children that share the same
+    // mismatch signature relative to their common parent (the error
+    // happened once during amplification, then was copied). A parent whose
+    // children's edges have many duplicate (mm_pos, alt_base) signatures
+    // is exhibiting a PCR family; one whose edges have all-unique
+    // signatures is more likely seeing independent real variation.
+    // log_pi_ratio_occ[o] = log( (recurring + α) / (unique + α) )
+    // Positive ⇒ favor PCR ⇒ higher absorption at this occupancy.
+    std::unordered_map<uint32_t, std::vector<const EdgeCandidate*>> by_parent;
+    by_parent.reserve(edges.size());
+    for (const auto& e : edges) by_parent[e.parent_id].push_back(&e);
+
+    std::array<uint64_t, kNumOccBins> n_recurring{}, n_unique{};
+    for (auto& kv : by_parent) {
+        auto& es = kv.second;
+        std::unordered_map<uint64_t, uint32_t> sig_count;
+        sig_count.reserve(es.size() * 2);
+        for (const auto* ep : es) {
+            for (int i = 0; i < ep->n_mm; ++i) {
+                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
+                               static_cast<uint64_t>(ep->mm[i].alt_2b);
+                ++sig_count[sig];
             }
         }
-        int o = occ_bin(e.bundle_occ);
-        if (any_recurring) n_recurring[o]++;
-        else               n_singleton[o]++;
+        for (const auto* ep : es) {
+            bool recurring = false;
+            for (int i = 0; i < ep->n_mm; ++i) {
+                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
+                               static_cast<uint64_t>(ep->mm[i].alt_2b);
+                if (sig_count[sig] >= 2) { recurring = true; break; }
+            }
+            int o = occ_bin(ep->bundle_occ);
+            if (recurring) ++n_recurring[o];
+            else           ++n_unique[o];
+        }
     }
-    uint64_t tot_sing = 0, tot_rec = 0;
-    for (int o = 0; o < kNumOccBins; ++o) { tot_sing += n_singleton[o]; tot_rec += n_recurring[o]; }
-    log_pi_ratio_global = std::log((static_cast<double>(tot_sing) + kBetaA) /
-                                    (static_cast<double>(tot_rec)  + kBetaA));
+    uint64_t tot_rec = 0, tot_uni = 0;
+    for (int o = 0; o < kNumOccBins; ++o) { tot_rec += n_recurring[o]; tot_uni += n_unique[o]; }
+    log_pi_ratio_global = std::log((static_cast<double>(tot_rec) + kBetaA) /
+                                    (static_cast<double>(tot_uni) + kBetaA));
     for (int o = 0; o < kNumOccBins; ++o) {
-        double s_o = static_cast<double>(n_singleton[o]) + kBetaA;
         double r_o = static_cast<double>(n_recurring[o]) + kBetaA;
-        log_pi_ratio_occ[o] = std::log(s_o / r_o);
+        double u_o = static_cast<double>(n_unique[o])    + kBetaA;
+        log_pi_ratio_occ[o] = std::log(r_o / u_o);
     }
 
     fitted = true;
