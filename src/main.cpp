@@ -14,6 +14,7 @@ int derep_pairs_main(int argc, char** argv);
 int derep_main(int argc, char** argv);
 int damage_main(int argc, char** argv);
 int gen_main(int argc, char** argv);
+int view_main(int argc, char** argv);
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <subcommand> [options]\n"
@@ -24,6 +25,7 @@ static void usage(const char* prog) {
               << "  derep       Deduplicate sorted single-file FASTQ (damage + error correction)\n"
               << "  profile     Profile deamination damage and library QC\n"
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
+              << "  view        Inspect .fqcl cluster genealogy files\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
               << "\nTypical workflow:\n"
               << "  " << prog << " sort        -i merged.fq.gz  -o merged.sorted.fq.gz  --max-memory 64G\n"
@@ -49,6 +51,7 @@ int main(int argc, char** argv) {
     if (sub == "derep")       return derep_main(argc - 1, argv + 1);
     if (sub == "profile") return damage_main(argc - 1, argv + 1);
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
+    if (sub == "view")        return view_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {
         usage(argv[0]);

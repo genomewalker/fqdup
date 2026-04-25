@@ -685,7 +685,7 @@ struct ExtendConfig {
     int      mask_5_override = -1;   // >= 0: use directly, skip Pass 0
     int      mask_3_override = -1;
     double   mask_threshold  = 0.05;
-    int64_t  damage_sample   = 500000;  // 0 = full scan; default samples 500k reads
+    int64_t  damage_sample   = 1'000'000;  // 0 = scan all; default samples 1M reads
     taph::SampleDamageProfile::LibraryType library_type =
         taph::SampleDamageProfile::LibraryType::UNKNOWN;
     int      n_threads       = 1;
@@ -732,8 +732,9 @@ void ExtendEngine::pass0_estimate_damage() {
     }
 
     if (cfg_.mask_5_override >= 0 && cfg_.mask_3_override >= 0) {
-        override_mask5_ = std::min(cfg_.mask_5_override, DamageProfile::MASK_POSITIONS);
-        override_mask3_ = std::min(cfg_.mask_3_override, DamageProfile::MASK_POSITIONS);
+        // CLI parser enforces 0 <= override <= MASK_POSITIONS; no silent clamp.
+        override_mask5_ = cfg_.mask_5_override;
+        override_mask3_ = cfg_.mask_3_override;
         log_info("extend: manual mask override: 5'=" + std::to_string(override_mask5_) +
                  "  3'=" + std::to_string(override_mask3_) + " bp");
         return;
@@ -791,6 +792,7 @@ void ExtendEngine::pass1_build_graph() {
     bool reader_done = false;
 
     std::atomic<int64_t> n_kmers{0};
+    std::atomic<int64_t> n_low_complexity_skipped{0};
 
     auto build_worker = [&]() {
         // Collect all k-mer observations as packed uint64_t (canon << 7 | flags),
@@ -814,6 +816,7 @@ void ExtendEngine::pass1_build_graph() {
             Batch& b = bufs[slot];
             items.clear();
             int64_t local_kmers = 0;
+            int64_t local_lc_skipped = 0;
 
             // ── Phase 1: collect all k-mers (no locking) ─────────────────
             for (int ri = 0; ri < b.sz; ++ri) {
@@ -865,7 +868,7 @@ void ExtendEngine::pass1_build_graph() {
                         if (valid) kmer_rev = kmer_rc(kmer_fwd, k);
                     }
                     if (!valid) continue;
-                    if (count_distinct_dimers(kmer_fwd, k) < 3) continue;
+                    if (count_distinct_dimers(kmer_fwd, k) < 3) { ++local_lc_skipped; continue; }
                     ++local_kmers;
 
                     uint8_t rb = 0; bool rb_valid = false;
@@ -898,6 +901,7 @@ void ExtendEngine::pass1_build_graph() {
                 }
             }
             n_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            n_low_complexity_skipped.fetch_add(local_lc_skipped, std::memory_order_relaxed);
 
             // ── Phase 2: counting sort by shard (O(N + S), no comparison) ─
             const int n = static_cast<int>(items.size());
@@ -962,6 +966,7 @@ void ExtendEngine::pass1_build_graph() {
 
     log_info("extend pass1: " + std::to_string(n_reads) + " reads"
              "  " + std::to_string(n_kmers.load()) + " k-mer positions accumulated"
+             "  " + std::to_string(n_low_complexity_skipped.load()) + " low-complexity k-mers skipped"
              "  (" + std::to_string(table_.raw_size()) + " raw observations in shard buffers)");
 }
 
@@ -1059,6 +1064,7 @@ void ExtendEngine::pass2_extend_write() {
 
     // ── Worker threads ───────────────────────────────────────────────────────
     std::atomic<int> workers_left{nt};
+    std::atomic<int64_t> walk_budget_truncated{0};
 
     auto worker_fn = [&]() {
         const int walk_tmp_sz = walk_tmp_sz_;
@@ -1066,6 +1072,7 @@ void ExtendEngine::pass2_extend_write() {
         std::vector<char> left_tmp(walk_tmp_sz);
         std::array<char, 256> right_buf_local{};
         std::array<char, 256> left_ext_local{};
+        int64_t local_truncated = 0;
 
         Task task;
         while (work_queue.pop(task)) {
@@ -1101,7 +1108,9 @@ void ExtendEngine::pass2_extend_write() {
                             if (!valid) continue;
 
                             const int n_skip  = L - (p + k);
-                            const int budget  = std::min(cfg_.max_extend + n_skip, walk_tmp_sz - 1);
+                            const int wanted  = cfg_.max_extend + n_skip;
+                            const int budget  = std::min(wanted, walk_tmp_sz - 1);
+                            if (budget < wanted) ++local_truncated;
                             const int n_walk  = walk_right(table_, kmer_fwd, k, budget,
                                                            cfg_.min_count, right_tmp.data(),
                                                            &profile_, false, n_skip);
@@ -1138,7 +1147,9 @@ void ExtendEngine::pass2_extend_write() {
                             if (!valid) continue;
 
                             const int n_skip  = p;
-                            const int budget  = std::min(cfg_.max_extend + n_skip, walk_tmp_sz - 1);
+                            const int wanted  = cfg_.max_extend + n_skip;
+                            const int budget  = std::min(wanted, walk_tmp_sz - 1);
+                            if (budget < wanted) ++local_truncated;
                             const int n_walk  = walk_right(table_, kmer_rv, k, budget,
                                                            cfg_.min_count, left_tmp.data(),
                                                            &profile_, true, n_skip);
@@ -1164,6 +1175,7 @@ void ExtendEngine::pass2_extend_write() {
                 done_queue.push(ChunkResult{task.chunk->batch_id, task.chunk});
         }
 
+        walk_budget_truncated.fetch_add(local_truncated, std::memory_order_relaxed);
         if (workers_left.fetch_sub(1, std::memory_order_acq_rel) == 1)
             done_queue.close();
     };
@@ -1285,11 +1297,16 @@ void ExtendEngine::pass2_extend_write() {
     const double avg5     = next > 0 ? static_cast<double>(e5) / next : 0.0;
     const double avg3     = next > 0 ? static_cast<double>(e3) / next : 0.0;
 
+    const int64_t trunc = walk_budget_truncated.load();
     log_info("extend pass2: " + std::to_string(Nv) + " reads"
              "  extended=" + std::to_string(next)
              + " (" + std::to_string(static_cast<int>(frac_ext + 0.5)) + "%)"
              "  avg_5ext=" + std::to_string(avg5).substr(0, 4)
-             + " avg_3ext=" + std::to_string(avg3).substr(0, 4) + " bp");
+             + " avg_3ext=" + std::to_string(avg3).substr(0, 4) + " bp"
+             + (trunc > 0
+                ? "  walk_budget_truncated=" + std::to_string(trunc) +
+                  " (read longer than walk buffer; bump kWalkBufBase)"
+                : std::string{}));
 }
 
 int ExtendEngine::run() {
@@ -1332,7 +1349,7 @@ static void extend_usage(const char* prog) {
         << "  --mask-5 INT                Override 5' mask length; must pair with --mask-3\n"
         << "  --mask-3 INT                Override 3' mask length; must pair with --mask-5\n"
         << "  --mask-threshold FLOAT      Excess damage threshold (default: 0.05)\n"
-        << "  --damage-sample INT         Reads to sample for damage estimation (default: 500000; 0=all)\n"
+        << "  --damage-sample INT         Reads to sample for damage estimation (default: 1000000; 0 = scan all)\n"
         << "  --min-qual INT              Exclude bases below this Phred score (default: 20)\n"
         << "  --library-type auto|ds|ss   Library type for damage model (default: auto)\n"
         << "  --threads INT               Worker threads (default: 1)\n"
@@ -1366,13 +1383,30 @@ int extend_main(int argc, char** argv) {
         } else if (arg == "--bbhash") {
             cfg.use_bbhash = true;
         } else if (arg == "--mask-5" && i + 1 < argc) {
-            cfg.mask_5_override = std::stoi(argv[++i]);
+            int v = std::stoi(argv[++i]);
+            if (v < 0 || v > DamageProfile::MASK_POSITIONS) {
+                std::cerr << "Error: --mask-5 must be in [0, " << DamageProfile::MASK_POSITIONS
+                          << "], got " << v << " (recompile with larger MASK_POSITIONS to extend)\n";
+                return 1;
+            }
+            cfg.mask_5_override = v;
         } else if (arg == "--mask-3" && i + 1 < argc) {
-            cfg.mask_3_override = std::stoi(argv[++i]);
+            int v = std::stoi(argv[++i]);
+            if (v < 0 || v > DamageProfile::MASK_POSITIONS) {
+                std::cerr << "Error: --mask-3 must be in [0, " << DamageProfile::MASK_POSITIONS
+                          << "], got " << v << " (recompile with larger MASK_POSITIONS to extend)\n";
+                return 1;
+            }
+            cfg.mask_3_override = v;
         } else if (arg == "--mask-threshold" && i + 1 < argc) {
             cfg.mask_threshold = std::stod(argv[++i]);
         } else if (arg == "--damage-sample" && i + 1 < argc) {
-            cfg.damage_sample = static_cast<int64_t>(std::stoll(argv[++i]));
+            long long v = std::stoll(argv[++i]);
+            if (v < 0) {
+                std::cerr << "Error: --damage-sample must be >= 0 (0 = scan all), got " << v << "\n";
+                return 1;
+            }
+            cfg.damage_sample = static_cast<int64_t>(v);
         } else if (arg == "--min-qual" && i + 1 < argc) {
             cfg.min_qual = std::stoi(argv[++i]);
         } else if (arg == "--library-type" && i + 1 < argc) {
