@@ -214,9 +214,16 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     std::vector<int> edges;
     if (options.mode == LengthBinOptions::Mode::EXPLICIT) {
         out.method = "explicit";
+        int dropped_oor = 0;
         for (int e : options.explicit_edges) {
             if (e > LSD_L_MIN && e < LSD_L_MAX) edges.push_back(e);
+            else ++dropped_oor;
         }
+        if (dropped_oor > 0)
+            log_warn("damage_profile: " + std::to_string(dropped_oor) +
+                     " explicit length edges out of range (" +
+                     std::to_string(LSD_L_MIN) + "," + std::to_string(LSD_L_MAX) +
+                     ") were dropped");
         std::sort(edges.begin(), edges.end());
         edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
     } else if (options.mode == LengthBinOptions::Mode::QUANTILE) {
@@ -236,7 +243,13 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         out.method = "single";
     }
     const int max_edges = static_cast<int>(taph::LengthBinStats::MAX_BINS) - 1;
-    if (static_cast<int>(edges.size()) > max_edges) edges.resize(max_edges);
+    if (static_cast<int>(edges.size()) > max_edges) {
+        log_warn("damage_profile: " +
+                 std::to_string(edges.size() - max_edges) +
+                 " length edges truncated (libtaph LengthBinStats::MAX_BINS=" +
+                 std::to_string(taph::LengthBinStats::MAX_BINS) + ")");
+        edges.resize(max_edges);
+    }
     out.edges = edges;
 
     const int n_bins = 1 + static_cast<int>(edges.size());
