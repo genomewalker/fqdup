@@ -323,14 +323,14 @@ private:
     //   sig_count_weighted / parent_count >= snp_threshold.
     void phase3_error_correct() {
         if (errcor_.adj_len_probe && errcor_.legacy_veto)
-            log_warn("--errcor-adj-len: requires --errcor-lr-rule (legacy SNP veto has no indel notion); probe disabled.");
+            log_warn("--errcor-adj-len: requires the empirical posterior-odds rule (legacy SNP veto has no indel notion); probe disabled.");
         if (errcor_.adj_len_probe && !errcor_.legacy_veto && !fqcl_path_.empty())
             log_warn("--errcor-adj-len + --cluster-format: indel-edge absorptions are NOT recorded in the .fqcl genealogy "
                      "(ChildMismatch encodes substitutions only). Dedup output is correct, but the genealogy will under-report "
                      "edges. Disable --errcor-adj-len if exact edge accounting is required.");
         log_info(errcor_.legacy_veto
                  ? "Phase 3 decision rule: legacy SNP veto"
-                 : "Phase 3 decision rule: LR threshold (lr_threshold=" + std::to_string(errcor_.lr_threshold) + " nats)");
+                 : "Phase 3 decision rule: empirical posterior odds (S > 0)");
         if (arena_.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("Phase 3: arena size exceeds uint32_t range");
         const uint32_t N = static_cast<uint32_t>(arena_.size());
@@ -879,6 +879,66 @@ private:
                       return a.alt_base < b.alt_base;
                   });
 
+        // ── T5.8: empirical posterior-odds model ────────────────────────────
+        // Build EdgeCandidate features for every B1 edge and fit the model
+        // (per-bin P_real from cross-bundle recurrence; per-occ-bin
+        // log(π_pcr/π_real) from singleton-vs-recurring split). The fitted
+        // model replaces lr_threshold + kP_real_uniform + kBundlePrior_alpha.
+        constexpr int kDamageEdgeMargin_T58 = 5;
+        auto build_edge = [&](const ChildMismatch& cm) -> fqdup::errcor_emp::EdgeCandidate {
+            const int L  = static_cast<int>(arena_.length(cm.child_id));
+            const int k5 = get_layout(L).k5;
+            const int ilen = get_layout(L).ilen;
+            fqdup::errcor_emp::EdgeCandidate e{};
+            e.child_id   = cm.child_id;
+            e.parent_id  = cm.parent_id;
+            e.bundle_key = bundle_key_of[cm.parent_id];
+            e.bundle_occ = bundle_occ_of(cm.parent_id);
+            e.child_len  = static_cast<uint16_t>(L);
+            e.n_mm       = cm.hamming;
+            auto fill = [&](int i, uint16_t mm_pos, uint8_t alt, uint8_t pb) {
+                uint16_t pos_full = static_cast<uint16_t>(mm_pos + k5);
+                e.mm[i].pos        = pos_full;
+                e.mm[i].parent_2b  = pb;
+                e.mm[i].alt_2b     = alt;
+                e.mm[i].qual       = qual_arena_.q_at(cm.child_id, pos_full);
+                bool dmg_xor       = ((alt ^ pb) == 2u);
+                bool in_zone       = (mm_pos < kDamageEdgeMargin_T58 ||
+                                      mm_pos >= static_cast<uint16_t>(ilen - kDamageEdgeMargin_T58));
+                e.mm[i].damage_chan = (dmg_xor && in_zone) ? 1 : 0;
+                e.mm[i].p_damage    = (dmg_xor && profile_.enabled)
+                                      ? profile_.p_damage_at(pos_full, L) : 0.0;
+            };
+            fill(0, cm.mismatch_pos, cm.alt_base, cm.parent_base);
+            if (cm.hamming == 2)
+                fill(1, cm.mismatch_pos2, cm.alt_base2, cm.parent_base2);
+            return e;
+        };
+
+        fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
+        if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
+            std::vector<fqdup::errcor_emp::EdgeCandidate> all_edges;
+            all_edges.reserve(mismatches.size());
+            std::unordered_set<uint64_t> distinct_bundles;
+            distinct_bundles.reserve(mismatches.size());
+            for (const auto& cm : mismatches) {
+                all_edges.emplace_back(build_edge(cm));
+                distinct_bundles.insert(bundle_key_of[cm.parent_id]);
+            }
+            emp_model.fit(all_edges, distinct_bundles.size());
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.4g", emp_model.p_real_global);
+            log_info("Phase 3 empirical model: " + std::to_string(all_edges.size()) +
+                     " edges, " + std::to_string(distinct_bundles.size()) +
+                     " distinct bundles, p_real_global=" + buf);
+            std::snprintf(buf, sizeof(buf), "%.3f", emp_model.log_pi_ratio_global);
+            log_info("  log_pi_ratio_global=" + std::string(buf) + " nats; per-occ:");
+            for (int o = 0; o < fqdup::errcor_emp::kNumOccBins; ++o) {
+                std::snprintf(buf, sizeof(buf), "%.3f", emp_model.log_pi_ratio_occ[o]);
+                log_info("    occ_bin[" + std::to_string(o) + "] = " + buf);
+            }
+        }
+
         size_t i = 0;
         while (i < mismatches.size()) {
             uint32_t pid = mismatches[i].parent_id;
@@ -942,38 +1002,22 @@ private:
                                         static_cast<double>(sig)  >= eff_snp * static_cast<double>(veto_count)) ||
                                        (sig2 >= eff_min_count &&
                                         static_cast<double>(sig2) >= eff_snp * static_cast<double>(veto_count));
-                    // T5.1/2/3: damage- and bundle-aware LR for H=2.
-                double lr_h2;
-                {
-                    const int L  = static_cast<int>(arena_.length(cm.child_id));
-                    const int k5 = get_layout(L).k5;
-                    uint16_t pos_full[2] = {
-                        static_cast<uint16_t>(cm.mismatch_pos  + k5),
-                        static_cast<uint16_t>(cm.mismatch_pos2 + k5)
-                    };
-                    uint8_t qbuf[2] = {
-                        qual_arena_.q_at(cm.child_id, pos_full[0]),
-                        qual_arena_.q_at(cm.child_id, pos_full[1])
-                    };
-                    double pdmg[2] = {
-                        ((cm.alt_base  ^ cm.parent_base ) == 2u) ? profile_.p_damage_at(pos_full[0], L) : 0.0,
-                        ((cm.alt_base2 ^ cm.parent_base2) == 2u) ? profile_.p_damage_at(pos_full[1], L) : 0.0
-                    };
-                    lr_h2 = fqdup::lr::compute_lr(qbuf, 2, pos_full, 2,
-                                                   bundle_occ_of(eff_pid), pdmg);
-                    if (snp_veto_h2) { stats.lr_sum_protected += lr_h2; ++stats.lr_n_protected; }
-                    else             { stats.lr_sum_absorbed  += lr_h2; ++stats.lr_n_absorbed;  }
-                }
-
-                // T5.4: decision rule. Legacy = SNP veto; default = LR threshold.
-                bool absorb_h2 = errcor_.legacy_veto ? !snp_veto_h2
-                                                     : (lr_h2 > errcor_.lr_threshold);
-                if (errcor_.legacy_veto) {
-                    if (snp_veto_h2) ++stats.edge_legacy_veto;
-                    else             ++stats.edge_legacy_absorb;
-                } else {
+                    // T5.8: empirical posterior-odds for H=2.
+                bool   absorb_h2;
+                if (errcor_.empirical && !errcor_.legacy_veto) {
+                    auto e = build_edge(cm);
+                    e.bundle_key = bundle_key_of[eff_pid];
+                    e.bundle_occ = bundle_occ_of(eff_pid);
+                    double S = emp_model.score(e);
+                    absorb_h2 = (S > 0.0);
+                    if (snp_veto_h2) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
+                    else             { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h2) ++stats.edge_lr_absorbed;
                     else           ++stats.edge_lr_protected;
+                } else {
+                    absorb_h2 = !snp_veto_h2;
+                    if (snp_veto_h2) ++stats.edge_legacy_veto;
+                    else             ++stats.edge_legacy_absorb;
                 }
 
                 if (!absorb_h2) {
@@ -1017,30 +1061,22 @@ private:
                                                               static_cast<double>(veto_count));
                 if (damage_bypass) ++stats.edge_damage_bypass;
 
-                // T5.1/2/3: damage- and bundle-aware LR for H=1.
-                double lr_h1;
-                {
-                    const int L  = static_cast<int>(arena_.length(cm.child_id));
-                    const int k5 = get_layout(L).k5;
-                    uint16_t pos_full = static_cast<uint16_t>(cm.mismatch_pos + k5);
-                    uint8_t  q        = qual_arena_.q_at(cm.child_id, pos_full);
-                    double   pd       = ((cm.alt_base ^ cm.parent_base) == 2u)
-                                        ? profile_.p_damage_at(pos_full, L) : 0.0;
-                    lr_h1 = fqdup::lr::compute_lr(&q, 1, &pos_full, 1,
-                                                   bundle_occ_of(eff_pid), &pd);
-                    if (snp_veto) { stats.lr_sum_protected += lr_h1; ++stats.lr_n_protected; }
-                    else          { stats.lr_sum_absorbed  += lr_h1; ++stats.lr_n_absorbed;  }
-                }
-
-                // T5.4: decision rule. Legacy = SNP veto; default = LR threshold.
-                bool absorb_h1 = errcor_.legacy_veto ? !snp_veto
-                                                     : (lr_h1 > errcor_.lr_threshold);
-                if (errcor_.legacy_veto) {
-                    if (snp_veto) ++stats.edge_legacy_veto;
-                    else          ++stats.edge_legacy_absorb;
-                } else {
+                // T5.8: empirical posterior-odds for H=1.
+                bool absorb_h1;
+                if (errcor_.empirical && !errcor_.legacy_veto) {
+                    auto e = build_edge(cm);
+                    e.bundle_key = bundle_key_of[eff_pid];
+                    e.bundle_occ = bundle_occ_of(eff_pid);
+                    double S = emp_model.score(e);
+                    absorb_h1 = (S > 0.0);
+                    if (snp_veto) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
+                    else          { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h1) ++stats.edge_lr_absorbed;
                     else           ++stats.edge_lr_protected;
+                } else {
+                    absorb_h1 = !snp_veto;
+                    if (snp_veto) ++stats.edge_legacy_veto;
+                    else          ++stats.edge_legacy_absorb;
                 }
 
                 if (!absorb_h1) {
@@ -1168,16 +1204,29 @@ private:
                         uint32_t eff_pid = parent_id;
                         if (is_error_[eff_pid]) eff_pid = find_root_chain(eff_pid);
 
-                        // LR for indel: quality at indel pos in child, no damage prior.
-                        int      L_child = static_cast<int>(arena_.length(child_id));
-                        uint16_t pos16   = static_cast<uint16_t>(std::min(d, L_child - 1));
-                        uint8_t  q       = qual_arena_.q_at(child_id, pos16);
-                        double   pd      = 0.0;
-                        double   lr      = fqdup::lr::compute_lr(
-                            &q, 1, &pos16, 1, members.size(), &pd);
-                        if (lr <= errcor_.lr_threshold) {
-                            ++stats.adj_len_protected;
-                            continue;
+                        // T5.8: posterior odds for adj-len indel edge. Treated
+                        // as a single-mismatch edge at the indel position.
+                        if (errcor_.empirical && !errcor_.legacy_veto) {
+                            int L_child = static_cast<int>(arena_.length(child_id));
+                            uint16_t pos16 = static_cast<uint16_t>(std::min(d, L_child - 1));
+                            fqdup::errcor_emp::EdgeCandidate e{};
+                            e.child_id   = child_id;
+                            e.parent_id  = parent_id;
+                            e.bundle_key = bundle_key_of[eff_pid];
+                            e.bundle_occ = members.size();
+                            e.child_len  = static_cast<uint16_t>(L_child);
+                            e.n_mm       = 1;
+                            e.mm[0].pos        = pos16;
+                            e.mm[0].parent_2b  = 0;
+                            e.mm[0].alt_2b     = 1;  // arbitrary non-equal pair: flagged as transversion
+                            e.mm[0].qual       = qual_arena_.q_at(child_id, pos16);
+                            e.mm[0].damage_chan = 0;
+                            e.mm[0].p_damage    = 0.0;
+                            double S = emp_model.score(e);
+                            if (S <= 0.0) {
+                                ++stats.adj_len_protected;
+                                continue;
+                            }
                         }
 
                         is_error_[child_id] = true;
@@ -1573,10 +1622,9 @@ static void print_usage(const char* prog) {
         << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
         << "  --errcor-threads INT         Phase 3 B1 worker threads (default: 1, 0 = hardware concurrency)\n"
-        << "  --errcor-lr-rule             Use LR-threshold decision rule (default: legacy SNP veto).\n"
-        << "  --errcor-lr-threshold FLOAT  LR (nats) threshold for absorption; implies --errcor-lr-rule (default: -7.0).\n"
-        << "  --errcor-legacy-veto         Force legacy SNP-veto rule (default; explicit override).\n"
-        << "  --errcor-adj-len             Enable adjacent-length (L±1) indel probe (requires --errcor-lr-rule).\n"
+        << "  --errcor-empirical           Use empirical posterior-odds rule (default; absorb iff S>0).\n"
+        << "  --errcor-legacy-veto         Use legacy SNP-veto rule instead of the empirical model.\n"
+        << "  --errcor-adj-len             Enable adjacent-length (L±1) indel probe (uses the empirical rule).\n"
         << "\nAncient DNA damage variant collapsing (OFF by default):\n"
         << "  --collapse-damage        Collapse reads that differ only by terminal\n"
         << "                           deamination into one cluster (Pass 0 estimation)\n"
@@ -1662,10 +1710,8 @@ int derep_main(int argc, char** argv) {
             errcor.snp_low_cov_cutoff = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-factor" && i + 1 < argc) {
             errcor.snp_low_cov_factor = std::stod(argv[++i]);
-        } else if (arg == "--errcor-lr-threshold" && i + 1 < argc) {
-            errcor.lr_threshold = std::stod(argv[++i]);
-            errcor.legacy_veto  = false;   // explicit threshold ⇒ opt into LR rule
-        } else if (arg == "--errcor-lr-rule") {
+        } else if (arg == "--errcor-empirical") {
+            errcor.empirical   = true;
             errcor.legacy_veto = false;
         } else if (arg == "--errcor-legacy-veto") {
             errcor.legacy_veto = true;
@@ -1739,11 +1785,6 @@ int derep_main(int argc, char** argv) {
     if (errcor.snp_threshold < 0.0 || errcor.snp_threshold > 1.0) {
         std::cerr << "Error: --errcor-snp-threshold must be in [0, 1], got "
                   << errcor.snp_threshold << "\n";
-        return 1;
-    }
-    if (!std::isfinite(errcor.lr_threshold)) {
-        std::cerr << "Error: --errcor-lr-threshold must be finite, got "
-                  << errcor.lr_threshold << "\n";
         return 1;
     }
     // damage_dmax sentinel is -1.0 (not set); only validate explicitly-set values (> -0.5)
