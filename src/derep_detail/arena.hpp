@@ -64,6 +64,10 @@ struct Phase3Stats {
     // T5.5: edge-reason classification. Set in B2.
     uint64_t edge_lr_absorbed   = 0;  // absorbed because LR > threshold
     uint64_t edge_lr_protected  = 0;  // protected because LR <= threshold
+    // Per-occupancy-bin absorption breakdown (caveat-check: are absorptions
+    // concentrated in high-occ bins where the prior favors PCR?).
+    std::array<uint64_t, 6> edge_lr_absorbed_by_occ{};
+    std::array<uint64_t, 6> edge_lr_protected_by_occ{};
     uint64_t edge_legacy_absorb = 0;  // absorbed under legacy SNP-veto path
     uint64_t edge_legacy_veto   = 0;  // protected under legacy SNP-veto path
     uint64_t edge_damage_bypass = 0;  // damage-channel bypass fired
@@ -105,6 +109,11 @@ struct Phase3Stats {
             log_info("Phase 3 edge reasons:");
             log_info("  LR absorbed       : " + std::to_string(edge_lr_absorbed));
             log_info("  LR protected      : " + std::to_string(edge_lr_protected));
+            for (int o = 0; o < 6; ++o) {
+                log_info("    occ_bin[" + std::to_string(o) + "] absorbed/protected = " +
+                         std::to_string(edge_lr_absorbed_by_occ[o]) + " / " +
+                         std::to_string(edge_lr_protected_by_occ[o]));
+            }
             log_info("  Legacy absorbed   : " + std::to_string(edge_legacy_absorb));
             log_info("  Legacy SNP veto   : " + std::to_string(edge_legacy_veto));
             log_info("  Damage bypass     : " + std::to_string(edge_damage_bypass));
