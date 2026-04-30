@@ -86,8 +86,8 @@ FetchContent_MakeAvailable(librapidarchive)
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
+    GIT_TAG        df47bb0fd5271d2bdfd5d8d487bc71536f4fa77c
+    GIT_SHALLOW    FALSE
     UPDATE_DISCONNECTED TRUE
 )
 FetchContent_MakeAvailable(libtaph)
@@ -164,6 +164,11 @@ target_include_directories(test_cluster_format PRIVATE include ${ZSTD_INCLUDE_DI
 target_link_libraries(test_cluster_format PRIVATE ${ZSTD_LIB})
 target_compile_options(test_cluster_format PRIVATE -O2)
 add_test(NAME cluster_format COMMAND test_cluster_format)
+
+add_executable(test_syncmer_index tests/test_syncmer_index.cpp)
+target_include_directories(test_syncmer_index PRIVATE include src ${flat_hash_map_SOURCE_DIR})
+target_compile_options(test_syncmer_index PRIVATE -O2)
+add_test(NAME syncmer_index COMMAND test_syncmer_index)
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
     add_test(NAME smoke
