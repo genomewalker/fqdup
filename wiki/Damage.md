@@ -44,8 +44,31 @@ four biological channels per position:
 - **3' G→A spike**, amplitude at 3' position 0 (ligation-site signal in SS libraries)
 - **3' C→T**, T/(T+C) at 3' positions 0–14 (SS-original reads only)
 
-Background rates are estimated from the middle third of reads (consistent with
-DART and mapDamage2).
+Background rates are **tail-anchored**: estimated from positions 20..49 of
+the terminal accumulator (denom ≥ 100), where the exponential damage
+component has decayed by 1–2 orders of magnitude. This avoids the bias of a
+global-mean baseline, which leaks deamination signal into `b` and collapses
+`d_max` in damaged libraries.
+
+Alongside `d_max` libtaph reports a per-channel **area-excess** statistic
+(sum of `rate − bg` over the first 10 positions) and a likelihood-ratio
+score against the bg-only null. These are non-parametric companions used by
+the classifier when the exponential fit is noisy.
+
+### Paired-end mode
+
+When `fqdup damage` is given `-1/-2`, the profiler runs in native PE mode:
+`R1[i]` maps to top-strand 5'-end position `i` and the complement of `R2[i]`
+maps to top-strand 3'-end position `i` of the **same fragment**. Running SE
+on each mate separately would attribute R2's 5'-end signal to a non-existent
+second 5' damage process and would pollute ct5 with bottom-strand G→A.
+
+Pairs whose insert length is shorter than the read length read into the
+sequencing adapter; their bases would otherwise imprint adapter composition
+onto the terminal channels (the failure mode that produced the
+`LV7001884491` v8 SS_orig misclassification of a DS library). libtaph
+detects short-insert pairs by R1/R2 overlap (15 bp window, ≤3 mismatches)
+and skips them. The skip count is reported as `pe_short_insert_skipped`.
 
 ### Library-type detection
 
