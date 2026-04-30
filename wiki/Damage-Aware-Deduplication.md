@@ -196,6 +196,29 @@ mixed libraries or very low-coverage samples where the BIC test is
 underpowered). The library type only affects which channels are used for the
 damage model fit and masking; the downstream deduplication steps are identical.
 
+### Paired-end inputs
+
+When `-1/-2` is given, the classifier runs in native PE mode rather than
+SE-on-each-mate. `R1[i]` measures top-strand 5'-end position `i`; the
+complement of `R2[i]` measures the same fragment's 3'-end position `i`. Pairs
+whose insert is shorter than the read length read into the adapter — those
+adapter bases would otherwise pollute ct5 / ga3 and (in v8) misclassify
+clearly-DS libraries as `SS_orig`. v9 detects short-insert pairs by R1/R2
+overlap (15 bp window, ≤3 mismatches) and skips them; the count is reported
+as `pe_short_insert_skipped`.
+
+### Chemistry-aware Briggs fit
+
+The exponential model `d(p) = bg + d_max·exp(-p/λ)` uses a tail-anchored
+background estimated from positions 20..49 (denom ≥ 100), where the damage
+component has decayed by 1–2 orders of magnitude. A global-mean baseline
+leaks deamination signal into `bg` and biases `d_max` downward in damaged
+libraries. libtaph also reports a non-parametric **area-excess** statistic
+(sum of `rate − bg` over the first 10 positions) and a likelihood-ratio
+score; the BIC classifier consumes both, so libraries that fit the
+exponential form poorly but show clear terminal excess are still classified
+correctly.
+
 ---
 
 ## Damage estimation in `fqdup extend`
