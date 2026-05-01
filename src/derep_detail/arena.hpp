@@ -26,7 +26,7 @@ struct ErrCorParams {
     double   pcr_phi            = 5.3e-7;
     double   pcr_rate           = 0.0;
     uint32_t max_h2_count       = 2;
-    unsigned threads            = 1;  // 0 = hardware_concurrency
+    unsigned threads            = 0;  // 0 = hardware_concurrency (default)
     // T5.8: empirical posterior-odds decision rule. The model fits per-bin
     // P(real | subst×term×occ×damage) and per-occ-bin log(π_pcr/π_real)
     // from B1 candidate edges, then absorbs iff posterior log-odds S > 0.
@@ -36,6 +36,15 @@ struct ErrCorParams {
     bool     empirical          = true;
     bool     legacy_veto        = false;  // legacy SNP-only path (no LR/posterior)
     bool     adj_len_probe      = false;  // T5.6: adjacent-length (L±1) probe
+    // T8: opt-in indel-rescue path (syncmer-indexed, banded ed≤2).
+    bool     rescue_indels      = false;
+    int32_t  rescue_min_hits    = 0;      // 0 = auto (3 for cap=16, 2 for cap=8)
+    uint32_t rescue_topk        = 32;
+    uint32_t rescue_bundle_hot  = 50;
+    uint32_t rescue_hash_hot    = 4096;
+    double   rescue_alpha_ins   = 2.0;
+    double   rescue_alpha_del   = 2.0;
+    double   rescue_mask_bonus  = 1.0;
 };
 
 struct Phase3Stats {
@@ -76,6 +85,20 @@ struct Phase3Stats {
     uint64_t adj_len_matched   = 0;  // banded check passed (1-indel, 0-sub)
     uint64_t adj_len_absorbed  = 0;
     uint64_t adj_len_protected = 0;  // matched but LR ≤ threshold (or legacy mode)
+    // T8.9 indel-rescue counters (--errcor-rescue-indels).
+    double   rescue_index_size_mb     = 0.0;
+    uint64_t rescue_index_overflow    = 0;
+    uint64_t rescue_indexed_parents   = 0;
+    uint64_t rescue_children_examined = 0;
+    uint64_t rescue_skip_bundle_hot   = 0;
+    uint64_t rescue_index_queries     = 0;
+    uint64_t rescue_topk_truncated    = 0;
+    uint64_t rescue_pairs_banded      = 0;
+    uint64_t rescue_banded_reject     = 0;
+    std::array<uint64_t, 3> rescue_banded_ed{};   // ed=0/1/2
+    uint64_t rescue_absorbed          = 0;
+    uint64_t rescue_protected         = 0;        // S ≤ 0
+    std::array<uint64_t, 6> rescue_absorbed_by_occ{};
     void log() const {
         auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
         log_info("Phase 3 timing:");
@@ -125,6 +148,29 @@ struct Phase3Stats {
             log_info("  Absorbed          : " + std::to_string(adj_len_absorbed));
             log_info("  Protected (LR/legacy): " + std::to_string(adj_len_protected));
         }
+        if (rescue_pairs_banded > 0 || rescue_indexed_parents > 0) {
+            char b[64];
+            std::snprintf(b, sizeof(b), "%.2f", rescue_index_size_mb);
+            log_info("Phase 3 indel rescue (T8):");
+            log_info("  Index size (MB)   : " + std::string(b));
+            log_info("  Index parents     : " + std::to_string(rescue_indexed_parents));
+            log_info("  Index hot drops   : " + std::to_string(rescue_index_overflow));
+            log_info("  Children examined : " + std::to_string(rescue_children_examined));
+            log_info("  Skipped (bundle hot): " + std::to_string(rescue_skip_bundle_hot));
+            log_info("  Index queries     : " + std::to_string(rescue_index_queries));
+            log_info("  Topk truncated    : " + std::to_string(rescue_topk_truncated));
+            log_info("  Pairs banded      : " + std::to_string(rescue_pairs_banded));
+            log_info("  Banded reject     : " + std::to_string(rescue_banded_reject));
+            log_info("  Banded ed=0/1/2   : " + std::to_string(rescue_banded_ed[0]) +
+                     " / " + std::to_string(rescue_banded_ed[1]) +
+                     " / " + std::to_string(rescue_banded_ed[2]));
+            log_info("  Absorbed          : " + std::to_string(rescue_absorbed));
+            log_info("  Protected (S<=0)  : " + std::to_string(rescue_protected));
+            for (int o = 0; o < 6; ++o) {
+                log_info("    occ_bin[" + std::to_string(o) + "] absorbed = " +
+                         std::to_string(rescue_absorbed_by_occ[o]));
+            }
+        }
         if (bucket_overflow_drops > 0)
             log_warn("Phase 3: " + std::to_string(bucket_overflow_drops) +
                      " pair-key entries dropped — some PCR error candidates were not evaluated. "
@@ -149,7 +195,7 @@ struct SeqArena {
     std::vector<uint8_t>  packed;
     std::vector<uint64_t> offsets;
     std::vector<uint16_t> lengths;
-    std::vector<bool>     eligible;
+    std::vector<uint8_t>  eligible;  // 1 byte/read, no proxy bit-extract
 
     uint32_t append(const std::string& seq) {
         if (seq.size() > 65535u)
@@ -174,7 +220,7 @@ struct SeqArena {
             }
             dst[byte++] = v;
         }
-        eligible.push_back(ok);
+        eligible.push_back(ok ? uint8_t{1} : uint8_t{0});
         return id;
     }
 
@@ -200,7 +246,7 @@ struct SeqArena {
             }
             dst[byte++] = v;
         }
-        eligible.push_back(ok);
+        eligible.push_back(ok ? uint8_t{1} : uint8_t{0});
         return id;
     }
 
