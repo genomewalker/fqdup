@@ -3,3 +3,8 @@ build/
 # Internal benchmarks using external tools not included in the repo
 tests/bench_swarm.sh
 tests/generate_damaged_reads.py
+# Bench data — never commit (GitHub 100MB limit)
+bench/*.fq
+bench/*.fq.gz
+bench/*.fastq
+bench/*.fastq.gz
