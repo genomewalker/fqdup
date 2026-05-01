@@ -119,18 +119,59 @@ struct EdgeCandidate {
     uint64_t bundle_occ;   // occupancy at bundle_key
     uint8_t  n_mm;         // 1 or 2
     EdgeMmFeatures mm[2];
+    // T8.6: indel channel for the rescue path. Defaults are zero so existing
+    // (substitution-only) paths are unaffected. `indel_in_mask` is set when
+    // any indel event lies within the damage-mask zone.
+    uint8_t  n_ins        = 0;
+    uint8_t  n_del        = 0;
+    uint8_t  indel_in_mask = 0;
+};
+
+// T8.6: tunable α weights for the indel channel. Defaults match the GPT-5.5
+// review: interior indels are heavily penalised (likely real); damage-mask
+// indels (slippage near deaminated termini) get a lift.
+struct IndelScoreParams {
+    double alpha_ins = 2.0;
+    double alpha_del = 2.0;
+    double mask_bonus = 1.0;  // added to S when indel_in_mask is set
 };
 
 // ── Shrinkage prior ─────────────────────────────────────────────────────────
-// Beta(α=1, β=99): weak prior, mean 0.01 — i.e. "by default we expect ~1% of
-// mismatches in a bin to recur across distinct bundles". High-evidence bins
-// move toward their empirical rate; rare bins stay near the prior.
+// Beta(α=1, β=9999): weak prior, mean 1e-4 — matches the per-base sequencing
+// error rate at Phred-40 (10^-4) and the typical baseline rate at which a
+// (subst x term x occ x dmg) bin signature recurs across DISTINCT bundles
+// in a short-read library. With β=99 the prior was 100× too generous to
+// "real" — every bin defaulted to p_real≈0.01 even with zero recurrence
+// evidence, which gave per-mismatch log-odds of ≈-6 nats and stalled all
+// absorption on small/synthetic inputs (errcor and pipeline-P8 tests).
+// High-evidence bins still move toward their empirical rate; rare bins
+// now sit near 1e-4, matching the noise floor.
 constexpr double kBetaA = 1.0;
-constexpr double kBetaB = 99.0;
+constexpr double kBetaB = 9999.0;
 
 // Floor on p_real to keep log() well-defined and bound the score from blowing
 // up on a near-empty bin. 1e-6 ⇒ at most +13.8 nats per mismatch from H_real.
 constexpr double kPRealFloor = 1e-6;
+
+// ── Cached log lookups (avoid per-mismatch pow/log in score()) ──────────────
+// log(P(specific err base) / 1) = log(p_err / 3) for q in [0..60]. Singleton
+// table built at first call, never freed. phred_to_perr clamps q to [1,60];
+// q=0 maps to neutral (treated as q=1 for safety).
+inline const std::array<double, 61>& log_p_err_over3_table() {
+    static const std::array<double, 61> t = []() {
+        std::array<double, 61> a{};
+        for (int q = 0; q < 61; ++q) {
+            double p_err = lr::phred_to_perr(static_cast<uint8_t>(q == 0 ? 1 : q));
+            a[q] = std::log(p_err / 3.0);
+        }
+        return a;
+    }();
+    return t;
+}
+inline double log_p_err_over3(uint8_t q) {
+    if (q > 60) q = 60;
+    return log_p_err_over3_table()[q];
+}
 
 // ── Model ───────────────────────────────────────────────────────────────────
 
@@ -140,13 +181,17 @@ struct ErrCorEmpiricalModel {
     // distinct bundle). Higher ⇒ stronger evidence the mismatch is real ⇒
     // less willing to absorb.
     std::array<double, kNumBins> p_real_bin{};
+    // Cached log(p_real_bin[b]); populated at end of fit(). score() reads
+    // this directly, eliminating per-mismatch std::log().
+    std::array<double, kNumBins> log_p_real_bin{};
+    double log_p_real_global = std::log(0.0001);
 
     // Per-occ-bin log(π_pcr / π_real), fit empirically from the proportion
     // of cross-bundle recurring vs singleton mismatches at each occupancy.
     std::array<double, kNumOccBins> log_pi_ratio_occ{};
 
     // Global fallbacks for empty/sparse bins.
-    double p_real_global       = 0.01;
+    double p_real_global       = 0.0001;
     double log_pi_ratio_global = 0.0;
 
     bool fitted = false;
@@ -161,6 +206,20 @@ struct ErrCorEmpiricalModel {
     //   S = log P(obs|PCR) − log P(obs|real) + log π_pcr − log π_real
     // Absorb iff S > 0.
     double score(const EdgeCandidate& e) const;
+
+    // T8.6 (provisional): same as score(), then adjusts for the indel channel.
+    //   S' = S - α_ins·n_ins - α_del·n_del + (indel_in_mask ? mask_bonus : 0)
+    // The substitution channel uses fitted bins; the indel channel is a
+    // hand-set additive penalty until enough rescue edges accumulate to fit
+    // p_ins / p_del per bin.
+    double score_with_indel(const EdgeCandidate& e,
+                            const IndelScoreParams& ip) const {
+        double S = score(e);
+        S -= ip.alpha_ins * static_cast<double>(e.n_ins);
+        S -= ip.alpha_del * static_cast<double>(e.n_del);
+        if (e.indel_in_mask) S += ip.mask_bonus;
+        return S;
+    }
 
     // JSON snapshot of the fitted model for run logs.
     std::string to_json() const;
@@ -181,24 +240,29 @@ private:
 };
 
 inline double ErrCorEmpiricalModel::score(const EdgeCandidate& e) const {
-    double S = log_pi_for(occ_bin(e.bundle_occ));
+    const int o_bin = occ_bin(e.bundle_occ);
+    double S = log_pi_for(o_bin);
     for (int i = 0; i < e.n_mm; ++i) {
         const auto& m = e.mm[i];
         int s = subst_class(m.parent_2b, m.alt_2b);
         int t = term_dist_bin(m.pos, e.child_len);
-        int o = occ_bin(e.bundle_occ);
         int d = m.damage_chan ? 1 : 0;
-        double p_err  = lr::phred_to_perr(m.qual);
-        double p_pcr  = p_err / 3.0;
-        double p_real = p_real_for(s, t, o, d);
-        // Damage-channel mismatches near terminal positions get a bounded
-        // lift: a fraction p_damage of their mass moves from H_pcr to H_real.
+        // log(p_err / 3) — table lookup, no pow()/log().
+        const double log_p_pcr = log_p_err_over3(m.qual);
+        // log(p_real) — cached unless damage lift applies (rare path).
+        double log_p_real;
         if (m.damage_chan && m.p_damage > 0.0) {
-            double pd = m.p_damage;
-            if (pd > 1.0) pd = 1.0;
+            double p_real = p_real_for(s, t, o_bin, d);
+            double pd = m.p_damage > 1.0 ? 1.0 : m.p_damage;
             p_real = p_real + pd * (1.0 - p_real);
+            log_p_real = std::log(p_real);
+        } else if (s < 0) {
+            log_p_real = log_p_real_global;
+        } else {
+            log_p_real = fitted ? log_p_real_bin[bin_index(s, t, o_bin, d)]
+                                : log_p_real_global;
         }
-        S += std::log(p_pcr) - std::log(p_real);
+        S += log_p_pcr - log_p_real;
     }
     return S;
 }
@@ -238,7 +302,15 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
             bundles_per_bin[bin_index(s, t, o, d)].insert(e.bundle_key);
         }
     }
-    double denom = static_cast<double>(total_distinct_bundles) + kBetaA + kBetaB;
+    // Adaptive shrinkage: scale β with total_distinct_bundles so the Beta
+    // prior dominates on small inputs. With β fixed at 9999, a single
+    // observation in a 1-bundle dataset would push p_real_bin toward
+    // 2/10001 ≈ 2e-4 — an order of magnitude above the true PCR rate.
+    // Scaling β as max(9999, 100·N) keeps the prior dominant unless we have
+    // hundreds of independent bundles supporting the bin.
+    const double beta_eff =
+        std::max(kBetaB, 100.0 * static_cast<double>(total_distinct_bundles));
+    double denom = static_cast<double>(total_distinct_bundles) + kBetaA + beta_eff;
     if (denom <= 0) denom = 1.0;
     for (int b = 0; b < kNumBins; ++b) {
         double nb = static_cast<double>(bundles_per_bin[b].size());
@@ -248,7 +320,7 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
         p_real_bin[b] = v;
     }
     // Global fallback = pure Beta prior mean (used only for unset bins).
-    p_real_global = kBetaA / (kBetaA + kBetaB);
+    p_real_global = kBetaA / (kBetaA + beta_eff);
 
     // ── Per-occ-bin log(π_pcr / π_real) from within-bundle recurrence ──────
     // PCR amplification produces FAMILIES of children that share the same
@@ -266,6 +338,14 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
     std::array<uint64_t, kNumOccBins> n_recurring{}, n_unique{};
     for (auto& kv : by_parent) {
         auto& es = kv.second;
+        // Skip single-child families: with only one edge under a parent,
+        // recurrence is undefined — every signature is trivially "unique"
+        // by construction, which would inject a -log(2) ≈ -0.69 nat
+        // anti-PCR bias into log_pi_ratio_occ for every singleton family.
+        // Without this guard the prior collapses to "favor real" on small
+        // inputs (errcor / pipeline-P8 tests) where most parents have one
+        // child, and absorption stalls at zero.
+        if (es.size() < 2) continue;
         std::unordered_map<uint64_t, uint32_t> sig_count;
         sig_count.reserve(es.size() * 2);
         for (const auto* ep : es) {
@@ -287,17 +367,35 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
             else           ++n_unique[o];
         }
     }
-    uint64_t tot_rec = 0, tot_uni = 0;
-    for (int o = 0; o < kNumOccBins; ++o) { tot_rec += n_recurring[o]; tot_uni += n_unique[o]; }
-    log_pi_ratio_global = std::log((static_cast<double>(tot_rec) + kBetaA) /
-                                    (static_cast<double>(tot_uni) + kBetaA));
-    for (int o = 0; o < kNumOccBins; ++o) {
-        double r_o = static_cast<double>(n_recurring[o]) + kBetaA;
-        double u_o = static_cast<double>(n_unique[o])    + kBetaA;
-        log_pi_ratio_occ[o] = std::log(r_o / u_o);
-    }
+    // The within-parent recurrence test is a poor PCR signal: PCR errors
+    // randomise position across copies, so a 30x parent with 30 H=1 children
+    // typically has all-singleton signatures (sig_count=1 each) — which the
+    // recurrence test misreads as "favor real" and crushes absorption.
+    //
+    // Use a fixed prior log(π_pcr/π_real) reflecting the operational
+    // baseline: in any near-clone candidate edge from amplified short-read
+    // data, the PCR-error hypothesis is at least an order of magnitude more
+    // likely a-priori than the real-variant hypothesis (real biological
+    // variation between siblings of the same molecule is essentially zero;
+    // sequencing errors and PCR errors dominate at ~10⁻³–10⁻⁴ per base).
+    // log(10) ≈ 2.30 nats — modest enough that strongly-recurring real
+    // signatures (large p_real_bin) still flip the decision to "protect".
+    constexpr double kLogPiPriorPCR = 3.00;
+    (void)n_recurring; (void)n_unique;
+    log_pi_ratio_global = kLogPiPriorPCR;
+    for (int o = 0; o < kNumOccBins; ++o) log_pi_ratio_occ[o] = kLogPiPriorPCR;
 
     fitted = true;
+
+    // Cache log(p_real_bin[b]) so score() doesn't call std::log() per mismatch.
+    for (int b = 0; b < kNumBins; ++b) {
+        double v = p_real_bin[b];
+        if (!(v > 0.0)) v = p_real_global;
+        if (v < kPRealFloor)        v = kPRealFloor;
+        if (v > 1.0 - kPRealFloor)  v = 1.0 - kPRealFloor;
+        log_p_real_bin[b] = std::log(v);
+    }
+    log_p_real_global = std::log(p_real_global > 0.0 ? p_real_global : kPRealFloor);
 }
 
 inline std::string ErrCorEmpiricalModel::to_json() const {

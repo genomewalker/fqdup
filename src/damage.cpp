@@ -97,6 +97,67 @@ static void worker_fn(WorkQueue& queue, WorkerState& state) {
     }
 }
 
+// ---- paired-end work queue + worker -------------------------------------
+struct PairedBatch {
+    std::vector<std::string> r1;
+    std::vector<std::string> r2;
+};
+
+struct PairedWorkQueue {
+    std::mutex              mtx;
+    std::condition_variable cv_not_empty;
+    std::condition_variable cv_not_full;
+    std::vector<PairedBatch> batches;
+    bool   done      = false;
+    int    max_depth;
+
+    explicit PairedWorkQueue(int max_depth) : max_depth(max_depth) {}
+
+    void push(PairedBatch&& batch) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_not_full.wait(lk, [&]{ return (int)batches.size() < max_depth; });
+        batches.push_back(std::move(batch));
+        cv_not_empty.notify_one();
+    }
+    bool pop(PairedBatch& batch) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_not_empty.wait(lk, [&]{ return !batches.empty() || done; });
+        if (batches.empty()) return false;
+        batch = std::move(batches.back());
+        batches.pop_back();
+        cv_not_full.notify_one();
+        return true;
+    }
+    void set_done() {
+        std::unique_lock<std::mutex> lk(mtx);
+        done = true;
+        cv_not_empty.notify_all();
+    }
+};
+
+static void paired_worker_fn(PairedWorkQueue& queue, WorkerState& state) {
+    PairedBatch batch;
+    while (queue.pop(batch)) {
+        const size_t n = std::min(batch.r1.size(), batch.r2.size());
+        for (size_t k = 0; k < n; ++k) {
+            const std::string& s1 = batch.r1[k];
+            const std::string& s2 = batch.r2[k];
+            int L1 = static_cast<int>(s1.size());
+            int L2 = static_cast<int>(s2.size());
+            if (L1 < LSD_L_MIN || L2 < LSD_L_MIN) { ++state.reads_skipped; continue; }
+            const bool ok = taph::FrameSelector::update_sample_profile_paired(
+                state.profile, s1, s2);
+            if (!ok) { ++state.reads_skipped; continue; }
+            // Length tracking: use R1 as the canonical insert proxy.
+            ++state.lsd_hist[lsd_hist_bin(L1)];
+            if (L1 < state.len_min) state.len_min = L1;
+            if (L1 > state.len_max) state.len_max = L1;
+            state.len_sum += L1;
+            ++state.reads_scanned;
+        }
+    }
+}
+
 // ---- clip pass: re-profile after stripping 5' and/or 3' adapter stubs ------
 static void clip_worker_fn(WorkQueue& queue, WorkerState& state,
                            const std::vector<std::string>& stubs5,
@@ -247,9 +308,13 @@ static void oxog_worker(WorkQueue& queue,
 // ---- helpers -----------------------------------------------------------
 static void print_usage(const char* prog) {
     std::cerr
-        << "Usage: " << prog << " damage -i FILE [options]\n"
+        << "Usage: " << prog << " damage (-i FILE | -1 R1.fq -2 R2.fq) [options]\n"
+        << "\nInput modes (mutually exclusive):\n"
+        << "  -i FILE                    Single-end / merged input FASTQ (.gz or plain)\n"
+        << "  -1 FILE  -2 FILE           Paired-end raw reads (un-merged); R1 contributes\n"
+        << "                             5' counters, R2 (complement-mapped) contributes\n"
+        << "                             3' counters. Read 3' ends ignored (adapter zone).\n"
         << "\nOptions:\n"
-        << "  -i FILE                    Input FASTQ (.gz or plain)\n"
         << "  -p N                       Worker threads (default: all cores)\n"
         << "  --library-type auto|ds|ss  Library type for 3'-end interpretation (default: auto)\n"
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
@@ -295,6 +360,8 @@ static LengthBinOptions parse_length_bins(const std::string& spec, bool& ok) {
 // ---- main --------------------------------------------------------------
 int damage_main(int argc, char** argv) {
     std::string in_path;
+    std::string r1_path;
+    std::string r2_path;
     int         n_threads     = static_cast<int>(std::thread::hardware_concurrency());
     if (n_threads < 1) n_threads = 1;
     double      mask_threshold = 0.05;
@@ -310,6 +377,10 @@ int damage_main(int argc, char** argv) {
         std::string arg(argv[i]);
         if ((arg == "-i" || arg == "--input") && i + 1 < argc) {
             in_path = argv[++i];
+        } else if ((arg == "-1" || arg == "--read1") && i + 1 < argc) {
+            r1_path = argv[++i];
+        } else if ((arg == "-2" || arg == "--read2") && i + 1 < argc) {
+            r2_path = argv[++i];
         } else if ((arg == "-p" || arg == "--threads") && i + 1 < argc) {
             n_threads = std::stoi(argv[++i]);
             if (n_threads < 1) n_threads = 1;
@@ -355,8 +426,19 @@ int damage_main(int argc, char** argv) {
         }
     }
 
-    if (in_path.empty()) {
-        std::cerr << "Error: -i FILE required\n";
+    const bool paired_mode = !r1_path.empty() && !r2_path.empty();
+    if (paired_mode && !in_path.empty()) {
+        std::cerr << "Error: -i and -1/-2 are mutually exclusive\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (!paired_mode && (!r1_path.empty() || !r2_path.empty())) {
+        std::cerr << "Error: -1 and -2 must both be provided for paired mode\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (!paired_mode && in_path.empty()) {
+        std::cerr << "Error: -i FILE or -1/-2 required\n";
         print_usage(argv[0]);
         return 1;
     }
@@ -372,10 +454,11 @@ int damage_main(int argc, char** argv) {
 
     taph::AdapterStubs stubs;
 
-    {
+    std::array<uint32_t, 4096> hex3_terminal{};
+    uint64_t n_hex3 = 0;
+
+    if (!paired_mode) {
         WorkerState scan_state;
-        std::array<uint32_t, 4096> hex3_terminal{};
-        uint64_t n_hex3 = 0;
         auto reader_pre = make_fastq_reader(in_path, 1);
         FastqRecord rec;
         int64_t n = 0;
@@ -390,44 +473,110 @@ int damage_main(int argc, char** argv) {
             ++n;
         }
         stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
+    } else {
+        // Paired pre-scan: 5' hexamer from R1[0..5], 3' terminal hexamer from
+        // RC(R2[0..5]) (R2's 5' = molecule 3' end, complement-mapped).
+        WorkerState scan_state;
+        auto reader_r1 = make_fastq_reader(r1_path, 1);
+        auto reader_r2 = make_fastq_reader(r2_path, 1);
+        FastqRecord rec1, rec2;
+        int64_t n = 0;
+        auto rc_base = [](char c) -> char {
+            switch (c) { case 'A': return 'T'; case 'T': return 'A';
+                         case 'C': return 'G'; case 'G': return 'C';
+                         case 'a': return 't'; case 't': return 'a';
+                         case 'c': return 'g'; case 'g': return 'c'; }
+            return 'N';
+        };
+        while (reader_r1->read(rec1) && reader_r2->read(rec2)
+               && (pre_scan_reads == 0 || n < pre_scan_reads)) {
+            int L1 = static_cast<int>(rec1.seq.size());
+            int L2 = static_cast<int>(rec2.seq.size());
+            if (L1 < LSD_L_MIN || L2 < LSD_L_MIN) continue;
+            taph::FrameSelector::update_sample_profile_paired(
+                scan_state.profile, rec1.seq, rec2.seq);
+            // Molecule 3' terminal hexamer: revcomp(R2[0..5]).
+            if (L2 >= 6) {
+                std::string h3(6, 'N');
+                for (int i = 0; i < 6; ++i) h3[i] = rc_base(rec2.seq[5 - i]);
+                int code = taph::encode_hex_at(h3, 0);
+                if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
+            }
+            ++n;
+        }
+        stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     }
 
-    // ---- full pass: profile (with optional 5' clip) --------------------
-    WorkQueue queue(2 * n_threads);
+    // ---- full pass: profile --------------------------------------------
     std::vector<WorkerState> states(n_threads);
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        if (stubs.adapter_clipped || stubs.adapter3_clipped)
-            workers.emplace_back(clip_worker_fn, std::ref(queue),
-                                 std::ref(states[t]),
-                                 std::cref(stubs.stubs5), std::cref(stubs.stubs3));
-        else
-            workers.emplace_back(worker_fn, std::ref(queue), std::ref(states[t]));
-    }
 
-    try {
-        auto reader = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
-        FastqRecord rec;
-        std::vector<std::string> batch;
-        batch.reserve(BATCH_SZ);
-        while (reader->read(rec)) {
-            batch.push_back(std::move(rec.seq));
-            if ((int)batch.size() == BATCH_SZ) {
-                queue.push(std::move(batch));
-                batch.clear();
-                batch.reserve(BATCH_SZ);
-            }
+    if (!paired_mode) {
+        WorkQueue queue(2 * n_threads);
+        for (int t = 0; t < n_threads; ++t) {
+            if (stubs.adapter_clipped || stubs.adapter3_clipped)
+                workers.emplace_back(clip_worker_fn, std::ref(queue),
+                                     std::ref(states[t]),
+                                     std::cref(stubs.stubs5), std::cref(stubs.stubs3));
+            else
+                workers.emplace_back(worker_fn, std::ref(queue), std::ref(states[t]));
         }
-        if (!batch.empty())
-            queue.push(std::move(batch));
-    } catch (...) {
+        try {
+            auto reader = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
+            FastqRecord rec;
+            std::vector<std::string> batch;
+            batch.reserve(BATCH_SZ);
+            while (reader->read(rec)) {
+                batch.push_back(std::move(rec.seq));
+                if ((int)batch.size() == BATCH_SZ) {
+                    queue.push(std::move(batch));
+                    batch.clear();
+                    batch.reserve(BATCH_SZ);
+                }
+            }
+            if (!batch.empty()) queue.push(std::move(batch));
+        } catch (...) {
+            queue.set_done();
+            for (auto& w : workers) w.join();
+            throw;
+        }
         queue.set_done();
         for (auto& w : workers) w.join();
-        throw;
+    } else {
+        // Paired-end: clip workers not used (PE-mode skips read 3' ends, so
+        // 3' adapter contamination doesn't enter per_pos_3prime; and PE-mode
+        // pre-scan uses update_sample_profile_paired which doesn't drive the
+        // 5' adapter-stub detector well enough to reliably clip on this path).
+        PairedWorkQueue queue(2 * n_threads);
+        for (int t = 0; t < n_threads; ++t)
+            workers.emplace_back(paired_worker_fn, std::ref(queue), std::ref(states[t]));
+        try {
+            auto reader_r1 = make_fastq_reader(r1_path, static_cast<size_t>(n_threads));
+            auto reader_r2 = make_fastq_reader(r2_path, static_cast<size_t>(n_threads));
+            FastqRecord rec1, rec2;
+            PairedBatch batch;
+            batch.r1.reserve(BATCH_SZ);
+            batch.r2.reserve(BATCH_SZ);
+            while (reader_r1->read(rec1) && reader_r2->read(rec2)) {
+                batch.r1.push_back(std::move(rec1.seq));
+                batch.r2.push_back(std::move(rec2.seq));
+                if ((int)batch.r1.size() == BATCH_SZ) {
+                    queue.push(std::move(batch));
+                    batch = PairedBatch{};
+                    batch.r1.reserve(BATCH_SZ);
+                    batch.r2.reserve(BATCH_SZ);
+                }
+            }
+            if (!batch.r1.empty()) queue.push(std::move(batch));
+        } catch (...) {
+            queue.set_done();
+            for (auto& w : workers) w.join();
+            throw;
+        }
+        queue.set_done();
+        for (auto& w : workers) w.join();
     }
-    queue.set_done();
-    for (auto& w : workers) w.join();
 
     // ---- merge all per-thread results ----------------------------------
     taph::SampleDamageProfile dp;
@@ -473,6 +622,8 @@ int damage_main(int argc, char** argv) {
     double depur_ctrl_shift_3 = 0.0;
     double oxog_trinuc_cosine = std::numeric_limits<double>::quiet_NaN();
 
+    // Oxog second pass uses single-end reads; skip in paired mode.
+    if (paired_mode) run_oxog = false;
     if (run_oxog && dp.d_max_5prime > 0.01f) {
         WorkQueue queue2(2 * n_threads);
         std::vector<OxogWorkerState> ox_states(n_threads);
@@ -551,7 +702,7 @@ int damage_main(int argc, char** argv) {
 
         // Orientation-corrected Chargaff contrast D_oriented = T/(T+G) - C/(C+A)
         // on oriented reads (DS rotated by max-q orientation, SS as-is).
-        // Unlike the dart D field, this breaks the DS Chargaff cancellation because
+        // Unlike the deamination D field, this breaks the DS Chargaff cancellation because
         // both strands are measured from the same oriented direction after rotation.
         double w_dor = 0.0;
         for (int b = 0; b < N_GC; ++b) {
@@ -621,6 +772,19 @@ int damage_main(int argc, char** argv) {
               << "  DS=" << dp.library_bic_ds
               << "  SS=" << dp.library_bic_ss
               << "  SS_full=" << dp.library_bic_mix << "\n";
+    if (!dp.library_bic_winner_model.empty()) {
+        std::cout << "  winner=" << dp.library_bic_winner_model
+                  << "  second=" << dp.library_bic_second_model
+                  << "  margin=" << std::fixed << std::setprecision(1) << dp.library_bic_margin;
+        if (dp.library_artifact_contaminated && !dp.library_artifact_reasons.empty()) {
+            std::cout << "  [artifact-contaminated:";
+            for (size_t i = 0; i < dp.library_artifact_reasons.size(); ++i) {
+                std::cout << (i ? "," : " ") << dp.library_artifact_reasons[i];
+            }
+            std::cout << "]";
+        }
+        std::cout << "\n";
+    }
     if (dp.library_type_evaluable) {
         std::cout << "  post p_ds=" << std::fixed << std::setprecision(3) << dp.library_p_ds
                   << "  p_ss=" << dp.library_p_ss
@@ -775,7 +939,9 @@ int damage_main(int argc, char** argv) {
     bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
 
     LengthStratifiedDamageProfile lsd;
-    if (lb_opts.enabled()) {
+    if (lb_opts.enabled() && paired_mode) {
+        std::cerr << "Warning: --length-bins is not supported in paired mode; skipping.\n";
+    } else if (lb_opts.enabled()) {
         lsd = estimate_damage_by_length(in_path, forced_lib, lb_opts,
                                         &merged_lsd_hist,
                                         static_cast<size_t>(n_threads), 0, &bulk_dp);
@@ -872,6 +1038,77 @@ int damage_main(int argc, char** argv) {
         j << "  \"library_p_ss\": " << dp.library_p_ss << ",\n";
         j << "  \"library_p_bias\": " << dp.library_p_bias << ",\n";
         j << "  \"library_p_winner\": " << dp.library_p_winner << ",\n";
+        j << "  \"library_p_ds_final\": " << dp.library_p_ds_final << ",\n";
+        j << "  \"library_p_ss_final\": " << dp.library_p_ss_final << ",\n";
+        j << "  \"library_p_bias_final\": " << dp.library_p_bias_final << ",\n";
+        j << "  \"library_p_winner_final\": " << dp.library_p_winner_final << ",\n";
+        // P0-1 / P1 ADDITIVE library_* diagnostics
+        auto libtype_str = [](taph::SampleDamageProfile::LibraryType t) -> const char* {
+            switch (t) {
+                case taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED: return "DOUBLE_STRANDED";
+                case taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED: return "SINGLE_STRANDED";
+                default: return "UNKNOWN";
+            }
+        };
+        j << "  \"library_auto_type\": \"" << libtype_str(dp.library_auto_type) << "\",\n";
+        j << "  \"library_auto_evaluable\": " << (dp.library_auto_evaluable ? "true" : "false") << ",\n";
+        j << "  \"library_forced_type\": \"" << libtype_str(dp.library_forced_type) << "\",\n";
+        j << "  \"library_bic_winner_model\": \"" << dp.library_bic_winner_model << "\",\n";
+        j << "  \"library_bic_second_model\": \"" << dp.library_bic_second_model << "\",\n";
+        j << "  \"library_bic_margin\": " << std::setprecision(2) << dp.library_bic_margin << ",\n";
+        j << "  \"library_p_ds_class_min\": " << std::setprecision(6) << dp.library_p_ds_class_min << ",\n";
+        j << "  \"library_p_ss_class_min\": " << dp.library_p_ss_class_min << ",\n";
+        j << "  \"library_p_bias_class_min\": " << dp.library_p_bias_class_min << ",\n";
+        // Derive artifact_reasons from QC flags after the flags block runs;
+        // for now compute the subset directly from the taph::SampleDamageProfile here.
+        {
+            std::vector<const char*> reasons;
+            if (dp.position_0_artifact_5prime || dp.fit_offset_5prime > 1)
+                reasons.push_back("adapter_remnant_5prime");
+            if (dp.position_0_artifact_3prime || dp.fit_offset_3prime > 1)
+                reasons.push_back("adapter_remnant_3prime");
+            // hexamer_artifact_bias: rely on stubs.flag_hex_artifact below
+            if (stubs.flag_hex_artifact)
+                reasons.push_back("hexamer_artifact_bias");
+            if (dp.position_0_artifact_5prime)
+                reasons.push_back("position0_artifact_5prime");
+            if (dp.position_0_artifact_3prime)
+                reasons.push_back("position0_artifact_3prime");
+            if (dp.inverted_pattern_5prime)
+                reasons.push_back("inverted_pattern_5prime");
+            if (dp.inverted_pattern_3prime)
+                reasons.push_back("inverted_pattern_3prime");
+            j << "  \"library_artifact_contaminated\": " << (reasons.empty() ? "false" : "true") << ",\n";
+            j << "  \"library_artifact_reasons\": [";
+            for (size_t i = 0; i < reasons.size(); ++i) {
+                if (i) j << ",";
+                j << "\"" << reasons[i] << "\"";
+            }
+            j << "],\n";
+            // Mirror onto the taph::SampleDamageProfile for downstream consumers.
+            dp.library_artifact_reasons.clear();
+            for (auto* r : reasons) dp.library_artifact_reasons.emplace_back(r);
+            dp.library_artifact_contaminated = !reasons.empty();
+        }
+        j << "  \"library_M_SS_orig_active\": " << (dp.library_M_SS_orig_active ? "true" : "false") << ",\n";
+        j << "  \"library_M_SS_asym_active\": " << (dp.library_M_SS_asym_active ? "true" : "false") << ",\n";
+        j << "  \"library_spike_is_ss\": " << (dp.library_spike_is_ss ? "true" : "false") << ",\n";
+        j << "  \"library_spike_gate_ga0_amp\": " << std::setprecision(6) << dp.library_spike_gate_ga0_amp << ",\n";
+        j << "  \"library_spike_gate_structural_bilateral\": "
+          << (dp.library_spike_gate_structural_bilateral ? "true" : "false") << ",\n";
+        j << "  \"library_joint_lambda_restricted\": "
+          << (dp.library_joint_lambda_restricted ? "true" : "false") << ",\n";
+        // P0-2 fqdup-specific: 3' damage prior mode that fqdup applies for this lib type.
+        // Derived from dp.library_type (mirrors fqdup/src/damage_profile.cpp logic).
+        {
+            const char* m = "neutral";
+            switch (dp.library_type) {
+                case taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED: m = "ds_ga"; break;
+                case taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED: m = "ss_ct"; break;
+                default: m = "neutral"; break;
+            }
+            j << "  \"damage_3prime_mode\": \"" << m << "\",\n";
+        }
         const char* ds_str = (dp.damage_status == taph::SampleDamageProfile::DamageStatus::PRESENT) ? "present"
                            : (dp.damage_status == taph::SampleDamageProfile::DamageStatus::WEAK)    ? "weak"
                            : "absent";
@@ -1419,7 +1656,117 @@ int damage_main(int argc, char** argv) {
         j << "    \"p_ss\": " << dp.library_p_ss << ",\n";
         j << "    \"p_bias\": " << dp.library_p_bias << ",\n";
         j << "    \"p_winner\": " << dp.library_p_winner << ",\n";
-        j << "    \"evaluable\": " << (dp.library_type_evaluable ? "true" : "false") << "\n";
+        j << "    \"p_ds_final\": " << dp.library_p_ds_final << ",\n";
+        j << "    \"p_ss_final\": " << dp.library_p_ss_final << ",\n";
+        j << "    \"p_bias_final\": " << dp.library_p_bias_final << ",\n";
+        j << "    \"p_winner_final\": " << dp.library_p_winner_final << ",\n";
+        j << "    \"evaluable\": " << (dp.library_type_evaluable ? "true" : "false") << ",\n";
+        // P1-B ADDITIVE: per-submodel BICs and tournament metadata
+        j << "    \"library_submodel_bic\": {\n";
+        j << "      \"M_bias\": "        << std::setprecision(2) << dp.library_bic_M_bias        << ",\n";
+        j << "      \"M_DS_symm\": "     << dp.library_bic_M_DS_symm     << ",\n";
+        j << "      \"M_DS_spike\": "    << dp.library_bic_M_DS_spike    << ",\n";
+        j << "      \"M_DS_symm_art\": " << dp.library_bic_M_DS_symm_art << ",\n";
+        j << "      \"M_SS_comp\": "     << dp.library_bic_M_SS_comp     << ",\n";
+        j << "      \"M_SS_orig\": "     << dp.library_bic_M_SS_orig     << ",\n";
+        j << "      \"M_SS_asym\": "     << dp.library_bic_M_SS_asym     << ",\n";
+        j << "      \"M_SS_full\": "     << dp.library_bic_M_SS_full     << ",\n";
+        j << "      \"M_DS_asym_art\": " << dp.library_bic_M_DS_asym_art << "\n";
+        j << "    },\n";
+        j << "    \"library_bic_winner_model\": \"" << dp.library_bic_winner_model << "\",\n";
+        j << "    \"library_bic_second_model\": \"" << dp.library_bic_second_model << "\",\n";
+        j << "    \"library_bic_margin\": " << dp.library_bic_margin << ",\n";
+        // Protocol-tag classifier evidence (5' top hexamer ≈ chemistry fingerprint)
+        {
+            auto tag_class_str = [](taph::SampleDamageProfile::LibraryType t) -> const char* {
+                switch (t) {
+                    case taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED: return "double-stranded";
+                    case taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED: return "single-stranded";
+                    default: return "unknown";
+                }
+            };
+            j << "    \"protocol_tag_5prime\": \""   << dp.protocol_tag_5prime   << "\",\n";
+            j << "    \"protocol_tag_protocol\": \"" << dp.protocol_tag_protocol << "\",\n";
+            j << "    \"protocol_tag_class\": \""    << tag_class_str(dp.protocol_tag_class) << "\",\n";
+            j << "    \"protocol_tag_log2fc\": "     << std::setprecision(4) << dp.protocol_tag_log2fc   << ",\n";
+            j << "    \"protocol_tag_log_lr\": "     << dp.protocol_tag_log_lr   << ",\n";
+            j << "    \"protocol_tag_applied\": "    << (dp.protocol_tag_applied ? "true" : "false") << ",\n";
+        }
+        // Chemistry-aware Briggs fit + headline area-excess statistics.
+        j << "    \"briggs_pos0_masked_5prime\": "
+          << (dp.briggs_pos0_masked_5prime ? "true" : "false") << ",\n";
+        j << "    \"briggs_pos0_masked_3prime\": "
+          << (dp.briggs_pos0_masked_3prime ? "true" : "false") << ",\n";
+        j << "    \"bg_5prime_anchored\": " << std::setprecision(6) << dp.bg_5prime_anchored << ",\n";
+        j << "    \"bg_3prime_anchored\": " << dp.bg_3prime_anchored << ",\n";
+        j << "    \"bg_n_positions_5prime\": " << dp.bg_n_positions_5prime << ",\n";
+        j << "    \"bg_n_positions_3prime\": " << dp.bg_n_positions_3prime << ",\n";
+        j << "    \"bg_denominator_5prime\": " << static_cast<long long>(dp.bg_denominator_5prime) << ",\n";
+        j << "    \"bg_denominator_3prime\": " << static_cast<long long>(dp.bg_denominator_3prime) << ",\n";
+        j << "    \"damage_5prime_area_excess\": " << std::setprecision(6) << dp.damage_5prime_area_excess << ",\n";
+        j << "    \"damage_3prime_area_excess\": " << dp.damage_3prime_area_excess << ",\n";
+        j << "    \"damage_5prime_lr\": " << std::setprecision(4) << dp.damage_5prime_lr << ",\n";
+        j << "    \"damage_3prime_lr\": " << dp.damage_3prime_lr << ",\n";
+        j << "    \"input_mode\": \""
+          << (dp.input_mode == taph::SampleDamageProfile::InputMode::PAIRED ? "paired" : "single")
+          << "\",\n";
+        j << "    \"pe_short_insert_skipped\": "
+          << static_cast<long long>(dp.pe_short_insert_skipped) << ",\n";
+        // S1 telemetry block — frozen schema; never affects classification
+        j << "    \"library_bic_M_DS_asym_art\": " << dp.library_bic_M_DS_asym_art << ",\n";
+        j << "    \"library_bic_M_DS_symm_art_no_offset\": " << dp.library_bic_M_DS_symm_art_no_offset << ",\n";
+        j << "    \"library_bic_raw_winner_model\": \"" << dp.library_bic_raw_winner_model << "\",\n";
+        j << "    \"library_bic_raw_winner_class\": \"" << dp.library_bic_raw_winner_class << "\",\n";
+        j << "    \"library_bic_raw_second_model\": \"" << dp.library_bic_raw_second_model << "\",\n";
+        j << "    \"library_bic_raw_margin\": " << dp.library_bic_raw_margin << ",\n";
+        j << "    \"library_bic_raw_winner_in_cascade\": "
+          << (dp.library_bic_raw_winner_in_cascade ? "true" : "false") << ",\n";
+        j << "    \"library_bic_excl_structural_bilateral\": "
+          << (dp.library_bic_excl_structural_bilateral ? "true" : "false") << ",\n";
+        j << "    \"library_bic_excl_spike_is_ss\": "
+          << (dp.library_bic_excl_spike_is_ss ? "true" : "false") << ",\n";
+        j << "    \"library_bic_excl_ct3_zero\": "
+          << (dp.library_bic_excl_ct3_zero ? "true" : "false") << ",\n";
+        j << "    \"library_bic_excl_M_SS_full_hardcoded\": "
+          << (dp.library_bic_excl_M_SS_full_hardcoded ? "true" : "false") << ",\n";
+        j << "    \"library_bic_excl_in_cascade\": "
+          << (dp.library_bic_excl_in_cascade ? "true" : "false") << ",\n";
+        j << "    \"final_library_bic_winner_model\": \"" << dp.final_library_bic_winner_model << "\",\n";
+        j << "    \"final_library_bic_override_reason\": \"" << dp.final_library_bic_override_reason << "\",\n";
+        j << "    \"library_gate_artifact_5\": "
+          << (dp.library_gate_artifact_5 ? "true" : "false") << ",\n";
+        j << "    \"library_gate_artifact_3\": "
+          << (dp.library_gate_artifact_3 ? "true" : "false") << ",\n";
+        j << "    \"library_gate_position_0_artifact_5prime\": "
+          << (dp.library_gate_position_0_artifact_5prime ? "true" : "false") << ",\n";
+        j << "    \"library_gate_position_0_artifact_3prime\": "
+          << (dp.library_gate_position_0_artifact_3prime ? "true" : "false") << ",\n";
+        j << "    \"library_gate_inverted_pattern_5prime\": "
+          << (dp.library_gate_inverted_pattern_5prime ? "true" : "false") << ",\n";
+        j << "    \"library_gate_inverted_pattern_3prime\": "
+          << (dp.library_gate_inverted_pattern_3prime ? "true" : "false") << ",\n";
+        j << "    \"library_gate_max_damage_5prime\": " << std::setprecision(6)
+          << dp.library_gate_max_damage_5prime << ",\n";
+        j << "    \"library_gate_ss_orientation_evidence\": "
+          << (dp.library_gate_ss_orientation_evidence ? "true" : "false") << ",\n";
+        j << "    \"library_gate_ga_spike_dominant\": "
+          << (dp.library_gate_ga_spike_dominant ? "true" : "false") << ",\n";
+        j << "    \"library_gate_ds_spike_won\": "
+          << (dp.library_gate_ds_spike_won ? "true" : "false") << ",\n";
+        j << "    \"library_gate_ga0_dominates_ct5\": "
+          << (dp.library_gate_ga0_dominates_ct5 ? "true" : "false") << ",\n";
+        j << "    \"library_gate_structural_bilateral\": "
+          << (dp.library_gate_structural_bilateral ? "true" : "false") << ",\n";
+        j << "    \"library_joint_lambda_restricted\": "
+          << (dp.library_joint_lambda_restricted ? "true" : "false") << ",\n";
+        j << "    \"fit_offset_5prime\": " << dp.fit_offset_5prime << ",\n";
+        j << "    \"fit_offset_3prime\": " << dp.fit_offset_3prime << ",\n";
+        j << "    \"ct3_offset\": " << dp.library_ct3_offset << ",\n";
+        j << "    \"ds_symm_offset\": " << dp.library_ds_symm_offset << ",\n";
+        j << "    \"ds_symm_lambda_used\": " << std::setprecision(6) << dp.library_ds_symm_lambda_used << ",\n";
+        j << "    \"ds_symm_amp\": " << dp.library_ds_symm_amp << ",\n";
+        j << "    \"ds_symm_ct5_resid\": " << dp.library_ds_symm_ct5_resid << ",\n";
+        j << "    \"ds_symm_ga3_resid\": " << dp.library_ds_symm_ga3_resid << "\n";
         j << "  }\n";
         j << "}\n";
         std::cout << "JSON written: " << json_path << "\n";

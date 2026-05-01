@@ -80,9 +80,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
-# libtaph — taphonomy estimation library (deamination, 8-oxoG, PCR, length/GC,
-# mixture model). Provides taph::FrameSelector::{update,finalize}_sample_profile
-# and SampleDamageProfile with d_max_combined, all channels, GC bins.
+# libtaph — reference-free aDNA damage estimation library (deamination,
+# 8-oxoG, PCR, length/GC mixture model). Provides taph::FrameSelector::{update,
+# finalize}_sample_profile and taph::SampleDamageProfile with d_max_combined,
+# all channels, GC bins. Library target: `taph`.
+# To pin against a local checkout during development, set FETCHCONTENT_SOURCE_DIR_LIBTAPH.
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
@@ -116,6 +118,7 @@ add_executable(fqdup
     src/logger.cpp
     src/cluster_format.cpp
     src/view.cpp
+    # src/consensus.cpp  # TEMP DISABLED: WIP refactor — task #20
 )
 
 target_include_directories(fqdup PRIVATE

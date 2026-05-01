@@ -9,17 +9,127 @@
 #include <stdexcept>
 #include <zstd.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <cerrno>
+
 namespace fqdup::clusterfmt {
+
+namespace detail {
+
+// 64 MB userland buffer — matches a few NFS rsize/wsize multiples on Isilon
+// and is large enough to absorb a full Phase-3 burst of header rewrites
+// without any flush stalls before the bulk-writes start.
+inline constexpr std::size_t kDefaultBufSize = 64u * 1024u * 1024u;
+
+class BufferedFdWriter {
+public:
+    explicit BufferedFdWriter(const std::string& path,
+                              std::size_t bufsz = kDefaultBufSize)
+        : buf_(bufsz) {
+        fd_ = ::open(path.c_str(),
+                     O_WRONLY | O_CREAT | O_TRUNC,
+                     0644);
+        if (fd_ < 0)
+            throw std::runtime_error("BufferedFdWriter: open failed for " + path
+                                     + ": " + std::strerror(errno));
+    }
+
+    ~BufferedFdWriter() {
+        try { close(); } catch (...) {}
+    }
+
+    BufferedFdWriter(const BufferedFdWriter&) = delete;
+    BufferedFdWriter& operator=(const BufferedFdWriter&) = delete;
+
+    // ofstream-like surface ----------------------------------------------------
+
+    explicit operator bool() const noexcept { return fd_ >= 0 && !failed_; }
+
+    void write(const char* data, std::streamsize n) {
+        if (n <= 0) return;
+        const std::size_t need = static_cast<std::size_t>(n);
+
+        // Big-write fast path: bypass the buffer for writes larger than it.
+        if (need >= buf_.size()) {
+            flush_buf_();
+            do_write_all_(data, need);
+            logical_pos_ += static_cast<std::int64_t>(need);
+            return;
+        }
+        if (used_ + need > buf_.size()) flush_buf_();
+        std::memcpy(buf_.data() + used_, data, need);
+        used_ += need;
+        logical_pos_ += static_cast<std::int64_t>(need);
+    }
+
+    std::int64_t tellp() const noexcept { return logical_pos_; }
+
+    void seekp(std::int64_t pos) {
+        flush_buf_();
+        if (::lseek(fd_, static_cast<off_t>(pos), SEEK_SET) < 0)
+            throw std::runtime_error(std::string("BufferedFdWriter: lseek failed: ")
+                                     + std::strerror(errno));
+        logical_pos_ = pos;
+    }
+
+    void flush() { flush_buf_(); }
+
+    void close() {
+        if (fd_ < 0) return;
+        flush_buf_();
+        if (::close(fd_) < 0) {
+            fd_ = -1;
+            throw std::runtime_error(std::string("BufferedFdWriter: close failed: ")
+                                     + std::strerror(errno));
+        }
+        fd_ = -1;
+    }
+
+private:
+    void flush_buf_() {
+        if (used_ == 0) return;
+        do_write_all_(buf_.data(), used_);
+        used_ = 0;
+    }
+
+    void do_write_all_(const char* data, std::size_t n) {
+        std::size_t off = 0;
+        while (off < n) {
+            ssize_t w = ::write(fd_, data + off, n - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                failed_ = true;
+                throw std::runtime_error(std::string("BufferedFdWriter: write failed: ")
+                                         + std::strerror(errno));
+            }
+            if (w == 0) {
+                failed_ = true;
+                throw std::runtime_error("BufferedFdWriter: write returned 0");
+            }
+            off += static_cast<std::size_t>(w);
+        }
+    }
+
+    int                fd_ = -1;
+    std::vector<char>  buf_;
+    std::size_t        used_ = 0;
+    std::int64_t       logical_pos_ = 0;
+    bool               failed_ = false;
+};
+
+}  // namespace detail
 
 namespace {
 
 template <typename T>
-void write_le(std::ofstream& os, T v) {
+void write_le(detail::BufferedFdWriter& os, T v) {
     static_assert(std::is_trivially_copyable_v<T>);
     os.write(reinterpret_cast<const char*>(&v), sizeof(T));
 }
 
-void write_bytes(std::ofstream& os, const void* p, std::size_t n) {
+void write_bytes(detail::BufferedFdWriter& os, const void* p, std::size_t n) {
     if (n) os.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
 }
 
@@ -204,8 +314,10 @@ std::string serialise_meta_json(const WriterMetadata& m) {
       << "\"lambda_3\":" << m.lambda_3 << ","
       << "\"mask_pos_5\":" << m.mask_pos_5 << ","
       << "\"mask_pos_3\":" << m.mask_pos_3
-      << "},"
-      << "\"errcor\":{"
+      << "},";
+    if (!m.qc_json.empty())
+        o << "\"qc\":" << m.qc_json << ",";
+    o << "\"errcor\":{"
       << "\"snp_threshold\":" << m.snp_threshold << ","
       << "\"snp_min_count\":" << m.snp_min_count << ","
       << "\"bucket_cap\":"    << m.bucket_cap
@@ -225,10 +337,13 @@ std::string serialise_meta_json(const WriterMetadata& m) {
 
 Writer::Writer(const std::string& path, WriterMetadata meta)
     : path_(path), meta_(std::move(meta)) {
-    ofs_.open(path_, std::ios::binary | std::ios::trunc);
-    if (!ofs_) throw std::runtime_error("cluster_format: cannot open " + path_);
+    ofs_ = std::make_unique<detail::BufferedFdWriter>(path_);
     write_magic_header_();
     write_meta_header_();
+}
+
+void Writer::reserve_clusters(std::uint64_t n) {
+    offsets_.reserve(n);
 }
 
 Writer::~Writer() {
@@ -236,10 +351,10 @@ Writer::~Writer() {
 }
 
 void Writer::write_magic_header_() {
-    write_le<std::uint32_t>(ofs_, kMagic);
-    write_le<std::uint32_t>(ofs_, kVersion);
+    write_le<std::uint32_t>(*ofs_, kMagic);
+    write_le<std::uint32_t>(*ofs_, kVersion);
     // meta_size placeholder; written for real in write_meta_header_().
-    write_le<std::uint64_t>(ofs_, 0);
+    write_le<std::uint64_t>(*ofs_, 0);
 }
 
 void Writer::write_meta_header_() {
@@ -250,28 +365,28 @@ void Writer::write_meta_header_() {
     const std::string json = serialise_meta_json(meta_);
     if (json.size() > kMetaReserve)
         throw std::runtime_error("cluster_format: meta JSON exceeds reserved region");
-    const std::streampos cur = ofs_.tellp();
-    ofs_.seekp(8, std::ios::beg);
-    write_le<std::uint64_t>(ofs_, kMetaReserve);
-    ofs_.seekp(cur);
+    const std::int64_t cur = ofs_->tellp();
+    ofs_->seekp(8);
+    write_le<std::uint64_t>(*ofs_, kMetaReserve);
+    ofs_->seekp(cur);
     std::vector<char> region(kMetaReserve, ' ');
     std::memcpy(region.data(), json.data(), json.size());
     region.back() = '\n';
-    write_bytes(ofs_, region.data(), region.size());
+    write_bytes(*ofs_, region.data(), region.size());
 }
 
 void Writer::write_cluster(const ClusterRecord& rec) {
     if (closed_) throw std::runtime_error("cluster_format: write_cluster after close");
 
-    offsets_.push_back(static_cast<std::uint64_t>(ofs_.tellp()));
+    offsets_.push_back(static_cast<std::uint64_t>(ofs_->tellp()));
 
     std::vector<std::uint8_t> payload;
     if (is_singleton_tiny_eligible(rec)) {
         serialise_tiny(rec, payload);
         const std::uint32_t wire_size = static_cast<std::uint32_t>(1 + payload.size());
-        write_le<std::uint32_t>(ofs_, wire_size);
-        write_le<std::uint8_t >(ofs_, kBlockTypeTiny);
-        write_bytes(ofs_, payload.data(), payload.size());
+        write_le<std::uint32_t>(*ofs_, wire_size);
+        write_le<std::uint8_t >(*ofs_, kBlockTypeTiny);
+        write_bytes(*ofs_, payload.data(), payload.size());
         ++meta_.n_singletons_tinyblock;
     } else {
         serialise_full(rec, payload);
@@ -286,15 +401,15 @@ void Writer::write_cluster(const ClusterRecord& rec) {
                                          + ZSTD_getErrorName(zsz));
             const std::uint32_t wire_size =
                 static_cast<std::uint32_t>(1 + 4 + zsz);
-            write_le<std::uint32_t>(ofs_, wire_size);
-            write_le<std::uint8_t >(ofs_, kBlockTypeFullZstd);
-            write_le<std::uint32_t>(ofs_, static_cast<std::uint32_t>(payload.size()));
-            write_bytes(ofs_, z.data(), zsz);
+            write_le<std::uint32_t>(*ofs_, wire_size);
+            write_le<std::uint8_t >(*ofs_, kBlockTypeFullZstd);
+            write_le<std::uint32_t>(*ofs_, static_cast<std::uint32_t>(payload.size()));
+            write_bytes(*ofs_, z.data(), zsz);
         } else {
             const std::uint32_t wire_size = static_cast<std::uint32_t>(1 + payload.size());
-            write_le<std::uint32_t>(ofs_, wire_size);
-            write_le<std::uint8_t >(ofs_, kBlockTypeFull);
-            write_bytes(ofs_, payload.data(), payload.size());
+            write_le<std::uint32_t>(*ofs_, wire_size);
+            write_le<std::uint8_t >(*ofs_, kBlockTypeFull);
+            write_bytes(*ofs_, payload.data(), payload.size());
         }
     }
     ++n_clusters_;
@@ -305,11 +420,11 @@ void Writer::close() {
     closed_ = true;
 
     const std::uint64_t n = static_cast<std::uint64_t>(offsets_.size());
-    write_bytes(ofs_, offsets_.data(), n * sizeof(std::uint64_t));
-    write_le<std::uint64_t>(ofs_, n);
+    write_bytes(*ofs_, offsets_.data(), n * sizeof(std::uint64_t));
+    write_le<std::uint64_t>(*ofs_, n);
     const std::uint32_t crc = crc32(offsets_.data(), n * sizeof(std::uint64_t));
-    write_le<std::uint32_t>(ofs_, crc);
-    write_le<std::uint32_t>(ofs_, kMagic);
+    write_le<std::uint32_t>(*ofs_, crc);
+    write_le<std::uint32_t>(*ofs_, kMagic);
 
     // Rewrite meta JSON with final counts. The reserved region is fixed-size,
     // so we just overwrite within [8 + 8, 8 + 8 + kMetaReserve).
@@ -317,14 +432,14 @@ void Writer::close() {
     constexpr std::uint64_t kMetaReserve = 8192;
     const std::string json = serialise_meta_json(meta_);
     if (json.size() <= kMetaReserve) {
-        ofs_.seekp(16, std::ios::beg);
+        ofs_->seekp(16);
         std::vector<char> region(kMetaReserve, ' ');
         std::memcpy(region.data(), json.data(), json.size());
         region.back() = '\n';
-        write_bytes(ofs_, region.data(), region.size());
+        write_bytes(*ofs_, region.data(), region.size());
     }
-    ofs_.flush();
-    ofs_.close();
+    ofs_->flush();
+    ofs_->close();
 }
 
 // ── Reader ──────────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@
 // extended.
 //
 // Algorithm:
-//   Pass 0 (optional): DART damage estimation (default: sample 500k reads)
+//   Pass 0 (optional): deamination damage estimation (default: sample 500k reads)
 //   Pass 1: Build canonical k-mer graph (only min(kmer, rc(kmer)) stored per position)
 //   Pass 2: Extend each read at both termini and write extended FASTQ
 //
@@ -689,6 +689,9 @@ struct ExtendConfig {
     taph::SampleDamageProfile::LibraryType library_type =
         taph::SampleDamageProfile::LibraryType::UNKNOWN;
     int      n_threads       = 1;
+    bool     damage_qc_enabled    = true;
+    int64_t  damage_qc_scan_reads = 1'000'000;
+    DamageClipPolicy damage_clip_policy = DamageClipPolicy::ReportOnly;
 };
 
 class ExtendEngine {
@@ -703,7 +706,8 @@ private:
     std::string  in_path_, out_path_;
     ExtendConfig cfg_;
     ShardedKmerTable table_;
-    DamageProfile profile_;
+    DamageProfile  profile_;
+    DamageQcReport qc_report_;
     // Asymmetric mask lengths; -1 = derive from profile_.
     int override_mask5_ = -1;
     int override_mask3_ = -1;
@@ -740,8 +744,19 @@ void ExtendEngine::pass0_estimate_damage() {
         return;
     }
 
-    profile_ = estimate_damage(in_path_, cfg_.mask_threshold, cfg_.library_type,
-                               cfg_.damage_sample);
+    {
+        DamageEstimateOptions opts;
+        opts.mask_threshold     = cfg_.mask_threshold;
+        opts.forced_lib         = cfg_.library_type;
+        opts.max_reads          = cfg_.damage_sample;
+        opts.qc_enabled         = cfg_.damage_qc_enabled;
+        opts.adapter_scan_reads = cfg_.damage_qc_scan_reads;
+        opts.clip_policy        = cfg_.damage_qc_enabled ? cfg_.damage_clip_policy
+                                                         : DamageClipPolicy::Off;
+        DamageEstimate est = estimate_damage_with_qc(in_path_, opts);
+        profile_   = est.profile;
+        qc_report_ = est.qc;
+    }
 
     int m5 = 0, m3 = 0;
     get_mask_lengths(1000, m5, m3);
@@ -1350,6 +1365,9 @@ static void extend_usage(const char* prog) {
         << "  --mask-3 INT                Override 3' mask length; must pair with --mask-5\n"
         << "  --mask-threshold FLOAT      Excess damage threshold (default: 0.05)\n"
         << "  --damage-sample INT         Reads to sample for damage estimation (default: 1000000; 0 = scan all)\n"
+        << "  --no-damage-qc              Disable adapter/hexamer QC report\n"
+        << "  --damage-qc-scan-reads N    Reads sampled for adapter-stub detection (default: 1000000; 0=all)\n"
+        << "  --damage-clip-pass MODE     off|report|refit (default: report)\n"
         << "  --min-qual INT              Exclude bases below this Phred score (default: 20)\n"
         << "  --library-type auto|ds|ss   Library type for damage model (default: auto)\n"
         << "  --threads INT               Worker threads (default: 1)\n"
@@ -1407,6 +1425,24 @@ int extend_main(int argc, char** argv) {
                 return 1;
             }
             cfg.damage_sample = static_cast<int64_t>(v);
+        } else if (arg == "--no-damage-qc") {
+            cfg.damage_qc_enabled = false;
+        } else if (arg == "--damage-qc-scan-reads" && i + 1 < argc) {
+            long long v = std::stoll(argv[++i]);
+            if (v < 0) {
+                std::cerr << "Error: --damage-qc-scan-reads must be >= 0, got " << v << "\n";
+                return 1;
+            }
+            cfg.damage_qc_scan_reads = static_cast<int64_t>(v);
+        } else if (arg == "--damage-clip-pass" && i + 1 < argc) {
+            std::string v(argv[++i]);
+            if      (v == "off")    cfg.damage_clip_policy = DamageClipPolicy::Off;
+            else if (v == "report") cfg.damage_clip_policy = DamageClipPolicy::ReportOnly;
+            else if (v == "refit")  cfg.damage_clip_policy = DamageClipPolicy::Refit;
+            else {
+                std::cerr << "Error: --damage-clip-pass must be off|report|refit, got " << v << "\n";
+                return 1;
+            }
         } else if (arg == "--min-qual" && i + 1 < argc) {
             cfg.min_qual = std::stoi(argv[++i]);
         } else if (arg == "--library-type" && i + 1 < argc) {
