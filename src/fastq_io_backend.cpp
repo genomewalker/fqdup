@@ -9,6 +9,8 @@
 
 #include "fqdup/fastq_common.hpp"
 #include <memory>
+#include <sys/stat.h>
+#include <stdexcept>
 
 namespace {
 
@@ -16,13 +18,16 @@ namespace {
 class FastqReaderRapidgzip : public FastqReaderBase {
 public:
     explicit FastqReaderRapidgzip(const std::string& path, size_t threads = 0)
-        : buffer_pos_(0), buffer_used_(0), eof_(false), record_count_(0) {
+        : path_(path), buffer_pos_(0), buffer_used_(0), eof_(false), record_count_(0) {
         buffer_.resize(GZBUF_SIZE);
         reader_ = std::make_unique<rapidgzip::ParallelGzipReader<>>(
             std::make_unique<rapidgzip::StandardFileReader>(path),
             threads,    // 0 = auto-detect from hardware_concurrency
             GZBUF_SIZE
         );
+        struct stat st{};
+        compressed_size_ = (::stat(path.c_str(), &st) == 0)
+                               ? static_cast<uint64_t>(st.st_size) : 0;
     }
 
     bool read(FastqRecord& rec) override {
@@ -60,17 +65,37 @@ private:
             buffer_used_ = 0;
             if (eof_) return !line.empty();
             const size_t n = reader_->read(buffer_.data(), buffer_.size());
-            if (n == 0) { eof_ = true; return !line.empty(); }
+            if (n == 0) {
+                eof_ = true;
+                // Detect truncated gzip: if rapidgzip stops decoding before the
+                // last compressed byte, the underlying stream lacked a proper
+                // gzip footer (CRC32+ISIZE) — i.e. it was truncated mid-stream.
+                // tellCompressed() returns bits; compare with file size in bits.
+                if (compressed_size_ > 0) {
+                    const uint64_t bits_consumed = reader_->tellCompressed();
+                    const uint64_t bits_total    = compressed_size_ * 8ULL;
+                    // Allow up to 7 bits of padding within the last byte.
+                    if (bits_consumed + 7 < bits_total)
+                        throw std::runtime_error(
+                            "Truncated gzip input '" + path_ +
+                            "': decoded " + std::to_string(bits_consumed / 8) +
+                            "/" + std::to_string(compressed_size_) +
+                            " bytes (missing gzip footer)");
+                }
+                return !line.empty();
+            }
             buffer_used_ = n;
         }
     }
 
     std::unique_ptr<rapidgzip::ParallelGzipReader<>> reader_;
+    std::string       path_;
     std::vector<char> buffer_;
     size_t            buffer_pos_;
     size_t            buffer_used_;
     bool              eof_;
     uint64_t          record_count_;
+    uint64_t          compressed_size_ = 0;
 };
 #endif  // HAVE_RAPIDGZIP
 
