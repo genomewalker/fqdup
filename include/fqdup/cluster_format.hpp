@@ -10,10 +10,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace fqdup::clusterfmt {
+
+namespace detail {
+// Manually-buffered POSIX-FD writer. ~2-3× faster than std::ofstream for
+// write-heavy workloads (no streambuf indirection, no synchronized stdio).
+// Mirrors the subset of std::ofstream we use: write/seekp/tellp/flush/close/operator bool.
+class BufferedFdWriter;
+}  // namespace detail
 
 inline constexpr std::uint32_t kMagic       = 0x4C434651u; // 'FQCL' little-endian
 inline constexpr std::uint32_t kVersion     = 2u;
@@ -83,6 +91,9 @@ struct WriterMetadata {
     double        lambda_3      = 0.0;
     int           mask_pos_5    = 0;
     int           mask_pos_3    = 0;
+    // Adapter/hexamer QC report (T6.2). Opaque JSON object string emitted
+    // verbatim into the .fqcl meta JSON; empty = QC disabled / not run.
+    std::string   qc_json;
     double        snp_threshold = 0.0;
     int           snp_min_count = 0;
     int           bucket_cap    = 0;
@@ -111,13 +122,17 @@ public:
     // Finalise: writes footer index + closes file. Idempotent.
     void close();
 
+    // Pre-size internal offset table when the cluster count is known up front.
+    // Avoids ~25 vector regrows for 100M-cluster runs.
+    void reserve_clusters(std::uint64_t n);
+
     std::uint64_t n_clusters() const noexcept { return n_clusters_; }
 
 private:
     void write_magic_header_();
     void write_meta_header_();
 
-    std::ofstream                ofs_;
+    std::unique_ptr<detail::BufferedFdWriter> ofs_;
     std::string                  path_;
     WriterMetadata               meta_;
     std::vector<std::uint64_t>   offsets_;     // file_offset per cluster, in write order

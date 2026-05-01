@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -64,6 +65,9 @@ extern "C" {
 #include "derep_detail/packed_ops.hpp"
 #include "derep_detail/arena.hpp"
 #include "derep_detail/damage_keys.hpp"
+#include "derep_detail/banded_ed.hpp"
+#include "derep_detail/syncmer_index.hpp"
+#include "fqdup/syncmer.hpp"
 
 // All file-local types are in an anonymous namespace to give their member
 // functions internal linkage, avoiding ODR violations with other TUs.
@@ -83,17 +87,28 @@ public:
                 bool /*errcor_mode_explicit*/ = false,
                 bool bucket_cap_explicit = false,
                 std::string fqcl_path = "",
-                std::string input_fastq = "")
+                std::string input_fastq = "",
+                std::string qc_json = "",
+                std::string library_type_resolved = "auto")
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
           bucket_cap_explicit_(bucket_cap_explicit),
           fqcl_path_(std::move(fqcl_path)),
           fqcl_input_fastq_(std::move(input_fastq)),
+          qc_json_(std::move(qc_json)),
+          library_type_resolved_(std::move(library_type_resolved)),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     void process(const std::string& in_path,
                  const std::string& out_path,
                  const std::string& cluster_path) {
+        using clk = std::chrono::steady_clock;
+        auto fmt_secs = [](clk::duration d) {
+            double s = std::chrono::duration<double>(d).count();
+            char b[64];
+            std::snprintf(b, sizeof(b), "%.1f s", s);
+            return std::string(b);
+        };
 
         log_info("=== Two-pass single-file deduplication ===");
         log_info("Pass 1: Build lightweight index");
@@ -107,7 +122,10 @@ public:
 #endif
         ));
 
+        auto t_pass1_begin = clk::now();
         pass1(in_path);
+        auto t_pass1_end = clk::now();
+        log_info("Phase timer: Pass 1 = " + fmt_secs(t_pass1_end - t_pass1_begin));
 
         size_t index_mb = (index_.size() *
                            sizeof(std::pair<SequenceFingerprint, IndexEntry>)) /
@@ -138,7 +156,9 @@ public:
             }
 
             log_info("Phase 3: parent-centric mismatch pattern detection");
+            auto t_p3_begin = clk::now();
             phase3_error_correct();
+            log_info("Phase timer: Phase 3 = " + fmt_secs(clk::now() - t_p3_begin));
         }
 
         // Free arena_ + qual_arena_ — only needed for phase3, not pass2.
@@ -160,7 +180,9 @@ public:
 
         log_info("Pass 2: Write unique records");
 
+        auto t_pass2_begin = clk::now();
         pass2(in_path, out_path, cluster_path);
+        log_info("Phase timer: Pass 2 = " + fmt_secs(clk::now() - t_pass2_begin));
 
         print_stats();
     }
@@ -240,6 +262,49 @@ private:
     }
 
     void pass1(const std::string& in_path) {
+        // Pre-reserve hash map + arenas based on input file size. Without this,
+        // ska::flat_hash_map (max_load_factor=0.5) regrows ~26 times to reach
+        // 100M entries, and SeqArena::packed doubles ~30 times — each regrow is
+        // a full re-hash + memcpy of the existing data. On a 6.3 GB compressed
+        // input this single change saves ~30 minutes of wall time.
+        //
+        // Estimate: ~250 B per uncompressed FASTQ record (typical aDNA SE).
+        // Compressed gz is ~5×, so compressed_bytes / 50 ≈ records.
+        // Use 0.6× safety factor (we'd rather one regrow at the end than
+        // over-reserve memory by 2×).
+        try {
+            std::error_code ec;
+            auto fsize = std::filesystem::file_size(in_path, ec);
+            if (!ec && fsize > 0) {
+                bool gz = in_path.size() >= 3 &&
+                          in_path.compare(in_path.size() - 3, 3, ".gz") == 0;
+                size_t est_records = gz ? static_cast<size_t>(fsize / 50)
+                                        : static_cast<size_t>(fsize / 250);
+                est_records = static_cast<size_t>(est_records * 0.6);
+                est_records = std::min(est_records, size_t{500'000'000});
+                if (est_records >= 100'000) {
+                    log_info("Pass 1: pre-reserving capacity for ~" +
+                             std::to_string(est_records) +
+                             " entries (heuristic from input size " +
+                             std::to_string(fsize / (1024 * 1024)) + " MB)");
+                    index_.reserve(est_records);
+                    if (errcor_.enabled) {
+                        arena_.offsets.reserve(est_records);
+                        arena_.lengths.reserve(est_records);
+                        arena_.eligible.reserve(est_records);
+                        // ~100 bp avg sequence → 25 bytes packed
+                        arena_.packed.reserve(est_records * 25);
+                        qual_arena_.offsets.reserve(est_records);
+                        qual_arena_.lengths.reserve(est_records);
+                        qual_arena_.bytes.reserve(est_records * 100);
+                    }
+                }
+            }
+        } catch (...) {
+            // reserve is best-effort; any failure just means we fall back to
+            // the regrow path.
+        }
+
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
@@ -369,6 +434,37 @@ private:
         auto bundle_occ_of = [&](uint32_t id) -> uint64_t {
             auto it = bundle_occ_map.find(bundle_key_of[id]);
             return it == bundle_occ_map.end() ? 1u : it->second;
+        };
+
+        // T8 (rescue): length-agnostic parallel bundle key + occupancy. Built
+        // only when --errcor-rescue-indels is set so the standard path pays
+        // nothing. Indel pairs (L vs L±1, L vs L±2) collapse to the same key
+        // here, so the within-bundle gate in the rescue driver actually fires
+        // for them. Occupancy is computed against this key so bundle_hot sees
+        // the true PCR cloud size that spans neighbouring lengths.
+        std::vector<uint64_t> rescue_bundle_key_of;
+        ska::flat_hash_map<uint64_t, uint32_t> rescue_bundle_occ_map;
+        if (errcor_.rescue_indels && !errcor_.legacy_veto && errcor_.empirical) {
+            rescue_bundle_key_of.assign(N, 0);
+            rescue_bundle_occ_map.reserve(N);
+            std::vector<uint8_t> dec;
+            std::vector<char>    asc;
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                int L = arena_.length(id);
+                if ((int)dec.size() < L) { dec.resize(L); asc.resize(L); }
+                arena_.decode_range(id, 0, L, dec.data());
+                for (int i = 0; i < L; ++i) asc[i] = static_cast<char>(dec[i]);
+                uint64_t k = fqdup::bundlekey::from_decoded_no_len(
+                    asc.data(), L, fqdup::bundlekey::kDefaultEndK);
+                rescue_bundle_key_of[id] = k;
+                ++rescue_bundle_occ_map[k];
+            }
+        }
+        auto rescue_bundle_occ_of = [&](uint32_t id) -> uint64_t {
+            if (rescue_bundle_key_of.empty()) return 1u;
+            auto it = rescue_bundle_occ_map.find(rescue_bundle_key_of[id]);
+            return it == rescue_bundle_occ_map.end() ? 1u : it->second;
         };
 
         is_error_.assign(N, false);
@@ -958,40 +1054,55 @@ private:
             size_t parent_end = i;
 
             // Accumulate sig_count per (pos, alt_base) for SNP detection.
-            // Key: mismatch_pos * 4 + alt_base. Use unordered_map for O(1) lookup
-            // per child instead of the previous O(m) linear scan.
-            std::unordered_map<uint32_t, uint64_t> pos_alt_counts;
-            pos_alt_counts.reserve(parent_end - parent_start);
-
+            // Key: mismatch_pos * 4 + alt_base. Sort+collapse a small vector
+            // (typical fanout ≤ 32) — beats unordered_map allocations + cache misses.
+            std::vector<std::pair<uint32_t, uint64_t>> pos_alt_counts;
+            pos_alt_counts.reserve(2 * (parent_end - parent_start));
             for (size_t j = parent_start; j < parent_end; ++j) {
-                uint32_t key = static_cast<uint32_t>(mismatches[j].mismatch_pos) * 4
-                               + mismatches[j].alt_base;
-                pos_alt_counts[key] += id_count[mismatches[j].child_id];
+                uint64_t cc = id_count[mismatches[j].child_id];
+                pos_alt_counts.emplace_back(
+                    static_cast<uint32_t>(mismatches[j].mismatch_pos) * 4u
+                        + mismatches[j].alt_base,
+                    cc);
                 if (mismatches[j].hamming == 2) {
-                    uint32_t key2 = static_cast<uint32_t>(mismatches[j].mismatch_pos2) * 4
-                                    + mismatches[j].alt_base2;
-                    pos_alt_counts[key2] += id_count[mismatches[j].child_id];
+                    pos_alt_counts.emplace_back(
+                        static_cast<uint32_t>(mismatches[j].mismatch_pos2) * 4u
+                            + mismatches[j].alt_base2,
+                        cc);
                 }
             }
+            std::sort(pos_alt_counts.begin(), pos_alt_counts.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            // Collapse runs of equal key in-place.
+            size_t pac_w = 0;
+            for (size_t r = 0; r < pos_alt_counts.size(); ++r) {
+                if (pac_w > 0 && pos_alt_counts[pac_w - 1].first == pos_alt_counts[r].first)
+                    pos_alt_counts[pac_w - 1].second += pos_alt_counts[r].second;
+                else
+                    pos_alt_counts[pac_w++] = pos_alt_counts[r];
+            }
+            pos_alt_counts.resize(pac_w);
+            auto find_pac = [&](uint32_t k) -> uint64_t {
+                auto it = std::lower_bound(
+                    pos_alt_counts.begin(), pos_alt_counts.end(), k,
+                    [](const std::pair<uint32_t, uint64_t>& p, uint32_t v) {
+                        return p.first < v;
+                    });
+                return (it != pos_alt_counts.end() && it->first == k) ? it->second : 0ull;
+            };
 
             // For each child, decide: SNP-protected or absorb
             const int pid_ilen = get_layout(static_cast<int>(arena_.length(pid))).ilen;
             for (size_t j = parent_start; j < parent_end; ++j) {
                 const ChildMismatch& cm = mismatches[j];
-                uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4 + cm.alt_base;
-
-                // O(1) sig_count lookup
-                uint64_t sig = 0;
-                auto it = pos_alt_counts.find(key);
-                if (it != pos_alt_counts.end()) sig = it->second;
+                uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4u + cm.alt_base;
+                uint64_t sig = find_pac(key);
 
                 // H=2 path: both mismatches already verified non-damage in B1.
                 // SNP veto: protect if either mismatch position has population support.
                 if (cm.hamming == 2) {
-                    uint32_t key2 = static_cast<uint32_t>(cm.mismatch_pos2) * 4 + cm.alt_base2;
-                    uint64_t sig2 = 0;
-                    auto it2 = pos_alt_counts.find(key2);
-                    if (it2 != pos_alt_counts.end()) sig2 = it2->second;
+                    uint32_t key2 = static_cast<uint32_t>(cm.mismatch_pos2) * 4u + cm.alt_base2;
+                    uint64_t sig2 = find_pac(key2);
 
                     double eff_snp = errcor_.snp_threshold *
                         (veto_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
@@ -1009,6 +1120,21 @@ private:
                     e.bundle_key = bundle_key_of[eff_pid];
                     e.bundle_occ = bundle_occ_of(eff_pid);
                     double S = emp_model.score(e);
+                    // Count-asymmetry prior: PCR error families have
+                    // parent_count >> child_count (the error is rare per
+                    // amplification, so the descendant lineage is small).
+                    // Real biology has parent_count ~ child_count (two
+                    // independent molecules drawn from the same coverage).
+                    // log((p+1)/(c+1)) shifts the log-odds toward PCR when
+                    // the parent dominates. Scale by n_mm: each independent
+                    // PCR error compounds the parent-vs-child likelihood
+                    // ratio (probability of N errors going the same direction
+                    // is the product), so the H=2 hypothesis needs 2× the
+                    // count-asymmetry support that H=1 needs to overcome the
+                    // 2× per-mismatch penalty.
+                    S += static_cast<double>(e.n_mm) *
+                         std::log(static_cast<double>(parent_count + 1) /
+                                  static_cast<double>(id_count[cm.child_id] + 1));
                     absorb_h2 = (S > 0.0);
                     if (snp_veto_h2) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
                     else             { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
@@ -1071,6 +1197,9 @@ private:
                     e.bundle_key = bundle_key_of[eff_pid];
                     e.bundle_occ = bundle_occ_of(eff_pid);
                     double S = emp_model.score(e);
+                    // See H=2 site for rationale on the count-asymmetry term.
+                    S += std::log(static_cast<double>(parent_count + 1) /
+                                  static_cast<double>(id_count[cm.child_id] + 1));
                     absorb_h1 = (S > 0.0);
                     if (snp_veto) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
                     else          { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
@@ -1229,6 +1358,9 @@ private:
                             e.mm[0].damage_chan = 0;
                             e.mm[0].p_damage    = 0.0;
                             double S = emp_model.score(e);
+                            // Count-asymmetry term (see B2 H=2 site).
+                            S += std::log(static_cast<double>(id_count[parent_id] + 1) /
+                                          static_cast<double>(id_count[child_id]  + 1));
                             if (S <= 0.0) {
                                 ++stats.adj_len_protected;
                                 continue;
@@ -1252,6 +1384,410 @@ private:
                         // dedup output is correct (is_error_ drops the read).
                     }
                 }
+            }
+        }
+
+        // ── T8.7: Phase3RescueIndels ──────────────────────────────────────────
+        // Opt-in indel-rescue path. T8 rescue is strictly within-bundle
+        // (the bundle filter is a hard correctness constraint, not a
+        // scoring preference), so candidate generation iterates bundles
+        // directly. For each bundle with ≥2 eligible members:
+        //   - direct path (default): pairwise banded-ed over same-bundle
+        //     parents with |Δlen|≤1
+        //   - syncmer path (only above ~32k directed pairs): bundle-local
+        //     ephemeral SyncmerIndex
+        // Decisions go to per-thread vectors and are merged in (child_id,
+        // score desc, parent_id asc) order, applying at most one
+        // absorption per child.
+        if (errcor_.rescue_indels && !errcor_.legacy_veto && errcor_.empirical) {
+            using fqdup::derep_detail::SyncmerIndex;
+            using fqdup::derep_detail::build_syncmer_index_from_pids;
+            using fqdup::derep_detail::EditScript;
+            using fqdup::derep_detail::banded_edit_distance_le2;
+            using fqdup::errcor_emp::EdgeCandidate;
+            using fqdup::errcor_emp::IndelScoreParams;
+
+            IndelScoreParams ip;
+            ip.alpha_ins  = errcor_.rescue_alpha_ins;
+            ip.alpha_del  = errcor_.rescue_alpha_del;
+            ip.mask_bonus = errcor_.rescue_mask_bonus;
+
+            auto child_bundle_occ_of = rescue_bundle_occ_of;
+
+            // T8 Step 1 — Pre-group eligible ids by rescue_bundle_key. Bundle
+            // membership is the hard correctness gate; iterating bundles
+            // directly makes the SyncmerIndex unnecessary for the common case
+            // (mean bundle size ~3 → direct banded-ed beats build+query+sort
+            // overhead). The pre-grouping pass also (a) accounts the bundle-
+            // hot skip into stats.rescue_skip_bundle_hot (previously silent;
+            // GPT-5.5 audit), and (b) computes pairs_est used to drive LPT
+            // scheduling and the syncmer-path threshold.
+            ska::flat_hash_map<uint64_t, std::vector<uint32_t>> bundle_members;
+            bundle_members.reserve(N / 4 + 16);
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                if (is_error_[id]) continue;
+                uint32_t occ = static_cast<uint32_t>(child_bundle_occ_of(id));
+                if (occ < 2u) continue;
+                if (occ >= errcor_.rescue_bundle_hot) {
+                    // Fix silent recall loss: bundle-hot skip was uncounted.
+                    ++stats.rescue_skip_bundle_hot;
+                    continue;
+                }
+                bundle_members[rescue_bundle_key_of[id]].push_back(id);
+            }
+
+            struct BundleTask {
+                uint64_t                key;
+                std::vector<uint32_t>*  members;     // borrowed
+                uint32_t                M;
+                uint64_t                pairs_est;   // est. directed pairs |Δlen|≤2
+            };
+            std::vector<BundleTask> tasks;
+            tasks.reserve(bundle_members.size());
+            for (auto& kv : bundle_members) {
+                if (kv.second.size() < 2) continue;
+                std::sort(kv.second.begin(), kv.second.end());
+                const auto& bm = kv.second;
+                const uint32_t M = static_cast<uint32_t>(bm.size());
+                // Length histogram. M is bounded by rescue_bundle_hot (≤50
+                // by default) so a flat hashmap is overkill; sort the lens
+                // and run-length-encode.
+                std::vector<int> lens; lens.reserve(M);
+                for (uint32_t i = 0; i < M; ++i) lens.push_back(arena_.length(bm[i]));
+                std::sort(lens.begin(), lens.end());
+                uint64_t pairs_est = 0;
+                size_t i = 0;
+                while (i < lens.size()) {
+                    int Lv = lens[i];
+                    size_t j = i + 1;
+                    while (j < lens.size() && lens[j] == Lv) ++j;
+                    uint64_t cnt = j - i;
+                    // Window neighbours within ±2 (inclusive) of Lv.
+                    uint64_t neigh = 0;
+                    for (size_t k = 0; k < lens.size(); ++k)
+                        if (std::abs(lens[k] - Lv) <= 2) ++neigh;
+                    // Exclude self from neighbour count.
+                    pairs_est += cnt * (neigh - 1);
+                    i = j;
+                }
+                tasks.push_back(BundleTask{kv.first, &kv.second, M, pairs_est});
+            }
+            // LPT scheduling: biggest-pair-count bundles start first so tail
+            // latency is minimised. Tie-break by key for determinism.
+            std::sort(tasks.begin(), tasks.end(),
+                      [](const BundleTask& a, const BundleTask& b) {
+                          if (a.pairs_est != b.pairs_est) return a.pairs_est > b.pairs_est;
+                          return a.key < b.key;
+                      });
+
+            struct RescueDecision {
+                uint32_t child_id;
+                uint32_t parent_id;
+                double   score;
+                uint8_t  ed;
+            };
+
+            unsigned n_threads = errcor_.threads;
+            if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
+
+            struct alignas(64) T8Local {
+                std::vector<RescueDecision> dec;
+                uint64_t children_examined = 0;
+                uint64_t index_queries     = 0;
+                uint64_t topk_truncated    = 0;
+                uint64_t pairs_banded      = 0;
+                uint64_t banded_reject     = 0;
+                uint64_t protected_        = 0;
+                uint64_t banded_ed[3]      = {0, 0, 0};
+                char _pad[8] = {};
+            };
+            std::vector<T8Local> per_thread(n_threads);
+            std::vector<SyncmerIndex::QueryScratch> per_thread_qs(n_threads);
+
+            // Above this directed-pair count per bundle, switch to a bundle-
+            // local SyncmerIndex. Below, direct banded-ed is cheaper than
+            // build+query overhead. Long-tail bundles trigger the syncmer
+            // path; mean-bundle case never does.
+            constexpr uint64_t kSyncmerPairThreshold = 32000;
+
+            // T8 Step 2 — atomic dynamic scheduler (replaces static round-robin).
+            // Combined with LPT ordering this keeps tail-thread idle time small
+            // even when bundle work is heavily skewed.
+            std::atomic<size_t> next_bundle{0};
+
+            auto worker = [&](unsigned tid) {
+                T8Local& T = per_thread[tid];
+                SyncmerIndex::QueryScratch& qs = per_thread_qs[tid];
+                // T8 Step 3 / Step 7 — per-thread reusable scratch.
+                thread_local std::vector<uint8_t>  decoded;
+                thread_local std::vector<uint32_t> off;          // size = M+1
+                thread_local std::vector<int>      L;            // per-member length
+                thread_local std::vector<uint32_t> order_by_len; // local indices sorted by L
+                thread_local std::vector<uint64_t> ch_h;
+                thread_local std::vector<uint16_t> ch_p;
+                thread_local ska::flat_hash_map<uint32_t, uint32_t> pid_to_local;
+                // Step 7 — reusable bundle-local SyncmerIndex (zero allocs after warmup).
+                thread_local SyncmerIndex bidx;
+                thread_local std::vector<std::pair<uint64_t, uint32_t>> pairs_scratch;
+
+                while (true) {
+                    size_t bi = next_bundle.fetch_add(1, std::memory_order_relaxed);
+                    if (bi >= tasks.size()) break;
+                    const BundleTask& task = tasks[bi];
+                    const auto& bm = *task.members;
+                    const size_t M = task.M;
+                    if (M < 2) continue;
+
+                    // Step 3 — cache lengths and compute decode offsets in one pass.
+                    L.assign(M, 0);
+                    off.assign(M + 1, 0);
+                    for (size_t i = 0; i < M; ++i) {
+                        L[i] = arena_.length(bm[i]);
+                        off[i + 1] = off[i] + L[i];
+                    }
+                    if (decoded.size() < off.back()) decoded.resize(off.back());
+                    for (size_t i = 0; i < M; ++i)
+                        arena_.decode_range(bm[i], 0, L[i], decoded.data() + off[i]);
+
+                    // Local indices sorted by (length asc, parent_id asc) — used
+                    // for the 2-pointer / binary-search Δlen window in the
+                    // direct path. Determinism via the parent_id tiebreak.
+                    order_by_len.resize(M);
+                    for (uint32_t i = 0; i < M; ++i) order_by_len[i] = i;
+                    std::sort(order_by_len.begin(), order_by_len.end(),
+                              [&](uint32_t a, uint32_t b) {
+                                  if (L[a] != L[b]) return L[a] < L[b];
+                                  return bm[a] < bm[b];
+                              });
+
+                    // T8 Step 1 / Step 3 — pairs_est drives the path switch.
+                    // Old code recomputed an O(M²) probe here; deleted entirely.
+                    const bool over_threshold = (task.pairs_est > kSyncmerPairThreshold);
+
+                    if (over_threshold) {
+                        // Step 7 — build into reusable thread_local index.
+                        build_syncmer_index_from_decoded(
+                            bidx,
+                            decoded.data(), off.data(), L.data(),
+                            bm.data(), M,
+                            pairs_scratch,
+                            errcor_.rescue_hash_hot);
+                        pid_to_local.clear();
+                        if (pid_to_local.bucket_count() < M * 2)
+                            pid_to_local.reserve(M * 2);
+                        for (size_t i = 0; i < M; ++i)
+                            pid_to_local[bm[i]] = static_cast<uint32_t>(i);
+                    }
+
+                    // T8 Step 5 — refactored try_pair. Returns through the
+                    // best_* refs; the per-child best is pushed to T.dec ONCE
+                    // after the parent loop (Step 4 / GPT-5.5 P1.6).
+                    auto try_pair = [&](uint32_t child_id, uint32_t parent_id,
+                                        int Lc, int Lp,
+                                        const uint8_t* child_dec_p,
+                                        const uint8_t* parent_dec_p,
+                                        int k5_c, int k3_c,
+                                        double& best_score, uint32_t& best_parent,
+                                        uint8_t& best_ed) {
+                        // |Δlen|≤2 already filtered by callers; defensive.
+                        if (std::abs(Lp - Lc) > 2) return;
+
+                        EditScript es{};
+                        int ed = banded_edit_distance_le2(
+                            parent_dec_p, Lp, child_dec_p, Lc, &es);
+                        ++T.pairs_banded;
+                        if (ed < 0) { ++T.banded_reject; return; }
+                        if (ed >= 0 && ed < 3) ++T.banded_ed[ed];
+
+                        EdgeCandidate e{};
+                        e.child_id   = child_id;
+                        e.parent_id  = parent_id;
+                        e.bundle_key = bundle_key_of[parent_id];
+                        e.bundle_occ = bundle_occ_of(parent_id);
+                        e.child_len  = static_cast<uint16_t>(Lc);
+                        e.n_mm       = 0;
+                        e.n_ins      = static_cast<uint8_t>(es.n_ins);
+                        e.n_del      = static_cast<uint8_t>(es.n_del);
+                        e.indel_in_mask = 0;
+                        for (int s = 0; s < 2; ++s) {
+                            if (es.kind[s] != 1 && es.kind[s] != 2) continue;
+                            int p = es.pos[s];
+                            if (p < k5_c || p >= Lc - k3_c) {
+                                e.indel_in_mask = 1; break;
+                            }
+                        }
+                        for (int s = 0; s < 2 && e.n_mm < 2; ++s) {
+                            if (es.kind[s] != 0) continue;
+                            int p = es.pos[s];
+                            auto& mm = e.mm[e.n_mm];
+                            mm.pos        = static_cast<uint16_t>(p);
+                            mm.parent_2b  = es.ref_base[s];
+                            mm.alt_2b     = es.alt_base[s];
+                            mm.qual       = qual_arena_.q_at(child_id, p);
+                            mm.damage_chan = 0;
+                            mm.p_damage    = 0.0;
+                            ++e.n_mm;
+                        }
+
+                        double S = emp_model.score_with_indel(e, ip);
+                        if (!(S > 0.0)) { ++T.protected_; return; }
+                        // Track per-child best (score desc, parent_id asc).
+                        if (S > best_score ||
+                            (S == best_score && parent_id < best_parent)) {
+                            best_score  = S;
+                            best_parent = parent_id;
+                            best_ed     = static_cast<uint8_t>(ed);
+                        }
+                    };
+
+                    // id_count gate hoisted out of try_pair (cheap; pre-prunes
+                    // banded-ed work).
+                    auto id_count_admits = [&](uint32_t child_id, uint32_t parent_id) {
+                        if (parent_id == child_id) return false;
+                        if (id_count[parent_id] < id_count[child_id]) return false;
+                        if (id_count[parent_id] == id_count[child_id] &&
+                            parent_id > child_id) return false;
+                        return true;
+                    };
+
+                    for (size_t ci_local = 0; ci_local < M; ++ci_local) {
+                        const uint32_t child_id = bm[ci_local];
+                        ++T.children_examined;
+                        const int Lc = L[ci_local];
+                        const uint8_t* child_dec_p = decoded.data() + off[ci_local];
+                        auto [k5_c, k3_c] = damage_zone_bounds(Lc, profile_);
+
+                        double   best_score  = 0.0;
+                        uint32_t best_parent = UINT32_MAX;
+                        uint8_t  best_ed     = 0;
+
+                        if (!over_threshold) {
+                            // T8 Step 4 — direct path. |Δlen|≤2 (was ≤1; the
+                            // banded_ed cap supports 2 — silent recall miss
+                            // flagged by GPT-5.5). Iterate via order_by_len
+                            // window; M ≤ rescue_bundle_hot (≤50 default), so
+                            // std::lower_bound is fine.
+                            auto lo = std::lower_bound(
+                                order_by_len.begin(), order_by_len.end(), Lc - 2,
+                                [&](uint32_t a, int v) { return L[a] < v; });
+                            auto hi = std::upper_bound(
+                                order_by_len.begin(), order_by_len.end(), Lc + 2,
+                                [&](int v, uint32_t a) { return v < L[a]; });
+                            for (auto it = lo; it != hi; ++it) {
+                                const uint32_t pi_local = *it;
+                                if (pi_local == ci_local) continue;
+                                const uint32_t parent_id = bm[pi_local];
+                                if (!id_count_admits(child_id, parent_id)) continue;
+                                try_pair(child_id, parent_id,
+                                         Lc, L[pi_local],
+                                         child_dec_p,
+                                         decoded.data() + off[pi_local],
+                                         k5_c, k3_c,
+                                         best_score, best_parent, best_ed);
+                            }
+                        } else {
+                            fqdup::SyncmerParams sp = fqdup::syncmer_params_for_length(Lc);
+                            uint16_t min_hits = errcor_.rescue_min_hits > 0
+                                ? static_cast<uint16_t>(errcor_.rescue_min_hits)
+                                : (sp.cap >= 16 ? uint16_t{3} : uint16_t{2});
+                            fqdup::compute_sketch(child_dec_p, Lc, ch_h, ch_p);
+                            if (ch_h.empty()) continue;
+                            ++T.index_queries;
+                            // T8 Step 6 — filtered query. Pre-tally rejection
+                            // by length AND id_count avoids same-bundle
+                            // wrong-length parents stealing topk slots from
+                            // valid same-length ones (silent recall loss).
+                            auto accept = [&](uint32_t pid) -> bool {
+                                auto pit = pid_to_local.find(pid);
+                                if (pit == pid_to_local.end()) return false;
+                                int Lp = L[pit->second];
+                                if (std::abs(Lp - Lc) > 2) return false;
+                                return id_count_admits(child_id, pid);
+                            };
+                            const auto& hits = bidx.query_filtered(
+                                qs, ch_h.data(), (int)ch_h.size(),
+                                min_hits, errcor_.rescue_topk, accept);
+                            if (hits.size() == errcor_.rescue_topk) ++T.topk_truncated;
+                            for (auto& h : hits) {
+                                auto pit = pid_to_local.find(h.parent_id);
+                                if (pit == pid_to_local.end()) continue;
+                                const uint32_t pi_local = pit->second;
+                                try_pair(child_id, h.parent_id,
+                                         Lc, L[pi_local],
+                                         child_dec_p,
+                                         decoded.data() + off[pi_local],
+                                         k5_c, k3_c,
+                                         best_score, best_parent, best_ed);
+                            }
+                        }
+
+                        // Push at most ONE decision per child — the global
+                        // sort + first-wins below reduces to identity.
+                        if (best_parent != UINT32_MAX) {
+                            T.dec.push_back(RescueDecision{
+                                child_id, best_parent, best_score, best_ed});
+                        }
+                    }
+                }
+            };
+
+            if (n_threads == 1) {
+                worker(0);
+            } else {
+                std::vector<std::thread> ts;
+                ts.reserve(n_threads - 1);
+                for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(worker, t);
+                worker(0);
+                for (auto& t : ts) t.join();
+            }
+
+            // Fold per-thread sub-counters and decisions into globals.
+            std::vector<RescueDecision> decisions;
+            for (auto& T : per_thread) {
+                stats.rescue_children_examined += T.children_examined;
+                stats.rescue_index_queries     += T.index_queries;
+                stats.rescue_topk_truncated    += T.topk_truncated;
+                stats.rescue_pairs_banded      += T.pairs_banded;
+                stats.rescue_banded_reject     += T.banded_reject;
+                stats.rescue_protected         += T.protected_;
+                for (int e = 0; e < 3; ++e)
+                    stats.rescue_banded_ed[e]  += T.banded_ed[e];
+                decisions.insert(decisions.end(),
+                                 T.dec.begin(), T.dec.end());
+            }
+
+            // Deterministic merge: at most one absorption per child, picking
+            // the highest-scoring parent (ties broken by parent_id asc).
+            std::sort(decisions.begin(), decisions.end(),
+                      [](const RescueDecision& a, const RescueDecision& b) {
+                          if (a.child_id != b.child_id) return a.child_id < b.child_id;
+                          if (a.score    != b.score)    return a.score    > b.score;
+                          return a.parent_id < b.parent_id;
+                      });
+            uint32_t prev_child = UINT32_MAX;
+            for (auto& d : decisions) {
+                if (d.child_id == prev_child) continue;
+                prev_child = d.child_id;
+                if (is_error_[d.child_id]) continue;
+                uint32_t eff_pid = d.parent_id;
+                if (is_error_[eff_pid]) eff_pid = find_root_chain(eff_pid);
+                if (eff_pid == d.child_id) continue;
+                is_error_[d.child_id] = true;
+                parent_chain[d.child_id] = eff_pid;
+                acc_count[eff_pid]      += acc_count[d.child_id];
+                acc_count[d.child_id]    = 0;
+                if (seq_entry[d.child_id] && seq_entry[eff_pid] &&
+                    seq_entry[d.child_id]->damage_score > seq_entry[eff_pid]->damage_score) {
+                    seq_entry[eff_pid]->record_index = seq_entry[d.child_id]->record_index;
+                    seq_entry[eff_pid]->damage_score = seq_entry[d.child_id]->damage_score;
+                }
+                ++stats.absorbed;
+                ++stats.rescue_absorbed;
+                int ob = static_cast<int>(fqdup::errcor_emp::occ_bin(rescue_bundle_occ_of(eff_pid)));
+                if (ob >= 0 && ob < 6) ++stats.rescue_absorbed_by_occ[ob];
+                ++errcor_absorbed_;
+                // No fqcl record (indel edge — same constraint as adj-len).
             }
         }
 
@@ -1325,7 +1861,17 @@ private:
         meta.tool_version  = "0.1";
         meta.input_fastq   = fqcl_input_fastq_;
         meta.n_input_reads = total_reads_;
-        meta.library_type  = profile_.ss_mode ? "ss" : (profile_.enabled ? "ds" : "auto");
+        // Bug 1 fix: report the resolved library type from the user flag
+        // (or "auto" when truly auto-detected). Previously this read
+        // profile_.enabled, which is false whenever deamination fit didn'''t converge (small
+        // input, --no-damage-auto, manual dmax=0…), wiping the user's
+        // explicit --library-type ds/ss request from the header.
+        if (!library_type_resolved_.empty()) {
+            meta.library_type = library_type_resolved_;
+        } else {
+            meta.library_type = profile_.ss_mode ? "ss"
+                : (profile_.enabled ? "ds" : "auto");
+        }
         meta.d_max_5       = profile_.d_max_5prime;
         meta.d_max_3       = profile_.d_max_3prime;
         meta.lambda_5      = profile_.lambda_5prime;
@@ -1339,6 +1885,7 @@ private:
         meta.snp_threshold = errcor_.snp_threshold;
         meta.snp_min_count = static_cast<int>(errcor_.snp_min_count);
         meta.bucket_cap    = static_cast<int>(errcor_.bucket_cap);
+        meta.qc_json                 = qc_json_;
         meta.bucket_overflow_drops   = loss_bucket_overflow_drops_;
         meta.short_interior_skipped  = loss_short_interior_skipped_;
         meta.short_brute_evaluated   = loss_short_brute_evaluated_;
@@ -1347,6 +1894,7 @@ private:
         // v2: singletons are always written (as tinyblocks) — never silently dropped.
 
         cf::Writer writer(fqcl_path_, meta);
+        writer.reserve_clusters(seq_entry.size());
 
         std::uint64_t cluster_id = 0;
         cf::ClusterRecord rec;
@@ -1445,16 +1993,42 @@ private:
                const std::string& cluster_path) {
         bool compress = (out_path.size() > 3 &&
                          out_path.substr(out_path.size() - 3) == ".gz");
-        FastqWriter writer(out_path, compress);
+
+        // Multi-thread compressed output via BGZF (htslib). Cap at 16: BGZF
+        // throughput plateaus there and extra threads just steal from the read
+        // loop. Without HAVE_BGZF or with threads<=1, FastqWriter falls back to
+        // single-thread zlib.
+        unsigned writer_threads = errcor_.threads;
+        if (writer_threads == 0)
+            writer_threads = std::max(1u, std::thread::hardware_concurrency());
+        writer_threads = std::min(writer_threads, 16u);
+
+        FastqWriter writer(out_path, compress, static_cast<int>(writer_threads));
 
         gzFile cluster_gz = nullptr;
+#ifdef HAVE_BGZF
+        BGZF*  cluster_bgz = nullptr;
+#endif
         if (write_clusters_ && !cluster_path.empty()) {
-            cluster_gz = gzopen(cluster_path.c_str(), "wb6");
-            if (!cluster_gz)
-                throw std::runtime_error("Cannot open cluster file: " + cluster_path);
-            gzbuffer(cluster_gz, GZBUF_SIZE);
-            if (gzprintf(cluster_gz, "hash\tseq_len\tcount\n") < 0)
-                throw std::runtime_error("gzprintf failed while writing cluster header");
+#ifdef HAVE_BGZF
+            if (writer_threads > 1) {
+                cluster_bgz = bgzf_open(cluster_path.c_str(), "w");
+                if (!cluster_bgz)
+                    throw std::runtime_error("Cannot open cluster file: " + cluster_path);
+                bgzf_mt(cluster_bgz, static_cast<int>(writer_threads), 0);
+                static const char* hdr = "hash\tseq_len\tcount\n";
+                if (bgzf_write(cluster_bgz, hdr, std::strlen(hdr)) < 0)
+                    throw std::runtime_error("bgzf_write failed writing cluster header");
+            } else
+#endif
+            {
+                cluster_gz = gzopen(cluster_path.c_str(), "wb6");
+                if (!cluster_gz)
+                    throw std::runtime_error("Cannot open cluster file: " + cluster_path);
+                gzbuffer(cluster_gz, GZBUF_SIZE);
+                if (gzprintf(cluster_gz, "hash\tseq_len\tcount\n") < 0)
+                    throw std::runtime_error("gzprintf failed while writing cluster header");
+            }
         }
 
         struct WriteEntry {
@@ -1510,6 +2084,18 @@ private:
                         throw std::runtime_error(
                             "gzprintf failed while writing cluster record");
                 }
+#ifdef HAVE_BGZF
+                else if (cluster_bgz) {
+                    char buf[80];
+                    int n = std::snprintf(buf, sizeof(buf), "%016lx%016lx\t%lu\t%lu\n",
+                                          static_cast<unsigned long>(entry.fingerprint.hash_hi),
+                                          static_cast<unsigned long>(entry.fingerprint.hash_lo),
+                                          static_cast<unsigned long>(rec.seq.size()),
+                                          static_cast<unsigned long>(entry.count));
+                    if (n <= 0 || bgzf_write(cluster_bgz, buf, static_cast<size_t>(n)) < 0)
+                        throw std::runtime_error("bgzf_write failed writing cluster record");
+                }
+#endif
 
                 written++;
                 next_write++;
@@ -1523,6 +2109,10 @@ private:
 
         if (cluster_gz && gzclose(cluster_gz) != Z_OK)
             throw std::runtime_error("gzclose failed writing cluster file");
+#ifdef HAVE_BGZF
+        if (cluster_bgz && bgzf_close(cluster_bgz) < 0)
+            throw std::runtime_error("bgzf_close failed writing cluster file");
+#endif
         std::cerr << "\r";
         log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }
@@ -1567,6 +2157,8 @@ private:
     bool bucket_cap_explicit_;
     std::string fqcl_path_;
     std::string fqcl_input_fastq_;
+    std::string qc_json_;
+    std::string library_type_resolved_;
     std::vector<ChildMismatch> fqcl_mismatches_;
     std::vector<uint32_t>      fqcl_parent_chain_;
 
@@ -1602,7 +2194,7 @@ private:
 // Public entry point
 // ============================================================================
 
-static void print_usage(const char* prog) {
+static void print_usage(const char* prog, bool advanced = false) {
     std::cerr
         << "Usage: fqdup " << prog << " [OPTIONS]\n"
         << "\nSingle-file FASTQ deduplication with damage-aware hashing\n"
@@ -1610,45 +2202,71 @@ static void print_usage(const char* prog) {
         << "(e.g. the non-extended output of 'fqdup derep_pairs').\n"
         << "\nInput MUST be sorted by read ID (use 'fqdup sort' first).\n"
         << "\nRequired:\n"
-        << "  -i FILE      Input sorted FASTQ\n"
-        << "  -o FILE      Output deduplicated FASTQ\n"
-        << "\nOptional:\n"
-        << "  -c FILE      Write cluster statistics to gzipped TSV\n"
-        << "  --no-revcomp Disable reverse-complement matching (default: enabled)\n"
-        << "  -h, --help   Show this help\n"
-        << "\nPCR error correction (Phase 3 — ON by default):\n"
-        << "  --no-error-correct           Disable PCR error duplicate removal\n"
-        << "  --error-correct              Explicitly enable (already default)\n"
+        << "  -i FILE              Input sorted FASTQ\n"
+        << "  -o FILE              Output deduplicated FASTQ\n"
+        << "\nOutput:\n"
+        << "  -c FILE              Cluster statistics (gzipped TSV)\n"
+        << "  --cluster-format F   Write .fqcl genealogy (requires error correction)\n"
+        << "\nCore:\n"
+        << "  --no-revcomp         Disable reverse-complement matching\n"
+        << "  --no-error-correct   Disable PCR error correction (Phase 3, ON by default)\n"
+        << "  --errcor-rescue-indels  Enable syncmer-indexed indel rescue (ed<=2; default OFF)\n"
+        << "  -h, --help           Show this help\n"
+        << "  --help-advanced      Show advanced options (errcor/damage/PCR knobs)\n"
+        << "\nDamage:\n"
+        << "  --damage MODE        off | report | collapse  (default: report)\n"
+        << "                         off      — no fit, no QC\n"
+        << "                         report   — fit + QC, header only (no clustering use)\n"
+        << "                         collapse — fit + QC + use damage when clustering\n"
+        << "                                    WARNING: distorts per-position damage rates;\n"
+        << "                                    do NOT use upstream of metaDMG/mapDamage.\n"
+        << "  --library-type T     auto (default) | ds | ss | unknown\n"
+        << "  --damage-dmax N[,N]  Manual d_max override (skips fit). \"0.21,0.13\" = 5',3'\n"
+        << "  --damage-clip-pass M off | report (default) | refit\n"
+        << "  --damage-scan N      Reads sampled for QC + adapter scan (default: 1000000; 0=all)\n"
+        << "  --damage-deam-sample N  Reads sampled for deamination d_max/lambda fit (default: 5000000; 0=all)\n";
+
+    if (!advanced) {
+        std::cerr << "\nMemory: ~16 bytes per input read + 2-bit seq arena (~1 byte/4 bp) for error correction.\n";
+        return;
+    }
+
+    std::cerr
+        << "\n--- Advanced ---\n"
+        << "\nError correction (Phase 3) tuning:\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)\n"
-        << "                               On equal-count edges this is raised to 2 automatically.\n"
-        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited).\n"
-        << "                               Set >0 only as an OOM safety valve; any drops are\n"
-        << "                               counted and warned (Bucket overflow drops).\n"
-        << "  --errcor-snp-cutoff INT      Parent count below which SNP threshold is tightened (default: 10)\n"
-        << "  --errcor-snp-factor FLOAT    SNP threshold multiplier at low coverage (default: 1.75)\n"
-        << "  --errcor-threads INT         Phase 3 B1 worker threads (default: 1, 0 = hardware concurrency)\n"
-        << "  --errcor-empirical           Use empirical posterior-odds rule (default; absorb iff S>0).\n"
-        << "  --errcor-legacy-veto         Use legacy SNP-veto rule instead of the empirical model.\n"
-        << "  --errcor-adj-len             Enable adjacent-length (L±1) indel probe (uses the empirical rule).\n"
-        << "\nAncient DNA damage variant collapsing (OFF by default):\n"
-        << "  --collapse-damage        Collapse reads that differ only by terminal\n"
-        << "                           deamination into one cluster (Pass 0 estimation)\n"
-        << "                           WARNING: distorts per-position damage frequencies.\n"
-        << "                           Do NOT use if running metaDMG or mapDamage downstream.\n"
-        << "  --library-type TYPE      Library prep: auto (default), ds, ss\n"
-        << "                           auto = DART infers from data; ds/ss = override\n"
-        << "  --damage-dmax  FLOAT     Set d_max for both 5' and 3' ends manually\n"
-        << "  --damage-dmax5 FLOAT     Set d_max for 5' end only\n"
-        << "  --damage-dmax3 FLOAT     Set d_max for 3' end only\n"
-        << "  --damage-lambda FLOAT    Set lambda (decay) for both ends\n"
-        << "  --damage-lambda5 FLOAT   Set lambda for 5' end only\n"
-        << "  --damage-lambda3 FLOAT   Set lambda for 3' end only\n"
-        << "  --damage-bg FLOAT        Background deamination rate (default: 0.02)\n"
-        << "  --mask-threshold FLOAT   Mask positions with excess damage > T (default: 0.05)\n"
-        << "  --pcr-cycles INT         Number of PCR cycles (informational; for log only)\n"
-        << "  --pcr-efficiency FLOAT   PCR efficiency per cycle, 0-1 (default: 1.0)\n"
-        << "  --pcr-error-rate FLOAT   Error rate sub/base/doubling (default: 5.3e-7 = Q5)\n"
+        << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited)\n"
+        << "  --errcor-snp-cutoff INT      Low-coverage cutoff (default: 10)\n"
+        << "  --errcor-snp-factor FLOAT    Low-coverage SNP multiplier (default: 1.75)\n"
+        << "  -t, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
+        << "  --errcor-empirical           Empirical posterior-odds rule (default; absorb iff S>0)\n"
+        << "  --errcor-legacy-veto         Legacy SNP-veto rule\n"
+        << "  --errcor-adj-len             Adjacent-length (L±1) indel probe\n"
+        << "\nIndel rescue (T8) tuning:\n"
+        << "  --rescue-min-hits INT        Min shared syncmers (default: auto: 3 cap=16, 2 cap=8)\n"
+        << "  --rescue-topk INT            Per-child max parent candidates (default: 32)\n"
+        << "  --rescue-bundle-hot INT      Skip bundles with occupancy >= N (default: 50)\n"
+        << "  --rescue-hash-hot INT        Drop syncmer postings with list size >= N (default: 4096)\n"
+        << "  --rescue-alpha-ins FLOAT     Per-insertion log-odds penalty (default: 2.0)\n"
+        << "  --rescue-alpha-del FLOAT     Per-deletion log-odds penalty (default: 2.0)\n"
+        << "  --rescue-mask-bonus FLOAT    Bonus when indel falls in damage mask (default: 1.0)\n"
+        << "\nDamage expert overrides (rarely needed):\n"
+        << "  --damage-dmax5 FLOAT         5'-only d_max (alternative to comma syntax)\n"
+        << "  --damage-dmax3 FLOAT         3'-only d_max\n"
+        << "  --damage-lambda FLOAT        Lambda (decay) for both ends\n"
+        << "  --damage-lambda5 FLOAT       Lambda for 5' end\n"
+        << "  --damage-lambda3 FLOAT       Lambda for 3' end\n"
+        << "  --damage-bg FLOAT            Background deamination rate (default: 0.02)\n"
+        << "  --mask-threshold FLOAT       Mask positions with excess damage > T (default: 0.05)\n"
+        << "\nDeprecated aliases (still parsed):\n"
+        << "  --collapse-damage            → --damage collapse\n"
+        << "  --no-damage-qc               → --damage off\n"
+        << "  --damage-qc-scan-reads N     → --damage-scan N\n"
+        << "\nPCR (informational):\n"
+        << "  --pcr-cycles INT             Number of PCR cycles (log only)\n"
+        << "  --pcr-efficiency FLOAT       Efficiency per cycle, 0-1 (default: 1.0)\n"
+        << "  --pcr-error-rate FLOAT       Error rate sub/base/doubling (default: 5.3e-7 = Q5)\n"
         << "\nMemory: ~16 bytes per input read + 2-bit seq arena (~1 byte/4 bp) for error correction.\n";
 }
 
@@ -1666,8 +2284,16 @@ int derep_main(int argc, char** argv) {
     bool bucket_cap_explicit  = false;   // default on: aDNA primary use case
 
     bool   damage_auto    = false;  // default off: damage-aware hashing distorts
-                                    // downstream damage analysis (e.g. DART) when
+                                    // downstream damage analysis (e.g. deamination fit) when
                                     // run on fqdup output. Use --damage-auto explicitly.
+    bool    damage_qc_enabled    = true;
+    int64_t damage_qc_scan_reads = 1'000'000;
+    // deamination model fit sample cap. 0 = use all reads (was the silent default,
+    // which scans the entire input before Pass 1 even starts). 5M is plenty
+    // for stable d_max/lambda estimates and saves a full input pass on large
+    // libraries.
+    int64_t damage_deam_max_reads = 5'000'000;
+    DamageClipPolicy damage_clip_policy = DamageClipPolicy::ReportOnly;
     taph::SampleDamageProfile::LibraryType forced_library_type =
         taph::SampleDamageProfile::LibraryType::UNKNOWN;  // auto-detect by default
     double damage_dmax5   = -1.0;
@@ -1683,7 +2309,10 @@ int derep_main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "-h" || arg == "--help") {
-            print_usage(argv[0]);
+            print_usage(argv[0], /*advanced=*/false);
+            return 0;
+        } else if (arg == "--help-advanced") {
+            print_usage(argv[0], /*advanced=*/true);
             return 0;
         } else if (arg == "-i" && i + 1 < argc) {
             in_path = argv[++i];
@@ -1723,9 +2352,33 @@ int derep_main(int argc, char** argv) {
             errcor.legacy_veto = true;
         } else if (arg == "--errcor-adj-len") {
             errcor.adj_len_probe = true;
-        } else if (arg == "--errcor-threads" && i + 1 < argc) {
+        } else if (arg == "--errcor-rescue-indels") {
+            errcor.rescue_indels = true;
+        } else if (arg == "--rescue-min-hits" && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
-            if (v < 0) { std::cerr << "Error: --errcor-threads must be >= 0 (0 = auto), got " << v << "\n"; return 1; }
+            if (v < 1) { std::cerr << "Error: --rescue-min-hits must be >= 1, got " << v << "\n"; return 1; }
+            errcor.rescue_min_hits = v;
+        } else if (arg == "--rescue-topk" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 1) { std::cerr << "Error: --rescue-topk must be >= 1, got " << v << "\n"; return 1; }
+            errcor.rescue_topk = static_cast<uint32_t>(v);
+        } else if (arg == "--rescue-bundle-hot" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 2) { std::cerr << "Error: --rescue-bundle-hot must be >= 2, got " << v << "\n"; return 1; }
+            errcor.rescue_bundle_hot = static_cast<uint32_t>(v);
+        } else if (arg == "--rescue-hash-hot" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 1) { std::cerr << "Error: --rescue-hash-hot must be >= 1, got " << v << "\n"; return 1; }
+            errcor.rescue_hash_hot = static_cast<uint32_t>(v);
+        } else if (arg == "--rescue-alpha-ins" && i + 1 < argc) {
+            errcor.rescue_alpha_ins = std::stod(argv[++i]);
+        } else if (arg == "--rescue-alpha-del" && i + 1 < argc) {
+            errcor.rescue_alpha_del = std::stod(argv[++i]);
+        } else if (arg == "--rescue-mask-bonus" && i + 1 < argc) {
+            errcor.rescue_mask_bonus = std::stod(argv[++i]);
+        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 0) { std::cerr << "Error: " << arg << " must be >= 0 (0 = auto), got " << v << "\n"; return 1; }
             errcor.threads = static_cast<unsigned>(v);
         } else if (arg == "--library-type" && i + 1 < argc) {
             std::string lt(argv[++i]);
@@ -1736,10 +2389,24 @@ int derep_main(int argc, char** argv) {
             else if (lt == "auto")
                 forced_library_type = taph::SampleDamageProfile::LibraryType::UNKNOWN;
             else { std::cerr << "Error: Unknown --library-type: " << lt << " (use auto, ds, ss)\n"; return 1; }
+        } else if (arg == "--damage" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "off")      { damage_qc_enabled = false; damage_auto = false; }
+            else if (m == "report")   { damage_qc_enabled = true;  damage_auto = false; }
+            else if (m == "collapse") { damage_qc_enabled = true;  damage_auto = true;  }
+            else { std::cerr << "Error: --damage must be off|report|collapse, got " << m << "\n"; return 1; }
         } else if (arg == "--collapse-damage") {
-            damage_auto = true;
+            // Deprecated alias for --damage collapse
+            damage_qc_enabled = true; damage_auto = true;
         } else if (arg == "--damage-dmax" && i + 1 < argc) {
-            damage_dmax5 = damage_dmax3 = std::stod(argv[++i]);
+            std::string v = argv[++i];
+            auto comma = v.find(',');
+            if (comma != std::string::npos) {
+                damage_dmax5 = std::stod(v.substr(0, comma));
+                damage_dmax3 = std::stod(v.substr(comma + 1));
+            } else {
+                damage_dmax5 = damage_dmax3 = std::stod(v);
+            }
         } else if (arg == "--damage-dmax5" && i + 1 < argc) {
             damage_dmax5 = std::stod(argv[++i]);
         } else if (arg == "--damage-dmax3" && i + 1 < argc) {
@@ -1760,6 +2427,37 @@ int derep_main(int argc, char** argv) {
             pcr_efficiency = std::stod(argv[++i]);
         } else if (arg == "--pcr-error-rate" && i + 1 < argc) {
             pcr_phi = std::stod(argv[++i]);
+        } else if (arg == "--no-damage-qc") {
+            damage_qc_enabled = false;
+        } else if (arg == "--damage-deam-sample" && i + 1 < argc) {
+            long long v = std::stoll(argv[++i]);
+            if (v < 0) {
+                std::cerr << "Error: --damage-deam-sample must be >= 0 (0 = scan all), got "
+                          << v << "\n";
+                return 1;
+            }
+            damage_deam_max_reads = static_cast<int64_t>(v);
+        } else if ((arg == "--damage-scan" || arg == "--damage-qc-scan-reads") && i + 1 < argc) {
+            long long v = std::stoll(argv[++i]);
+            if (v < 0) {
+                std::cerr << "Error: --damage-qc-scan-reads must be >= 0 (0 = scan all), got "
+                          << v << "\n";
+                return 1;
+            }
+            damage_qc_scan_reads = static_cast<int64_t>(v);
+        } else if (arg == "--damage-clip-pass" && i + 1 < argc) {
+            std::string v(argv[++i]);
+            if      (v == "off")    damage_clip_policy = DamageClipPolicy::Off;
+            else if (v == "report") damage_clip_policy = DamageClipPolicy::ReportOnly;
+            else if (v == "refit")  damage_clip_policy = DamageClipPolicy::Refit;
+            else {
+                std::cerr << "Error: --damage-clip-pass must be off|report|refit, got " << v << "\n";
+                return 1;
+            }
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Error: Unknown argument: " << arg << "\n\n";
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
@@ -1818,8 +2516,10 @@ int derep_main(int argc, char** argv) {
     if (!cluster_path.empty())
         log_info("Cluster output: " + cluster_path);
     log_info("Reverse-complement: " + std::string(use_revcomp ? "enabled" : "disabled"));
-    log_info("Damage variant collapsing: " + std::string(damage_auto ? "on (--collapse-damage)" :
-             (damage_dmax5 >= 0.0 ? "manual" : "disabled (default)")));
+    log_info(std::string("Damage mode: ") +
+             (damage_auto ? "collapse" :
+              (damage_qc_enabled ? "report" : "off")) +
+             (damage_dmax5 >= 0.0 ? " (manual d_max override)" : ""));
     log_info("PCR error correction: " + std::string(errcor.enabled ? "enabled (default)" : "disabled (--no-error-correct)"));
 
     // Thread polymerase error rate into Phase 3 adaptive threshold.
@@ -1840,12 +2540,44 @@ int derep_main(int argc, char** argv) {
     DamageProfile profile;
     profile.mask_threshold = mask_threshold;
     profile.pcr_error_rate = pcr_total_rate;
+    DamageQcReport qc_report;
 
     try {
-        if (damage_auto) {
-            profile = estimate_damage(in_path, mask_threshold, forced_library_type);
+        // Always fit deamination + run QC so the .fqcl header reports full damage
+        // stats (d_max, BIC, library evidence, adapter/hexamer QC) for
+        // downstream consumers. Only gate the *use* of damage in clustering
+        // on --collapse-damage via profile.enabled below.
+        if (damage_auto || damage_qc_enabled) {
+            DamageEstimateOptions opts;
+            opts.mask_threshold     = mask_threshold;
+            opts.forced_lib         = forced_library_type;
+            opts.qc_enabled         = damage_qc_enabled;
+            opts.adapter_scan_reads = damage_qc_scan_reads;
+            opts.clip_policy        = damage_qc_enabled ? damage_clip_policy
+                                                        : DamageClipPolicy::Off;
+            opts.skip_deam_fit      = false;
+            opts.max_reads          = damage_deam_max_reads;
+            if (damage_deam_max_reads > 0)
+                log_info("Damage deamination fit: sampling first " +
+                         std::to_string(damage_deam_max_reads) +
+                         " reads (--damage-deam-sample 0 to scan all)");
+            auto t_dart_begin = std::chrono::steady_clock::now();
+            DamageEstimate est = estimate_damage_with_qc(in_path, opts);
+            {
+                double s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_dart_begin).count();
+                char b[64];
+                std::snprintf(b, sizeof(b), "%.1f s", s);
+                log_info("Phase timer: Damage estimate (deamination+QC) = " + std::string(b));
+            }
+            profile = est.profile;
             profile.pcr_error_rate = pcr_total_rate;
-        } else if (damage_dmax5 >= 0.0) {
+            // profile.enabled controls whether derep CONSUMES damage for
+            // clustering decisions. Default off — preserve damage signal.
+            if (!damage_auto) profile.enabled = false;
+            qc_report = est.qc;
+        }
+        if (damage_dmax5 >= 0.0) {
             profile.d_max_5prime  = damage_dmax5;
             profile.d_max_3prime  = (damage_dmax3 >= 0.0) ? damage_dmax3 : damage_dmax5;
             profile.lambda_5prime = damage_lambda5;
@@ -1869,8 +2601,58 @@ int derep_main(int argc, char** argv) {
             log_warn("--cluster-format requires PCR error correction; ignoring (run without --no-error-correct).");
             fqcl_path.clear();
         }
+
+        // Build QC JSON object string (opaque payload for cluster_format).
+        std::string qc_json;
+        if (qc_report.enabled) {
+            std::ostringstream q;
+            q.precision(6);
+            const char* policy_str =
+                damage_clip_policy == DamageClipPolicy::Off    ? "off" :
+                damage_clip_policy == DamageClipPolicy::Refit  ? "refit" : "report";
+            q << "{\"enabled\":true"
+              << ",\"clip_policy\":\"" << policy_str << "\""
+              << ",\"profile_clipped\":" << (qc_report.profile_clipped ? "true" : "false")
+              << ",\"adapter_reads_scanned\":" << qc_report.adapter_reads_scanned
+              << ",\"adapter_stubs_5prime\":[";
+            for (size_t i = 0; i < qc_report.adapter.stubs5.size(); ++i) {
+                if (i) q << ",";
+                q << "\"" << qc_report.adapter.stubs5[i] << "\"";
+            }
+            q << "],\"adapter_stubs_3prime\":[";
+            for (size_t i = 0; i < qc_report.adapter.stubs3.size(); ++i) {
+                if (i) q << ",";
+                q << "\"" << qc_report.adapter.stubs3[i] << "\"";
+            }
+            q << "],\"hexamer_entropy_5prime\":" << qc_report.hex_stats.entropy_terminal
+              << ",\"hexamer_terminal_interior_jsd\":" << qc_report.hex_stats.jsd
+              << ",\"d5_hexamer_corrected\":" << qc_report.preservation.d5_hexamer_corrected
+              << ",\"flags\":[";
+            for (size_t i = 0; i < qc_report.flag_names.size(); ++i) {
+                if (i) q << ",";
+                q << "\"" << qc_report.flag_names[i] << "\"";
+            }
+            q << "]}";
+            qc_json = q.str();
+        }
+
+        // Bug 1: resolve library_type from the user-provided CLI flag.
+        // Order: explicit --library-type ds/ss > auto-detected by the deamination fit
+        // (when damage_auto produced an evaluable result) > "auto".
+        std::string library_type_str = "auto";
+        if (forced_library_type ==
+                taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED) {
+            library_type_str = "ds";
+        } else if (forced_library_type ==
+                taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED) {
+            library_type_str = "ss";
+        } else if (profile.enabled) {
+            library_type_str = profile.ss_mode ? "ss" : "ds";
+        }
+
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
-                           false, bucket_cap_explicit, fqcl_path, in_path);
+                           false, bucket_cap_explicit, fqcl_path, in_path,
+                           std::move(qc_json), library_type_str);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

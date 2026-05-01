@@ -40,9 +40,9 @@ echo "--- M2: damage d_max estimates in [0, 1] ---"
 "$GEN" --n-unique 200 --n-reads 5000 --read-len 75 \
     --dmax5 0.30 --dmax3 0.20 --lambda5 0.40 --lambda3 0.40 \
     --seed 2 > "$TMPDIR/m2.fq" 2>/dev/null
-DMAX5=$("$FQDUP" damage -i "$TMPDIR/m2.fq" 2>&1 | \
+DMAX5=$("$FQDUP" profile -i "$TMPDIR/m2.fq" 2>&1 | \
     grep "5'-end" | grep -oP 'd_max=\K[0-9.]+' | head -1)
-DMAX3=$("$FQDUP" damage -i "$TMPDIR/m2.fq" 2>&1 | \
+DMAX3=$("$FQDUP" profile -i "$TMPDIR/m2.fq" 2>&1 | \
     grep "3'-end" | grep -oP 'd_max=\K[0-9.]+' | head -1)
 python3 - <<EOF
 import sys

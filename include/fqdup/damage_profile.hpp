@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "fqdup/logger.hpp"
+#include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
 
 inline constexpr int LSD_L_MIN             = 30;
@@ -32,7 +33,17 @@ inline int lsd_hist_bin(int L) {
     return hb;
 }
 
+// 3' damage prior mode. ds_ga = use 3' G→A signal (DS libraries),
+// ss_ct = use 3' C→T signal (SS libraries), neutral = no 3' damage prior
+// (UNKNOWN library type — drop the 3' channel from masking entirely).
+enum class Damage3PrimeMode : uint8_t { ds_ga, ss_ct, neutral };
+
 struct DamageProfile {
+    // 3' damage prior mode — set from taph::SampleDamageProfile::library_type. UNKNOWN maps to
+    // neutral so we don't silently apply DS or SS priors. ss_mode (below) is
+    // kept for compatibility and derived from this field.
+    Damage3PrimeMode mode_3prime = Damage3PrimeMode::ds_ga;
+
     // Fitted exponential model parameters (for logging and expected_mismatches only).
     double d_max_5prime   = 0.0;
     double d_max_3prime   = 0.0;
@@ -200,7 +211,7 @@ struct LengthBinDamageProfile {
     std::array<double, N_POS> per_pos_5prime_ct{};
     std::array<double, N_POS> per_pos_3prime{};
 
-    // Per-length-bin K-component GC mixture (populated by libdart finalize).
+    // Per-length-bin K-component GC mixture (populated by libtaph finalize).
     static constexpr int N_GC_BINS = 10;
     double mixture_d_damaged   = 0.0;
     double mixture_d_reference = 0.0;
@@ -248,7 +259,7 @@ struct LengthBinDamageProfile {
     double pG_terminal_5_damaged = std::numeric_limits<double>::quiet_NaN();
     double pG_interior_5_damaged = std::numeric_limits<double>::quiet_NaN();
 
-    // Reference-free trinucleotide spectrum (bulk, from libdart).
+    // Reference-free trinucleotide spectrum (bulk, from libtaph).
     // 64 contexts = prev*16 + mid*4 + next; A=0,C=1,G=2,T=3.
     // Terminal = read pos 1..4 from that end; interior = pos 10..14 (null baseline).
     // Downstream post-processing can contrast the terminal counters against
@@ -281,7 +292,7 @@ struct LengthStratifiedDamageProfile {
     std::vector<std::array<double, LengthBinDamageProfile::N_GC_BINS>> cell_w_ancient;
 };
 
-// Run DART damage estimation on a FASTQ file and return a populated DamageProfile.
+// Run deamination damage estimation on a FASTQ file and return a populated DamageProfile.
 // max_reads: stop after this many reads (0 = use all reads).
 DamageProfile estimate_damage(
     const std::string& path,
@@ -289,6 +300,47 @@ DamageProfile estimate_damage(
     taph::SampleDamageProfile::LibraryType forced_lib =
         taph::SampleDamageProfile::LibraryType::UNKNOWN,
     int64_t max_reads = 0);
+
+// ── Unified estimation + adapter/hexamer QC -----------------------------------
+// T6.2: shared damage path used by `damage`, `derep`, and `extend` subcommands.
+
+enum class DamageClipPolicy { Off, ReportOnly, Refit };
+
+struct DamageEstimateOptions {
+    double  mask_threshold      = 0.05;
+    taph::SampleDamageProfile::LibraryType forced_lib =
+        taph::SampleDamageProfile::LibraryType::UNKNOWN;
+    int64_t max_reads           = 0;
+    size_t  threads             = 1;
+    bool    qc_enabled          = true;
+    int64_t adapter_scan_reads  = 1'000'000;
+    DamageClipPolicy clip_policy = DamageClipPolicy::ReportOnly;
+    // T6.2 fix (Bug 2): when true, run the input scan and populate QC tables
+    // but skip the deamination damage-fit emission — DamageProfile returned has
+    // enabled=false and all zeros. Callers that want QC without committing
+    // to damage-aware hashing (the common derep default) should set this.
+    bool    skip_deam_fit       = false;
+};
+
+struct DamageQcReport {
+    bool                       enabled              = false;
+    bool                       profile_clipped      = false;
+    int64_t                    adapter_reads_scanned = 0;
+    taph::AdapterStubs         adapter;
+    taph::HexStats             hex_stats;
+    taph::LibraryQcFlags       flags;
+    taph::PreservationSummary  preservation;
+    double                     short_read_frac      = 0.0;
+    std::vector<std::string>   flag_names;
+};
+
+struct DamageEstimate {
+    DamageProfile  profile;
+    DamageQcReport qc;
+};
+
+DamageEstimate estimate_damage_with_qc(const std::string& path,
+                                       const DamageEstimateOptions& opts);
 
 LengthStratifiedDamageProfile estimate_damage_by_length(
     const std::string& path,

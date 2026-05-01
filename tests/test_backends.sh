@@ -101,9 +101,9 @@ echo "  PASS: derep_pairs plain and gzip inputs agree ($U unique reads)"
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- B4: damage plain vs gzip input → same d_max estimates ---"
-D5_PLAIN=$("$FQDUP" damage -i "$TMPDIR/raw.fq" 2>&1 | \
+D5_PLAIN=$("$FQDUP" profile -i "$TMPDIR/raw.fq" 2>&1 | \
     grep "5'-end" | grep -oP 'd_max=\K[0-9.]+' | head -1)
-D5_GZ=$("$FQDUP" damage -i "$TMPDIR/sorted.fq.gz" 2>&1 | \
+D5_GZ=$("$FQDUP" profile -i "$TMPDIR/sorted.fq.gz" 2>&1 | \
     grep "5'-end" | grep -oP 'd_max=\K[0-9.]+' | head -1)
 python3 - <<EOF
 import sys

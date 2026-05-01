@@ -15,6 +15,11 @@ int derep_main(int argc, char** argv);
 int damage_main(int argc, char** argv);
 int gen_main(int argc, char** argv);
 int view_main(int argc, char** argv);
+// consensus_main: TEMP DISABLED — WIP refactor (task #20). Stubbed to keep linker happy.
+static int consensus_main(int, char**) {
+    std::cerr << "fqdup consensus: temporarily disabled (WIP refactor, task #20)\n";
+    return 2;
+}
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <subcommand> [options]\n"
@@ -26,6 +31,7 @@ static void usage(const char* prog) {
               << "  profile     Profile deamination damage and library QC\n"
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
               << "  view        Inspect .fqcl cluster genealogy files\n"
+              << "  consensus   Emit per-cluster consensus FASTQ from .fqcl\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
               << "\nTypical workflow:\n"
               << "  " << prog << " sort        -i merged.fq.gz  -o merged.sorted.fq.gz  --max-memory 64G\n"
@@ -52,6 +58,7 @@ int main(int argc, char** argv) {
     if (sub == "profile") return damage_main(argc - 1, argv + 1);
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
     if (sub == "view")        return view_main(argc - 1, argv + 1);
+    if (sub == "consensus")   return consensus_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {
         usage(argv[0]);
