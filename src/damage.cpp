@@ -1440,7 +1440,7 @@ int damage_main(int argc, char** argv) {
                   << ",\"z_score\":" << lb.channel_h_z
                   << ",\"z_score_p2plus\":" << lb.channel_h_z_p2plus
                   << ",\"valid\":" << (lb.channel_h_valid ? "true" : "false")
-                  << ",\"detected\":" << (lb.channel_h_valid && lb.channel_h_z > kOxChannelZDetect ? "true" : "false") << "}"
+                  << ",\"detected\":" << (lb.channel_h_valid && (lb.channel_h_z > kOxChannelZDetect || lb.channel_h_z_p2plus > kOxChannelZDetect) ? "true" : "false") << "}"
                   << "}";
             }
             j << "]\n";
@@ -1903,7 +1903,7 @@ int damage_main(int argc, char** argv) {
 
             bool ch_f_detected = dp.channel_f_valid && dp.channel_f_z > kOxChannelZDetect;
             bool ch_g_detected = dp.channel_g_valid && dp.channel_g_z > kOxChannelZDetect;
-            bool ch_h_detected = dp.channel_h_valid && dp.channel_h_z > kOxChannelZDetect;
+            bool ch_h_detected = dp.channel_h_valid && (dp.channel_h_z > kOxChannelZDetect || dp.channel_h_z_p2plus > kOxChannelZDetect);
             bool ch_d_detected = std::abs(dp.ox_gt_asymmetry) > 0.01f;
 
             j << "  \"damage_types\": [\n";
