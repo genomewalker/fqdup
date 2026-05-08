@@ -20,6 +20,12 @@ struct ErrCorParams {
     bool     enabled            = false;
     double   snp_threshold      = 0.20;
     uint32_t snp_min_count      = 1;
+    // Singleton high-Q SNP veto: block H=1/H=2 absorption when child carries a
+    // mismatch base with quality >= this and the mismatch is not damage-bypass.
+    // Rationale: empirical S>0 still permits absorption of singleton (sig=1)
+    // SNP-bearing reads at low-coverage variant loci. A high-Q non-damage base
+    // is direct sequence-divergence evidence; blocking costs at most one dup.
+    uint8_t  singleton_qual_min = 25;
     uint32_t snp_low_cov_cutoff = 10;
     double   snp_low_cov_factor = 1.75;
     uint32_t bucket_cap         = 0;
@@ -35,6 +41,30 @@ struct ErrCorParams {
     // SNP-veto path instead (kept for ablation studies).
     bool     empirical          = true;
     bool     legacy_veto        = false;  // legacy SNP-only path (no LR/posterior)
+    // B1 damage-adjusted Hamming: terminal C→T (5') and G→A (3', DS only) mismatches
+    // are not counted toward the H≤2 admission threshold. h_adj=1 pairs are recorded
+    // as H=1 (non-damage mismatch only); h_adj=0 pairs (both terminal damage) are
+    // skipped here and require tag-folding to reach Phase 3.
+    // Set false for ablation to restore old transversion-only H=2 behaviour.
+    bool     b1_damage_adjust   = true;
+    // Calibration-free LRT for interior C↔T / G↔A candidates admitted by
+    // b1_damage_adjust. Bypasses the empirical model for this subclass.
+    // f0 = expected child fraction under PCR error (cycle 3-4 ≈ 0.10),
+    // f1 = under real variant (0.50). Absorb if log(P(H0)/P(H1)) > log(lrt_T).
+    // Hard absorb when parent/child > lrt_hard_ratio regardless of LRT.
+    // SNP veto uses Wilson-95 lower CI bound instead of raw frequency.
+    // κ gate: ratio of interior C↔T mismatches to interior transversions.
+    // κ≈1 → no excess above PCR floor → suppress absorption.
+    // κ≥b1_kappa_min → genuine interior deamination signal → allow absorption.
+    // Cross-strand veto: child cluster with reads from both orientations (≥cs_min_total total)
+    // is treated as a real SNP (strand-symmetric) and protected from absorption.
+    double   b1_kappa_min        = 2.0;
+    uint32_t b1_cs_min_total     = 3;
+    double   lrt_f0              = 0.10;
+    double   lrt_f1              = 0.50;
+    double   lrt_T               = 10.0;
+    double   lrt_hard_ratio      = 30.0;
+    double   snp_cp_lb_threshold = 0.10;
     bool     adj_len_probe      = false;  // T5.6: adjacent-length (L±1) probe
     // T8: opt-in indel-rescue path (syncmer-indexed, banded ed≤2).
     bool     rescue_indels      = false;
@@ -45,6 +75,20 @@ struct ErrCorParams {
     double   rescue_alpha_ins   = 2.0;
     double   rescue_alpha_del   = 2.0;
     double   rescue_mask_bonus  = 1.0;
+    // Phase B3: damage-aware H>2 merge for heavily damaged ancient DNA.
+    // Pairs that differ only in deamination at near-terminal positions
+    // (p_damage > b3_deam_threshold) are merged when 3 ≤ H ≤ b3_max_hamming
+    // and the count LRT confirms PCR-error origin.
+    bool     b3_enabled             = true;
+    // Gate: skip B3 if fewer than b3_min_n_elig interior positions have
+    // P(damage) > b3_deam_threshold, OR if their sum (expected deamination
+    // events in unmasked interior) < b3_min_mass. Both are derived from the
+    // fitted profile — no magic d_max cutoff needed.
+    int      b3_min_n_elig          = 3;     // min eligible positions (= H_min)
+    float    b3_min_mass            = 0.1f;  // min sum(P(damage)) over eligible positions
+    float    b3_deam_threshold      = 0.01f; // P(damage) threshold for normalization
+    int      b3_max_hamming         = 5;     // max H to consider in B3
+    double   b3_count_ratio         = 5.0;   // min parent/child count ratio
 };
 
 struct Phase3Stats {
@@ -85,6 +129,10 @@ struct Phase3Stats {
     uint64_t adj_len_matched   = 0;  // banded check passed (1-indel, 0-sub)
     uint64_t adj_len_absorbed  = 0;
     uint64_t adj_len_protected = 0;  // matched but LR ≤ threshold (or legacy mode)
+    // H=3 shadow: near-boundary H=2 edges (|S| < 1.0 nat). Flag-only, never absorbed.
+    // Tracks LR score distribution near zero to inform future H=3 absorption threshold.
+    uint64_t h3_shadow_absorbed_near_boundary  = 0;
+    uint64_t h3_shadow_protected_near_boundary = 0;
     // T8.9 indel-rescue counters (--errcor-rescue-indels).
     double   rescue_index_size_mb     = 0.0;
     uint64_t rescue_index_overflow    = 0;
@@ -99,6 +147,10 @@ struct Phase3Stats {
     uint64_t rescue_absorbed          = 0;
     uint64_t rescue_protected         = 0;        // S ≤ 0
     std::array<uint64_t, 6> rescue_absorbed_by_occ{};
+    // Phase B3 counters.
+    uint64_t b3_candidates  = 0;
+    uint64_t b3_absorbed    = 0;
+    uint64_t b3_protected   = 0;
     void log() const {
         auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
         log_info("Phase 3 timing:");
@@ -148,6 +200,11 @@ struct Phase3Stats {
             log_info("  Absorbed          : " + std::to_string(adj_len_absorbed));
             log_info("  Protected (LR/legacy): " + std::to_string(adj_len_protected));
         }
+        if (h3_shadow_absorbed_near_boundary + h3_shadow_protected_near_boundary > 0) {
+            log_info("H=3 shadow (near-boundary H=2, |S|<1.0 nat):");
+            log_info("  Absorbed  near-boundary: " + std::to_string(h3_shadow_absorbed_near_boundary));
+            log_info("  Protected near-boundary: " + std::to_string(h3_shadow_protected_near_boundary));
+        }
         if (rescue_pairs_banded > 0 || rescue_indexed_parents > 0) {
             char b[64];
             std::snprintf(b, sizeof(b), "%.2f", rescue_index_size_mb);
@@ -183,9 +240,10 @@ struct IndexEntry {
     uint64_t count;
     uint32_t seq_id;
     uint8_t  damage_score;
+    uint32_t fwd_count = 0;  // reads arriving in canonical (fwd) orientation
 
-    IndexEntry() : record_index(0), count(1), seq_id(0), damage_score(0) {}
-    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0), damage_score(0) {}
+    IndexEntry() : record_index(0), count(1), seq_id(0), damage_score(0), fwd_count(0) {}
+    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0), damage_score(0), fwd_count(0) {}
 };
 
 // 2-bit packed sequence arena. ~4× memory reduction vs ASCII.

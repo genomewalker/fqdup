@@ -46,8 +46,8 @@ Two absorption paths:
 
 - **H=1**: any single non-damage interior substitution. Applies to all children
   regardless of count.
-- **H=2**: two non-damage interior substitutions (both must be A↔T or C↔G
-  transversions). Only applies to children with count ≤ `--errcor-max-h2-count`
+- **H=2**: two non-damage interior substitutions. Only applies to children
+  with count ≤ `--errcor-max-h2-count`
   (default 2). This catches double-error reads from chimera formation, nick
   translation, or clustered oxidative damage that escape H=1 detection.
 
@@ -226,13 +226,80 @@ of a genuine double-PCR-error is ~φ² × D_eff² × parent_count, which is
 astronomically small; a read appearing 3+ times at H=2 from a parent is almost
 certainly a real variant, chimera at elevated frequency, or genuine molecule.
 
-`--errcor-bucket-cap INT` (default 64) — prevents low-complexity regions
+`--errcor-empirical` (default: on) — use the empirical posterior-odds model
+(T5.8) instead of the legacy count-ratio threshold. Absorb iff S > 0 where S is
+the log posterior-odds ratio; see [Empirical model](#empirical-posterior-odds-model)
+below. Disable with `--errcor-legacy-veto` to revert to the pre-T5.8 behaviour.
+
+`--errcor-singleton-qual-min INT` (default 25) — block absorption of any H=1 or
+H=2 child that carries a non-damage mismatch base with Phred quality ≥ this
+value, regardless of the empirical score. A single high-quality non-damage base
+is direct sequence-divergence evidence.
+
+`--errcor-bucket-cap INT` (default 0 = unlimited) — prevents low-complexity regions
 (poly-A, microsatellites) from producing enormous bucket collisions in the
 pair-hash index.
 
 `--pcr-error-rate FLOAT` (default Q5: 5.3e-7), `--pcr-cycles INT`,
 `--pcr-efficiency FLOAT` — parameterise the PCR error model used for the
 logged D_eff estimate. These values do not affect absorption decisions.
+
+---
+
+## Empirical posterior-odds model
+
+Since `fb8195c` (T5.8), absorption decisions use a data-driven posterior-odds
+model rather than a fixed count-ratio threshold. For each candidate edge the
+model computes:
+
+```
+S = log π(occ_bin) + Σ_i [ log p_err(qual_i) − log p_real(s_i, t_i, occ, dmg_i) ]
+```
+
+where:
+- `π(occ_bin)` — per-occupancy prior log-odds (PCR-error vs real), fit
+  empirically from the fraction of singleton vs recurring edges per bundle-size bin
+- `p_err(qual)` — sequencing error probability from the Phred score
+- `p_real(s,t,occ,dmg)` — probability that a mismatch of substitution class `s`
+  at terminal-distance bin `t`, bundle-occupancy bin `occ`, and damage-channel
+  flag `dmg` is a real variant, estimated from **cross-bundle recurrence**: a
+  signature that appears in many independent bundles (PCR families) is flagged as
+  systematic; one confined to a single bundle stays near the sequencing error
+  prior (~10⁻⁴)
+
+The edge is absorbed iff `S > 0`. A count-asymmetry term
+`log((parent_count+1)/(child_count+1))` and a `joint_dispersion_adj` (see below)
+are added before the threshold.
+
+Six substitution classes are tracked: C>T/G>A (class 0, deamination channel),
+A>G/T>C, C>A/G>T, A>C/T>G, C>G/G>C, A>T/T>A.
+
+### Singleton high-quality clamp
+
+After the empirical score, any H=1 or H=2 edge is vetoed if:
+- the child carries a mismatch base with Phred ≥ `singleton_qual_min` (default
+  25) **and** the mismatch is not in the terminal damage zone, **or**
+- the co-occurrence count `sig` for the same `(pos, alt)` across the parent's
+  bundle reaches `max(snp_min_count, 2)`
+
+Terminal damage-channel positions are exempt from the singleton clamp (residual
+deamination at the ends should still be absorbed).
+
+### Joint dispersion adjustment
+
+`joint_dispersion_adj` inspects the distribution of `(pos, alt)` pairs among a
+parent's candidate children. If multiple distinct variant positions cluster with
+no single dominant allele, the score is penalised (evidence of real variant
+diversity); three or more evenly-spread positions give a small positive push
+(consistent with a PCR error cloud). This term is logged as
+`Joint adj fired: neg=X pos=Y (of N parents)`.
+
+### H=3 shadow
+
+Near-boundary H=2 edges (|S| < 1.0 nat) are counted separately as
+`h3_shadow_absorbed_near_boundary` / `h3_shadow_protected_near_boundary` in the
+Phase 3 log. These are diagnostic only — H=3 direct absorption is not yet
+implemented.
 
 ---
 
