@@ -50,9 +50,11 @@ sequencing; its input is single-end merged reads from `fastp --merge`.
 **4. `fqdup derep`**: biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
 
-- **PCR error correction (Phase 3, default: on).** A 3-way pigeonhole Hamming
-  search finds low-count clusters that differ from a high-count cluster by
-  exactly one interior substitution. These are removed as PCR copying errors.
+- **PCR error correction (Phase 3, default: on).** A pigeonhole Hamming
+  search finds low-count clusters that differ from a high-count cluster by one
+  or two interior substitutions (H≤2). An empirical posterior-odds model scores
+  each candidate edge using cross-bundle recurrence; reads are absorbed only when
+  the evidence favours PCR error over a real variant.
   C↔T and G↔A mismatches are never absorbed; they are indistinguishable from
   damage signal and are always kept.
 
@@ -62,6 +64,18 @@ Two mechanisms, both on by default:
   deamination collapse into the same cluster. Library type is detected
   automatically via a 7-model BIC competition; override with
   `--library-type ds|ss`.
+
+- **Phase B3: damage-aware H>2 merge (default: on when `--damage collapse/report`).** For
+  libraries with d_max ≥ 0.25, PCR copies of the same ancient molecule can
+  accumulate 3–5 deamination events at positions just outside the mask zone,
+  placing them beyond Phase 3's H≤2 reach. Phase B3 normalizes damage-probable
+  interior positions (T→C / A→G), hashes the result, and gates candidate pairs
+  by a composite key combining the damage-normalized interior hash with the
+  `bundle_key` locus anchor (`start_kmer ⊕ end_kmer`). Only reads sharing
+  both the same genomic locus **and** the same normalized interior are compared.
+  Within each bucket, all mismatches must be deamination-consistent and pass a
+  count-ratio LRT before absorption. See [[Damage-Aware-Deduplication]] for
+  details.
 
   **Leave this off if you plan to run metaDMG or mapDamage on the fqdup output.**
   Here is why. Say one molecule was sequenced 5 times and 3 of those reads
@@ -311,11 +325,14 @@ required.
 ```
   --no-error-correct           Disable Phase 3
   --error-correct              Explicitly enable (already default)
-  --errcor-mode capture|shotgun  Coverage regime (default: shotgun)
   --errcor-min-parent    INT   Min count to index as parent (default: 3)
   --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)
-  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 2/1)
-  --errcor-bucket-cap    INT   Max pair-key bucket size (default: 64)
+  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)
+  --errcor-bucket-cap    INT   Max pair-key bucket size (default: 0 = unlimited)
+  --errcor-empirical           Empirical posterior-odds model (default: on)
+  --errcor-legacy-veto         Revert to pre-T5.8 count-ratio veto
+  --errcor-singleton-qual-min INT  Block absorption when mismatch Phred ≥ N (default: 25)
+  --errcor-rescue-indels       Syncmer-indexed indel rescue, ed≤2 (default: off)
 
   PCR model (for D_eff log estimate only, does not affect absorption):
   --pcr-cycles      INT   Number of PCR cycles

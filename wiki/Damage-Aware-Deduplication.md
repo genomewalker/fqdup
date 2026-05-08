@@ -158,9 +158,11 @@ Benchmarked on sample `a88af16f35`, 5.58 M merged reads input to `derep`
 
 Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
 correction (with damage substitution protection) absorbed a further 1,456
-PCR-error clusters. Only A↔T and C↔G transversions are eligible for absorption;
-C↔T and G↔A (deamination) and G↔T and C↔A (8-oxoG oxidative damage) are all
-protected as potential ancient DNA damage signal.
+PCR-error clusters. Only A↔T and C↔G transversions are eligible for absorption in read interiors.
+C↔T and G↔A at **terminal positions** (within 5 bp of the read ends) are handled
+by the damage-aware bypass: they are preferentially absorbed as residual
+deamination rather than protected as SNPs (see below). G↔T and C↔A (8-oxoG
+oxidative damage) are always protected.
 
 ---
 
@@ -193,8 +195,25 @@ Library type: SS (complement-only; d_max_3=0.221, spike at pos 0)
 
 Override with `--library-type ds|ss` if the auto-detection is incorrect (e.g.
 mixed libraries or very low-coverage samples where the BIC test is
-underpowered). The library type only affects which channels are used for the
-damage model fit and masking; the downstream deduplication steps are identical.
+underpowered).
+
+### Damage-aware bypass
+
+The detected library type also controls which terminal mismatches are treated as
+residual deamination rather than candidate SNPs during Phase 3 error correction:
+
+- **DS libraries**: C→T within 5 bp of the 5′ end and G→A within 5 bp of the
+  3′ end are flagged as damage-channel mismatches. These are absorbed more
+  aggressively (exempt from the singleton high-quality veto).
+- **SS libraries**: C→T within 5 bp of **either** end is flagged. G→A is not a
+  primary damage pattern in SS protocols and is treated like any other
+  substitution.
+
+Interior C↔T and G↔A mismatches (beyond 5 bp from the ends) are scored by the
+empirical posterior-odds model like any other transition. They are absorbed if
+the cross-bundle recurrence evidence is low (consistent with PCR error) and
+protected if the same signature recurs across multiple independent bundles
+(consistent with a real variant).
 
 ### Paired-end inputs
 
@@ -246,3 +265,64 @@ heavily damaged libraries (cave sediments, permafrost), raising the threshold
 to 0.08–0.10 reduces over-masking. Cross-check the logged masked position count
 against a damage plot from DART or mapDamage2 to confirm the threshold
 captures the actual damage zone.
+
+---
+
+## Phase B3: damage-aware H>2 merge
+
+The terminal masking (Phase 1) and H≤2 pigeonhole correction (Phase 3) together handle the majority of duplicate fragmentation caused by deamination. However, for libraries with very high terminal damage (d_max ≥ 0.25), PCR copies of the same ancient molecule can accumulate 3–5 deamination events at positions just outside the mask zone (where P(damage) is 1–5%). These reads are too distant for Phase 3's H≤2 pigeonhole to ever pair them.
+
+Phase B3 handles this case with a dedicated damage-normalised bucket hash.
+
+### How it works
+
+For each eligible read, Phase B3 computes two values:
+
+**1. `bundle_key` (locus anchor)**
+The same `start_kmer ⊕ end_kmer` used by Phase 3. Two reads sharing a `bundle_key` originated from the same genomic locus (same fragment endpoints). This is the reference-free equivalent of mapping coordinates.
+
+**2. `kdamage_hash` (damage-normalized interior)**
+The interior sequence (between the damage mask zones) is extracted into a packed 2-bit buffer. Positions where `P(damage | profile, L) > b3_deam_threshold` (default 0.01) are normalized in-place: T→C at 5'-proximal positions, A→G at 3'-proximal positions. The result is hashed with XXH3. PCR copies of the same molecule that differ only in deamination state at these positions yield identical `kdamage_hash` values.
+
+**3. Composite bucket key `b3k`**
+The two values are combined into a single 64-bit key:
+```
+b3k = XXH3_64bits_withSeed(&kdamage_hash, 8, bundle_key)
+```
+Two reads land in the same B3 bucket if and only if they share both their locus anchor **and** their damage-normalized interior. This prevents cross-locus collisions — a critical safeguard for high-depth capture data where unrelated molecules at different loci can coincidentally share similar interior sequences.
+
+### Within-bucket filtering
+
+For each pair within a bucket (sorted by descending count, parent-child monotone ascent):
+
+1. **Count ratio**: `parent_count / child_count ≥ b3_count_ratio` (default 5×)
+2. **Hamming distance**: H ∈ [3, `b3_max_hamming`] (default max 5)
+3. **Deamination consistency**: every mismatch must be C↔T at 5'-proximal or G↔A at 3'-proximal positions with `P(damage) > b3_deam_threshold`
+4. **LRT**: the count-ratio likelihood-ratio test must favour PCR error over independent origin (`LRT > log(10)`)
+
+All four conditions must pass for absorption.
+
+### Parameters
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--b3-disable` | — | Disable Phase B3 entirely |
+| `--b3-min-dmax` | 0.25 | Skip B3 if d_max_avg below this |
+| `--b3-deam-threshold` | 0.01 | P(damage) threshold for normalization and consistency check |
+| `--b3-max-hamming` | 5 | Maximum H for B3 absorption |
+| `--b3-count-ratio` | 5.0 | Minimum parent/child count ratio |
+
+### Shotgun vs capture
+
+For shotgun data, Phase 3 and terminal masking already handle the bulk of damage-driven fragmentation. B3 fires only when `d_max_avg ≥ 0.25` (2+ Myr libraries), and the bundle_key locus gate has negligible precision cost because cross-locus interior collisions are rare over a large genome.
+
+For capture data, the locus gate is essential. Many independent molecules land on the same narrow target region, so `kdamage_hash` alone would group unrelated molecules into the same bucket. The `bundle_key` gate restricts comparisons to reads sharing identical fragment endpoints — the same constraint that keeps Phase 3 precise.
+
+### Log output
+
+```
+Phase B3: running (d_max_avg=0.411)
+Phase B3: candidates=12483 absorbed=183 protected=41
+```
+
+`candidates` = pairs passing the count ratio and Hamming filter before the deamination-consistency and LRT checks. `absorbed` = pairs fully merged. `protected` = pairs that passed Hamming + count ratio but failed deamination-consistency or LRT (kept separate).

@@ -67,6 +67,7 @@ extern "C" {
 #include "derep_detail/damage_keys.hpp"
 #include "derep_detail/banded_ed.hpp"
 #include "derep_detail/syncmer_index.hpp"
+#include "derep_detail/b3_deam_merge.hpp"
 #include "fqdup/syncmer.hpp"
 
 // All file-local types are in an anonymous namespace to give their member
@@ -362,6 +363,7 @@ private:
                     }
                 }
             }
+            if (is_forward) it->second.fwd_count++;
 
             record_idx++;
             total_reads_++;
@@ -470,10 +472,12 @@ private:
         is_error_.assign(N, false);
 
         std::vector<uint64_t> id_count(N, 0);
+        std::vector<uint32_t> id_fwd_count(N, 0);
         // Reverse map: seq_id → IndexEntry* for representative propagation during absorption.
         std::vector<IndexEntry*> seq_entry(N, nullptr);
         for (auto& [fp, entry] : index_) {
             id_count[entry.seq_id] = entry.count;
+            id_fwd_count[entry.seq_id] = entry.fwd_count;
             seq_entry[entry.seq_id] = &entry;
         }
 
@@ -882,34 +886,54 @@ private:
                     continue;
                 }
                 // H=2 path: only for reads with count ≤ max_h2_count.
-                // Both mismatches must be non-damage transversions (A↔T or C↔G, xr==3).
+                // With b1_damage_adjust=true (default): terminal damage mismatches
+                // (C→T at 5', G→A at 3' for DS; both channels at both ends for SS)
+                // are not counted toward H_adj. h_adj=2 → record both; h_adj=1 →
+                // record only the non-damage mismatch as H=1; h_adj=0 → skip (both
+                // terminal damage, handled by Phase 2 tag-folding).
+                // With b1_damage_adjust=false: reverts to old transversion-only rule.
                 if (id_count[cid] <= errcor_.max_h2_count) {
+                    auto admit_h2 = [&](MismatchInfo2 mm2, bool rc) -> bool {
+                        if (mm2.count != 2) return false;
+                        bool dmg0, dmg1;
+                        if (errcor_.b1_damage_adjust) {
+                            dmg0 = is_terminal_damage_mismatch(
+                                       mm2.base_a[0], mm2.base_b[0],
+                                       mm2.pos[0], lay.ilen, profile_.ss_mode);
+                            dmg1 = is_terminal_damage_mismatch(
+                                       mm2.base_a[1], mm2.base_b[1],
+                                       mm2.pos[1], lay.ilen, profile_.ss_mode);
+                        } else {
+                            dmg0 = is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false);
+                            dmg1 = is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false);
+                            if (dmg0 || dmg1) return false; // old: reject any damage type
+                        }
+                        int h_adj = 2 - (int)dmg0 - (int)dmg1;
+                        if (h_adj == 0) return false; // both terminal damage → skip (Phase 2)
+                        auto cvt = [&](int i, uint16_t p, uint8_t ab, uint8_t pb) {
+                            if (rc) {
+                                p  = static_cast<uint16_t>(lay.ilen - 1 - p);
+                                ab = static_cast<uint8_t>(ab ^ 0x3u);
+                                pb = static_cast<uint8_t>(pb ^ 0x3u);
+                            }
+                            return std::make_tuple(p, ab, pb);
+                        };
+                        if (h_adj == 1) {
+                            int ri = dmg0 ? 1 : 0;
+                            auto [p, ab, pb] = cvt(ri, mm2.pos[ri], mm2.base_b[ri], mm2.base_a[ri]);
+                            local_mm.push_back({pid, cid, p, ab, pb, 0, 0, 0, 1, {}});
+                        } else {
+                            auto [p0, ab0, pb0] = cvt(0, mm2.pos[0], mm2.base_b[0], mm2.base_a[0]);
+                            auto [p1, ab1, pb1] = cvt(1, mm2.pos[1], mm2.base_b[1], mm2.base_a[1]);
+                            local_mm.push_back({pid, cid, p0, ab0, pb0, p1, ab1, pb1, 2, {}});
+                        }
+                        ls.children_found++;
+                        return true;
+                    };
                     MismatchInfo2 mm2 = packed_find_mismatches2(pi_buf, ci_full, 0, lay.ilen);
-                    if (mm2.count == 2 &&
-                        !is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false) &&
-                        !is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false)) {
-                        local_mm.push_back({pid, cid,
-                                              mm2.pos[0], mm2.base_b[0], mm2.base_a[0],
-                                              mm2.pos[1], mm2.base_b[1], mm2.base_a[1],
-                                              2, {}});
-                        ls.children_found++;
-                        continue;
-                    }
+                    if (admit_h2(mm2, false)) continue;
                     mm2 = packed_find_mismatches2(pi_buf, crc_full, 0, lay.ilen);
-                    if (mm2.count == 2 &&
-                        !is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false) &&
-                        !is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false)) {
-                        // Convert RC positions/bases to child canonical frame
-                        uint16_t p0 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[0]);
-                        uint16_t p1 = static_cast<uint16_t>(lay.ilen - 1 - mm2.pos[1]);
-                        local_mm.push_back({pid, cid,
-                                              p0, static_cast<uint8_t>(mm2.base_b[0] ^ 0x3u),
-                                                  static_cast<uint8_t>(mm2.base_a[0] ^ 0x3u),
-                                              p1, static_cast<uint8_t>(mm2.base_b[1] ^ 0x3u),
-                                                  static_cast<uint8_t>(mm2.base_a[1] ^ 0x3u),
-                                              2, {}});
-                        ls.children_found++;
-                    }
+                    if (admit_h2(mm2, true)) { /* admitted */ }
                 }
             }
             ls.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
@@ -998,11 +1022,15 @@ private:
                 e.mm[i].parent_2b  = pb;
                 e.mm[i].alt_2b     = alt;
                 e.mm[i].qual       = qual_arena_.q_at(cm.child_id, pos_full);
-                bool dmg_xor       = ((alt ^ pb) == 2u);
-                bool in_zone       = (mm_pos < kDamageEdgeMargin_T58 ||
-                                      mm_pos >= static_cast<uint16_t>(ilen - kDamageEdgeMargin_T58));
-                e.mm[i].damage_chan = (dmg_xor && in_zone) ? 1 : 0;
-                e.mm[i].p_damage    = (dmg_xor && profile_.enabled)
+                const uint32_t dmg_xr = alt ^ pb;
+                const bool is_ct_e  = (dmg_xr == 2u) && ((alt & pb) == 1u);
+                const bool is_ga_e  = (dmg_xr == 2u) && ((alt & pb) == 0u);
+                const bool at_5_e   = mm_pos < kDamageEdgeMargin_T58;
+                const bool at_3_e   = mm_pos >= static_cast<uint16_t>(ilen - kDamageEdgeMargin_T58);
+                e.mm[i].damage_chan = (profile_.ss_mode
+                    ? (is_ct_e && (at_5_e || at_3_e))
+                    : ((is_ct_e && at_5_e) || (is_ga_e && at_3_e))) ? 1 : 0;
+                e.mm[i].p_damage    = (dmg_xr && profile_.enabled)
                                       ? profile_.p_damage_at(pos_full, L) : 0.0;
             };
             fill(0, cm.mismatch_pos, cm.alt_base, cm.parent_base);
@@ -1010,6 +1038,54 @@ private:
                 fill(1, cm.mismatch_pos2, cm.alt_base2, cm.parent_base2);
             return e;
         };
+
+        // Cross-bundle recurrence map for interior-transition candidates.
+        // Key: mismatch_pos * 4 + alt_base. Value: number of distinct bundle_keys
+        // that have an interior-transition H=1 mismatch at (pos, alt).
+        // Built once before B2; used in LRT path to veto absorption when ≥2
+        // independent fragments (bundles) share the same interior mismatch.
+        std::unordered_map<uint32_t, uint32_t> interior_trans_bundle_count;
+        uint64_t n_interior_ct = 0;
+        uint64_t n_interior_tv = 0;
+        if (errcor_.b1_damage_adjust) {
+            std::unordered_map<uint32_t, std::unordered_set<uint64_t>> key_to_bundles;
+            for (const auto& cm : mismatches) {
+                if (cm.hamming != 1) continue;
+                const int pid_len = get_layout(static_cast<int>(arena_.length(cm.parent_id))).ilen;
+                if (is_terminal_damage_mismatch(cm.parent_base, cm.alt_base,
+                                                static_cast<int>(cm.mismatch_pos),
+                                                pid_len, profile_.ss_mode))
+                    continue;
+                const uint32_t xr = cm.alt_base ^ cm.parent_base;
+                if (xr == 2u) {
+                    ++n_interior_ct;
+                    uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4u + cm.alt_base;
+                    key_to_bundles[key].insert(bundle_key_of[cm.parent_id]);
+                } else {
+                    ++n_interior_tv;
+                }
+            }
+            interior_trans_bundle_count.reserve(key_to_bundles.size());
+            for (const auto& [k, bset] : key_to_bundles)
+                interior_trans_bundle_count[k] = static_cast<uint32_t>(bset.size());
+        }
+        // κ = interior C↔T rate / interior transversion rate.
+        // κ≈1: no excess above PCR error floor → absorption would destroy real variants.
+        // κ≥b1_kappa_min: genuine interior deamination signal → absorption is safe.
+        double kappa = (n_interior_tv > 0)
+            ? static_cast<double>(n_interior_ct) / static_cast<double>(n_interior_tv)
+            : (n_interior_ct > 0 ? std::numeric_limits<double>::infinity() : 0.0);
+        bool b1_active = errcor_.b1_damage_adjust && (kappa >= errcor_.b1_kappa_min);
+        {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.3f", kappa);
+            std::string verdict = !errcor_.b1_damage_adjust ? "" :
+                (b1_active ? " → active" : " → suppressed (κ < " +
+                    std::to_string(errcor_.b1_kappa_min).substr(0, 4) + ")");
+            log_info("Phase 3: interior κ=" + std::string(buf) +
+                     " (CT=" + std::to_string(n_interior_ct) +
+                     " TV=" + std::to_string(n_interior_tv) + ")" + verdict);
+        }
 
         fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
         if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
@@ -1034,8 +1110,27 @@ private:
                 log_info("    occ_bin[" + std::to_string(o) + "] = " + buf);
             }
         }
+        auto joint_dispersion_adj = [](
+            const std::vector<std::pair<uint32_t,uint64_t>>& pac,
+            uint64_t veto_count,
+            double snp_threshold) -> double
+        {
+            if (pac.empty() || veto_count < 4) return 0.0;
+            uint64_t total_w = 0, max_w = 0;
+            for (const auto& [k, w] : pac) { total_w += w; max_w = std::max(max_w, w); }
+            if (total_w == 0) return 0.0;
+            double max_frac = static_cast<double>(max_w) / static_cast<double>(total_w);
+            if (max_frac >= snp_threshold) return 0.0;
+            if (max_frac > 0.10)
+                return -1.5 * (max_frac - 0.10) / (snp_threshold - 0.10);
+            if (pac.size() >= 3) return 0.3;
+            return 0.0;
+        };
 
         size_t i = 0;
+        uint64_t n_joint_adj_pos = 0;
+        uint64_t n_joint_adj_neg = 0;
+        uint64_t n_parents_processed = 0;
         while (i < mismatches.size()) {
             uint32_t pid = mismatches[i].parent_id;
             // Reroute to effective root if this parent was itself absorbed.
@@ -1082,6 +1177,10 @@ private:
                     pos_alt_counts[pac_w++] = pos_alt_counts[r];
             }
             pos_alt_counts.resize(pac_w);
+            double joint_adj = joint_dispersion_adj(pos_alt_counts, veto_count, errcor_.snp_threshold);
+            ++n_parents_processed;
+            if (joint_adj > 0.0)  ++n_joint_adj_pos;
+            else if (joint_adj < 0.0) ++n_joint_adj_neg;
             auto find_pac = [&](uint32_t k) -> uint64_t {
                 auto it = std::lower_bound(
                     pos_alt_counts.begin(), pos_alt_counts.end(), k,
@@ -1135,7 +1234,32 @@ private:
                     S += static_cast<double>(e.n_mm) *
                          std::log(static_cast<double>(parent_count + 1) /
                                   static_cast<double>(id_count[cm.child_id] + 1));
+                    S += joint_adj;
                     absorb_h2 = (S > 0.0);
+                    // H=3 shadow: track near-boundary LR scores before veto logic.
+                    constexpr double kH3ShadowNat = 1.0;
+                    if      (S >  0.0 && S <  kH3ShadowNat) ++stats.h3_shadow_absorbed_near_boundary;
+                    else if (S <= 0.0 && S > -kH3ShadowNat) ++stats.h3_shadow_protected_near_boundary;
+                    // Count-based co-occurrence clamp. The ratio test in
+                    // snp_veto_h2 fails at hyper-cluster scale (sig must clear
+                    // ~snp_threshold * inflated parent_count). When ≥K
+                    // independent reads share the same (pos, alt), that is
+                    // direct population evidence of a real SNP — block
+                    // absorption regardless of S. K = max(snp_min_count, 2):
+                    // sig==1 is the child alone; sig≥2 is genuine co-occurrence.
+                    // H=2 mismatches were pre-filtered against damage in B1, so
+                    // no damage_bypass exemption applies here.
+                    uint32_t hard_veto_min_h2 = std::max(errcor_.snp_min_count, 2u);
+                    // Singleton high-Q clamp. H=2 mismatches were pre-filtered
+                    // against damage in B1, so any high-Q mismatch is variant
+                    // evidence regardless of co-occurrence count.
+                    bool hi_q_singleton_h2 =
+                        (e.mm[0].qual >= errcor_.singleton_qual_min) ||
+                        (e.mm[1].qual >= errcor_.singleton_qual_min);
+                    if (absorb_h2 && (sig >= hard_veto_min_h2 ||
+                                      sig2 >= hard_veto_min_h2 ||
+                                      hi_q_singleton_h2))
+                        absorb_h2 = false;
                     if (snp_veto_h2) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
                     else             { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h2) ++stats.edge_lr_absorbed;
@@ -1170,14 +1294,20 @@ private:
                     continue;  // skip the H=1 block below
                 }
 
-                // Damage-aware bypass: C↔T / G↔A (xr=2) mismatches at interior
-                // positions adjacent to the damage zone are residual deamination,
-                // not genuine SNPs — bypass the SNP veto for these.
-                bool damage_bypass = profile_.enabled &&
-                                     ((cm.alt_base ^ cm.parent_base) == 2u) &&
-                                     (cm.mismatch_pos < kDamageEdgeMargin ||
-                                      cm.mismatch_pos >=
-                                          static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin));
+                // Damage-aware bypass: residual deamination at terminal positions.
+                // DS libraries: C→T at 5' end, G→A at 3' end.
+                // SS libraries: C→T at both ends (G→A is not a damage pattern in SS).
+                // Distinguish C↔T (xr=2, AND=1) from G↔A (xr=2, AND=0).
+                const uint32_t dmg_xr_h1 = cm.alt_base ^ cm.parent_base;
+                const bool is_ct_h1 = (dmg_xr_h1 == 2u) && ((cm.alt_base & cm.parent_base) == 1u);
+                const bool is_ga_h1 = (dmg_xr_h1 == 2u) && ((cm.alt_base & cm.parent_base) == 0u);
+                const bool at_5_h1  = cm.mismatch_pos < kDamageEdgeMargin;
+                const bool at_3_h1  = cm.mismatch_pos >=
+                                          static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin);
+                bool damage_bypass = profile_.enabled && (
+                    profile_.ss_mode
+                    ? (is_ct_h1 && (at_5_h1 || at_3_h1))
+                    : ((is_ct_h1 && at_5_h1) || (is_ga_h1 && at_3_h1)));
 
                 double eff_snp_threshold = errcor_.snp_threshold *
                     (veto_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
@@ -1190,17 +1320,79 @@ private:
                                                               static_cast<double>(veto_count));
                 if (damage_bypass) ++stats.edge_damage_bypass;
 
+                // Interior transition: C↔T or G↔A at a non-terminal position.
+                // Admitted by b1_damage_adjust but requires calibration-free LRT
+                // (not the empirical model, which was fit on transversion candidates).
+                const bool is_interior_trans_h1 = !damage_bypass && (dmg_xr_h1 == 2u) && b1_active;
+
                 // T5.8: empirical posterior-odds for H=1.
                 bool absorb_h1;
                 if (errcor_.empirical && !errcor_.legacy_veto) {
                     auto e = build_edge(cm);
                     e.bundle_key = bundle_key_of[eff_pid];
                     e.bundle_occ = bundle_occ_of(eff_pid);
+
+                    if (is_interior_trans_h1) {
+                        // === Calibration-free LRT path for interior transitions ===
+                        uint64_t n_child_count = id_count[cm.child_id];
+                        double log_lambda = interior_transition_lrt(
+                            parent_count, n_child_count, errcor_.lrt_f0, errcor_.lrt_f1);
+                        bool lrt_absorb = (log_lambda > std::log(errcor_.lrt_T));
+                        bool cross_strand_veto = false;
+                        bool hard_absorb = (parent_count >
+                                            static_cast<uint64_t>(errcor_.lrt_hard_ratio * n_child_count))
+                                        && (e.mm[0].qual < errcor_.singleton_qual_min);
+                        // Wilson CI SNP veto: require sig ≥ 2 (same as empirical hard_veto_min).
+                        double wlb = wilson_lower95(sig, veto_count);
+                        bool wilson_veto = (sig >= 2 && wlb >= errcor_.snp_cp_lb_threshold);
+                        // Cross-bundle recurrence veto: if ≥2 independent bundles show
+                        // this same (pos, alt) interior mismatch it is biological, not PCR.
+                        auto cb_it = interior_trans_bundle_count.find(key);
+                        bool cross_bundle_veto = (cb_it != interior_trans_bundle_count.end()
+                                                  && cb_it->second >= 2);
+                        // Cross-strand veto: ancient deamination is strand-specific; a
+                        // deamination artifact child has reads from one orientation only.
+                        // A true SNP child has reads from both fwd and RC orientations.
+                        // Require ≥b1_cs_min_total total child reads to avoid false vetoes
+                        // where orientation balance is random at very low coverage.
+                        {
+                            uint64_t cf = id_fwd_count[cm.child_id];
+                            uint64_t ct = id_count[cm.child_id];
+                            uint64_t cr = (ct >= cf) ? ct - cf : 0;
+                            cross_strand_veto = (cf > 0 && cr > 0 &&
+                                                 ct >= errcor_.b1_cs_min_total);
+                        }
+                        bool hi_q = (e.mm[0].qual >= errcor_.singleton_qual_min);
+                        absorb_h1 = (hard_absorb || lrt_absorb)
+                                    && !wilson_veto && !cross_bundle_veto
+                                    && !cross_strand_veto && !hi_q;
+                        ++stats.edge_lr_absorbed;  // reuse counter for logging
+                    } else {
                     double S = emp_model.score(e);
                     // See H=2 site for rationale on the count-asymmetry term.
                     S += std::log(static_cast<double>(parent_count + 1) /
                                   static_cast<double>(id_count[cm.child_id] + 1));
+                    S += joint_adj;
                     absorb_h1 = (S > 0.0);
+                    // Count-based co-occurrence clamp. snp_veto's ratio test
+                    // fails at hyper-cluster scale (sig must clear ~snp_threshold
+                    // * inflated parent_count). When ≥K independent reads share
+                    // the same (pos, alt), that is direct population evidence of
+                    // a real SNP — block absorption regardless of S.
+                    // K = max(snp_min_count, 2): sig==1 is the child alone;
+                    // sig≥2 is genuine co-occurrence. damage_bypass mismatches
+                    // at terminal positions remain exempt (residual deamination).
+                    uint32_t hard_veto_min = std::max(errcor_.snp_min_count, 2u);
+                    // Singleton high-Q clamp. A single high-Q non-damage
+                    // mismatch is direct sequence-divergence evidence; the
+                    // empirical S>0 path otherwise allows absorption of
+                    // singleton variant alleles at low-coverage loci.
+                    // damage_bypass remains exempt (residual deamination).
+                    bool hi_q_singleton =
+                        (e.mm[0].qual >= errcor_.singleton_qual_min);
+                    if (absorb_h1 && !damage_bypass &&
+                        (sig >= hard_veto_min || hi_q_singleton))
+                        absorb_h1 = false;
                     if (snp_veto) { stats.lr_sum_protected += S; ++stats.lr_n_protected; }
                     else          { stats.lr_sum_absorbed  += S; ++stats.lr_n_absorbed;  }
                     if (absorb_h1) ++stats.edge_lr_absorbed;
@@ -1208,6 +1400,7 @@ private:
                     int ob = fqdup::errcor_emp::occ_bin(e.bundle_occ);
                     if (absorb_h1) ++stats.edge_lr_absorbed_by_occ[ob];
                     else           ++stats.edge_lr_protected_by_occ[ob];
+                    }  // end empirical path (non-interior-transition)
                 } else {
                     absorb_h1 = !snp_veto;
                     if (snp_veto) ++stats.edge_legacy_veto;
@@ -1233,6 +1426,145 @@ private:
                         if (!fqcl_path_.empty()) fqcl_mismatches_.push_back(cm);
                     }
                 }
+            }
+        }
+
+        // ── Phase B3: damage-aware H>2 merge ───────────────────────────────
+        // For heavily damaged ancient DNA (d_max ≥ b3_min_dmax), PCR copies of
+        // the same molecule can accumulate 3–5 deamination differences in the
+        // near-terminal interior zone (just beyond the mask). Phase 3 pigeonhole
+        // only covers H≤2 — this pass fills that gap.
+        // Algorithm: K_deam hash buckets (normalize damage-probable positions)
+        // → same-length pairs within bucket → all-deam-consistent diff check
+        // → count LRT (same threshold as B2).
+        if (errcor_.b3_enabled && profile_.enabled && !errcor_.legacy_veto) {
+            // Profile-derived gate: count interior positions where P(damage) >
+            // b3_deam_threshold using the median read length from the arena.
+            // Skip if n_elig < b3_min_n_elig (B3 cannot produce H>=3 absorptions)
+            // or sum(P) < b3_min_mass (events too rare to matter).
+            int rep_L = 0;
+            {
+                std::vector<uint16_t> ls(arena_.lengths.begin(), arena_.lengths.end());
+                if (!ls.empty()) {
+                    std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
+                    rep_L = static_cast<int>(ls[ls.size() / 2]);
+                }
+            }
+            int    b3_n_elig = 0;
+            double b3_mass   = 0.0;
+            if (rep_L > 0) {
+                auto [k5, k3] = damage_zone_bounds(rep_L, profile_);
+                int interior_end = rep_L - k3;
+                for (int p = k5; p < interior_end; ++p) {
+                    double q = profile_.p_damage_at(p, rep_L);
+                    if (q > static_cast<double>(errcor_.b3_deam_threshold)) {
+                        ++b3_n_elig;
+                        b3_mass += q;
+                    }
+                }
+            }
+            double dmax_avg = 0.5 * (profile_.d_max_5prime + profile_.d_max_3prime);
+            if (b3_n_elig < errcor_.b3_min_n_elig ||
+                b3_mass   < static_cast<double>(errcor_.b3_min_mass)) {
+                log_info("Phase B3: skipped (n_elig=" + std::to_string(b3_n_elig) +
+                         " mass=" + std::to_string(b3_mass) +
+                         " d_max_avg=" + std::to_string(dmax_avg) + ")");
+            } else {
+                log_info("Phase B3: running (n_elig=" + std::to_string(b3_n_elig) +
+                         " mass=" + std::to_string(b3_mass) +
+                         " d_max_avg=" + std::to_string(dmax_avg) + ")");
+                // Build K_deam buckets.
+                ska::flat_hash_map<uint64_t, std::vector<uint32_t>> b3_buckets;
+                b3_buckets.reserve(N / 2);
+                {
+                    std::vector<uint8_t> scratch;
+                    for (uint32_t id = 0; id < N; ++id) {
+                        if (is_error_[id]) continue;
+                        if (!arena_.is_eligible(id)) continue;
+                        int L = arena_.length(id);
+                        const auto& lay = get_layout(L);
+                        if (lay.ilen < kMinInteriorLen) continue;
+                        scratch.resize(static_cast<size_t>((lay.ilen + 3) / 4));
+                        uint64_t kd = fqdup::b3::kdamage_hash(
+                            arena_.data(id), lay.k5, lay.ilen, L,
+                            profile_, errcor_.b3_deam_threshold, scratch.data());
+                        // Gate by locus: combine bundle_key (same fragment endpoints)
+                        // with kdamage_hash so only reads from the same capture site
+                        // are ever compared.
+                        uint64_t b3k = XXH3_64bits_withSeed(&kd, sizeof(kd), bundle_key_of[id]);
+                        b3_buckets[b3k].push_back(id);
+                    }
+                }
+                // Pairwise check within each bucket.
+                std::vector<uint8_t> pi_buf, ci_buf;
+                for (auto& [kd, bucket] : b3_buckets) {
+                    if (bucket.size() < 2) continue;
+                    std::sort(bucket.begin(), bucket.end(),
+                              [&](uint32_t a, uint32_t b_) {
+                                  return acc_count[a] > acc_count[b_];
+                              });
+                    for (size_t pidx = 0; pidx < bucket.size(); ++pidx) {
+                        uint32_t pid = bucket[pidx];
+                        if (is_error_[pid]) continue;
+                        uint32_t eff_pid = find_root_chain(pid);
+                        int Lp = arena_.length(eff_pid);
+                        const auto& layp = get_layout(Lp);
+                        if (layp.ilen < kMinInteriorLen) continue;
+                        int nbp = (layp.ilen + 3) / 4;
+                        pi_buf.resize(static_cast<size_t>(nbp));
+                        extract_packed_part(arena_.data(eff_pid), layp.k5, layp.ilen,
+                                            pi_buf.data());
+                        uint64_t cp = acc_count[eff_pid];
+                        for (size_t cidx = pidx + 1; cidx < bucket.size(); ++cidx) {
+                            uint32_t cid = bucket[cidx];
+                            if (is_error_[cid]) continue;
+                            if (arena_.length(cid) != Lp) continue;
+                            uint64_t cc = acc_count[cid];
+                            if (cc == 0) continue;
+                            if (cp > 0 && static_cast<double>(cc) /
+                                static_cast<double>(cp) > errcor_.b3_count_ratio)
+                                continue;
+                            ++stats.b3_candidates;
+                            ci_buf.resize(static_cast<size_t>(nbp));
+                            extract_packed_part(arena_.data(cid), layp.k5, layp.ilen,
+                                                ci_buf.data());
+                            fqdup::b3::DiffList diffs;
+                            fqdup::b3::packed_diff_list(pi_buf.data(), ci_buf.data(),
+                                                         layp.ilen, diffs);
+                            if (diffs.count < 3 || diffs.count > errcor_.b3_max_hamming)
+                                continue;
+                            if (!fqdup::b3::all_diffs_deam_consistent(
+                                    diffs, layp.k5, Lp, profile_,
+                                    errcor_.b3_deam_threshold))
+                                continue;
+                            double lrt = fqdup::b3::b3_count_lrt(
+                                cp, cc, errcor_.lrt_f0, errcor_.lrt_f1);
+                            if (lrt <= std::log(errcor_.lrt_T)) {
+                                ++stats.b3_protected;
+                                continue;
+                            }
+                            if (!is_error_[cid]) {
+                                is_error_[cid] = true;
+                                parent_chain[cid] = eff_pid;
+                                acc_count[eff_pid] += cc;
+                                acc_count[cid] = 0;
+                                if (seq_entry[cid] && seq_entry[eff_pid] &&
+                                    seq_entry[cid]->damage_score >
+                                    seq_entry[eff_pid]->damage_score) {
+                                    seq_entry[eff_pid]->record_index =
+                                        seq_entry[cid]->record_index;
+                                    seq_entry[eff_pid]->damage_score =
+                                        seq_entry[cid]->damage_score;
+                                }
+                                ++stats.b3_absorbed;
+                                ++errcor_absorbed_;
+                            }
+                        }
+                    }
+                }
+                log_info("Phase B3: candidates=" + std::to_string(stats.b3_candidates) +
+                         " absorbed=" + std::to_string(stats.b3_absorbed) +
+                         " protected=" + std::to_string(stats.b3_protected));
             }
         }
 
@@ -1827,6 +2159,9 @@ private:
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
                  " sequences (H=1 directed-ascent + H=2 direct-detection, snp_threshold=" +
                  std::to_string(errcor_.snp_threshold) + ")");
+        log_info("  Joint adj fired: neg=" + std::to_string(n_joint_adj_neg) +
+                 " pos=" + std::to_string(n_joint_adj_pos) +
+                 " (of " + std::to_string(n_parents_processed) + " parents)");
 
         if (!fqcl_path_.empty()) {
             fqcl_parent_chain_ = std::move(parent_chain);
@@ -2234,6 +2569,8 @@ static void print_usage(const char* prog, bool advanced = false) {
     std::cerr
         << "\n--- Advanced ---\n"
         << "\nError correction (Phase 3) tuning:\n"
+        << "  --b1-kappa-min FLOAT         Interior CT/TV ratio threshold to enable b1_damage_adjust (default: 2.0)\n"
+        << "  --b1-cs-min-total INT        Min child reads to apply cross-strand SNP veto (default: 3)\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)\n"
         << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited)\n"
@@ -2328,6 +2665,19 @@ int derep_main(int argc, char** argv) {
             errcor.enabled = true;
         } else if (arg == "--no-error-correct") {
             errcor.enabled = false;
+        } else if (arg == "--b1-kappa-min" && i + 1 < argc) {
+            errcor.b1_kappa_min = std::stod(argv[++i]);
+            if (errcor.b1_kappa_min < 0.0) {
+                std::cerr << "Error: --b1-kappa-min must be >= 0, got " << errcor.b1_kappa_min << "\n";
+                return 1;
+            }
+        } else if (arg == "--b1-cs-min-total" && i + 1 < argc) {
+            long v = std::stol(argv[++i]);
+            if (v < 1) {
+                std::cerr << "Error: --b1-cs-min-total must be >= 1, got " << v << "\n";
+                return 1;
+            }
+            errcor.b1_cs_min_total = static_cast<uint32_t>(v);
         } else if (arg == "--errcor-snp-threshold" && i + 1 < argc) {
             errcor.snp_threshold = std::stod(argv[++i]);
         } else if (arg == "--errcor-snp-min-count" && i + 1 < argc) {
@@ -2376,6 +2726,24 @@ int derep_main(int argc, char** argv) {
             errcor.rescue_alpha_del = std::stod(argv[++i]);
         } else if (arg == "--rescue-mask-bonus" && i + 1 < argc) {
             errcor.rescue_mask_bonus = std::stod(argv[++i]);
+        } else if (arg == "--b3-disable") {
+            errcor.b3_enabled = false;
+        } else if (arg == "--b3-min-n-elig" && i + 1 < argc) {
+            errcor.b3_min_n_elig = std::stoi(argv[++i]);
+        } else if (arg == "--b3-min-mass" && i + 1 < argc) {
+            errcor.b3_min_mass = static_cast<float>(std::stod(argv[++i]));
+        } else if (arg == "--b3-deam-threshold" && i + 1 < argc) {
+            errcor.b3_deam_threshold = static_cast<float>(std::stod(argv[++i]));
+        } else if (arg == "--b3-max-hamming" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v < 3 || v > fqdup::b3::kMaxDiffs) {
+                std::cerr << "Error: --b3-max-hamming must be 3.." << fqdup::b3::kMaxDiffs
+                          << ", got " << v << "\n";
+                return 1;
+            }
+            errcor.b3_max_hamming = v;
+        } else if (arg == "--b3-count-ratio" && i + 1 < argc) {
+            errcor.b3_count_ratio = std::stod(argv[++i]);
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
             if (v < 0) { std::cerr << "Error: " << arg << " must be >= 0 (0 = auto), got " << v << "\n"; return 1; }

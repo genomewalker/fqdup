@@ -196,7 +196,7 @@ fqdup derep       ... --no-revcomp
 | `--mask-5 N` | Manually mask N bp at 5' end (skips Pass 0) | - |
 | `--mask-3 N` | Manually mask N bp at 3' end (skips Pass 0) | - |
 | `--mask-threshold F` | Excess damage threshold for terminal masking | 0.05 |
-| `--damage-sample N` | Estimate damage from first N reads only (0=all) | 500000 |
+| `--damage-deam-sample N` | Estimate damage from first N reads only (0=all) | 500000 |
 
 Added bases receive quality `#` (Phred 2). Reads with no clean interior k-mers
 are written unchanged.
@@ -261,5 +261,9 @@ See [[Damage]] for full output description and typical workflow.
 | `--errcor-min-parent INT` | Min count to index as parent | 3 |
 | `--errcor-max-h2-count INT` | Max child count eligible for H=2 absorption | 2 |
 | `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
-| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 |
-| `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |
+| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 1 |
+| `--errcor-bucket-cap INT` | Pair-key bucket size cap | 0 (unlimited) |
+| `--errcor-empirical` | Empirical posterior-odds model (T5.8) | **on** |
+| `--errcor-legacy-veto` | Revert to pre-T5.8 count-ratio veto | off |
+| `--errcor-singleton-qual-min INT` | Block absorption when mismatch Phred ≥ N (non-damage) | 25 |
+| `--errcor-rescue-indels` | Syncmer-indexed indel rescue (ed≤2) | off |
