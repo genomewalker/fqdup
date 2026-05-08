@@ -839,6 +839,26 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
             lb.tri_3prime_terminal[i] = static_cast<int64_t>(pr.tri_3prime_terminal[i]);
             lb.tri_3prime_interior[i] = static_cast<int64_t>(pr.tri_3prime_interior[i]);
         }
+        lb.ox_stop_rate_baseline = pr.ox_stop_conversion_rate_baseline;
+        lb.ox_stop_rate_terminal = pr.ox_stop_rate_terminal;
+        lb.ox_uniformity_ratio   = pr.ox_uniformity_ratio;
+        lb.channel_c_valid       = pr.channel_c_valid;
+        lb.ca_stop_rate_baseline = pr.ca_stop_rate_baseline;
+        lb.ca_stop_rate_terminal = pr.ca_stop_rate_terminal;
+        lb.ca_uniformity_ratio   = pr.ca_uniformity_ratio;
+        lb.channel_f_z           = pr.channel_f_z;
+        lb.channel_f_valid       = pr.channel_f_valid;
+        lb.cg_stop_rate_baseline = pr.cg_stop_rate_baseline;
+        lb.cg_stop_rate_terminal = pr.cg_stop_rate_terminal;
+        lb.cg_uniformity_ratio   = pr.cg_uniformity_ratio;
+        lb.channel_g_z           = pr.channel_g_z;
+        lb.channel_g_valid       = pr.channel_g_valid;
+        lb.at_stop_rate_baseline = pr.at_stop_rate_baseline;
+        lb.at_stop_rate_terminal = pr.at_stop_rate_terminal;
+        lb.at_uniformity_ratio   = pr.at_uniformity_ratio;
+        lb.channel_h_z           = pr.channel_h_z;
+        lb.channel_h_z_p2plus    = pr.channel_h_z_p2plus;
+        lb.channel_h_valid       = pr.channel_h_valid;
         out.bins.push_back(lb);
     }
 
