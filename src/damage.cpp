@@ -1308,6 +1308,10 @@ int damage_main(int argc, char** argv) {
         j << "    \"gt_bg_fitted\": " << dp.g_bg_fitted << ",\n";
         j << "    \"gt_term_fitted\": " << dp.g_term_fitted << ",\n";
         j << "    \"gt_decay_fitted\": " << dp.g_decay_fitted << ",\n";
+        j << "    \"gt_bg_ci_lo\": " << std::setprecision(6) << dp.g_bg_fitted_ci_lo << ",\n";
+        j << "    \"gt_bg_ci_hi\": " << dp.g_bg_fitted_ci_hi << ",\n";
+        j << "    \"gt_fit_degenerate\": " << (dp.g_fit_degenerate ? "true" : "false") << ",\n";
+        j << "    \"gt_bg_interior_mean\": " << dp.g_bg_interior_mean << ",\n";
         j << "    \"s_gt\": " << dp.s_gt << ",\n";
         j << "    \"per_pos_5prime_gt\": [";
         for (int p = 0; p < N_POS; ++p) {
@@ -1324,6 +1328,36 @@ int damage_main(int argc, char** argv) {
         j << "    \"ox_stop_rate_interior\": " << dp.ox_stop_rate_interior << ",\n";
         j << "    \"ox_stop_rate_baseline\": " << dp.ox_stop_conversion_rate_baseline << ",\n";
         j << "    \"ox_uniformity_ratio\": " << dp.ox_uniformity_ratio << ",\n";
+        j << "    \"channel_c3_valid\": " << (dp.channel_c3_valid ? "true" : "false") << ",\n";
+        j << "    \"ox_stop_baseline_3prime\": " << std::setprecision(6) << dp.ox_stop_baseline_3prime << ",\n";
+        j << "    \"ox_stop_rate_terminal_3prime\": " << dp.ox_stop_rate_terminal_3prime << ",\n";
+        j << "    \"ox_stop_rate_interior_3prime\": " << dp.ox_stop_rate_interior_3prime << ",\n";
+        j << "    \"ox_uniformity_ratio_3prime\": " << dp.ox_uniformity_ratio_3prime << ",\n";
+        j << "    \"channel_f_valid\": " << (dp.channel_f_valid ? "true" : "false") << ",\n";
+        j << "    \"ca_stop_rate_baseline\": " << std::setprecision(6) << dp.ca_stop_rate_baseline << ",\n";
+        j << "    \"ca_stop_rate_terminal\": " << dp.ca_stop_rate_terminal << ",\n";
+        j << "    \"ca_uniformity_ratio\": " << dp.ca_uniformity_ratio << ",\n";
+        j << "    \"channel_f_z\": " << dp.channel_f_z << ",\n";
+        j << "    \"channel_f3_valid\": " << (dp.channel_f3_valid ? "true" : "false") << ",\n";
+        j << "    \"ca_stop_rate_terminal_3prime\": " << dp.ca_stop_rate_terminal_3prime << ",\n";
+        j << "    \"ca_uniformity_ratio_3prime\": " << dp.ca_uniformity_ratio_3prime << ",\n";
+        j << "    \"channel_g_valid\": " << (dp.channel_g_valid ? "true" : "false") << ",\n";
+        j << "    \"cg_stop_rate_baseline\": " << std::setprecision(6) << dp.cg_stop_rate_baseline << ",\n";
+        j << "    \"cg_stop_rate_terminal\": " << dp.cg_stop_rate_terminal << ",\n";
+        j << "    \"cg_uniformity_ratio\": " << dp.cg_uniformity_ratio << ",\n";
+        j << "    \"channel_g_z\": " << dp.channel_g_z << ",\n";
+        j << "    \"channel_g3_valid\": " << (dp.channel_g3_valid ? "true" : "false") << ",\n";
+        j << "    \"cg_stop_rate_terminal_3prime\": " << dp.cg_stop_rate_terminal_3prime << ",\n";
+        j << "    \"cg_uniformity_ratio_3prime\": " << dp.cg_uniformity_ratio_3prime << ",\n";
+        j << "    \"channel_h_valid\": " << (dp.channel_h_valid ? "true" : "false") << ",\n";
+        j << "    \"at_stop_rate_baseline\": " << std::setprecision(6) << dp.at_stop_rate_baseline << ",\n";
+        j << "    \"at_stop_rate_terminal\": " << dp.at_stop_rate_terminal << ",\n";
+        j << "    \"at_uniformity_ratio\": " << dp.at_uniformity_ratio << ",\n";
+        j << "    \"channel_h_z\": " << dp.channel_h_z << ",\n";
+        j << "    \"channel_h_z_p2plus\": " << dp.channel_h_z_p2plus << ",\n";
+        j << "    \"channel_h3_valid\": " << (dp.channel_h3_valid ? "true" : "false") << ",\n";
+        j << "    \"at_stop_rate_terminal_3prime\": " << dp.at_stop_rate_terminal_3prime << ",\n";
+        j << "    \"at_uniformity_ratio_3prime\": " << dp.at_uniformity_ratio_3prime << ",\n";
         j << "    \"ox_gt_rate_interior\": " << dp.ox_gt_rate_interior << ",\n";
         j << "    \"ox_gt_uniformity\": " << dp.ox_gt_uniformity << ",\n";
         j << "    \"ox_ca_rate_interior\": " << dp.ox_ca_rate_interior << ",\n";
@@ -1374,9 +1408,77 @@ int damage_main(int argc, char** argv) {
                 j << "    \"oxog_trinuc_cosine\": null,\n";
             else
                 j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
-            j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << "\n";
+            j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << (lsd.bins.empty() ? "\n" : ",\n");
+        }
+        if (!lsd.bins.empty()) {
+            j << "    \"by_length\": [";
+            for (size_t b = 0; b < lsd.bins.size(); ++b) {
+                const auto& lb = lsd.bins[b];
+                if (b > 0) j << ",";
+                j << std::setprecision(6);
+                j << "{\"length_lo\":" << lb.length_lo << ",\"length_hi\":" << lb.length_hi
+                  << ",\"n_reads\":" << lb.n_reads
+                  << ",\"channel_c\":{\"baseline_rate\":" << lb.ox_stop_rate_baseline
+                  << ",\"terminal_rate\":" << lb.ox_stop_rate_terminal
+                  << ",\"uniformity_ratio\":" << lb.ox_uniformity_ratio
+                  << ",\"valid\":" << (lb.channel_c_valid ? "true" : "false") << "}"
+                  << ",\"channel_f\":{\"baseline_rate\":" << lb.ca_stop_rate_baseline
+                  << ",\"terminal_rate\":" << lb.ca_stop_rate_terminal
+                  << ",\"uniformity_ratio\":" << lb.ca_uniformity_ratio
+                  << ",\"z_score\":" << lb.channel_f_z
+                  << ",\"valid\":" << (lb.channel_f_valid ? "true" : "false")
+                  << ",\"detected\":" << (lb.channel_f_valid && lb.channel_f_z > 3.0f ? "true" : "false") << "}"
+                  << ",\"channel_g\":{\"baseline_rate\":" << lb.cg_stop_rate_baseline
+                  << ",\"terminal_rate\":" << lb.cg_stop_rate_terminal
+                  << ",\"uniformity_ratio\":" << lb.cg_uniformity_ratio
+                  << ",\"z_score\":" << lb.channel_g_z
+                  << ",\"valid\":" << (lb.channel_g_valid ? "true" : "false")
+                  << ",\"detected\":" << (lb.channel_g_valid && lb.channel_g_z > 3.0f ? "true" : "false") << "}"
+                  << ",\"channel_h\":{\"baseline_rate\":" << lb.at_stop_rate_baseline
+                  << ",\"terminal_rate\":" << lb.at_stop_rate_terminal
+                  << ",\"uniformity_ratio\":" << lb.at_uniformity_ratio
+                  << ",\"z_score\":" << lb.channel_h_z
+                  << ",\"z_score_p2plus\":" << lb.channel_h_z_p2plus
+                  << ",\"valid\":" << (lb.channel_h_valid ? "true" : "false")
+                  << ",\"detected\":" << (lb.channel_h_valid && lb.channel_h_z > 3.0f ? "true" : "false") << "}"
+                  << "}";
+            }
+            j << "]\n";
         }
         j << "  },\n";
+        // OxoG unified estimate (oxo_schema: 1)
+        {
+            auto oxe = taph::compute_oxog_estimate(dp, is_ss);
+            j << "  \"oxog_estimate\": {\n";
+            j << "    \"oxo_schema\": " << taph::OxoGEstimate::oxo_schema << ",\n";
+            j << "    \"ox_theta\": " << std::setprecision(6) << oxe.ox_theta << ",\n";
+            j << "    \"ox_theta_ci_lo\": " << oxe.ox_theta_ci_lo << ",\n";
+            j << "    \"ox_theta_ci_hi\": " << oxe.ox_theta_ci_hi << ",\n";
+            j << "    \"ox_theta_interior\": " << oxe.ox_theta_interior << ",\n";
+            j << "    \"fit_degenerate\": " << (oxe.fit_degenerate ? "true" : "false") << ",\n";
+            j << "    \"ox_like_excess\": " << oxe.ox_like_excess << ",\n";
+            j << "    \"ox_like_z\": " << oxe.ox_like_z << ",\n";
+            j << "    \"ox_like_ci_lo\": " << oxe.ox_like_ci_lo << ",\n";
+            j << "    \"ox_like_ci_hi\": " << oxe.ox_like_ci_hi << ",\n";
+            j << "    \"ox_uniformity_ratio\": " << oxe.ox_uniformity_ratio << ",\n";
+            j << "    \"control_mode\": \"" << oxe.control_mode << "\",\n";
+            j << "    \"gc_skew_warning\": " << (oxe.gc_skew_warning ? "true" : "false") << "\n";
+            j << "  },\n";
+            auto otm = taph::compute_oxo_two_marker(dp, is_ss);
+            j << "  \"oxo_two_marker\": {\n";
+            j << "    \"valid\": " << (otm.valid ? "true" : "false") << ",\n";
+            j << "    \"n_cells_used\": " << otm.n_cells_used << ",\n";
+            j << "    \"beta1\": " << std::setprecision(6) << otm.beta1 << ",\n";
+            j << "    \"beta1_se\": " << otm.beta1_se << ",\n";
+            j << "    \"beta1_z\": " << otm.beta1_z << ",\n";
+            j << "    \"beta2\": " << otm.beta2 << ",\n";
+            j << "    \"beta2_se\": " << otm.beta2_se << ",\n";
+            j << "    \"beta2_z\": " << otm.beta2_z << ",\n";
+            j << "    \"alpha\": " << otm.alpha << ",\n";
+            j << "    \"delta_beta\": " << otm.delta_beta << ",\n";
+            j << "    \"markers_consistent\": " << (otm.markers_consistent ? "true" : "false") << "\n";
+            j << "  },\n";
+        }
         j << "  \"interior_ct_cluster\": {\n";
         j << "    \"short_asym_log2oe\": " << std::setprecision(6) << dp.interior_ct_cluster_short_asym_log2oe << ",\n";
         j << "    \"short_log2oe\": " << dp.interior_ct_cluster_short_log2oe << ",\n";
@@ -1460,6 +1562,23 @@ int damage_main(int argc, char** argv) {
                 j << "    \"d5_hexamer_corrected\": " << pres.d5_hexamer_corrected << ",\n";
             j << "    \"oxidation_eff\": " << pres.oxidation_eff << ",\n";
             j << "    \"oxidation_evidence\": " << pres.oxidation_evidence << ",\n";
+            j << "    \"oxidation\": {\n";
+            j << "      \"raw_rate\": {\"estimate\": " << pres.oxidation.raw_rate.estimate
+              << ", \"ci95_low\": " << pres.oxidation.raw_rate.ci95_low
+              << ", \"ci95_high\": " << pres.oxidation.raw_rate.ci95_high << "},\n";
+            j << "      \"control_rate\": {\"estimate\": " << pres.oxidation.control_rate.estimate
+              << ", \"ci95_low\": " << pres.oxidation.control_rate.ci95_low
+              << ", \"ci95_high\": " << pres.oxidation.control_rate.ci95_high << "},\n";
+            j << "      \"excess_rate\": {\"estimate\": " << pres.oxidation.excess_rate.estimate
+              << ", \"ci95_low\": " << pres.oxidation.excess_rate.ci95_low
+              << ", \"ci95_high\": " << pres.oxidation.excess_rate.ci95_high << "},\n";
+            j << "      \"z_score\": " << pres.oxidation.z_score << ",\n";
+            j << "      \"bins_used\": " << pres.oxidation.bins_used << ",\n";
+            j << "      \"effective_bins\": " << pres.oxidation.effective_bins << ",\n";
+            j << "      \"heterogeneity\": " << pres.oxidation.heterogeneity << ",\n";
+            j << "      \"reliability_score\": " << pres.oxidation.reliability_score << ",\n";
+            j << "      \"reliability\": \"" << pres.oxidation.reliability << "\"\n";
+            j << "    },\n";
             j << "    \"qc_risk_eff\": " << pres.qc_risk_eff << ",\n";
             j << "    \"qc_evidence\": " << pres.qc_evidence << ",\n";
             j << "    \"label\": \"" << pres.label << "\"\n";
@@ -1767,7 +1886,134 @@ int damage_main(int argc, char** argv) {
         j << "    \"ds_symm_amp\": " << dp.library_ds_symm_amp << ",\n";
         j << "    \"ds_symm_ct5_resid\": " << dp.library_ds_symm_ct5_resid << ",\n";
         j << "    \"ds_symm_ga3_resid\": " << dp.library_ds_symm_ga3_resid << "\n";
-        j << "  }\n";
+        j << "  },\n";
+
+        // damage_types: per-channel summary with human-readable labels.
+        // Each entry declares what damage type the channel is sensitive to,
+        // the mechanism, whether it was detected, and the key metrics.
+        {
+            auto jbool = [](bool v) -> const char* { return v ? "true" : "false"; };
+            auto jfloat = [&](double v) { j << std::setprecision(6) << v; };
+
+            double cf_ratio = (dp.channel_c_valid && dp.channel_f_valid
+                               && dp.ca_stop_rate_baseline > 1e-6f)
+                ? static_cast<double>(dp.ox_stop_conversion_rate_baseline)
+                  / static_cast<double>(dp.ca_stop_rate_baseline)
+                : -1.0;
+
+            bool ch_f_detected = dp.channel_f_valid && dp.channel_f_z > 3.0f;
+            bool ch_g_detected = dp.channel_g_valid && dp.channel_g_z > 3.0f;
+            bool ch_h_detected = dp.channel_h_valid && dp.channel_h_z > 3.0f;
+            bool ch_d_detected = std::abs(dp.ox_gt_asymmetry) > 0.01f;
+
+            j << "  \"damage_types\": [\n";
+
+            // Channel A: cytosine deamination
+            j << "    {\n";
+            j << "      \"channel\": \"A\",\n";
+            j << "      \"name\": \"cytosine_deamination\",\n";
+            j << "      \"description\": \"C to T post-mortem deamination at terminal positions\",\n";
+            j << "      \"mechanism\": \"hydrolytic_deamination\",\n";
+            j << "      \"detected\": " << jbool(dp.damage_validated) << ",\n";
+            j << "      \"d_max_5prime\": "; jfloat(dp.d_max_5prime); j << ",\n";
+            j << "      \"d_max_3prime\": "; jfloat(dp.d_max_3prime); j << ",\n";
+            j << "      \"validated\": " << jbool(dp.damage_validated) << "\n";
+            j << "    },\n";
+
+            // Channel B: stop codon conversion (C→T validator)
+            j << "    {\n";
+            j << "      \"channel\": \"B\",\n";
+            j << "      \"name\": \"stop_codon_conversion\",\n";
+            j << "      \"description\": \"CAA/CAG/CGA to TAA/TAG/TGA via C to T; reference-free damage validator\",\n";
+            j << "      \"mechanism\": \"hydrolytic_deamination\",\n";
+            j << "      \"detected\": " << jbool(dp.channel_b_valid && !dp.channel_b_inverted) << ",\n";
+            j << "      \"valid\": " << jbool(dp.channel_b_valid) << ",\n";
+            j << "      \"lrt_5prime\": "; jfloat(dp.stop_decay_llr_5prime); j << ",\n";
+            j << "      \"d_max_estimate\": "; jfloat(dp.d_max_from_channel_b); j << ",\n";
+            j << "      \"inverted\": " << jbool(dp.channel_b_inverted) << "\n";
+            j << "    },\n";
+
+            // Channel C: 8-oxoG top strand
+            j << "    {\n";
+            j << "      \"channel\": \"C\",\n";
+            j << "      \"name\": \"8_oxog_top_strand\",\n";
+            j << "      \"description\": \"G to T oxidative stop codons (GAA/GAG/GGA); top-strand 8-oxoguanine\",\n";
+            j << "      \"mechanism\": \"oxidative_guanine_8_oxog\",\n";
+            j << "      \"detected\": " << jbool(dp.ox_damage_detected) << ",\n";
+            j << "      \"valid\": " << jbool(dp.channel_c_valid) << ",\n";
+            j << "      \"baseline_rate\": "; jfloat(dp.ox_stop_conversion_rate_baseline); j << ",\n";
+            j << "      \"terminal_rate\": "; jfloat(dp.ox_stop_rate_terminal); j << ",\n";
+            j << "      \"uniformity_ratio\": "; jfloat(dp.ox_uniformity_ratio); j << "\n";
+            j << "    },\n";
+
+            // Channel D: Chargaff G→T / C→A asymmetry
+            j << "    {\n";
+            j << "      \"channel\": \"D\",\n";
+            j << "      \"name\": \"chargaff_gt_asymmetry\",\n";
+            j << "      \"description\": \"Strand-asymmetric G to T / C to A excess; reference-free 8-oxoG cross-check\",\n";
+            j << "      \"mechanism\": \"oxidative_guanine_8_oxog\",\n";
+            j << "      \"detected\": " << jbool(ch_d_detected) << ",\n";
+            j << "      \"D\": "; jfloat(dp.ox_gt_asymmetry); j << ",\n";
+            j << "      \"s_gt\": "; jfloat(dp.s_gt); j << "\n";
+            j << "    },\n";
+
+            // Channel E: purine enrichment / fragmentation bias
+            j << "    {\n";
+            j << "      \"channel\": \"E\",\n";
+            j << "      \"name\": \"fragmentation_bias\",\n";
+            j << "      \"description\": \"Purine enrichment at fragment starts; preferential cleavage at pyrimidines\",\n";
+            j << "      \"mechanism\": \"depurination_hydrolysis\",\n";
+            j << "      \"detected\": " << jbool(dp.depurination_detected) << ",\n";
+            j << "      \"enrichment_5prime\": "; jfloat(dp.purine_enrichment_5prime); j << ",\n";
+            j << "      \"enrichment_3prime\": "; jfloat(dp.purine_enrichment_3prime); j << "\n";
+            j << "    },\n";
+
+            // Channel F: complement 8-oxoG (C→A)
+            j << "    {\n";
+            j << "      \"channel\": \"F\",\n";
+            j << "      \"name\": \"8_oxog_complement\",\n";
+            j << "      \"description\": \"C to A oxidative stop codons (TCA/TCG/TAC/TGC); bottom-strand 8-oxoguanine\",\n";
+            j << "      \"mechanism\": \"oxidative_guanine_8_oxog\",\n";
+            j << "      \"detected\": " << jbool(ch_f_detected) << ",\n";
+            j << "      \"valid\": " << jbool(dp.channel_f_valid) << ",\n";
+            j << "      \"baseline_rate\": "; jfloat(dp.ca_stop_rate_baseline); j << ",\n";
+            j << "      \"terminal_rate\": "; jfloat(dp.ca_stop_rate_terminal); j << ",\n";
+            j << "      \"uniformity_ratio\": "; jfloat(dp.ca_uniformity_ratio); j << ",\n";
+            j << "      \"z_score\": "; jfloat(dp.channel_f_z); j << ",\n";
+            j << "      \"cf_ratio\": "; jfloat(cf_ratio); j << "\n";
+            j << "    },\n";
+
+            // Channel G: hydantoin / C→G advanced oxidation
+            j << "    {\n";
+            j << "      \"channel\": \"G\",\n";
+            j << "      \"name\": \"hydantoin_oxidation\",\n";
+            j << "      \"description\": \"C to G stop codons (TCA/TAC to TGA/TAG); spiroiminodihydantoin / guanidinohydantoin\",\n";
+            j << "      \"mechanism\": \"oxidative_guanine_hydantoin\",\n";
+            j << "      \"detected\": " << jbool(ch_g_detected) << ",\n";
+            j << "      \"valid\": " << jbool(dp.channel_g_valid) << ",\n";
+            j << "      \"baseline_rate\": "; jfloat(dp.cg_stop_rate_baseline); j << ",\n";
+            j << "      \"terminal_rate\": "; jfloat(dp.cg_stop_rate_terminal); j << ",\n";
+            j << "      \"uniformity_ratio\": "; jfloat(dp.cg_uniformity_ratio); j << ",\n";
+            j << "      \"z_score\": "; jfloat(dp.channel_g_z); j << "\n";
+            j << "    },\n";
+
+            // Channel H: adenine oxidation / A→T
+            j << "    {\n";
+            j << "      \"channel\": \"H\",\n";
+            j << "      \"name\": \"adenine_oxidation\",\n";
+            j << "      \"description\": \"A to T stop codons (AAA/AAG/AGA to TAA/TAG/TGA); adenine oxidation or trans-lesion\",\n";
+            j << "      \"mechanism\": \"oxidative_adenine\",\n";
+            j << "      \"detected\": " << jbool(ch_h_detected) << ",\n";
+            j << "      \"valid\": " << jbool(dp.channel_h_valid) << ",\n";
+            j << "      \"baseline_rate\": "; jfloat(dp.at_stop_rate_baseline); j << ",\n";
+            j << "      \"terminal_rate\": "; jfloat(dp.at_stop_rate_terminal); j << ",\n";
+            j << "      \"uniformity_ratio\": "; jfloat(dp.at_uniformity_ratio); j << ",\n";
+            j << "      \"z_score\": "; jfloat(dp.channel_h_z); j << ",\n";
+            j << "      \"z_score_p2plus\": "; jfloat(dp.channel_h_z_p2plus); j << "\n";
+            j << "    }\n";
+
+            j << "  ]\n";
+        }
         j << "}\n";
         std::cout << "JSON written: " << json_path << "\n";
     }
