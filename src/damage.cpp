@@ -1427,20 +1427,20 @@ int damage_main(int argc, char** argv) {
                   << ",\"uniformity_ratio\":" << lb.ca_uniformity_ratio
                   << ",\"z_score\":" << lb.channel_f_z
                   << ",\"valid\":" << (lb.channel_f_valid ? "true" : "false")
-                  << ",\"detected\":" << (lb.channel_f_valid && lb.channel_f_z > 3.0f ? "true" : "false") << "}"
+                  << ",\"detected\":" << (lb.channel_f_valid && lb.channel_f_z > kOxChannelZDetect ? "true" : "false") << "}"
                   << ",\"channel_g\":{\"baseline_rate\":" << lb.cg_stop_rate_baseline
                   << ",\"terminal_rate\":" << lb.cg_stop_rate_terminal
                   << ",\"uniformity_ratio\":" << lb.cg_uniformity_ratio
                   << ",\"z_score\":" << lb.channel_g_z
                   << ",\"valid\":" << (lb.channel_g_valid ? "true" : "false")
-                  << ",\"detected\":" << (lb.channel_g_valid && lb.channel_g_z > 3.0f ? "true" : "false") << "}"
+                  << ",\"detected\":" << (lb.channel_g_valid && lb.channel_g_z > kOxChannelZDetect ? "true" : "false") << "}"
                   << ",\"channel_h\":{\"baseline_rate\":" << lb.at_stop_rate_baseline
                   << ",\"terminal_rate\":" << lb.at_stop_rate_terminal
                   << ",\"uniformity_ratio\":" << lb.at_uniformity_ratio
                   << ",\"z_score\":" << lb.channel_h_z
                   << ",\"z_score_p2plus\":" << lb.channel_h_z_p2plus
                   << ",\"valid\":" << (lb.channel_h_valid ? "true" : "false")
-                  << ",\"detected\":" << (lb.channel_h_valid && lb.channel_h_z > 3.0f ? "true" : "false") << "}"
+                  << ",\"detected\":" << (lb.channel_h_valid && lb.channel_h_z > kOxChannelZDetect ? "true" : "false") << "}"
                   << "}";
             }
             j << "]\n";
@@ -1901,9 +1901,9 @@ int damage_main(int argc, char** argv) {
                   / static_cast<double>(dp.ca_stop_rate_baseline)
                 : -1.0;
 
-            bool ch_f_detected = dp.channel_f_valid && dp.channel_f_z > 3.0f;
-            bool ch_g_detected = dp.channel_g_valid && dp.channel_g_z > 3.0f;
-            bool ch_h_detected = dp.channel_h_valid && dp.channel_h_z > 3.0f;
+            bool ch_f_detected = dp.channel_f_valid && dp.channel_f_z > kOxChannelZDetect;
+            bool ch_g_detected = dp.channel_g_valid && dp.channel_g_z > kOxChannelZDetect;
+            bool ch_h_detected = dp.channel_h_valid && dp.channel_h_z > kOxChannelZDetect;
             bool ch_d_detected = std::abs(dp.ox_gt_asymmetry) > 0.01f;
 
             j << "  \"damage_types\": [\n";

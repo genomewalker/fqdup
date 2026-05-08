@@ -3,6 +3,9 @@
 // DamageProfile — ancient DNA damage model + per-position empirical mask.
 //
 // Global scope (not anonymous namespace) so it can be shared across TUs
+
+// Oxidative channel detection threshold (binomial z-score)
+static constexpr float kOxChannelZDetect = 3.0f;
 // (derep.cpp, extend.cpp).  All methods are inline; no ODR risk.
 
 #include <algorithm>
