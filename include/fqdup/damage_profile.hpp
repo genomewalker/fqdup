@@ -268,6 +268,28 @@ struct LengthBinDamageProfile {
     std::array<int64_t, 64> tri_5prime_interior{};
     std::array<int64_t, 64> tri_3prime_terminal{};
     std::array<int64_t, 64> tri_3prime_interior{};
+
+    // Oxidation channel metrics (Channels C / F / G / H) per length bin.
+    float ox_stop_rate_baseline  = 0.0f;  // Channel C
+    float ox_stop_rate_terminal  = 0.0f;
+    float ox_uniformity_ratio    = 0.0f;
+    bool  channel_c_valid        = false;
+    float ca_stop_rate_baseline  = 0.0f;  // Channel F
+    float ca_stop_rate_terminal  = 0.0f;
+    float ca_uniformity_ratio    = 0.0f;
+    float channel_f_z            = 0.0f;
+    bool  channel_f_valid        = false;
+    float cg_stop_rate_baseline  = 0.0f;  // Channel G
+    float cg_stop_rate_terminal  = 0.0f;
+    float cg_uniformity_ratio    = 0.0f;
+    float channel_g_z            = 0.0f;
+    bool  channel_g_valid        = false;
+    float at_stop_rate_baseline  = 0.0f;  // Channel H
+    float at_stop_rate_terminal  = 0.0f;
+    float at_uniformity_ratio    = 0.0f;
+    float channel_h_z            = 0.0f;
+    float channel_h_z_p2plus     = 0.0f;
+    bool  channel_h_valid        = false;
 };
 
 struct LengthStratifiedDamageProfile {
