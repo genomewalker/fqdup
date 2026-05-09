@@ -507,6 +507,18 @@ int damage_main(int argc, char** argv) {
         stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     }
 
+    // Build adapter prefix code sets for prefix-conditioned F/G/H recomputation.
+    // Populated after detect_adapter_stubs; consumed after finalize_sample_profile.
+    std::vector<uint32_t> adapter_pfx_codes_5p, adapter_pfx_codes_3p;
+    for (const auto& s : stubs.stubs5) {
+        int code = taph::encode_hex_at(s, 0);
+        if (code >= 0) adapter_pfx_codes_5p.push_back(static_cast<uint32_t>(code));
+    }
+    for (const auto& s : stubs.stubs3) {
+        int code = taph::encode_hex_at(s, 0);
+        if (code >= 0) adapter_pfx_codes_3p.push_back(static_cast<uint32_t>(code));
+    }
+
     // ---- full pass: profile --------------------------------------------
     std::vector<WorkerState> states(n_threads);
     std::vector<std::thread> workers;
@@ -599,6 +611,13 @@ int damage_main(int argc, char** argv) {
     }
     dp.forced_library_type = forced_lib;  // ensure forced_lib survives merge
     taph::FrameSelector::finalize_sample_profile(dp);
+
+    // Recompute F/G/H z-scores excluding reads whose first (5') or last (3')
+    // hexamer matches a detected adapter stub — single-pass prefix-conditioned
+    // correction without a second read pass.
+    if (!adapter_pfx_codes_5p.empty() || !adapter_pfx_codes_3p.empty())
+        taph::FrameSelector::recompute_fgh_excluding_adapter_prefixes(
+            dp, adapter_pfx_codes_5p, adapter_pfx_codes_3p);
 
     // Recompute top enriched hexamers from final (possibly clipped) dp for JSON output.
     stubs.top_enriched = taph::compute_hex_enriched_5prime(dp);
@@ -1417,7 +1436,7 @@ int damage_main(int argc, char** argv) {
                 j << "    \"oxog_trinuc_cosine\": null,\n";
             else
                 j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
-            j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << (lsd.bins.empty() ? "\n" : ",\n");
+            j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << ",\n";
         }
         if (!lsd.bins.empty()) {
             j << "    \"by_length\": [";
@@ -1452,8 +1471,9 @@ int damage_main(int argc, char** argv) {
                   << ",\"detected\":" << (lb.channel_h_valid && (lb.channel_h_z > kOxChannelZDetect || lb.channel_h_z_p2plus > kOxChannelZDetect) ? "true" : "false") << "}"
                   << "}";
             }
-            j << "]\n";
+            j << "],\n";
         }
+        j << "    \"fgh_adapter_prefixes_excluded\": " << dp.fgh_adapter_prefixes_excluded << "\n";
         j << "  },\n";
         // OxoG unified estimate (oxo_schema: 1)
         {
