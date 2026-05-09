@@ -219,12 +219,12 @@ deamination-based Channel A and the 8-oxoG uniformity check (Channel C/D):
 | Channel | Substitution | Chemistry | Key JSON field |
 |---------|-------------|-----------|----------------|
 | F | C→A | 8-oxoG on the opposite strand read as C→A | `channel_f_z` |
-| G | C→G | Hydantoin / spiroiminodihydantoin guanine products | `channel_g_z` |
-| H | A→T | 8-oxoadenine / adenine oxidation | `channel_h_z`, `channel_h_z_p2plus` |
+| G | C→G | Further-oxidized guanine products (Gh, Sp) | `channel_g_z` |
+| H | A→T | Empirical terminal A→T enrichment (mechanism uncertain) | `channel_h_z`, `channel_h_z_p2plus` |
 
 Each channel computes a **binomial z-score** comparing the terminal
 trinucleotide-context rate (positions 0–4) to a far-interior baseline
-(pos ≥ 30; mid-read fallback). Detection threshold: `|z| > 3.0`.
+(pos ≥ 30; mid-read fallback). Detection threshold: `z > 3.0` (one-sided; depletion is not a damage signal).
 
 ### Channel H detection note
 
@@ -232,19 +232,20 @@ Channel H provides two scores:
 
 - `channel_h_z` — full terminal window (positions p0–4, where p0 = 1 if a
   position-0 composition artifact is flagged, else 0).
-- `channel_h_z_p2plus` — restricted to positions 2–4 only; more robust for
-  libraries with TC hexamer priming bias and no formal position-0 artifact
-  (in such cases p=0 carries lower A→T rate and dilutes the signal).
+- `channel_h_z_p2plus` — restricted to positions 2–4 only; more robust
+  because position 0 carries a lower background A→T rate that dilutes the
+  signal when included.
 
-Detection fires when **either** score exceeds the threshold. Use
-`channel_h_z_p2plus` as the primary interpretive signal when
-`hexamer_excess_tc < −0.02` and `position_0_artifact_5prime = false`.
+Detection fires when **either** score exceeds the threshold.
 
 ### Interpreting F/G/H in context
 
 Genuine ancient oxidative damage typically co-elevates all three channels.
 A pattern of F+/G+ with H near zero is more consistent with GC-rich
 bacterial contamination (e.g. *Burkholderia*, *Pseudomonas*) driving
-trinucleotide composition asymmetry. Extraction negative controls showing
-this pattern should be checked for known lab contaminant taxa before
-interpreting F/G elevation as oxidative aDNA signal.
+trinucleotide composition asymmetry: high-GC reads carry a higher density
+of C-context trinucleotides at read termini relative to the interior,
+inflating z-scores for channels F and G without affecting A/T-context
+channel H. Extraction negative controls showing this pattern should be
+checked for known lab contaminant taxa before interpreting F/G elevation
+as oxidative aDNA signal.
