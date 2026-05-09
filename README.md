@@ -223,6 +223,7 @@ The `--json` output includes the complete machine-readable profile:
 - **8-oxoG asymmetry**: `s_oxog` (overall strand asymmetry), plus `s_oxog_16ctx[16]` —
   the G→T asymmetry split across all 16 flanking-dinucleotide contexts (NxN where x=G).
 - **Depurination enrichment** at 5′ and 3′ termini.
+- **Oxidative complement channels** (`complement_asymmetry`): binomial z-scores comparing terminal trinucleotide-context rates to far-interior baseline — `channel_f_z` (C→A, 8-oxoG bottom strand), `channel_g_z` (C→G, hydantoin products), `channel_h_z` / `channel_h_z_p2plus` (A→T, adenine oxidation). All three elevated together = genuine aDNA oxidative damage; F+/G+ with H flat = GC-rich bacterial contamination.
 
 Library-type classification returns `unknown` when no damage signal is detectable
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
