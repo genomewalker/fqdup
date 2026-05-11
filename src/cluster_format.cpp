@@ -476,6 +476,9 @@ Reader::Reader(const std::string& path) : path_(path) {
     meta_json_.resize(msz);
     if (msz) ifs_.read(meta_json_.data(), static_cast<std::streamsize>(msz));
     if (!ifs_) throw std::runtime_error("cluster_format: short meta read");
+    // Strip fixed-region padding (spaces and trailing newline written by writer).
+    const auto last = meta_json_.find_last_not_of(" \n\r");
+    if (last != std::string::npos) meta_json_.resize(last + 1);
 
     ifs_.seekg(-16, std::ios::end);
     n_clusters_ = read_le_<std::uint64_t>(ifs_);
