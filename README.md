@@ -333,6 +333,7 @@ required.
   --errcor-empirical           Empirical posterior-odds model (default: on)
   --errcor-legacy-veto         Revert to pre-T5.8 count-ratio veto
   --errcor-singleton-qual-min INT  Block absorption when mismatch Phred ≥ N (default: 25)
+  --protect-transversions      Protect A↔T / C↔G (Channels H/G) from absorption (default: off)
   --errcor-rescue-indels       Syncmer-indexed indel rescue, ed≤2 (default: off)
 
   PCR model (for D_eff log estimate only, does not affect absorption):
@@ -433,9 +434,12 @@ forward and reverse-complement reads into the same cluster. Collision probabilit
 and A/(A+G) frequencies; symmetric masking preserves
 `hash(seq) == hash(revcomp(seq))` after masking.
 
-**Phase 3 protection:** G↔T and C↔A (8-oxoG) are always protected. C↔T and
-G↔A (deamination) are additionally protected when damage mode is active. Only
-A↔T and C↔G transversions are eligible for absorption.
+**Phase 3 protection:** G↔T and C↔A (8-oxoG, Channel F) are always protected.
+C↔T and G↔A (deamination) are additionally protected when damage mode is active.
+A↔T (Channel H) and C↔G (Channel G) transversions are eligible for absorption
+by default; pass `--protect-transversions` to protect them too — recommended
+for high-oxidative-damage libraries where these substitutions are genuine
+ancient damage rather than PCR errors.
 
 See the [wiki](../../wiki) for detailed algorithm descriptions and benchmarks.
 
