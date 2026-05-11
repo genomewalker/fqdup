@@ -41,21 +41,24 @@ two_trans    = '$TWO_TRANS'
 q            = 'I' * len(parent)
 for i in range(1, 101):
     print(f'@apar_{i:04d}\n{parent}\n+\n{q}')
-# Case 1: H=1 A→T, count=1 → should be absorbed
-print(f'@berr_0001\n{error_1sub}\n+\n{q}')
-# Case 2: H=1 C→T, count=1 → should be preserved (damage sub)
+# Case 1: H=1 A→T at pos 15 — PCR error, low quality at mismatch position
+qe1 = 'I' * 15 + '0' + 'I' * 14
+print(f'@berr_0001\n{error_1sub}\n+\n{qe1}')
+# Case 2: H=1 C→T — damage sub, high quality (damage_bypass exempts it from singleton veto)
 print(f'@cdam_0001\n{damage_1sub}\n+\n{q}')
-# Case 3: H=2 C→G+C→T, count=1 → should be preserved (damage sub present)
+# Case 3: H=2 C→G+C→T — damage sub present, high quality
 print(f'@ddmg_0001\n{two_sub_dmg}\n+\n{q}')
-# Case 4: H=2 both transversions, count=1 → should be absorbed
-print(f'@etrn_0001\n{two_trans}\n+\n{q}')
-# Case 5: distinct H=2 both-transversion sequence at count=3 → should NOT be absorbed
+# Case 4: H=2 A→T+C→G at pos 8,21 — PCR errors, low quality at both mismatch positions
+qe4 = 'I' * 8 + '0' + 'I' * 12 + '0' + 'I' * 8
+print(f'@etrn_0001\n{two_trans}\n+\n{qe4}')
+# Case 5: count=3 two-transversion — low quality at pos 9,20; count veto preserves it
 two_trans3 = list(parent)
 two_trans3[9]  = 'G'   # C→G
 two_trans3[20] = 'T'   # A→T
 two_trans3 = ''.join(two_trans3)
+qe5 = 'I' * 9 + '0' + 'I' * 10 + '0' + 'I' * 9
 for i in range(1, 4):
-    print(f'@ftrn_{i:04d}\n{two_trans3}\n+\n{q}')
+    print(f'@ftrn_{i:04d}\n{two_trans3}\n+\n{qe5}')
 " > input.fq
 
 "$FQDUP" sort -i input.fq -o sorted.fq --max-memory 1G -t . --fast 2>/dev/null
