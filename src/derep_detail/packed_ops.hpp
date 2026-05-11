@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace fqdup::derep_detail {
 
@@ -235,8 +236,9 @@ struct ChildMismatch {
     uint8_t  parent_base2;
     uint8_t  hamming;
     uint8_t  _pad[3];
+    float    lr_score = std::numeric_limits<float>::quiet_NaN();
 };
-static_assert(sizeof(ChildMismatch) == 20, "ChildMismatch must be 20 bytes");
+static_assert(sizeof(ChildMismatch) == 24, "ChildMismatch must be 24 bytes");
 
 // Extract bases [start, start+count) from 2-bit packed data into dst[],
 // byte-normalized (first base at MSB of dst[0], trailing bits zeroed).
