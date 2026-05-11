@@ -158,7 +158,7 @@ Benchmarked on sample `a88af16f35`, 5.58 M merged reads input to `derep`
 
 Damage-aware mode merged 20,214 clusters split by terminal deamination. Error
 correction (with damage substitution protection) absorbed a further 1,456
-PCR-error clusters. Only A↔T and C↔G transversions are eligible for absorption in read interiors.
+PCR-error clusters. A↔T (Channel H) and C↔G (Channel G) transversions are eligible for absorption by default; pass `--protect-transversions` to protect them too.
 C↔T and G↔A at **terminal positions** (within 5 bp of the read ends) are handled
 by the damage-aware bypass: they are preferentially absorbed as residual
 deamination rather than protected as SNPs (see below). G↔T and C↔A (8-oxoG
