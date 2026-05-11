@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -24,7 +25,7 @@ class BufferedFdWriter;
 }  // namespace detail
 
 inline constexpr std::uint32_t kMagic       = 0x4C434651u; // 'FQCL' little-endian
-inline constexpr std::uint32_t kVersion     = 2u;
+inline constexpr std::uint32_t kVersion     = 3u;
 inline constexpr std::size_t   kTermWindow  = 8u;          // damage_term_{5,3}
 
 // Per-block wire format (v2):
@@ -48,8 +49,9 @@ struct Edge {
     std::uint8_t  from_base;   // 2-bit, low bits
     std::uint8_t  to_base;     // 2-bit
     std::uint32_t n_reads;     // size of subtree at to_node
+    float         score = std::numeric_limits<float>::quiet_NaN(); // LR score (NaN = not evaluated)
 };
-static_assert(sizeof(Edge) == 16, "Edge layout drift");
+static_assert(sizeof(Edge) == 20, "Edge layout drift");
 
 // Per-cluster damage histogram, fixed-window terminal C->T (5') / G->A (3').
 struct DamageTrack {
