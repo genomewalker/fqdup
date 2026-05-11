@@ -22,7 +22,7 @@
 using namespace fqdup::clusterfmt;
 
 static void check_static_invariants() {
-    static_assert(kVersion == 2u, ".fqcl v2 required");
+    static_assert(kVersion == 3u, ".fqcl v3 required");
     static_assert(kZstdMinBytes == 512u, "zstd threshold must be 512 B raw");
 }
 
