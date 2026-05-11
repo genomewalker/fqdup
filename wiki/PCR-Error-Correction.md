@@ -78,10 +78,12 @@ as residual deamination artefacts rather than true SNPs.
 This bypass applies only to C↔T and G↔A at the damage-zone edge.
 
 G↔T and C↔A mismatches (consistent with 8-oxoG oxidative damage) are also
-unconditionally protected from absorption by `is_damage_sub` — they are never
-treated as PCR errors regardless of position, count, or whether
-`--collapse-damage` is active. Only A↔T and C↔G transversions can be absorbed
-by Phase 3.
+unconditionally protected from absorption — they are never treated as PCR errors
+regardless of position, count, or whether `--collapse-damage` is active.
+A↔T (Channel H) and C↔G (Channel G) transversions are eligible for absorption
+by default. Pass `--protect-transversions` to protect them as well — recommended
+for high-oxidative-damage libraries where these substitutions are genuine ancient
+damage rather than PCR errors.
 
 ---
 

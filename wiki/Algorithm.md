@@ -165,7 +165,7 @@ from either strand maps to the same fingerprint, forward and reverse-complement
 reads collapse into the same cluster. The fingerprint key also includes the
 sequence length to reduce false collisions between reads of different lengths
 that happen to share a hash value. Using the full 128-bit hash reduces the
-collision probability to ~3×10⁻²⁴ at 100 M reads.
+collision probability to ~1.5×10⁻²³ at 100 M reads.
 
 [XXH3](https://github.com/Cyan4973/xxHash) exceeds 20 GB/s on modern
 hardware with excellent distribution. The hash map is `ska::flat_hash_map`
