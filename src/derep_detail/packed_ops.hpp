@@ -32,10 +32,13 @@ inline int packed_hamming(const uint8_t* pa, const uint8_t* pb,
 
 // Returns true if the substitution a→b (or b→a) is damage-consistent
 // using 2-bit encoded values. C↔T (xr=2) and G↔A/C↔A/G↔T (xr=1) are the
-// defining aDNA damage signatures; A↔T / C↔G (xr=3) are transversions.
-inline bool is_damage_sub_packed(uint8_t a, uint8_t b, bool /*protect_deamination*/) {
+// xr==1: A↔C / G↔T (Channel F, 8-oxoG); xr==2: A↔G / C↔T (deamination).
+// xr==3: A↔T / C↔G (Channels H/G, transversions). Always protected for xr 1-2;
+// xr==3 protected only when protect_transversions is set.
+inline bool is_damage_sub_packed(uint8_t a, uint8_t b, bool protect_transversions) {
     uint8_t xr = a ^ b;
-    return (xr == 1u || xr == 2u);
+    if (xr == 1u || xr == 2u) return true;
+    return protect_transversions && xr == 3u;
 }
 
 // True if the mismatch (pa_2b, pb_2b) at interior position ipos (0-based, length ilen)
@@ -86,7 +89,7 @@ inline double wilson_lower95(uint64_t x, uint64_t n) {
 // Returns true if child should be absorbed by parent: exactly 1 interior
 // mismatch AND the substitution is NOT damage-consistent.
 inline bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
-                                 int k5, int ilen, bool protect_deamination) {
+                                 int k5, int ilen, bool protect_transversions) {
     int mismatches = 0;
     uint8_t mm_a = 0, mm_b = 0;
 
@@ -120,7 +123,7 @@ inline bool packed_should_absorb(const uint8_t* pa, const uint8_t* pb,
             ++i;
         }
     }
-    return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_deamination);
+    return mismatches == 1 && !is_damage_sub_packed(mm_a, mm_b, protect_transversions);
 }
 
 struct MismatchInfo {
@@ -132,7 +135,7 @@ struct MismatchInfo {
 
 // Like packed_should_absorb but also returns position and bases of the single mismatch.
 inline MismatchInfo packed_find_mismatch(const uint8_t* pa, const uint8_t* pb,
-                                         int k5, int ilen, bool protect_deamination) {
+                                         int k5, int ilen, bool protect_transversions) {
     int mismatches = 0;
     uint8_t mm_a = 0, mm_b = 0;
     uint16_t mm_pos = 0;
@@ -170,7 +173,7 @@ inline MismatchInfo packed_find_mismatch(const uint8_t* pa, const uint8_t* pb,
         }
     }
     if (mismatches != 1) return {false, 0, 0, 0};
-    if (is_damage_sub_packed(mm_a, mm_b, protect_deamination)) return {false, 0, 0, 0};
+    if (is_damage_sub_packed(mm_a, mm_b, protect_transversions)) return {false, 0, 0, 0};
     return {true, mm_pos, mm_a, mm_b};
 }
 

@@ -46,7 +46,11 @@ struct ErrCorParams {
     // as H=1 (non-damage mismatch only); h_adj=0 pairs (both terminal damage) are
     // skipped here and require tag-folding to reach Phase 3.
     // Set false for ablation to restore old transversion-only H=2 behaviour.
-    bool     b1_damage_adjust   = true;
+    bool     b1_damage_adjust       = true;
+    // Protect Channel G (C↔G) and Channel H (A↔T) substitutions from H=1/H=2
+    // PCR-error absorption. Off by default; enable with --protect-transversions
+    // for high-oxidative-damage libraries.
+    bool     protect_transversions  = false;
     // Calibration-free LRT for interior C↔T / G↔A candidates admitted by
     // b1_damage_adjust. Bypasses the empirical model for this subclass.
     // f0 = expected child fraction under PCR error (cycle 3-4 ≈ 0.10),
