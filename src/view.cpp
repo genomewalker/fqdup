@@ -3,6 +3,7 @@
 
 #include "view_html_assets.hpp"
 #include "fqdup/cluster_format.hpp"
+#include "fqdup/version.hpp"
 #include "fqdup/bundle_key.hpp"
 #include "fqdup/fastq_types.hpp"
 
@@ -636,7 +637,7 @@ void emit_html_static(cf::Reader& rd, const std::string& path,
 </head>
 <body data-theme="light">
   <header id="topbar">
-    <div class="brand"><span class="b1">fqcl</span><span class="b2">cluster genealogy · v4</span></div>
+    <div class="brand"><span class="b1">fqcl</span><span class="b2">cluster genealogy · v)" FQDUP_VERSION R"(</span></div>
     <div id="ds-meta"></div>
     <div class="topbar-actions">
       <button id="theme-toggle" title="theme">◐</button>
