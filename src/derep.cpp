@@ -735,7 +735,7 @@ private:
                             extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf_s);
 
                             MismatchInfo mm = packed_find_mismatch(
-                                pi_buf_s, ci_full_s, 0, lay.ilen, profile_.enabled);
+                                pi_buf_s, ci_full_s, 0, lay.ilen, errcor_.protect_transversions);
                             if (mm.found) {
                                 local_mm.push_back({pid, cid, mm.position,
                                                     mm.base_b, mm.base_a,
@@ -745,7 +745,7 @@ private:
                                 continue;
                             }
                             mm = packed_find_mismatch(
-                                pi_buf_s, crc_full_s, 0, lay.ilen, profile_.enabled);
+                                pi_buf_s, crc_full_s, 0, lay.ilen, errcor_.protect_transversions);
                             if (mm.found) {
                                 uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
                                 local_mm.push_back({pid, cid, cpos,
@@ -867,7 +867,7 @@ private:
                 extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
 
                 // Try direct comparison (H=1 — same canonical orientation)
-                MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, profile_.enabled);
+                MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, errcor_.protect_transversions);
                 if (mm.found) {
                     local_mm.push_back({pid, cid, mm.position, mm.base_b, mm.base_a,
                                           0, 0, 0, 1, {}});
@@ -875,7 +875,7 @@ private:
                     continue;
                 }
                 // Try RC comparison (H=1)
-                mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, profile_.enabled);
+                mm = packed_find_mismatch(pi_buf, crc_full, 0, lay.ilen, errcor_.protect_transversions);
                 if (mm.found) {
                     uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
                     local_mm.push_back({pid, cid, cpos,
@@ -895,6 +895,12 @@ private:
                 if (id_count[cid] <= errcor_.max_h2_count) {
                     auto admit_h2 = [&](MismatchInfo2 mm2, bool rc) -> bool {
                         if (mm2.count != 2) return false;
+                        // Transversion guard: A↔T / C↔G (xr==3) protected regardless
+                        // of b1_damage_adjust when --protect-transversions is active.
+                        if (errcor_.protect_transversions) {
+                            if ((mm2.base_a[0] ^ mm2.base_b[0]) == 3u) return false;
+                            if ((mm2.base_a[1] ^ mm2.base_b[1]) == 3u) return false;
+                        }
                         bool dmg0, dmg1;
                         if (errcor_.b1_damage_adjust) {
                             dmg0 = is_terminal_damage_mismatch(
@@ -904,8 +910,8 @@ private:
                                        mm2.base_a[1], mm2.base_b[1],
                                        mm2.pos[1], lay.ilen, profile_.ss_mode);
                         } else {
-                            dmg0 = is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], false);
-                            dmg1 = is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], false);
+                            dmg0 = is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], errcor_.protect_transversions);
+                            dmg1 = is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], errcor_.protect_transversions);
                             if (dmg0 || dmg1) return false; // old: reject any damage type
                         }
                         int h_adj = 2 - (int)dmg0 - (int)dmg1;
@@ -2590,6 +2596,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  -t, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
         << "  --errcor-empirical           Empirical posterior-odds rule (default; absorb iff S>0)\n"
         << "  --errcor-legacy-veto         Legacy SNP-veto rule\n"
+        << "  --protect-transversions      Protect A↔T / C↔G (Channels H/G) from H=1/H=2 absorption\n"
         << "  --errcor-adj-len             Adjacent-length (L±1) indel probe\n"
         << "\nIndel rescue (T8) tuning:\n"
         << "  --rescue-min-hits INT        Min shared syncmers (default: auto: 3 cap=16, 2 cap=8)\n"
@@ -2711,6 +2718,8 @@ int derep_main(int argc, char** argv) {
             errcor.legacy_veto = false;
         } else if (arg == "--errcor-legacy-veto") {
             errcor.legacy_veto = true;
+        } else if (arg == "--protect-transversions") {
+            errcor.protect_transversions = true;
         } else if (arg == "--errcor-adj-len") {
             errcor.adj_len_probe = true;
         } else if (arg == "--errcor-rescue-indels") {

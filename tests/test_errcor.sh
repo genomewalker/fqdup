@@ -103,4 +103,23 @@ if ! grep -q "^${TWO_TRANS3}$" output.fq; then
 fi
 echo "OK: H=2 both-transversion count=3 preserved (above max_h2_count)"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Part 2: --protect-transversions
+# The same A→T+C→G count=1 child (case 4) must be PRESERVED when the flag is set.
+# ──────────────────────────────────────────────────────────────────────────────
+"$FQDUP" sort -i input.fq -o sorted_prot.fq --max-memory 1G -t . --fast 2>/dev/null
+"$FQDUP" derep \
+    -i sorted_prot.fq \
+    -o output_prot.fq \
+    --error-correct \
+    --protect-transversions \
+    --errcor-bucket-cap 0 2>/dev/null
+
+# count=1 transversion pair must now survive
+if ! grep -q "^${TWO_TRANS}$" output_prot.fq; then
+    echo "FAIL: --protect-transversions: A→T+C→G count=1 child was absorbed (should be preserved)"
+    exit 1
+fi
+echo "OK: --protect-transversions: A↔T / C↔G singletons preserved"
+
 echo "OK: test_errcor passed"
