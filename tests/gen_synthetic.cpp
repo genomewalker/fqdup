@@ -272,11 +272,11 @@ static std::string apply_oxidative(const std::string& seq,
     return s;
 }
 
+static void write_read(const std::string& name, const std::string& seq, const std::string& qual) {
+    std::cout << '@' << name << '\n' << seq << '\n' << '+' << '\n' << qual << '\n';
+}
 static void write_read(const std::string& name, const std::string& seq) {
-    std::cout << '@' << name  << '\n'
-              << seq          << '\n'
-              << '+'          << '\n'
-              << std::string(seq.size(), 'I') << '\n';
+    write_read(name, seq, std::string(seq.size(), 'I'));
 }
 
 // ---------------------------------------------------------------------------
@@ -509,13 +509,18 @@ int main(int argc, char** argv) {
     // Generate reads
     // -------------------------------------------------------------------------
     auto make_read = [&](const std::string& mol,
-                         const std::vector<Mutation>& shared_muts) -> std::string {
+                         const std::vector<Mutation>& shared_muts) -> std::pair<std::string, std::string> {
         int L = (int)mol.size();
         // Apply shared chained PCR errors first (same for all reads from this molecule)
         std::string seq = apply_mutations(mol, shared_muts, rng);
         // Independent late-cycle PCR errors (unique to this read), scaled by length
         double mol_mu_indep = rate_indep * L;
         seq = apply_indep_errors(seq, mol_mu_indep, rng);
+        // PCR error positions get low quality (phred 15); biological events keep high quality.
+        // Compare before biological mutations are applied so damage doesn't get flagged low-Q.
+        std::string qual(seq.size(), 'I');
+        for (size_t i = 0; i < std::min(mol.size(), seq.size()); ++i)
+            if (seq[i] != mol[i]) qual[i] = '0';  // phred 15
         // Thermocyclic oxidative C→T (uniform, independent per read)
         if (mu_thermo > 0.0) seq = apply_thermo(seq, mu_thermo, rng);
         // 8-oxoG oxidative G→T (Channel C/D, uniform, independent per read)
@@ -528,8 +533,9 @@ int main(int argc, char** argv) {
             int trim = (int)(rng.next() % (unsigned)(trim_sd + 1));
             int newlen = std::max(min_len, (int)seq.size() - trim);
             seq.resize(newlen);
+            qual.resize(newlen);
         }
-        return seq;
+        return {seq, qual};
     };
 
     if (dup_pair) {
@@ -542,7 +548,8 @@ int main(int argc, char** argv) {
             for (int copy = 0; copy < 2; ++copy) {
                 char name[64];
                 std::snprintf(name, sizeof(name), "mol%05d_c%d", i, copy);
-                write_read(name, make_read(molecules[i], shared));
+                auto [seq, qual] = make_read(molecules[i], shared);
+                write_read(name, seq, qual);
             }
         }
         return 0;
@@ -571,7 +578,8 @@ int main(int argc, char** argv) {
         const auto& chain = need_chain ? mol_chains[m] : empty_chain;
         char name[64];
         std::snprintf(name, sizeof(name), "r%07d_m%05d", i, m);
-        write_read(name, make_read(molecules[m], chain));
+        auto [seq, qual] = make_read(molecules[m], chain);
+        write_read(name, seq, qual);
     }
     return 0;
 }
