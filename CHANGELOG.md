@@ -14,9 +14,11 @@
   error-correction model. `NaN` when the legacy SNP-veto path was used or the
   edge was not evaluated. Visible in `fqdup view` JSON as `score` /
   `score_evaluated`.
-- **B3 deamination-aware merge** (`b3_deam_merge.hpp`): For libraries with
-  `d_max ≥ 0.25`, reads from the same ancient molecule that accumulate 3–5
-  deamination differences outside the mask zone now land in the same bucket.
+- **B3 deamination-aware merge** (`b3_deam_merge.hpp`): For high-damage
+  libraries (auto-activated when the profile-derived deamination mass gate
+  passes; most effective at `d_max ≥ 0.25`), reads from the same ancient
+  molecule that accumulate 3–5 deamination differences outside the mask zone
+  now land in the same bucket.
   Interior bases are damage-normalised (T→C at 5′-proximal positions, A→G at
   3′-proximal positions) before hashing, combined with the locus bundle key.
 - **HTML cluster visualiser** (`fqdup view --html out.html`): Produces a
