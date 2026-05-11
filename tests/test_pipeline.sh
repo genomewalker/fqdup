@@ -713,11 +713,12 @@ mol_snp = list(mol_A)
 # Transitions (C↔T, G↔A) are unconditionally protected as damage-consistent.
 mol_snp[37] = {'A':'T','C':'G','G':'C','T':'A'}[mol_A[37]]
 mol_snp = ''.join(mol_snp)
+qual_snp = qual[:37] + '0' + qual[38:]  # phred 15 at PCR error position
 
 cov = $COV
 for i in range(cov):
     print(f'@molA_r{i:05d}\n{mol_A}\n+\n{qual}')
-print(f'@snp_r00000\n{mol_snp}\n+\n{qual}')
+print(f'@snp_r00000\n{mol_snp}\n+\n{qual_snp}')
 PYEOF
 
 # Run derep directly on raw reads (EC requires multi-copy input)
