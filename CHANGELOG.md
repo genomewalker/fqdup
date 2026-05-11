@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.0.1] - 2026-05-11
+
+### New features
+- **`--protect-transversions`**: opt-in flag that prevents H=1/H=2 PCR-error
+  absorption of A↔T (Channel H) and C↔G (Channel G) singleton reads. Channel F
+  (C↔A / G↔T, 8-oxoG) and deamination substitutions were already protected by
+  default. Use for high-oxidative-damage libraries where transversion singletons
+  are real damage signal rather than PCR errors.
+
 ## [2.0.0] - 2026-05-11
 
 ### Breaking changes
@@ -28,11 +37,6 @@
 - **Oxidative channels F/G/H**: Z-scores and prefix-conditioned adapter exclusion
   for complement channels (see `channel_f_z`, `channel_h_z`, `channel_h_z_p2plus`
   in the damage JSON output).
-- **`--protect-transversions`**: opt-in flag that prevents H=1/H=2 PCR-error
-  absorption of A↔T (Channel H) and C↔G (Channel G) singleton reads. Channel F
-  (C↔A / G↔T, 8-oxoG) and deamination substitutions were already protected by
-  default. Use for high-oxidative-damage libraries where transversion singletons
-  are real damage signal rather than PCR errors.
 
 ### Improvements
 - `json_escape` in `fqdup view` now escapes `<`, `>`, `&` as Unicode escapes to
