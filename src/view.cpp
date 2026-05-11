@@ -1,6 +1,7 @@
 // fqdup view — inspect .fqcl cluster genealogy files.
 // Modes: header summary (default), single-cluster tree/staircase, sibling bundling.
 
+#include "view_html_assets.hpp"
 #include "fqdup/cluster_format.hpp"
 #include "fqdup/bundle_key.hpp"
 #include "fqdup/fastq_types.hpp"
@@ -9,10 +10,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <fstream>
 #include <map>
 #include <ostream>
 #include <sstream>
@@ -45,6 +48,10 @@ void json_escape(std::ostream& os, std::string_view s) {
             case '\n': os << "\\n";  break;
             case '\r': os << "\\r";  break;
             case '\t': os << "\\t";  break;
+            // Escape < and > so JSON embedded in <script> blocks can't inject closing tags
+            case '<':  os << "\\u003c"; break;
+            case '>':  os << "\\u003e"; break;
+            case '&':  os << "\\u0026"; break;
             default:
                 if (c < 0x20) {
                     char buf[8];
@@ -322,6 +329,9 @@ void emit_cluster_object(std::ostream& os, const cf::ClusterRecord& r) {
            << ",\"alt\":\"" << alt << "\""
            << ",\"n_reads\":" << e.n_reads
            << ",\"damage_like\":" << (damage_like ? "true" : "false")
+           << (std::isnan(e.score)
+                   ? ",\"score\":null,\"score_evaluated\":false"
+                   : ",\"score\":" + std::to_string(e.score) + ",\"score_evaluated\":true")
            << "}";
     }
     os << "]}";
@@ -521,6 +531,203 @@ void emit_top_json(std::ostream& os, cf::Reader& rd, const std::string& path,
     os << "\n";
 }
 
+// ── static HTML export ────────────────────────────────────────────────────────
+// Produces a single self-contained HTML file with embedded CSS, JS (viz4), and
+// all cluster data inlined as window.FQCL_DATA.  No server needed to view it.
+void emit_html_static(cf::Reader& rd, const std::string& path,
+                      const std::string& out_path, std::size_t n_top,
+                      bool by_edges = false) {
+    // 1. header JSON
+    std::ostringstream hdr;
+    emit_header_json(hdr, rd, path);
+
+    // 2. top-N clusters list + per-cluster JSON
+    //    Collect top N by member count (reuse same heap logic as emit_top_json)
+    struct Hit {
+        std::uint64_t id;
+        std::uint32_t n_members;
+        std::uint32_t n_edges;
+        std::uint32_t parent_len;
+        std::uint64_t bundle_key;
+    };
+    std::vector<Hit> top;
+    cf::ClusterRecord r;
+    auto cmp = [by_edges](const Hit& a, const Hit& b){
+        return by_edges ? a.n_edges > b.n_edges : a.n_members > b.n_members;
+    };
+    for (std::uint64_t i = 0; i < rd.n_clusters(); ++i) {
+        cf::ClusterRecord rec;
+        rd.read_cluster(i, rec);
+        Hit h{ rec.cluster_id,
+               rec.n_members,
+               static_cast<std::uint32_t>(rec.edges.size()),
+               rec.parent_seq_len,
+               from_cluster(rec, 16) };
+        if (top.size() < n_top) {
+            top.push_back(h);
+            std::push_heap(top.begin(), top.end(), cmp);
+        } else if (cmp(h, top.front())) {
+            std::pop_heap(top.begin(), top.end(), cmp);
+            top.back() = h;
+            std::push_heap(top.begin(), top.end(), cmp);
+        }
+        if ((i % 5000000) == 0)
+            std::fprintf(stderr, "scanned %lu / %lu\r",
+                         static_cast<unsigned long>(i),
+                         static_cast<unsigned long>(rd.n_clusters()));
+    }
+    std::sort(top.begin(), top.end(), [](const Hit& a, const Hit& b){
+        return a.n_members > b.n_members;
+    });
+
+    // top_members JSON (reuse envelope format viz4 expects)
+    std::ostringstream tm;
+    tm << "{\"schema\":\"fqdup.view.v1\",\"fqcl\":{\"path\":";
+    json_escape(tm, path);
+    tm << "},\"query\":{\"mode\":\"top_members\",\"args\":{\"k\":" << n_top << "}},"
+       << "\"data\":{\"by\":\"members\",\"k\":" << n_top << ",\"clusters\":[";
+    for (std::size_t i = 0; i < top.size(); ++i) {
+        if (i) tm << ",";
+        char hex[32];
+        std::snprintf(hex, sizeof(hex), "%016lx",
+                      static_cast<unsigned long>(top[i].bundle_key));
+        tm << "{\"cluster_id\":" << top[i].id
+           << ",\"n_members\":" << top[i].n_members
+           << ",\"n_edges\":" << top[i].n_edges
+           << ",\"parent_len\":" << top[i].parent_len
+           << ",\"bundle_key\":\"" << hex << "\"}";
+    }
+    tm << "]}}";
+
+    // per-cluster JSON map: second pass reading only the top clusters
+    std::map<std::uint64_t, std::string> cluster_jsons;
+    for (const auto& h : top) {
+        cf::ClusterRecord rec;
+        rd.read_cluster(h.id, rec);
+        std::ostringstream cj;
+        cj << "{\"schema\":\"fqdup.view.v1\",\"fqcl\":{\"path\":";
+        json_escape(cj, path);
+        cj << ",\"n_clusters\":" << rd.n_clusters();
+        cj << ",\"metadata\":" << (rd.meta_json().empty() ? "{}" : rd.meta_json());
+        cj << "},\"query\":{\"mode\":\"cluster\",\"args\":{\"cluster_id\":"
+           << rec.cluster_id << "}},\"data\":{\"cluster\":";
+        emit_cluster_object(cj, rec);
+        cj << "}}";
+        cluster_jsons[rec.cluster_id] = cj.str();
+    }
+
+    // 3. write HTML
+    std::ofstream out(out_path);
+    if (!out) throw std::runtime_error("cannot open output: " + out_path);
+
+    out << R"(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fqcl · cluster genealogy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+)";
+    out << fqdup_html::CSS;
+    out << R"(
+</style>
+</head>
+<body data-theme="light">
+  <header id="topbar">
+    <div class="brand"><span class="b1">fqcl</span><span class="b2">cluster genealogy · v4</span></div>
+    <div id="ds-meta"></div>
+    <div class="topbar-actions">
+      <button id="theme-toggle" title="theme">◐</button>
+      <button id="export-svg" title="export panel as SVG">↓ svg</button>
+    </div>
+  </header>
+  <main>
+    <aside id="nav">
+      <div class="nav-head">
+        <input id="nav-filter" placeholder="filter cluster id…">
+        <span id="nav-count"></span>
+      </div>
+      <div id="size-hist" class="size-hist"></div>
+      <div id="nav-list"></div>
+    </aside>
+    <section id="sheet">
+      <div id="cluster-head">
+        <div class="ch-id">
+          <span class="ch-label">cluster</span>
+          <span class="ch-num" id="cluster-id">—</span>
+          <div class="ch-stats" id="cluster-stats"></div>
+        </div>
+        <div id="qc-chips"></div>
+      </div>
+      <div class="grid">
+        <div class="panel wide">
+          <div class="panel-head"><span class="ph-l1">parent sequence</span></div>
+          <div id="parent-tracks"></div>
+        </div>
+        <div class="panel wide" id="heatmap-panel">
+          <div class="panel-head"><span class="ph-l1">damage fingerprint</span>
+            <span class="ph-l2 muted" style="font-size:11px"> · rows=depth cols=position color=mutation class</span></div>
+          <div id="heatmap-canvas"></div>
+        </div>
+        <div class="panel wide">
+          <div class="panel-head">
+            <span class="ph-l1">genealogy tree</span>
+            <span class="ph-l2 mono" id="gn-rowcount"></span>
+            <div class="panel-controls">
+              <div class="ctrl-group"><span>color</span>
+                <button data-color="class" class="active">class</button>
+                <button data-color="depth">depth</button>
+              </div>
+            </div>
+          </div>
+          <div id="tree-canvas"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><span class="ph-l1">mutation class</span></div>
+          <div id="class-bar"></div>
+          <div id="class-legend" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;font-size:11px"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><span class="ph-l1">evidence</span></div>
+          <div id="evidence"></div>
+        </div>
+        <div class="panel wide">
+          <div class="panel-head"><span class="ph-l1">mutation ledger</span></div>
+          <div class="ledger-row head">
+            <div></div><div>class</div><div>pos</div><div>change</div>
+            <div>zone</div><div>reason</div><div>reads</div><div>fraction</div>
+          </div>
+          <div id="ledger"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div id="tooltip"></div>
+)";
+
+    // embed data
+    out << "<script>\nwindow.FQCL_DATA = {\n";
+    out << "  header: " << hdr.str() << ",\n";
+    out << "  top_members: " << tm.str() << ",\n";
+    out << "  clusters: {\n";
+    bool first = true;
+    for (const auto& [cid, json] : cluster_jsons) {
+        if (!first) out << ",\n";
+        out << "    \"" << cid << "\": " << json;
+        first = false;
+    }
+    out << "\n  }\n};\n</script>\n";
+
+    // d3 + viz
+    out << R"(<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+)";
+    out << fqdup_html::JS;
+    out << "\n</script>\n</body>\n</html>\n";
+}
+
 void emit_dump_members_ndjson(std::ostream& os, cf::Reader& rd) {
     rd.for_each([&os](std::uint64_t /*idx*/, const cf::ClusterRecord& r) {
         os << "{\"cluster_id\":" << r.cluster_id << ",\"members\":[";
@@ -709,6 +916,8 @@ void usage(const char* prog) {
       "                            damage-mask-merged twins report -1)\n"
       "  --json                   emit structured JSON (schema fqdup.view.v1)\n"
       "                           NOTE: --dump-members --json emits NDJSON,\n"
+      "  --html PATH              write self-contained HTML viz (top 50 clusters)\n"
+      "                           combine with --top-members N to change count\n"
       "                                 one cluster object per line (no envelope).\n";
 }
 
@@ -730,6 +939,7 @@ int view_main(int argc, char** argv) {
     bool dump_members = false;
     bool emit_json = false;
     std::string member_of_fastq;
+    std::string html_out;
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
@@ -748,6 +958,7 @@ int view_main(int argc, char** argv) {
         else if (a == "--dump-members")                    dump_members = true;
         else if (a == "--member-of" && i + 1 < argc)      member_of_fastq = argv[++i];
         else if (a == "--json")                            emit_json = true;
+        else if (a == "--html" && i + 1 < argc)          html_out = argv[++i];
         else if (path.empty())                            path = a;
         else { std::cerr << "unknown arg: " << a << "\n"; usage(argv[0]); return 1; }
     }
@@ -755,6 +966,14 @@ int view_main(int argc, char** argv) {
 
     try {
         cf::Reader rd(path);
+        if (!html_out.empty()) {
+            bool by_edges_html = (top_edges > 0 && top_members <= 0);
+            std::size_t n = by_edges_html ? static_cast<std::size_t>(top_edges)
+                          : (top_members > 0 ? static_cast<std::size_t>(top_members) : 50);
+            emit_html_static(rd, path, html_out, n, by_edges_html);
+            std::cerr << "wrote " << html_out << "\n";
+            return 0;
+        }
         if (cluster_n >= 0) {
             cf::ClusterRecord r;
             rd.read_cluster(static_cast<std::uint64_t>(cluster_n), r);
