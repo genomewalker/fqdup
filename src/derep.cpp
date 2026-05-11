@@ -56,6 +56,7 @@ extern "C" {
 // FastqWriter, SequenceFingerprint, SequenceFingerprintHash, canonical_hash,
 // revcomp, trim_id, shell_escape_path, GZBUF_SIZE — all in anonymous namespace.
 #include "fqdup/cluster_format.hpp"
+#include "fqdup/version.hpp"
 #include "fqdup/damage_profile.hpp"
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
@@ -2209,7 +2210,7 @@ private:
 
         // Build cluster_id mapping over surviving roots: dense u64 in seq_id order.
         cf::WriterMetadata meta;
-        meta.tool_version  = "0.1";
+        meta.tool_version  = FQDUP_VERSION;
         meta.input_fastq   = fqcl_input_fastq_;
         meta.n_input_reads = total_reads_;
         // Bug 1 fix: report the resolved library type from the user flag
