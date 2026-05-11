@@ -1214,6 +1214,7 @@ private:
                                         static_cast<double>(sig2) >= eff_snp * static_cast<double>(veto_count));
                     // T5.8: empirical posterior-odds for H=2.
                 bool   absorb_h2;
+                float  fqcl_lr_h2 = std::numeric_limits<float>::quiet_NaN();
                 if (errcor_.empirical && !errcor_.legacy_veto) {
                     auto e = build_edge(cm);
                     e.bundle_key = bundle_key_of[eff_pid];
@@ -1236,6 +1237,7 @@ private:
                                   static_cast<double>(id_count[cm.child_id] + 1));
                     S += joint_adj;
                     absorb_h2 = (S > 0.0);
+                    fqcl_lr_h2 = static_cast<float>(S);
                     // H=3 shadow: track near-boundary LR scores before veto logic.
                     constexpr double kH3ShadowNat = 1.0;
                     if      (S >  0.0 && S <  kH3ShadowNat) ++stats.h3_shadow_absorbed_near_boundary;
@@ -1288,7 +1290,10 @@ private:
                             }
                             stats.absorbed++;
                             errcor_absorbed_++;
-                            if (!fqcl_path_.empty()) fqcl_mismatches_.push_back(cm);
+                            if (!fqcl_path_.empty()) {
+                                auto cm_s = cm; cm_s.lr_score = fqcl_lr_h2;
+                                fqcl_mismatches_.push_back(cm_s);
+                            }
                         }
                     }
                     continue;  // skip the H=1 block below
@@ -1327,6 +1332,7 @@ private:
 
                 // T5.8: empirical posterior-odds for H=1.
                 bool absorb_h1;
+                float fqcl_lr_h1 = std::numeric_limits<float>::quiet_NaN();
                 if (errcor_.empirical && !errcor_.legacy_veto) {
                     auto e = build_edge(cm);
                     e.bundle_key = bundle_key_of[eff_pid];
@@ -1374,6 +1380,7 @@ private:
                                   static_cast<double>(id_count[cm.child_id] + 1));
                     S += joint_adj;
                     absorb_h1 = (S > 0.0);
+                    fqcl_lr_h1 = static_cast<float>(S);
                     // Count-based co-occurrence clamp. snp_veto's ratio test
                     // fails at hyper-cluster scale (sig must clear ~snp_threshold
                     // * inflated parent_count). When ≥K independent reads share
@@ -1423,7 +1430,10 @@ private:
                         }
                         stats.absorbed++;
                         errcor_absorbed_++;
-                        if (!fqcl_path_.empty()) fqcl_mismatches_.push_back(cm);
+                        if (!fqcl_path_.empty()) {
+                            auto cm_s = cm; cm_s.lr_score = fqcl_lr_h1;
+                            fqcl_mismatches_.push_back(cm_s);
+                        }
                     }
                 }
             }
@@ -2292,6 +2302,7 @@ private:
                     ed.to_base   = cm.alt_base;
                     ed.n_reads   = static_cast<uint32_t>(
                         cm.child_id < fqcl_parent_chain_.size() ? 1u : 1u);
+                    ed.score     = cm.lr_score;
                     rec.edges.push_back(ed);
 
                     // H=2: emit a second edit hanging off the same child node.
@@ -2929,14 +2940,14 @@ int derep_main(int argc, char** argv) {
                 log_info("Damage deamination fit: sampling first " +
                          std::to_string(damage_deam_max_reads) +
                          " reads (--damage-deam-sample 0 to scan all)");
-            auto t_dart_begin = std::chrono::steady_clock::now();
+            auto t_taph_begin = std::chrono::steady_clock::now();
             DamageEstimate est = estimate_damage_with_qc(in_path, opts);
             {
                 double s = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - t_dart_begin).count();
+                    std::chrono::steady_clock::now() - t_taph_begin).count();
                 char b[64];
                 std::snprintf(b, sizeof(b), "%.1f s", s);
-                log_info("Phase timer: Damage estimate (deamination+QC) = " + std::string(b));
+                log_info("Phase timer: taph (deamination+QC) = " + std::string(b));
             }
             profile = est.profile;
             profile.pcr_error_rate = pcr_total_rate;
