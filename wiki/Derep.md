@@ -44,8 +44,10 @@ cluster is the first occurrence.
 After Pass 1, a 4-way pigeonhole Hamming search identifies clusters with low
 count that differ from a high-count cluster by one or two interior
 substitutions (H≤2). These are absorbed as PCR copying errors. C↔T, G↔A,
-G↔T, and C↔A mismatches are never absorbed (damage-consistent). H=2
-absorption requires both mismatches to be non-damage transversions and the
+G↔T, and C↔A mismatches are never absorbed (damage-consistent). A↔T and C↔G
+transversions are eligible by default; use `--protect-transversions` to protect
+them too (recommended for high-oxidative-damage libraries). H=2 absorption
+requires both mismatches to be eligible (non-protected) transversions and the
 child count to be ≤ `--errcor-max-h2-count` (default 2). Enabled by default;
 disable with `--no-error-correct`.
 
@@ -96,7 +98,8 @@ be masked before committing to `--collapse-damage`. See [[Damage]].
 | `--errcor-max-h2-count INT` | Max child count eligible for H=2 absorption | 2 |
 | `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
 | `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 |
-| `--errcor-bucket-cap INT` | Pair-key bucket size cap | 64 |
+| `--errcor-bucket-cap INT` | Pair-key bucket size cap | 0 (unlimited) |
+| `--protect-transversions` | Protect A↔T / C↔G (Channels H/G) from absorption | off |
 | `--pcr-cycles INT` | PCR cycles for D_eff log estimate | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Amplification efficiency per cycle | 1.0 |
 | `--pcr-error-rate FLOAT` | Substitutions per base per doubling (log only) | 5.3e-7 |
