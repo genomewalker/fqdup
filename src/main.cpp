@@ -28,7 +28,7 @@ static void usage(const char* prog) {
               << "  extend      Extend merged reads via self-referential k-mer graph\n"
               << "  derep_pairs Deduplicate sorted paired-end FASTQ (structural dedup)\n"
               << "  derep       Deduplicate sorted single-file FASTQ (damage + error correction)\n"
-              << "  profile     Profile deamination damage and library QC\n"
+              << "  profile     Profile deamination damage and library QC (alias: damage)\n"
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
               << "  view        Inspect .fqcl cluster genealogy files\n"
               << "  consensus   Emit per-cluster consensus FASTQ from .fqcl\n"
@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     if (sub == "extend")      return extend_main(argc - 1, argv + 1);
     if (sub == "derep_pairs") return derep_pairs_main(argc - 1, argv + 1);
     if (sub == "derep")       return derep_main(argc - 1, argv + 1);
-    if (sub == "profile") return damage_main(argc - 1, argv + 1);
+    if (sub == "profile" || sub == "damage") return damage_main(argc - 1, argv + 1);
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
     if (sub == "view")        return view_main(argc - 1, argv + 1);
     if (sub == "consensus")   return consensus_main(argc - 1, argv + 1);
