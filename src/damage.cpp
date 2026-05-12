@@ -1357,6 +1357,7 @@ int damage_main(int argc, char** argv) {
         j << "    \"ca_stop_rate_terminal\": " << dp.ca_stop_rate_terminal << ",\n";
         j << "    \"ca_uniformity_ratio\": " << dp.ca_uniformity_ratio << ",\n";
         j << "    \"channel_f_z\": " << dp.channel_f_z << ",\n";
+        j << "    \"channel_f_applicable\": " << (!is_ss ? "true" : "false") << ",\n";
         j << "    \"ca_stop_rate_interior\": " << dp.ca_stop_rate_interior << ",\n";
         j << "    \"channel_f3_valid\": " << (dp.channel_f3_valid ? "true" : "false") << ",\n";
         j << "    \"ca_stop_rate_terminal_3prime\": " << dp.ca_stop_rate_terminal_3prime << ",\n";
@@ -1368,6 +1369,7 @@ int damage_main(int argc, char** argv) {
         j << "    \"cg_stop_rate_terminal\": " << dp.cg_stop_rate_terminal << ",\n";
         j << "    \"cg_uniformity_ratio\": " << dp.cg_uniformity_ratio << ",\n";
         j << "    \"channel_g_z\": " << dp.channel_g_z << ",\n";
+        j << "    \"channel_g_applicable\": " << (!is_ss ? "true" : "false") << ",\n";
         j << "    \"cg_stop_rate_interior\": " << dp.cg_stop_rate_interior << ",\n";
         j << "    \"channel_g3_valid\": " << (dp.channel_g3_valid ? "true" : "false") << ",\n";
         j << "    \"cg_stop_rate_terminal_3prime\": " << dp.cg_stop_rate_terminal_3prime << ",\n";
@@ -2004,6 +2006,7 @@ int damage_main(int argc, char** argv) {
             j << "      \"description\": \"C to A oxidative stop codons (TCA/TCG/TAC/TGC); bottom-strand 8-oxoguanine\",\n";
             j << "      \"mechanism\": \"oxidative_guanine_8_oxog\",\n";
             j << "      \"detected\": " << jbool(ch_f_detected) << ",\n";
+            j << "      \"applicable\": " << (!is_ss ? "true" : "false") << ",\n";
             j << "      \"valid\": " << jbool(dp.channel_f_valid) << ",\n";
             j << "      \"baseline_rate\": "; jfloat(dp.ca_stop_rate_baseline); j << ",\n";
             j << "      \"terminal_rate\": "; jfloat(dp.ca_stop_rate_terminal); j << ",\n";
@@ -2019,6 +2022,7 @@ int damage_main(int argc, char** argv) {
             j << "      \"description\": \"C to G stop codons (TCA/TAC to TGA/TAG); spiroiminodihydantoin / guanidinohydantoin\",\n";
             j << "      \"mechanism\": \"oxidative_guanine_hydantoin\",\n";
             j << "      \"detected\": " << jbool(ch_g_detected) << ",\n";
+            j << "      \"applicable\": " << (!is_ss ? "true" : "false") << ",\n";
             j << "      \"valid\": " << jbool(dp.channel_g_valid) << ",\n";
             j << "      \"baseline_rate\": "; jfloat(dp.cg_stop_rate_baseline); j << ",\n";
             j << "      \"terminal_rate\": "; jfloat(dp.cg_stop_rate_terminal); j << ",\n";
