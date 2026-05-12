@@ -88,7 +88,7 @@ FetchContent_MakeAvailable(librapidarchive)
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-    GIT_TAG        df47bb0fd5271d2bdfd5d8d487bc71536f4fa77c
+    GIT_TAG        5a553d211d3c006c4cf8ae9ad53c3021c230982f
     GIT_SHALLOW    FALSE
     UPDATE_DISCONNECTED TRUE
 )
