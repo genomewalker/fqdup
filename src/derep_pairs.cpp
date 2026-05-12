@@ -31,9 +31,14 @@ extern "C" {
 }
 #endif
 
+#include "fqdup/cluster_format.hpp"
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
+#include "fqdup/version.hpp"
 #include "flat_hash_map.hpp"
+#include <xxhash.h>
+
+namespace cf = fqdup::clusterfmt;
 
 namespace {
 
@@ -55,10 +60,26 @@ struct IndexEntry {
 // DerepPairsEngine — two-pass paired deduplication
 // ============================================================================
 
+static std::vector<std::uint8_t> pack_2bit(const std::string& seq) {
+    static const auto enc = []() {
+        std::array<std::uint8_t, 256> t{};
+        t['A'] = t['a'] = 0; t['C'] = t['c'] = 1;
+        t['G'] = t['g'] = 2; t['T'] = t['t'] = 3;
+        return t;
+    }();
+    std::uint32_t L = static_cast<std::uint32_t>(seq.size());
+    std::vector<std::uint8_t> out((L + 3) / 4, 0u);
+    for (std::uint32_t i = 0; i < L; ++i)
+        out[i >> 2] |= enc[static_cast<unsigned char>(seq[i])] << (6 - 2 * (i & 3));
+    return out;
+}
+
 class DerepPairsEngine {
 public:
-    DerepPairsEngine(bool use_revcomp, bool write_clusters, bool allow_id_mismatch = false)
+    DerepPairsEngine(bool use_revcomp, bool write_clusters,
+                     std::string fqcl_path, bool allow_id_mismatch = false)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
+          fqcl_path_(std::move(fqcl_path)),
           allow_id_mismatch_(allow_id_mismatch), total_reads_(0) {}
 
     void process(const std::string& ext_path,
@@ -89,7 +110,7 @@ public:
 
         log_info("Pass 2: Write unique records");
 
-        pass2(ext_path, non_path, out_ext_path, out_non_path, cluster_path);
+        pass2(ext_path, non_path, out_ext_path, out_non_path, cluster_path, fqcl_path_);
 
         print_stats();
     }
@@ -169,7 +190,7 @@ private:
 
     void pass2(const std::string& ext_path, const std::string& non_path,
                const std::string& out_ext_path, const std::string& out_non_path,
-               const std::string& cluster_path) {
+               const std::string& cluster_path, const std::string& fqcl_path) {
         bool compress_ext = (out_ext_path.size() > 3 &&
                              out_ext_path.substr(out_ext_path.size() - 3) == ".gz");
         bool compress_non = (out_non_path.size() > 3 &&
@@ -187,6 +208,19 @@ private:
             if (gzprintf(cluster_gz, "hash\text_len\tpair_count\tnon_len\n") < 0)
                 throw std::runtime_error("gzprintf failed while writing cluster header");
         }
+
+        // fqcl writer — optional, opened only when --cluster-format was given.
+        std::unique_ptr<cf::Writer> fqcl_writer;
+        if (!fqcl_path.empty()) {
+            cf::WriterMetadata meta;
+            meta.tool         = "fqdup-pairs";
+            meta.tool_version = FQDUP_VERSION;
+            meta.input_fastq  = non_path;
+            meta.n_input_reads = total_reads_;
+            fqcl_writer = std::make_unique<cf::Writer>(fqcl_path, std::move(meta));
+            fqcl_writer->reserve_clusters(index_.size());
+        }
+        uint64_t fqcl_cluster_id = 0;
 
         ska::flat_hash_map<uint64_t, SequenceFingerprint> records_to_write;
         records_to_write.reserve(index_.size());
@@ -207,14 +241,27 @@ private:
                 ext_writer.write(ext_rec);
                 non_writer.write(non_rec);
 
-                if (cluster_gz) {
+                if (fqcl_writer || cluster_gz) {
                     const SequenceFingerprint& fp = it->second;
                     auto ei = index_.find(fp);
                     if (ei == index_.end())
                         throw std::runtime_error(
                             "Internal error: missing fingerprint for cluster output");
                     const IndexEntry& entry = ei->second;
-                    if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\t%u\n",
+
+                    if (fqcl_writer) {
+                        cf::ClusterRecord rec;
+                        rec.cluster_id    = XXH3_64bits(non_rec.seq.data(), non_rec.seq.size());
+                        rec.n_members     = static_cast<uint32_t>(entry.count);
+                        rec.n_after_damage = rec.n_members;
+                        rec.parent_seq_len = static_cast<uint32_t>(non_rec.seq.size());
+                        rec.parent_seq    = pack_2bit(non_rec.seq);
+                        rec.flags         = 0;
+                        (void)fqcl_cluster_id++;
+                        fqcl_writer->write_cluster(rec);
+                    }
+                    if (cluster_gz &&
+                        gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\t%u\n",
                                  static_cast<unsigned long>(fp.hash_hi),
                                  static_cast<unsigned long>(fp.hash_lo),
                                  static_cast<unsigned long>(ext_rec.seq.size()),
@@ -233,6 +280,7 @@ private:
             record_idx++;
         }
 
+        if (fqcl_writer) fqcl_writer->close();
         if (cluster_gz && gzclose(cluster_gz) != Z_OK)
             throw std::runtime_error("gzclose failed writing cluster file");
         std::cerr << "\r";
@@ -262,6 +310,7 @@ private:
 
     bool use_revcomp_;
     bool write_clusters_;
+    std::string fqcl_path_;
     bool allow_id_mismatch_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
@@ -287,6 +336,7 @@ static void print_usage(const char* prog) {
         << "  -o-ext FILE  Output extended FASTQ\n"
         << "\nOptional:\n"
         << "  -c FILE             Write cluster statistics to gzipped TSV\n"
+        << "  --cluster-format F  Write cluster genealogy to .fqcl (use with derep --prior-fqcl)\n"
         << "  --no-revcomp        Disable reverse-complement matching (default: enabled)\n"
         << "  --allow-id-mismatch Warn instead of failing on read ID mismatches\n"
         << "  -h, --help          Show this help\n"
@@ -299,7 +349,7 @@ int derep_pairs_main(int argc, char** argv) {
         return 1;
     }
 
-    std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path;
+    std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path, fqcl_path;
     bool use_revcomp = true;
     bool allow_id_mismatch = false;
 
@@ -318,6 +368,8 @@ int derep_pairs_main(int argc, char** argv) {
             out_non_path = argv[++i];
         } else if (arg == "-c" && i + 1 < argc) {
             cluster_path = argv[++i];
+        } else if (arg == "--cluster-format" && i + 1 < argc) {
+            fqcl_path = argv[++i];
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
         } else if (arg == "--allow-id-mismatch") {
@@ -345,7 +397,9 @@ int derep_pairs_main(int argc, char** argv) {
         log_info("ID mismatch handling: warn (--allow-id-mismatch)");
 
     try {
-        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), allow_id_mismatch);
+        if (!fqcl_path.empty())
+            log_info("Cluster fqcl output: " + fqcl_path);
+        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), fqcl_path, allow_id_mismatch);
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
