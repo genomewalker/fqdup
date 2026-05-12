@@ -278,8 +278,9 @@ Required:
   -o-ext FILE  Output extended FASTQ (representatives)
 
 Optional:
-  -c FILE        Cluster statistics (gzipped TSV)
-  --no-revcomp   Disable reverse-complement collapsing (default: enabled)
+  -c FILE              Cluster statistics (gzipped TSV)
+  --cluster-format FILE  Write a .fqcl cluster genealogy file (wire format v3)
+  --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```
 
 Representative selection: pair with the longest merged read.
@@ -324,6 +325,11 @@ required.
 #### PCR error correction: Phase 3 (default: on)
 
 ```
+  --cluster-format FILE        Write a .fqcl cluster genealogy file (wire format v3)
+  --prior-fqcl FILE            Load cluster_id→n_members from a derep_pairs .fqcl to
+                               weight Phase 3 LR count-ratio tests (recommended when
+                               using the cascade workflow; see below)
+
   --no-error-correct           Disable Phase 3
   --error-correct              Explicitly enable (already default)
   --errcor-min-parent    INT   Min count to index as parent (default: 3)
@@ -365,6 +371,50 @@ required.
 | `hash` | 128-bit XXH3 canonical hash (32 hex chars) |
 | `seq_len` | Sequence length of the representative |
 | `count` | Number of reads in the cluster |
+
+### `.fqcl` cluster genealogy format (wire format v3)
+
+Both `derep_pairs --cluster-format` and `derep --cluster-format` can emit a binary
+`.fqcl` file recording the full cluster genealogy. Each cluster stores:
+
+- **nodes** — the root (parent) and all absorbed reads in BFS order
+- **edges** — one entry per absorption with `{from, to, pos, ref, alt, n_reads,
+  damage_like, score, score_evaluated}`, where `score` is the log-odds LR from the
+  empirical model (NaN when not evaluated)
+
+View a `.fqcl` file with:
+
+```bash
+fqdup view clusters.fqcl               # terminal summary
+fqdup view clusters.fqcl --html out.html  # self-contained HTML visualiser
+```
+
+### Cascade workflow (`derep_pairs` → `derep`)
+
+For the best error-correction quality, run `derep_pairs` first and pass its genealogy
+to `derep` via `--prior-fqcl`. This seeds Phase 3 count-ratio weights from the
+pair-level cluster sizes, preventing over-aggressive merging of independently
+captured molecules:
+
+```bash
+# Step 1 — pair-aware dedup
+fqdup derep_pairs \
+  -n sorted.fq.gz -e extended.sorted.fq.gz \
+  -o-non derep_pairs.fq.gz -o-ext derep_pairs_ext.fq.gz \
+  --cluster-format derep_pairs.fqcl
+
+# Step 2 — damage-aware error correction seeded by pair priors
+fqdup sort -i derep_pairs.fq.gz -o derep_pairs.sorted.fq.gz --max-memory 8G
+fqdup derep \
+  -i derep_pairs.sorted.fq.gz \
+  -o final.fq.gz \
+  --cluster-format final.fqcl \
+  --prior-fqcl derep_pairs.fqcl
+```
+
+The `--prior-fqcl` option has no effect when the input was not produced by
+`derep_pairs --cluster-format`; it is safe to omit for single-end or pre-merged
+libraries.
 
 ---
 
