@@ -626,9 +626,6 @@ void emit_html_static(cf::Reader& rd, const std::string& path,
 <head>
 <meta charset="utf-8">
 <title>fqcl · cluster genealogy</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 )";
     out << fqdup_html::CSS;
@@ -721,10 +718,10 @@ void emit_html_static(cf::Reader& rd, const std::string& path,
     }
     out << "\n  }\n};\n</script>\n";
 
-    // d3 + viz
-    out << R"(<script src="https://d3js.org/d3.v7.min.js"></script>
-<script>
-)";
+    // d3 + viz — both inlined, no external requests
+    out << "<script>\n";
+    out << fqdup_html::D3_JS;
+    out << "\n</script>\n<script>\n";
     out << fqdup_html::JS;
     out << "\n</script>\n</body>\n</html>\n";
 }

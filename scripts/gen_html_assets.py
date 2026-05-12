@@ -6,10 +6,12 @@ _here = os.path.dirname(os.path.abspath(__file__))
 _src  = os.path.join(_here, '..', 'src')
 css_path = os.path.join(_src, 'fqcl_viz.css')
 js_path  = os.path.join(_src, 'fqcl_viz.js')
-out_path = '/maps/projects/fernandezguerra/apps/repos/fqdup/src/view_html_assets.hpp'
+d3_path  = os.path.join(_src, 'd3.v7.min.js')
+out_path = os.path.join(_src, 'view_html_assets.hpp')
 
 css = open(css_path).read()
 js  = open(js_path).read()
+d3  = open(d3_path).read()
 
 def make_raw(content, varname):
     for delim in ['ASSET', 'FQDUP_ASSET', 'FQDUP_HTML_ASSET', 'RAWDELIM']:
@@ -23,6 +25,8 @@ with open(out_path, 'w') as f:
     f.write('#include <string_view>\n\n')
     f.write('namespace fqdup_html {\n\n')
     f.write(make_raw(css, 'CSS'))
+    f.write('\n')
+    f.write(make_raw(d3, 'D3_JS'))
     f.write('\n')
     f.write(make_raw(js, 'JS'))
     f.write('\n} // namespace fqdup_html\n')
