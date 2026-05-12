@@ -1515,6 +1515,34 @@ private:
                 log_info("Phase B3: running (n_elig=" + std::to_string(b3_n_elig) +
                          " mass=" + std::to_string(b3_mass) +
                          " d_max_avg=" + std::to_string(dmax_avg) + ")");
+                // Cross-bundle veto map: (pos_abs*4 + base) → count of distinct
+                // bundle_keys that carry that (position, base) combination at a
+                // damage-eligible interior position. If ≥2 independent loci share
+                // the same mismatch, it is a real SNP, not PCR deamination noise.
+                ska::flat_hash_map<uint32_t, uint32_t> b3_bundle_veto;
+                {
+                    ska::flat_hash_map<uint32_t, ska::flat_hash_set<uint64_t>> key_to_bundles;
+                    for (uint32_t id = 0; id < N; ++id) {
+                        if (is_error_[id]) continue;
+                        if (!arena_.is_eligible(id)) continue;
+                        int L = arena_.length(id);
+                        const auto& lay = get_layout(L);
+                        if (lay.ilen < kMinInteriorLen) continue;
+                        const uint8_t* data = arena_.data(id);
+                        uint64_t bkey = bundle_key_of[id];
+                        for (int ip = 0; ip < lay.ilen; ++ip) {
+                            int pos_abs = lay.k5 + ip;
+                            if (profile_.p_damage_at(pos_abs, L) < static_cast<double>(errcor_.b3_deam_threshold))
+                                continue;
+                            uint8_t base = (data[pos_abs >> 2] >> (6 - 2 * (pos_abs & 3))) & 0x3u;
+                            uint32_t key = static_cast<uint32_t>(pos_abs) * 4u + base;
+                            key_to_bundles[key].insert(bkey);
+                        }
+                    }
+                    b3_bundle_veto.reserve(key_to_bundles.size());
+                    for (const auto& [k, bset] : key_to_bundles)
+                        b3_bundle_veto[k] = static_cast<uint32_t>(bset.size());
+                }
                 // Build K_deam buckets.
                 ska::flat_hash_map<uint64_t, std::vector<uint32_t>> b3_buckets;
                 b3_buckets.reserve(N / 2);
@@ -1579,8 +1607,25 @@ private:
                                     diffs, layp.k5, Lp, profile_,
                                     errcor_.b3_deam_threshold))
                                 continue;
+                            // Cross-bundle veto: if any diff position+base is seen
+                            // in ≥2 independent bundle_keys it is a real SNP, not
+                            // a PCR deamination artifact — block absorption.
+                            {
+                                bool cross_veto = false;
+                                for (int di = 0; di < diffs.count && !cross_veto; ++di) {
+                                    uint32_t key = static_cast<uint32_t>(layp.k5 + diffs.pos[di]) * 4u
+                                                   + diffs.base_c[di];
+                                    auto it = b3_bundle_veto.find(key);
+                                    if (it != b3_bundle_veto.end() && it->second >= 2)
+                                        cross_veto = true;
+                                }
+                                if (cross_veto) {
+                                    ++stats.b3_cross_bundle_protected;
+                                    continue;
+                                }
+                            }
                             double lrt = fqdup::b3::b3_count_lrt(
-                                cp, cc, errcor_.lrt_f0, errcor_.lrt_f1);
+                                cp, cc, diffs.count, errcor_.lrt_f0, errcor_.lrt_f1);
                             if (lrt <= std::log(errcor_.lrt_T)) {
                                 ++stats.b3_protected;
                                 continue;
@@ -1600,13 +1645,32 @@ private:
                                 }
                                 ++stats.b3_absorbed;
                                 ++errcor_absorbed_;
+                                if (!fqcl_path_.empty()) {
+                                    ChildMismatch cm_b3{};
+                                    cm_b3.parent_id  = eff_pid;
+                                    cm_b3.child_id   = cid;
+                                    cm_b3.hamming    = static_cast<uint8_t>(diffs.count);
+                                    cm_b3.lr_score   = std::numeric_limits<float>::quiet_NaN();
+                                    if (diffs.count >= 1) {
+                                        cm_b3.mismatch_pos = static_cast<uint16_t>(layp.k5 + diffs.pos[0]);
+                                        cm_b3.alt_base     = diffs.base_c[0];
+                                        cm_b3.parent_base  = diffs.base_p[0];
+                                    }
+                                    if (diffs.count >= 2) {
+                                        cm_b3.mismatch_pos2 = static_cast<uint16_t>(layp.k5 + diffs.pos[1]);
+                                        cm_b3.alt_base2     = diffs.base_c[1];
+                                        cm_b3.parent_base2  = diffs.base_p[1];
+                                    }
+                                    fqcl_mismatches_.push_back(cm_b3);
+                                }
                             }
                         }
                     }
                 }
                 log_info("Phase B3: candidates=" + std::to_string(stats.b3_candidates) +
                          " absorbed=" + std::to_string(stats.b3_absorbed) +
-                         " protected=" + std::to_string(stats.b3_protected));
+                         " protected=" + std::to_string(stats.b3_protected) +
+                         " cross_bundle_protected=" + std::to_string(stats.b3_cross_bundle_protected));
             }
         }
 

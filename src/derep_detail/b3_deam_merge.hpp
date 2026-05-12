@@ -117,10 +117,18 @@ inline uint64_t kdamage_hash(const uint8_t* arena_packed, int k5, int ilen, int 
     return h ^ (static_cast<uint64_t>(static_cast<uint16_t>(ilen)) << 48);
 }
 
-// Count-based LRT identical to interior_transition_lrt — reused for B3.
+// Count-based LRT for B3 multi-diff absorptions.
+// Each of the n_diffs deamination-consistent mismatches requires an independent
+// PCR error event under H0. The base LRT (count ratio) is penalised by
+// (n_diffs-1)*log(f0/f1) per extra diff — log(f0/f1)<0 so each additional diff
+// raises the count-ratio bar required for absorption.
 inline double b3_count_lrt(uint64_t n_parent, uint64_t n_child,
+                            int n_diffs,
                             double f0, double f1) {
-    return fqdup::derep_detail::interior_transition_lrt(n_parent, n_child, f0, f1);
+    double base = fqdup::derep_detail::interior_transition_lrt(n_parent, n_child, f0, f1);
+    if (n_diffs > 1)
+        base += (n_diffs - 1) * std::log(f0 / f1);
+    return base;
 }
 
 }  // namespace fqdup::b3

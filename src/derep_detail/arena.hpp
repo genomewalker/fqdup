@@ -152,9 +152,10 @@ struct Phase3Stats {
     uint64_t rescue_protected         = 0;        // S ≤ 0
     std::array<uint64_t, 6> rescue_absorbed_by_occ{};
     // Phase B3 counters.
-    uint64_t b3_candidates  = 0;
-    uint64_t b3_absorbed    = 0;
-    uint64_t b3_protected   = 0;
+    uint64_t b3_candidates             = 0;
+    uint64_t b3_absorbed               = 0;
+    uint64_t b3_protected              = 0;
+    uint64_t b3_cross_bundle_protected = 0;
     void log() const {
         auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
         log_info("Phase 3 timing:");
