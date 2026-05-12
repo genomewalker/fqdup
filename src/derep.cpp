@@ -73,6 +73,8 @@ extern "C" {
 
 // All file-local types are in an anonymous namespace to give their member
 // functions internal linkage, avoiding ODR violations with other TUs.
+namespace cf = fqdup::clusterfmt;
+
 namespace {
 
 using namespace fqdup::derep_detail;
@@ -91,7 +93,8 @@ public:
                 std::string fqcl_path = "",
                 std::string input_fastq = "",
                 std::string qc_json = "",
-                std::string library_type_resolved = "auto")
+                std::string library_type_resolved = "auto",
+                std::string prior_fqcl_path = "")
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           profile_(profile), errcor_(errcor),
           bucket_cap_explicit_(bucket_cap_explicit),
@@ -99,6 +102,7 @@ public:
           fqcl_input_fastq_(std::move(input_fastq)),
           qc_json_(std::move(qc_json)),
           library_type_resolved_(std::move(library_type_resolved)),
+          prior_fqcl_path_(std::move(prior_fqcl_path)),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     void process(const std::string& in_path,
@@ -113,6 +117,7 @@ public:
         };
 
         log_info("=== Two-pass single-file deduplication ===");
+        if (!prior_fqcl_path_.empty()) load_prior_fqcl(prior_fqcl_path_);
         log_info("Pass 1: Build lightweight index");
         log_info("Decompression: " + std::string(
 #ifdef HAVE_RAPIDGZIP
@@ -263,6 +268,19 @@ private:
         return static_cast<uint8_t>(std::min(score, 255));
     }
 
+    void load_prior_fqcl(const std::string& path) {
+        cf::Reader rdr(path);
+        prior_counts_.reserve(rdr.n_clusters());
+        cf::ClusterRecord rec;
+        for (std::uint64_t i = 0; i < rdr.n_clusters(); ++i) {
+            rdr.read_cluster(i, rec);
+            if (rec.n_members > 1)
+                prior_counts_[rec.cluster_id] = rec.n_members;
+        }
+        log_info("Prior fqcl loaded: " + std::to_string(rdr.n_clusters()) +
+                 " clusters, " + std::to_string(prior_counts_.size()) + " with count > 1");
+    }
+
     void pass1(const std::string& in_path) {
         // Pre-reserve hash map + arenas based on input file size. Without this,
         // ska::flat_hash_map (max_load_factor=0.5) regrows ~26 times to reach
@@ -318,6 +336,13 @@ private:
 
             auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
             if (inserted) {
+                // Seed count from derep_pairs prior when available.
+                if (!prior_counts_.empty()) {
+                    uint64_t h = XXH3_64bits(rec.seq.data(), rec.seq.size());
+                    auto pit = prior_counts_.find(h);
+                    if (pit != prior_counts_.end())
+                        it->second.count = pit->second;
+                }
                 if (profile_.enabled)
                     it->second.damage_score = compute_damage_score(rec.seq, profile_);
                 if (errcor_.enabled) {
@@ -2533,6 +2558,11 @@ private:
     uint64_t errcor_absorbed_;
     size_t   n_unique_clusters_;  // saved before index_ is freed in pass2
 
+    // Prior counts from a preceding derep_pairs --cluster-format run.
+    // Maps XXH3_64(raw_seq) → n_members so Phase 1 seeds the correct count.
+    std::string prior_fqcl_path_;
+    ska::flat_hash_map<uint64_t, uint32_t> prior_counts_;
+
     // Loss counters surfaced into .fqcl metadata (T1.3, T1.2, T3.1).
     uint64_t loss_bucket_overflow_drops_   = 0;
     uint64_t loss_short_interior_skipped_  = 0;
@@ -2560,6 +2590,8 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "\nOutput:\n"
         << "  -c FILE              Cluster statistics (gzipped TSV)\n"
         << "  --cluster-format F   Write .fqcl genealogy (requires error correction)\n"
+        << "  --prior-fqcl F       Load cluster counts from a derep_pairs --cluster-format output;\n"
+        << "                       seeds Phase 3 count weights for correct PCR-error scoring\n"
         << "\nCore:\n"
         << "  --no-revcomp         Disable reverse-complement matching\n"
         << "  --no-error-correct   Disable PCR error correction (Phase 3, ON by default)\n"
@@ -2632,7 +2664,7 @@ int derep_main(int argc, char** argv) {
         return 1;
     }
 
-    std::string in_path, out_path, cluster_path, fqcl_path;
+    std::string in_path, out_path, cluster_path, fqcl_path, prior_fqcl_path;
     bool use_revcomp = true;
 
     ErrCorParams errcor;
@@ -2676,6 +2708,8 @@ int derep_main(int argc, char** argv) {
             out_path = argv[++i];
         } else if (arg == "-c" && i + 1 < argc) {
             cluster_path = argv[++i];
+        } else if (arg == "--prior-fqcl" && i + 1 < argc) {
+            prior_fqcl_path = argv[++i];
         } else if (arg == "--cluster-format" && i + 1 < argc) {
             fqcl_path = argv[++i];
         } else if (arg == "--no-revcomp") {
@@ -3039,9 +3073,11 @@ int derep_main(int argc, char** argv) {
             library_type_str = profile.ss_mode ? "ss" : "ds";
         }
 
+        if (!prior_fqcl_path.empty())
+            log_info("Prior fqcl: " + prior_fqcl_path);
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
                            false, bucket_cap_explicit, fqcl_path, in_path,
-                           std::move(qc_json), library_type_str);
+                           std::move(qc_json), library_type_str, prior_fqcl_path);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
