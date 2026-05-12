@@ -226,866 +226,565 @@ static const char D3_JS[] = R"ASSET(
 )ASSET";
 
 static const char JS[] = R"ASSET(
-// fqcl-viz v4 — cluster-genealogy specimen sheet
-// Layout: parent-axis evidence tracks (left) + tidy depth tree (right) + grouped edge ledger + evidence
+// fqcl-viz v5 — cluster genealogy visualizer
+// Fonts: system stack only (no IBM Plex Mono or other web fonts)
 
+const MONO = "ui-monospace, 'Cascadia Mono', 'Segoe UI Mono', 'Liberation Mono', monospace";
 const TRANSITIONS = new Set(['CT','TC','AG','GA']);
-const CLASS_COLOR = {
-  damage: '#d97757', transition: '#4a8db8', transversion: '#b88a3a',
-  ins: '#6b9a5a', del: '#8a6ba0', seqerr: '#a39e8c'
+const DAMAGE_MASK = 5;
+
+const COL_HEX = {
+  damage:      '#d97757',
+  transition:  '#4a8db8',
+  transversion:'#b88a3a',
+  ins:         '#6b9a5a',
+  del:         '#8a6ba0',
+  seqerr:      '#a39e8c'
 };
 const CLASS_ORDER = ['damage','transition','transversion','ins','del','seqerr'];
-const AGG_THRESHOLD = 120;
+const CLASS_LABEL = {
+  damage: 'Damage (C→T/G→A)', transition: 'Transition', transversion: 'Transversion',
+  ins: 'Insertion', del: 'Deletion', seqerr: 'Seq error'
+};
 
-const tip = document.getElementById('tooltip');
-function showTip(html, ev) {
-  tip.innerHTML = html;
-  tip.classList.add('show'); moveTip(ev);
-}
-function moveTip(ev) {
-  const w = tip.offsetWidth, h = tip.offsetHeight;
-  tip.style.left = Math.min(window.innerWidth - w - 8, ev.clientX + 12) + 'px';
-  tip.style.top = Math.min(window.innerHeight - h - 8, ev.clientY + 12) + 'px';
-}
-function hideTip() { tip.classList.remove('show'); }
-
-const fmtInt = n => n.toLocaleString();
-const fmtPct = n => (n*100).toFixed(1) + '%';
-
-async function loadJSON(p) {
-  if (window.FQCL_DATA) {
-    const key = p.replace(/^data\//, '').replace(/\.json$/, '');
-    if (key === 'header') return window.FQCL_DATA.header;
-    if (key === 'top_members') return window.FQCL_DATA.top_members;
-    const m = key.match(/^cluster_(\d+)$/);
-    if (m && window.FQCL_DATA.clusters[m[1]]) return window.FQCL_DATA.clusters[m[1]];
-    throw new Error(`cluster ${key} not embedded in static HTML`);
-  }
-  const r = await fetch(p);
-  if (!r.ok) throw new Error(`${p} → ${r.status}`);
-  return r.json();
-}
-
-function classifyEdge(e, mask5, mask3, parentLen) {
-  if (e.kind === 'ins' || e.n_ins > 0) return 'ins';
-  if (e.kind === 'del' || e.n_del > 0) return 'del';
+// ── edge classification ────────────────────────────────────────────────────
+function classifyEdge(e) {
   if (e.damage_like) return 'damage';
-  if (mask5 > 0 && e.pos < mask5 && (e.ref+e.alt === 'CT')) return 'damage';
-  if (mask3 > 0 && e.pos >= parentLen - mask3 && (e.ref+e.alt === 'GA')) return 'damage';
   if (TRANSITIONS.has(e.ref + e.alt)) return 'transition';
   return 'transversion';
 }
-function terminalZone(pos, parentLen, mask5, mask3) {
-  const m5 = mask5 || 5, m3 = mask3 || 5;
-  if (pos < m5) return "5'";
-  if (pos >= parentLen - m3) return "3'";
+function termZone(pos, L) {
+  if (pos < DAMAGE_MASK) return "5'";
+  if (pos >= L - DAMAGE_MASK) return "3'";
   return 'int';
 }
 
-// ---------- topbar ----------
-function renderTopbar(header) {
-  const m = header.fqcl.metadata;
-  const dedup = (1 - m.n_clusters / m.n_input_reads) * 100;
-  document.getElementById('ds-meta').innerHTML = `
-    <div class="kv"><span class="k">tool</span><span class="v">${m.tool} v${m.tool_version}</span></div>
-    <div class="kv"><span class="k">input reads</span><span class="v">${fmtInt(m.n_input_reads)}</span></div>
-    <div class="kv"><span class="k">clusters</span><span class="v">${fmtInt(m.n_clusters)}</span></div>
-    <div class="kv"><span class="k">dedup</span><span class="v">${dedup.toFixed(2)}%</span></div>
-    <div class="kv"><span class="k">library</span><span class="v">${m.library_type}</span></div>
-    <div class="kv"><span class="k">mask 5'/3'</span><span class="v">${m.damage.mask_pos_5}/${m.damage.mask_pos_3}</span></div>
-  `;
+// ── tooltip ────────────────────────────────────────────────────────────────
+const tip = document.getElementById('tooltip');
+function showTip(html, ev) {
+  tip.innerHTML = html;
+  tip.classList.add('show');
+  moveTip(ev);
 }
-
-// ---------- nav ----------
-let navItems = [];
-let activeId = null;
-function renderNav(items) {
-  navItems = items;
-  document.getElementById('nav-count').textContent = `${items.length}`;
-  applyFilter('');
+function moveTip(ev) {
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, ev.clientX + 14) + 'px';
+  tip.style.top  = Math.min(window.innerHeight - h - 8, ev.clientY + 14) + 'px';
 }
-function applyFilter(q) {
-  const list = document.getElementById('nav-list');
-  list.innerHTML = '';
-  const filtered = q ? navItems.filter(x => x.id.toString().includes(q)) : navItems;
-  for (const it of filtered) {
-    const div = document.createElement('div');
-    div.className = 'nav-item' + (it.id === activeId ? ' active' : '');
-    div.innerHTML = `<span class="id">#${it.id}</span><span class="n">${fmtInt(it.n_members)}</span>`;
-    div.onclick = () => loadCluster(it.id);
-    list.appendChild(div);
-  }
-}
-function renderSizeHist(items) {
-  const counts = items.map(x => x.n_members).sort((a,b)=>a-b);
-  const w = 216, h = 60, pad = 4;
-  const max = counts[counts.length-1] || 1;
-  const min = counts[0] || 1;
-  const bins = 24;
-  const logMin = Math.log10(Math.max(1, min));
-  const logMax = Math.log10(Math.max(2, max));
-  const edges = d3.range(bins+1).map(i => Math.pow(10, logMin + (logMax-logMin)*i/bins));
-  const counts2 = new Array(bins).fill(0);
-  for (const c of counts) {
-    let i = 0;
-    while (i < bins && c > edges[i+1]) i++;
-    counts2[Math.min(i, bins-1)]++;
-  }
-  const maxBin = Math.max(...counts2);
-  const svg = d3.select('#size-hist').html('').append('svg').attr('width', w).attr('height', h);
-  const bw = (w - 2*pad) / bins;
-  svg.selectAll('rect').data(counts2).enter().append('rect')
-    .attr('x', (_,i) => pad + i*bw + 0.5)
-    .attr('y', d => h - 12 - (d/maxBin) * (h - 18))
-    .attr('width', bw - 1)
-    .attr('height', d => (d/maxBin) * (h - 18))
-    .attr('fill', 'var(--ink-muted)');
-  svg.append('text').attr('x', pad).attr('y', h-2).attr('font-size', 9).attr('fill','var(--ink-faint)').attr('font-family','IBM Plex Mono').text('size →');
-  svg.append('text').attr('x', w-pad).attr('y', h-2).attr('font-size', 9).attr('text-anchor','end').attr('fill','var(--ink-faint)').attr('font-family','IBM Plex Mono').text(fmtInt(max));
-}
-
-// ---------- cluster header ----------
-function renderClusterHead(c, header) {
-  document.getElementById('cluster-id').textContent = '#' + c.cluster_id;
-  const dedupRatio = c.n_members > 0 ? (1 - 1/c.n_members) * 100 : 0;
-  document.getElementById('cluster-stats').innerHTML = `
-    <div class="kv"><span class="k">members</span><span class="v">${fmtInt(c.n_members)}</span></div>
-    <div class="kv"><span class="k">edges</span><span class="v">${fmtInt(c.n_edges)}</span></div>
-    <div class="kv"><span class="k">parent len</span><span class="v">${c.parent_len} bp</span></div>
-    <div class="kv"><span class="k">collapse</span><span class="v">${dedupRatio.toFixed(1)}%</span></div>
-  `;
-  // QC chips from header (damage + library + flags)
-  const m = header.fqcl.metadata;
-  const d = m.damage || {};
-  const chips = [];
-  if (d.d_max_5 > 0 || d.d_max_3 > 0) {
-    chips.push(`<span class="qc-chip">d5=${(d.d_max_5||0).toFixed(3)}</span>`);
-    chips.push(`<span class="qc-chip">d3=${(d.d_max_3||0).toFixed(3)}</span>`);
-  } else {
-    chips.push(`<span class="qc-chip">no taph fit</span>`);
-  }
-  if (d.library_type_detected) chips.push(`<span class="qc-chip">lib=${d.library_type_detected}</span>`);
-  else if (m.library_type) chips.push(`<span class="qc-chip">lib=${m.library_type}</span>`);
-  if (d.preservation_label) chips.push(`<span class="qc-chip">${d.preservation_label}</span>`);
-  if (d.authenticity_eff != null) chips.push(`<span class="qc-chip">auth=${d.authenticity_eff.toFixed(2)}</span>`);
-  if (d.p_damage_signal != null) chips.push(`<span class="qc-chip">p_dmg=${d.p_damage_signal.toFixed(2)}</span>`);
-  if (m.errcor && m.errcor.snp_threshold) chips.push(`<span class="qc-chip">θ=${m.errcor.snp_threshold}</span>`);
-  if (d.qc_flags && Array.isArray(d.qc_flags)) {
-    for (const f of d.qc_flags) chips.push(`<span class="qc-chip warn">${f}</span>`);
-  }
-  if (m.loss_counters && m.loss_counters.bucket_overflow_drops > 0)
-    chips.push(`<span class="qc-chip warn">bucket-overflow ${m.loss_counters.bucket_overflow_drops}</span>`);
-  document.getElementById('qc-chips').innerHTML = chips.join('');
-}
-
-// ---------- selected lineage state ----------
-let selectedNodeId = null; // tree node id (not 0) currently selected
-function lineagePath(c, nodeId) {
-  // path from root → node, returning the list of edges along the way
-  const edgeByChild = {};
-  for (const e of c.edges) edgeByChild[e.to] = edgeByChild[e.to] || e;
-  const parentOf = {};
-  for (const n of c.nodes) parentOf[n.id] = n.parent;
-  const path = [];
-  let cur = nodeId;
-  while (cur != null && cur !== 0) {
-    const e = edgeByChild[cur];
-    if (e) path.push(e);
-    cur = parentOf[cur];
-  }
-  return path.reverse();
-}
-
-// ---------- parent panel (3 tracks + bases) ----------
-function renderParent(c, header) {
-  const m = header.fqcl.metadata;
-  const mask5 = m.damage.mask_pos_5 || 0;
-  const mask3 = m.damage.mask_pos_3 || 0;
-  const L = c.parent_len;
-  const W = document.getElementById('parent-tracks').clientWidth - 70;
-  const px = i => (i / L) * (W - 4) + 2;
-
-  // Aggregate: per-position edge counts split by class
-  const perPos = d3.range(L).map(_ => ({coverage: 0, ct5: 0, ga3: 0, total: 0, classes: {}}));
-  for (const e of c.edges) {
-    if (e.pos == null || e.pos < 0 || e.pos >= L) continue;
-    perPos[e.pos].total += e.n_reads || 1;
-    const cls = classifyEdge(e, mask5, mask3, L);
-    perPos[e.pos].classes[cls] = (perPos[e.pos].classes[cls] || 0) + (e.n_reads || 1);
-    if ((e.ref + e.alt) === 'CT' && e.pos < Math.max(mask5, 15)) perPos[e.pos].ct5 += e.n_reads || 1;
-    if ((e.ref + e.alt) === 'GA' && e.pos >= L - Math.max(mask3, 15)) perPos[e.pos].ga3 += e.n_reads || 1;
-  }
-  const maxTotal = d3.max(perPos, d => d.total) || 1;
-  const maxDmg = d3.max(perPos, d => d.ct5 + d.ga3) || 1;
-
-  const root = d3.select('#parent-tracks').html('');
-
-  function track(label, h) {
-    const row = root.append('div').attr('class', 'track-row');
-    row.append('div').attr('class', 'track-label').text(label);
-    return row.append('svg').attr('class','track-svg').attr('width', W).attr('height', h);
-  }
-
-  // Track 1: bases — always show, scrollable when long. Mutation positions
-  // for the selected lineage (or all edges if none selected) are highlighted.
-  const CH = 9; // char pitch px (readable)
-  const baseW = Math.max(W, L * CH);
-  const lineEdges = selectedNodeId != null ? lineagePath(c, selectedNodeId) : [];
-  const lineageMut = new Map(); // pos → alt
-  for (const e of lineEdges) lineageMut.set(e.pos, e);
-
-  const baseRow = root.append('div').attr('class', 'track-row');
-  baseRow.append('div').attr('class','track-label').text('bases');
-  const baseScroll = baseRow.append('div').style('overflow-x', L * CH > W ? 'auto' : 'hidden').style('width', '100%');
-  const sBase = baseScroll.append('svg').attr('width', baseW).attr('height', 22);
-  for (let i = 0; i < L; i++) {
-    const b = c.parent_seq[i];
-    const col = {A:'#4a8db8', C:'#b4513a', G:'#6b9a5a', T:'#b88a3a'}[b] || '#a39e8c';
-    sBase.append('text').attr('x', i * CH + CH/2).attr('y', 12)
-      .attr('text-anchor','middle').attr('font-family','IBM Plex Mono')
-      .attr('font-size', 11).attr('fill', col).text(b);
-    if (lineageMut.has(i)) {
-      const e = lineageMut.get(i);
-      sBase.append('rect').attr('x', i * CH).attr('y', 0).attr('width', CH).attr('height', 22)
-        .attr('fill', CLASS_COLOR[classifyEdge(e, mask5, mask3, L)]).attr('opacity', 0.18);
-      sBase.append('text').attr('x', i * CH + CH/2).attr('y', 21)
-        .attr('text-anchor','middle').attr('font-family','IBM Plex Mono')
-        .attr('font-size', 10).attr('font-weight', 600).attr('fill', CLASS_COLOR[classifyEdge(e, mask5, mask3, L)]).text(e.alt);
-    }
-  }
-  // selection summary
-  if (selectedNodeId != null) {
-    const sub = root.append('div').style('font-family','IBM Plex Mono').style('font-size','11px')
-      .style('color','var(--ink-muted)').style('padding','2px 0 6px 70px');
-    const node = c.nodes.find(n => n.id === selectedNodeId);
-    const members = node && node.n_reads != null ? node.n_reads : '?';
-    sub.html(`selected node <b style="color:var(--accent)">#${selectedNodeId}</b> · ${lineEdges.length} mutation${lineEdges.length===1?'':'s'} from parent · n_reads=${members} · <span style="cursor:pointer;text-decoration:underline" id="clear-sel">clear</span>`);
-    sub.select('#clear-sel').on('click', () => { selectedNodeId = null; loadCluster(activeId); });
-  }
-
-  // Track 2: coverage (per-pos edge support log-scaled)
-  const sCov = track('edge load', 28);
-  // Mask zone bands first
-  if (mask5 > 0)
-    sCov.append('rect').attr('x', 0).attr('y', 0).attr('width', px(mask5)).attr('height', 28).attr('fill','var(--c-mask)');
-  if (mask3 > 0)
-    sCov.append('rect').attr('x', px(L - mask3)).attr('y', 0).attr('width', W - px(L - mask3)).attr('height', 28).attr('fill','var(--c-mask)');
-  const bwc = Math.max(1, W / L);
-  perPos.forEach((d, i) => {
-    if (d.total === 0) return;
-    const stacks = CLASS_ORDER.filter(k => d.classes[k]);
-    let yOff = 28;
-    for (const k of stacks) {
-      const fr = d.classes[k] / maxTotal;
-      const hh = fr * 26;
-      yOff -= hh;
-      sCov.append('rect').attr('x', px(i)).attr('y', yOff).attr('width', bwc).attr('height', hh).attr('fill', CLASS_COLOR[k]);
-    }
-  });
-
-  // Track 3: damage (C->T 5', G->A 3' only; lollipop)
-  const sDmg = track('damage', 28);
-  if (mask5 > 0)
-    sDmg.append('rect').attr('x', 0).attr('y', 0).attr('width', px(mask5)).attr('height', 28).attr('fill','var(--c-mask)');
-  if (mask3 > 0)
-    sDmg.append('rect').attr('x', px(L - mask3)).attr('y', 0).attr('width', W - px(L - mask3)).attr('height', 28).attr('fill','var(--c-mask)');
-  perPos.forEach((d, i) => {
-    if (d.ct5 + d.ga3 === 0) return;
-    const sum = d.ct5 + d.ga3;
-    const hh = (sum / Math.max(1, maxDmg)) * 24;
-    sDmg.append('line').attr('x1', px(i) + bwc/2).attr('x2', px(i) + bwc/2)
-      .attr('y1', 28).attr('y2', 28 - hh)
-      .attr('stroke', d.ct5 > d.ga3 ? CLASS_COLOR.damage : '#a06b3a').attr('stroke-width', Math.max(1, bwc-0.5));
-    sDmg.append('circle').attr('cx', px(i) + bwc/2).attr('cy', 28 - hh).attr('r', 1.6).attr('fill', d.ct5 > d.ga3 ? CLASS_COLOR.damage : '#a06b3a');
-  });
-
-  // Track 4: position ruler
-  const sRule = track('', 14);
-  const ticks = [0, Math.floor(L/4), Math.floor(L/2), Math.floor(3*L/4), L-1];
-  for (const t of ticks) {
-    sRule.append('line').attr('x1', px(t)).attr('x2', px(t)).attr('y1', 0).attr('y2', 4).attr('stroke','var(--ink-faint)');
-    sRule.append('text').attr('x', px(t)).attr('y', 12).attr('text-anchor','middle')
-      .attr('font-size', 9).attr('font-family','IBM Plex Mono').attr('fill','var(--ink-faint)').text(t);
-  }
-}
-
-// ---------- class breakdown (stacked bar + legend) ----------
-function renderClassBar(c, header) {
-  const m = header.fqcl.metadata;
-  const mask5 = m.damage.mask_pos_5 || 0, mask3 = m.damage.mask_pos_3 || 0;
-  const counts = {};
-  for (const e of c.edges) {
-    const cls = classifyEdge(e, mask5, mask3, c.parent_len);
-    counts[cls] = (counts[cls] || 0) + (e.n_reads || 1);
-  }
-  const total = d3.sum(Object.values(counts)) || 1;
-  const W = document.getElementById('class-bar').clientWidth;
-  const root = d3.select('#class-bar').html('');
-  const svg = root.append('svg').attr('width', W).attr('height', 26);
-  let xOff = 0;
-  for (const k of CLASS_ORDER) {
-    if (!counts[k]) continue;
-    const w = (counts[k] / total) * W;
-    svg.append('rect').attr('x', xOff).attr('y', 4).attr('width', w).attr('height', 18)
-      .attr('fill', CLASS_COLOR[k])
-      .on('mousemove', ev => showTip(`<b>${k}</b> · ${fmtInt(counts[k])} (${fmtPct(counts[k]/total)})`, ev))
-      .on('mouseout', hideTip);
-    if (w > 36)
-      svg.append('text').attr('x', xOff + w/2).attr('y', 16).attr('text-anchor','middle')
-        .attr('font-size', 10).attr('font-family','IBM Plex Mono').attr('fill','#fff').text(fmtInt(counts[k]));
-    xOff += w;
-  }
-  const lg = d3.select('#class-legend').html('');
-  for (const k of CLASS_ORDER) {
-    if (!counts[k]) continue;
-    const item = lg.append('span').attr('class', 'lg');
-    item.append('span').attr('class','sw').style('background', CLASS_COLOR[k]);
-    item.append('span').text(`${k} ${fmtInt(counts[k])} ${fmtPct(counts[k]/total)}`);
-  }
-}
-
-// ---------- tidy depth tree ----------
-let treeColorMode = 'class';
-let expandedBundles = new Set(); // sigs the user clicked to expand
-function renderTree(c, header) {
-  const m = header.fqcl.metadata;
-  const mask5 = m.damage.mask_pos_5 || 0, mask3 = m.damage.mask_pos_3 || 0;
-  const root = d3.select('#tree-canvas').html('');
-  document.getElementById('gn-rowcount').textContent = c.n_members;
-
-  // Build node→edge map: edge whose `to`==node gives parent edge
-  const edgeByChild = {};
-  for (const e of c.edges) {
-    edgeByChild[e.to] = edgeByChild[e.to] || e; // pick first edge to each child
-  }
-  const childrenOf = {};
-  for (const n of c.nodes) {
-    if (n.parent != null) {
-      (childrenOf[n.parent] = childrenOf[n.parent] || []).push(n.id);
-    }
-  }
-
-  // Build hierarchy carrying member counts (subtree size) for sizing
-  function buildD3(nodeId) {
-    const kids = (childrenOf[nodeId] || []).map(buildD3);
-    return { id: nodeId, children: kids.length ? kids : null };
-  }
-  let d3root = d3.hierarchy(buildD3(0));
-
-  // Recursive aggregation at ALL depths: bundle siblings with identical
-  // (parent-edge signature, child-subtree shape). Uses eachAfter so child
-  // signatures are computed before parents.
-  d3root.eachAfter(n => {
-    // signature for THIS node = its parent edge + recursive child sigs
-    const e = edgeByChild[n.data.id];
-    const selfSig = e ? `${e.pos}${e.ref}${e.alt}` : (n.data.id === 0 ? 'root' : 'na');
-    const childSig = n.children
-      ? n.children.map(c => c._sig).sort().join('|')
-      : '';
-    n._sig = `${selfSig}::(${childSig})`;
-    n._size = 1 + (n.children ? d3.sum(n.children, c => c._size) : 0);
-  });
-  d3root.eachBefore(n => {
-    if (!n.children) return;
-    const groups = {};
-    for (const ch of n.children) {
-      (groups[ch._sig] = groups[ch._sig] || []).push(ch);
-    }
-    const newCh = [];
-    for (const k of Object.keys(groups)) {
-      const grp = groups[k];
-      if (grp.length === 1) { newCh.push(grp[0]); continue; }
-      // user clicked to expand this bundle — keep individuals, tag them
-      if (expandedBundles.has(k)) {
-        for (const ch of grp) { ch.data.bundle_sig = k; newCh.push(ch); }
-        continue;
-      }
-      const repr = grp[0];
-      repr.data.bundle_n = grp.length;
-      repr.data.bundle_sig = k;
-      repr._size = d3.sum(grp, g => g._size);
-      newCh.push(repr);
-    }
-    n.children = newCh;
-  });
-
-  // Per-parent overflow cap: keep top-K children by subtree size, lump rest
-  const SIB_CAP = 24;
-  d3root.eachBefore(n => {
-    if (!n.children || n.children.length <= SIB_CAP) return;
-    n.children.sort((a, b) => b._size - a._size);
-    const kept = n.children.slice(0, SIB_CAP - 1);
-    const rest = n.children.slice(SIB_CAP - 1);
-    const lumpKids = rest.length;
-    const lumpMembers = d3.sum(rest, c => c._size);
-    const lump = d3.hierarchy({ id: `lump_${n.data.id}`, lump: true, children: null });
-    lump.data.lump_n = lumpKids;
-    lump.data.lump_members = lumpMembers;
-    lump.depth = n.depth + 1;
-    lump.parent = n;
-    lump._size = lumpMembers;
-    kept.push(lump);
-    n.children = kept;
-  });
-
-  // Recompute leaf count for height
-  const visibleLeaves = d3root.leaves().length;
-  const W = document.getElementById('tree-canvas').clientWidth;
-  const ROW = 14;
-  const H = Math.max(360, visibleLeaves * ROW + 60);
-
-  // Vertical orientation: depth → Y (top→bottom), siblings → X
-  const tree = d3.tree().size([W - 80, H - 60]).separation((a, b) => (a.parent === b.parent ? 1 : 1.4));
-  tree(d3root);
-
-  const svg = root.append('svg').attr('width', W).attr('height', H);
-  const g = svg.append('g').attr('transform', 'translate(40, 30)');
-
-  // zoom/pan: scroll-wheel to zoom, drag to pan, double-click to reset
-  const zoomBehavior = d3.zoom().scaleExtent([0.3, 8])
-    .on('zoom', ev => g.attr('transform', `translate(${40 + ev.transform.x}, ${30 + ev.transform.y}) scale(${ev.transform.k})`));
-  svg.call(zoomBehavior).on('dblclick.zoom', () => svg.transition().duration(250).call(zoomBehavior.transform, d3.zoomIdentity));
-
-  // hint
-  svg.append('text').attr('x', W - 6).attr('y', 12).attr('text-anchor','end')
-    .attr('font-size', 9).attr('font-family','IBM Plex Mono').attr('fill','var(--ink-faint)')
-    .text('scroll=zoom · drag=pan · dbl-click=reset · click bundle to expand');
-
-  // Depth ticks (left margin)
-  const depths = [...new Set(d3root.descendants().map(d => d.depth))].sort((a,b)=>a-b);
-  for (const dd of depths) {
-    const sample = d3root.descendants().find(n => n.depth === dd);
-    if (!sample) continue;
-    g.append('text').attr('x', -28).attr('y', sample.y + 3)
-      .attr('font-size', 9).attr('font-family','IBM Plex Mono').attr('fill','var(--ink-faint)')
-      .text(`d${dd}`);
-    g.append('line').attr('x1', -8).attr('x2', W - 80).attr('y1', sample.y).attr('y2', sample.y)
-      .attr('stroke', 'var(--line-soft)').attr('stroke-dasharray','2,3');
-  }
-
-  // Links (vertical curves)
-  g.selectAll('path.tree-link').data(d3root.links()).enter().append('path')
-    .attr('class', d => {
-      if (d.target.data.lump) return 'tree-link';
-      const e = edgeByChild[d.target.data.id];
-      if (!e) return 'tree-link';
-      return 'tree-link ' + classifyEdge(e, mask5, mask3, c.parent_len);
-    })
-    .attr('stroke-width', d => Math.min(3, 0.6 + 0.4 * Math.log2(Math.max(1, d.target._size))))
-    .attr('d', d => {
-      const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
-      const my = (sy + ty) / 2;
-      return `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
-    })
-    .on('mousemove', (ev, d) => {
-      if (d.target.data.lump) { showTip(`+${d.target.data.lump_n} more siblings`, ev); return; }
-      const e = edgeByChild[d.target.data.id];
-      if (!e) { showTip(`node ${d.target.data.id}`, ev); return; }
-      const cls = classifyEdge(e, mask5, mask3, c.parent_len);
-      const zone = terminalZone(e.pos, c.parent_len, mask5, mask3);
-      showTip(`<b>${e.from}→${e.to}</b><br>pos ${e.pos} · ${e.ref}→${e.alt} · ${cls}<br>zone ${zone} · n=${e.n_reads}`, ev);
-    })
-    .on('mouseout', hideTip);
-
-  // Nodes
-  g.selectAll('circle.tree-node').data(d3root.descendants()).enter().append('circle')
-    .attr('class', 'tree-node')
-    .attr('cx', d => d.x).attr('cy', d => d.y)
-    .attr('r', d => {
-      if (d.data.lump) return 3;
-      if (d.data.id === 0) return 5;
-      const sz = d.data.bundle_n || d._size || 1;
-      return 2 + Math.min(5, Math.log2(sz));
-    })
-    .attr('fill', d => {
-      if (d.data.lump) return 'var(--ink-faint)';
-      if (d.data.id === 0) return 'var(--accent)';
-      if (treeColorMode === 'depth') return d3.interpolateGreys(0.3 + 0.5*(d.depth / Math.max(1, d3root.height)));
-      const e = edgeByChild[d.data.id];
-      return e ? CLASS_COLOR[classifyEdge(e, mask5, mask3, c.parent_len)] : 'var(--ink-faint)';
-    })
-    .attr('stroke', d => d.data.id === selectedNodeId ? 'var(--accent)' : 'var(--bg-elev)')
-    .attr('stroke-width', d => d.data.id === selectedNodeId ? 2.5 : 1)
-    .style('cursor', d => d.data.lump ? 'default' : 'pointer')
-    .on('click', (ev, d) => {
-      ev.stopPropagation();
-      if (d.data.lump) return;
-      if (d.data.bundle_n && d.data.bundle_sig) {
-        expandedBundles.add(d.data.bundle_sig);
-        renderTree(c, header);
-        return;
-      }
-      if (d.data.bundle_sig && !d.data.bundle_n && expandedBundles.has(d.data.bundle_sig)) {
-        expandedBundles.delete(d.data.bundle_sig);
-        renderTree(c, header);
-        return;
-      }
-      // regular node → select lineage and refresh parent panel
-      if (d.data.id != null && d.data.id !== 0) {
-        selectedNodeId = (selectedNodeId === d.data.id) ? null : d.data.id;
-        renderParent(c, header);
-        renderTree(c, header);
-      }
-    })
-    .on('mousemove', (ev, d) => {
-      if (d.data.lump) {
-        showTip(`<b>+${d.data.lump_n}</b> hidden sibling subtrees<br>${d.data.lump_members} members total`, ev);
-        return;
-      }
-      const e = edgeByChild[d.data.id];
-      const bundleNote = d.data.bundle_n ? `<br>bundle ×${d.data.bundle_n} identical subtrees<br><i>click to expand</i>` : '';
-      if (d.data.id === 0) { showTip(`<b>parent</b> (node 0)${bundleNote}`, ev); return; }
-      if (!e) { showTip(`node ${d.data.id}${bundleNote}`, ev); return; }
-      const cls = classifyEdge(e, mask5, mask3, c.parent_len);
-      showTip(`<b>node ${d.data.id}</b> @ depth ${d.depth}<br>edge ${e.from}→${e.to} ${e.ref}→${e.alt} pos ${e.pos}<br>class ${cls}${bundleNote}`, ev);
-    })
-    .on('mouseout', hideTip);
-
-  // Bundle / lump / abundance labels
-  g.selectAll('text.bundle').data(
-    d3root.descendants().filter(d => d.data.bundle_n || d.data.lump || (d._size >= 5 && d.data.id !== 0))
-  ).enter().append('text')
-    .attr('class','bundle')
-    .attr('x', d => d.x + 6).attr('y', d => d.y + 3)
-    .attr('font-size', 9).attr('font-family','IBM Plex Mono').attr('fill','var(--ink-muted)')
-    .text(d => {
-      if (d.data.lump) return `+${d.data.lump_n}`;
-      if (d.data.bundle_n) return `×${d.data.bundle_n} (n=${d._size})`;
-      return `n=${d._size}`;
-    });
-}
-
-// ---------- ledger ----------
-function renderLedger(c, header) {
-  const m = header.fqcl.metadata;
-  const mask5 = m.damage.mask_pos_5 || 0, mask3 = m.damage.mask_pos_3 || 0;
-  const groups = {};
-  for (const e of c.edges) {
-    const cls = classifyEdge(e, mask5, mask3, c.parent_len);
-    const zone = terminalZone(e.pos, c.parent_len, mask5, mask3);
-    const reason = e.reason || (e.score != null ? 'B2' : 'B1');
-    const key = `${cls}|${e.pos}|${e.ref}>${e.alt}|${zone}|${reason}`;
-    if (!groups[key]) groups[key] = { cls, pos: e.pos, alt: `${e.ref}→${e.alt}`, zone, reason, n: 0, lr: [] };
-    groups[key].n += e.n_reads || 1;
-    if (e.score != null) groups[key].lr.push(e.score);
-  }
-  const rows = Object.values(groups).sort((a,b) => b.n - a.n);
-  const totalN = d3.sum(rows, d => d.n) || 1;
-  const root = d3.select('#ledger').html('');
-
-  // Header
-  const head = root.append('div').attr('class','ledger-row head');
-  head.html(`
-    <div></div><div>class</div><div>pos</div><div>change</div><div>zone</div><div>reason</div><div>count</div><div>share</div>
-  `);
-
-  for (const r of rows.slice(0, 200)) {
-    const row = root.append('div').attr('class','ledger-row');
-    row.html(`
-      <div class="ledger-class-dot" style="background:${CLASS_COLOR[r.cls]}"></div>
-      <div>${r.cls}</div>
-      <div>${r.pos}</div>
-      <div>${r.alt}</div>
-      <div>${r.zone}</div>
-      <div>${r.reason}</div>
-      <div>${fmtInt(r.n)}</div>
-      <div class="ledger-bar"><div class="ledger-bar-fill" style="width:${(r.n/totalN*100).toFixed(1)}%"></div></div>
-    `);
-    row.on('mousemove', ev => {
-      const lrTxt = r.lr.length ? `median LR ${d3.median(r.lr).toFixed(2)} (n=${r.lr.length})` : 'no LR (legacy SNP veto)';
-      showTip(`<b>${r.cls}</b> @ pos ${r.pos} ${r.alt}<br>zone ${r.zone} · reason ${r.reason}<br>${fmtInt(r.n)} reads · ${(r.n/totalN*100).toFixed(2)}%<br>${lrTxt}`, ev);
-    }).on('mouseout', hideTip);
-  }
-  if (rows.length > 200) {
-    root.append('div').attr('class','muted').style('padding','6px 12px').style('font-size','11px')
-      .text(`… ${rows.length - 200} more groups`);
-  }
-}
-
-// ---------- evidence panel ----------
-function renderEvidence(c, header) {
-  const m = header.fqcl.metadata;
-  const mask5 = m.damage.mask_pos_5 || 0, mask3 = m.damage.mask_pos_3 || 0;
-
-  // 1) LR histogram (placeholder when no scores)
-  const lrs = c.edges.map(e => e.score).filter(v => v != null && isFinite(v));
-  const root = d3.select('#evidence').html('');
-  const hist = root.append('div').attr('class','ev-panel');
-  hist.append('div').attr('class','ev-title').text('LR score distribution');
-  if (lrs.length) {
-    const W = 240, H = 90;
-    const x = d3.scaleLinear().domain(d3.extent(lrs)).range([4, W-4]);
-    const bins = d3.bin().domain(x.domain()).thresholds(20)(lrs);
-    const y = d3.scaleLinear().domain([0, d3.max(bins, b => b.length)]).range([H-12, 4]);
-    const svg = hist.append('svg').attr('width', W).attr('height', H);
-    svg.selectAll('rect').data(bins).enter().append('rect')
-      .attr('x', d => x(d.x0)).attr('y', d => y(d.length))
-      .attr('width', d => Math.max(0, x(d.x1) - x(d.x0) - 1))
-      .attr('height', d => H - 12 - y(d.length))
-      .attr('fill','var(--ink-muted)');
-    svg.append('line').attr('x1', x(0)).attr('x2', x(0)).attr('y1', 4).attr('y2', H-12)
-      .attr('stroke','var(--accent)').attr('stroke-dasharray','2,2');
-    svg.append('text').attr('x', x(0)).attr('y', H-2).attr('font-size',9).attr('text-anchor','middle')
-      .attr('font-family','IBM Plex Mono').attr('fill','var(--accent)').text('S=0');
-  } else {
-    hist.append('div').attr('class','muted').style('font-size','11px').style('padding','12px 0')
-      .text('No LR scores in this cluster (all absorptions via damage-bypass or legacy path).');
-  }
-
-  // 2) terminal vs interior split
-  const split = { "5'":0, "int":0, "3'":0 };
-  for (const e of c.edges) split[terminalZone(e.pos, c.parent_len, mask5, mask3)] += (e.n_reads || 1);
-  const total = d3.sum(Object.values(split)) || 1;
-  const zonePan = root.append('div').attr('class','ev-panel');
-  zonePan.append('div').attr('class','ev-title').text('terminal vs interior');
-  for (const z of ["5'","int","3'"]) {
-    const row = zonePan.append('div').attr('class','ev-stat');
-    row.append('span').attr('class','k').text(z);
-    row.append('span').text(`${fmtInt(split[z])} ${fmtPct(split[z]/total)}`);
-  }
-
-  // 3) provenance legend
-  const prov = root.append('div').attr('class','ev-panel');
-  prov.append('div').attr('class','ev-title').text('provenance');
-  const reasons = {};
-  for (const e of c.edges) {
-    const r = e.reason || (e.score != null ? 'B2 (empirical)' : 'B1 (SNP veto)');
-    reasons[r] = (reasons[r] || 0) + (e.n_reads || 1);
-  }
-  for (const [k, v] of Object.entries(reasons).sort((a,b)=>b[1]-a[1])) {
-    const row = prov.append('div').attr('class','ev-stat');
-    row.append('span').attr('class','k').text(k);
-    row.append('span').text(fmtInt(v));
-  }
-}
-
-// ---------- main entry ----------
-let HEADER = null;
-let TOP_MEMBERS = [];
-
-// ── Damage fingerprint heatmap ────────────────────────────────────────────────
-// Rows = tree depth, cols = sequence position.
-// Cell color = dominant mutation class; cell opacity = edge load at that cell.
-// Shown instead of (or alongside) the tree for large clusters.
-const HEATMAP_THRESHOLD = 200; // show heatmap when n_edges > this
-
-function renderHeatmap(c, header) {
-  const el = document.getElementById('heatmap-canvas');
-  if (!el) return;
-  const m = header.fqcl.metadata || {};
-  const mask5 = (m.damage || {}).mask_pos_5 || 0;
-  const mask3 = (m.damage || {}).mask_pos_3 || 0;
-  const L = c.parent_len;
-
-  // Build depth map: edge.to_node → depth
-  const edgeByTo = {};
-  for (const e of c.edges) edgeByTo[e.to] = e;
-  const depth = {0: 0};
-  const queue = [0];
-  for (let qi = 0; qi < queue.length; qi++) {
-    const cur = queue[qi];
-    for (const e of c.edges) {
-      if (e.from === cur && depth[e.to] == null) {
-        depth[e.to] = depth[cur] + 1;
-        queue.push(e.to);
-      }
-    }
-  }
-  const maxDepth = Math.max(...Object.values(depth), 1);
-
-  // Accumulate: grid[depth][pos] = {class counts}
-  const grid = Array.from({length: maxDepth + 1}, () =>
-    Array.from({length: L}, () => ({}))
-  );
-  for (const e of c.edges) {
-    const d = depth[e.to] ?? depth[e.from] ?? 0;
-    const cls = classifyEdge(e, mask5, mask3, L);
-    const cell = grid[d][e.pos];
-    cell[cls] = (cell[cls] || 0) + (e.n_reads || 1);
-  }
-
-  // Find max cell total for opacity scaling
-  let maxCell = 1;
-  for (const row of grid)
-    for (const cell of row) {
-      const tot = Object.values(cell).reduce((a,b)=>a+b,0);
-      if (tot > maxCell) maxCell = tot;
-    }
-
-  // Position marginal (top): total edge load per position
-  const posMarginal = Array(L).fill(0);
-  for (const e of c.edges) posMarginal[e.pos] += (e.n_reads || 1);
-  const maxPos = Math.max(...posMarginal, 1);
-
-  // Render
-  el.innerHTML = '';
-  const CELL_W = Math.max(2, Math.min(10, Math.floor(600 / L)));
-  const CELL_H = Math.max(4, Math.min(14, Math.floor(300 / (maxDepth + 1))));
-  const W = L * CELL_W + 60;
-  const MARG_H = 30;
-  const H = MARG_H + (maxDepth + 1) * CELL_H + 20;
-
-  const svg = d3.select(el).append('svg')
-    .attr('width', W).attr('height', H)
-    .style('font-family', 'IBM Plex Mono').style('font-size', '10px');
-
-  // Y-axis label
-  svg.append('text').attr('x', 2).attr('y', MARG_H + H/2 - MARG_H)
-    .attr('transform', `rotate(-90, 8, ${MARG_H + H/2 - MARG_H})`)
-    .attr('fill','var(--ink-faint)').attr('font-size', 9).text('depth →');
-
-  // Position marginal bars
-  const mg = svg.append('g').attr('transform', 'translate(50,4)');
-  for (let p = 0; p < L; p++) {
-    const h = (posMarginal[p] / maxPos) * (MARG_H - 6);
-    // color by damage zone
-    const isDmg5 = p < mask5, isDmg3 = p >= L - mask3;
-    const col = isDmg5 ? CLASS_COLOR.damage : isDmg3 ? '#a06b3a' : 'var(--ink-faint)';
-    mg.append('rect')
-      .attr('x', p * CELL_W).attr('y', MARG_H - 6 - h)
-      .attr('width', Math.max(1, CELL_W - 0.5)).attr('height', h)
-      .attr('fill', col).attr('opacity', 0.7);
-  }
-  mg.append('line').attr('x1',0).attr('x2', L*CELL_W).attr('y1',MARG_H-6).attr('y2',MARG_H-6)
-    .attr('stroke','var(--line)');
-
-  // Mask zone overlays on heatmap
-  const hg = svg.append('g').attr('transform', `translate(50,${MARG_H})`);
-  if (mask5 > 0)
-    hg.append('rect').attr('x',0).attr('y',0).attr('width', mask5*CELL_W)
-      .attr('height', (maxDepth+1)*CELL_H).attr('fill','var(--c-mask)');
-  if (mask3 > 0)
-    hg.append('rect').attr('x',(L-mask3)*CELL_W).attr('y',0).attr('width', mask3*CELL_W)
-      .attr('height', (maxDepth+1)*CELL_H).attr('fill','var(--c-mask)');
-
-  // Heatmap cells
-  for (let d = 0; d <= maxDepth; d++) {
-    for (let p = 0; p < L; p++) {
-      const cell = grid[d][p];
-      const entries = Object.entries(cell);
-      if (!entries.length) continue;
-      const tot = entries.reduce((s,[,v])=>s+v, 0);
-      const [domCls] = entries.sort((a,b)=>b[1]-a[1])[0];
-      const opacity = 0.15 + 0.85 * (tot / maxCell);
-      hg.append('rect')
-        .attr('x', p * CELL_W).attr('y', d * CELL_H)
-        .attr('width', Math.max(1, CELL_W - 0.5))
-        .attr('height', Math.max(1, CELL_H - 0.5))
-        .attr('fill', CLASS_COLOR[domCls])
-        .attr('opacity', opacity)
-        .on('mousemove', ev => {
-          const parts = entries.map(([k,v])=>`${k}:${v}`).join(' ');
-          showTip(`depth ${d} · pos ${p}<br>${parts}`, ev);
-        })
-        .on('mouseout', hideTip);
-    }
-    // depth label
-    if (d % Math.max(1, Math.round(maxDepth/10)) === 0)
-      hg.append('text').attr('x', -4).attr('y', d*CELL_H + CELL_H/2 + 3)
-        .attr('text-anchor','end').attr('fill','var(--ink-faint)').attr('font-size',8)
-        .text(d);
-  }
-
-  // Legend
-  const lg = svg.append('g').attr('transform', `translate(50,${MARG_H + (maxDepth+1)*CELL_H + 6})`);
-  let lx = 0;
-  for (const cls of CLASS_ORDER) {
-    lg.append('rect').attr('x', lx).attr('y',0).attr('width',10).attr('height',8).attr('fill',CLASS_COLOR[cls]);
-    lg.append('text').attr('x', lx+12).attr('y',8).attr('fill','var(--ink-faint)').text(cls);
-    lx += cls.length*6 + 20;
-  }
-}
-
-async function loadCluster(id) {
-  if (id !== activeId) { expandedBundles = new Set(); selectedNodeId = null; }
-  activeId = id;
-  applyFilter(document.getElementById('nav-filter').value || '');
-  try {
-    const j = await loadJSON(`data/cluster_${id}.json`);
-    const c = j.data.cluster;
-    renderClusterHead(c, HEADER);
-    renderParent(c, HEADER);
-    renderClassBar(c, HEADER);
-    // large clusters: show heatmap as primary view; small: tree only
-    const heatmapEl = document.getElementById('heatmap-canvas');
-    const treeEl = document.getElementById('tree-canvas');
-    const treePanel = treeEl ? treeEl.closest('.panel') : null;
-    if (c.n_edges > HEATMAP_THRESHOLD) {
-      if (heatmapEl) heatmapEl.closest('.panel').style.display = '';
-      if (treePanel) treePanel.style.display = 'none';
-      renderHeatmap(c, HEADER);
-    } else {
-      if (heatmapEl) heatmapEl.closest('.panel').style.display = 'none';
-      if (treePanel) treePanel.style.display = '';
-      renderTree(c, HEADER);
-    }
-    renderLedger(c, HEADER);
-    renderEvidence(c, HEADER);
-  } catch (e) {
-    document.getElementById('cluster-id').textContent = '#' + id;
-    document.getElementById('cluster-stats').innerHTML = `<span class="muted">no detailed JSON for cluster ${id} (run: fqdup view ${HEADER.fqcl.path} --cluster ${id} --json &gt; data/cluster_${id}.json)</span>`;
-    document.getElementById('parent-tracks').innerHTML = '';
-    document.getElementById('class-bar').innerHTML = '';
-    document.getElementById('class-legend').innerHTML = '';
-    document.getElementById('tree-canvas').innerHTML = '';
-    document.getElementById('ledger').innerHTML = '';
-    document.getElementById('evidence').innerHTML = '';
-  }
-}
-
-async function init() {
-  HEADER = await loadJSON('data/header.json');
-  renderTopbar(HEADER);
-  // Try to load a top-members manifest; fall back to scanning known clusters.
-  let items = [];
-  try {
-    const tm = await loadJSON('data/top_members.json');
-    items = (tm.data && (tm.data.clusters || tm.data.top)) || tm.top || [];
-  } catch (_) {}
-  items = items.map(x => ({
-    id: x.id != null ? x.id : x.cluster_id,
-    n_members: x.n_members != null ? x.n_members : 0,
-    n_edges: x.n_edges, parent_len: x.parent_len, bundle_key: x.bundle_key
-  })).filter(x => x.id != null);
-  if (!items.length) {
-    // Probe staircase_*.json filenames manually (dev fallback)
-    items = [
-      1179551, 1134971, 113743, 1142600, 1310471, 145883, 17078173, 1825788,
-      224523, 2923086, 326211, 45935, 48596, 549383, 564992, 570113,
-      6016013, 708741, 71513, 765354, 895276, 9186847, 948697
-    ].map(id => ({ id, n_members: 0 }));
-  }
-  // Try to read n_members per item from cluster JSON we have
-  renderNav(items);
-  renderSizeHist(items);
-  if (items.length) loadCluster(items[0].id);
-
-  document.getElementById('nav-filter').oninput = e => applyFilter(e.target.value);
-  document.getElementById('theme-toggle').onclick = () => {
-    document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
-  };
-  document.getElementById('export-svg').onclick = () => {
-    const svg = document.querySelector('#tree-canvas svg');
-    if (!svg) return;
-    const blob = new Blob([new XMLSerializer().serializeToString(svg)], {type:'image/svg+xml'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = `cluster_${activeId}_tree.svg`; a.click();
-    URL.revokeObjectURL(url);
-  };
-  document.querySelectorAll('[data-color]').forEach(b => {
-    b.onclick = () => {
-      document.querySelectorAll('[data-color]').forEach(x => x.classList.remove('active'));
-      b.classList.add('active');
-      treeColorMode = b.dataset.color;
-      if (activeId != null) loadCluster(activeId);
-    };
-  });
-  document.addEventListener('mousemove', moveTip);
-}
-
-init().catch(err => {
-  document.body.insertAdjacentHTML('beforeend', `<pre style="color:var(--c-damage);padding:18px">init failed: ${err.message}</pre>`);
+function hideTip() { tip.classList.remove('show'); }
+document.addEventListener('mousemove', ev => {
+  if (tip.classList.contains('show')) moveTip(ev);
 });
+
+// ── formatters ────────────────────────────────────────────────────────────
+const fmtInt = n => n.toLocaleString();
+const fmtPct = (n, d=1) => (n * 100).toFixed(d) + '%';
+
+// ── data access ───────────────────────────────────────────────────────────
+function getTopClusters() {
+  return window.FQCL_DATA.top_members.data.clusters;
+}
+function getClusterData(id) {
+  const r = window.FQCL_DATA.clusters[String(id)];
+  return r ? r.data.cluster : null;
+}
+function getGlobalMeta() {
+  const top = getTopClusters();
+  if (!top.length) return {};
+  const r = window.FQCL_DATA.clusters[String(top[0].cluster_id)];
+  if (!r) return {};
+  const fqcl = r.fqcl || {};
+  return { n_clusters: fqcl.n_clusters, metadata: fqcl.metadata || {}, path: fqcl.path };
+}
+
+// ── topbar ────────────────────────────────────────────────────────────────
+function renderTopbar() {
+  const top = getTopClusters();
+  const gm = getGlobalMeta();
+  const meta = gm.metadata || {};
+  const chips = [['clusters', fmtInt(gm.n_clusters || top.length)], ['showing', fmtInt(top.length)]];
+  if (meta.n_input_reads) chips.push(['input reads', fmtInt(meta.n_input_reads)]);
+  if (meta.library_type)  chips.push(['library', meta.library_type]);
+  if (meta.tool_version)  chips.push(['fqdup', meta.tool_version]);
+  document.getElementById('ds-meta').innerHTML = chips.map(([k, v]) =>
+    `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+}
+document.getElementById('theme-toggle').addEventListener('click', () => {
+  document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+});
+
+// ── sidebar size histogram ─────────────────────────────────────────────────
+function renderSizeHist(clusters) {
+  const el = document.getElementById('size-hist');
+  const W = el.clientWidth || 216, H = 52;
+  const pad = { l: 4, r: 4, t: 4, b: 14 };
+  const vals = clusters.map(c => c.n_members);
+  const maxV = Math.max(...vals, 2), minV = Math.min(...vals, 1);
+  const bins = Math.min(24, Math.ceil((W - pad.l - pad.r) / 6));
+  const logMin = Math.log10(Math.max(1, minV)), logMax = Math.log10(Math.max(2, maxV));
+  const edges = Array.from({length: bins + 1}, (_, i) =>
+    Math.pow(10, logMin + (logMax - logMin) * i / bins));
+  const hist = new Array(bins).fill(0);
+  for (const v of vals) {
+    let b = edges.findIndex((e, i) => i < bins && v >= edges[i] && v < edges[i + 1]);
+    if (b < 0) b = bins - 1;
+    hist[Math.max(0, b)]++;
+  }
+  const yMax = Math.max(...hist, 1);
+  const aw = W - pad.l - pad.r, ah = H - pad.t - pad.b;
+  const bw = aw / bins;
+  const svg = d3.create('svg').attr('width', W).attr('height', H);
+  svg.selectAll('rect').data(hist).join('rect')
+    .attr('x', (_, i) => pad.l + i * bw)
+    .attr('y', d => pad.t + ah - d * ah / yMax)
+    .attr('width', Math.max(1, bw - 0.5))
+    .attr('height', d => d * ah / yMax)
+    .attr('fill', 'var(--accent)').attr('opacity', 0.65);
+  svg.append('text').attr('x', pad.l).attr('y', H - 2)
+    .attr('font-size', 9).attr('fill', 'var(--ink-faint)').attr('font-family', MONO)
+    .text(fmtInt(minV));
+  svg.append('text').attr('x', W - pad.r).attr('y', H - 2)
+    .attr('text-anchor', 'end').attr('font-size', 9)
+    .attr('fill', 'var(--ink-faint)').attr('font-family', MONO)
+    .text(fmtInt(maxV) + ' →');
+  el.innerHTML = '';
+  el.appendChild(svg.node());
+}
+
+// ── nav list (virtual scroll) ─────────────────────────────────────────────
+let navAll = [], navFiltered = [], activeId = null;
+const ITEM_H = 36;
+
+function renderNav(clusters) {
+  navAll = clusters;
+  document.getElementById('nav-count').textContent = clusters.length;
+  applyNavFilter('');
+}
+function applyNavFilter(q) {
+  navFiltered = q ? navAll.filter(x => String(x.cluster_id).includes(q)) : navAll;
+  refreshNavList();
+}
+function refreshNavList() {
+  const list = document.getElementById('nav-list');
+  const scrollTop = list.scrollTop, viewH = list.clientHeight || 500;
+  const total = navFiltered.length, buf = 8;
+  const firstVis = Math.floor(scrollTop / ITEM_H);
+  const lastVis  = Math.min(total - 1, Math.ceil((scrollTop + viewH) / ITEM_H));
+  const first = Math.max(0, firstVis - buf), last = Math.min(total - 1, lastVis + buf);
+  let html = `<div style="height:${first * ITEM_H}px"></div>`;
+  for (let i = first; i <= last; i++) {
+    const it = navFiltered[i];
+    const act = it.cluster_id === activeId ? ' active' : '';
+    html += `<div class="nav-item${act}" data-id="${it.cluster_id}">` +
+            `<span class="id">${it.cluster_id}</span>` +
+            `<span class="n">${fmtInt(it.n_members)}</span></div>`;
+  }
+  html += `<div style="height:${Math.max(0, total - last - 1) * ITEM_H}px"></div>`;
+  list.innerHTML = html;
+  list.querySelectorAll('.nav-item').forEach(el =>
+    el.addEventListener('click', () => loadCluster(+el.dataset.id)));
+}
+document.getElementById('nav-filter').addEventListener('input', ev => applyNavFilter(ev.target.value.trim()));
+document.getElementById('nav-list').addEventListener('scroll', refreshNavList);
+
+// ── cluster loading ────────────────────────────────────────────────────────
+let currentCluster = null;
+
+function loadCluster(id) {
+  activeId = id;
+  refreshNavList();
+  const cl = getClusterData(id);
+  if (!cl) {
+    document.getElementById('sheet').innerHTML =
+      `<div style="padding:24px;color:var(--ink-muted)">Cluster ${id} not embedded in this file.</div>`;
+    return;
+  }
+  currentCluster = cl;
+  selectedNodeId = null;
+  document.getElementById('cluster-id').textContent = `#${cl.cluster_id}`;
+  const scored = cl.edges.filter(e => e.score_evaluated).length;
+  const dmg = cl.edges.filter(e => classifyEdge(e) === 'damage').length;
+  document.getElementById('cluster-stats').innerHTML =
+    `<div class="kv"><span class="k">reads</span><span class="v">${fmtInt(cl.n_members)}</span></div>` +
+    `<div class="kv"><span class="k">edges</span><span class="v">${cl.n_edges}</span></div>` +
+    `<div class="kv"><span class="k">length</span><span class="v">${cl.parent_len} bp</span></div>` +
+    `<div class="kv"><span class="k">scored</span><span class="v">${scored}</span></div>` +
+    `<div class="kv"><span class="k">damage</span><span class="v">${dmg}</span></div>`;
+  document.getElementById('qc-chips').innerHTML = '';
+  renderParentTracks(cl);
+  renderHeatmap(cl);
+  renderTree(cl);
+  renderClassBar(cl);
+  renderEvidence(cl);
+  renderLedger(cl);
+}
+
+// ── parent sequence track ─────────────────────────────────────────────────
+function renderParentTracks(cl) {
+  const el = document.getElementById('parent-tracks');
+  if (!cl.parent_seq) { el.innerHTML = ''; return; }
+  const seq = cl.parent_seq, L = seq.length;
+  const posCls = new Map(), posEdges = new Map();
+  for (const e of cl.edges) {
+    const ec = classifyEdge(e);
+    if (!posEdges.has(e.pos)) posEdges.set(e.pos, []);
+    posEdges.get(e.pos).push(e);
+    if (!posCls.has(e.pos) || ec === 'damage') posCls.set(e.pos, ec);
+  }
+  let ruler = '';
+  for (let i = 0; i < L; i++) {
+    if (i % 10 === 0) ruler += `<span class="rtick">${i}</span>`;
+  }
+  let bases = '';
+  for (let i = 0; i < L; i++) {
+    const b = seq[i], ec = posCls.get(i);
+    const inMask = i < DAMAGE_MASK || i >= L - DAMAGE_MASK;
+    if (ec) {
+      const col = COL_HEX[ec];
+      const edges = posEdges.get(i);
+      const tt = edges.map(e =>
+        `${e.ref}→${e.alt} (${classifyEdge(e)}, ${termZone(e.pos, L)}, n=${e.n_reads})`
+      ).join('<br>');
+      bases += `<span class="sbase variant" style="--vc:${col}" ` +
+               `onmouseenter="showTip('pos ${i}: ${tt}',event)" onmouseleave="hideTip()">${b}</span>`;
+    } else if (inMask) {
+      bases += `<span class="sbase mask">${b}</span>`;
+    } else {
+      bases += `<span class="sbase">${b}</span>`;
+    }
+  }
+  el.innerHTML =
+    `<div class="seq-wrap">` +
+    `<div class="seq-ruler mono">${ruler}</div>` +
+    `<div class="seq-bases mono">${bases}</div>` +
+    `</div>`;
+}
+
+// ── damage heatmap ────────────────────────────────────────────────────────
+function renderHeatmap(cl) {
+  const el = document.getElementById('heatmap-canvas');
+  const L = cl.parent_len;
+  if (!L || !cl.edges.length) {
+    el.innerHTML = '<div style="padding:8px;color:var(--ink-faint);font-size:11px">no edges</div>';
+    return;
+  }
+  const W = Math.min(el.clientWidth || 700, 1000);
+  const cellW = Math.max(2, Math.floor(W / L));
+  const actualW = cellW * L, rowH = 11, padT = 2, padB = 14;
+  const nodeDepth = new Map([[0, 0]]);
+  for (const n of cl.nodes) {
+    if (!n.is_parent && n.depth !== undefined) nodeDepth.set(n.id, n.depth);
+  }
+  const maxDepth = Math.max(...nodeDepth.values(), 0);
+  const H = (maxDepth + 1) * rowH + padT + padB;
+  const svg = d3.create('svg').attr('width', actualW).attr('height', H).style('display', 'block');
+  for (const e of cl.edges) {
+    const ec = classifyEdge(e), depth = nodeDepth.get(e.from) ?? 0;
+    svg.append('rect')
+      .attr('x', e.pos * cellW).attr('y', padT + depth * rowH)
+      .attr('width', cellW - 0.5).attr('height', rowH - 1)
+      .attr('fill', COL_HEX[ec]).attr('rx', 1).attr('opacity', 0.85)
+      .on('mouseenter', ev => showTip(
+        `pos ${e.pos} · ${e.ref}→${e.alt} · ${ec} · ${termZone(e.pos, L)} · reads=${e.n_reads}` +
+        (e.score_evaluated ? ` · S=${(+e.score).toFixed(2)}` : ''), ev))
+      .on('mouseleave', hideTip);
+  }
+  for (let d = 0; d <= Math.min(maxDepth, 8); d++) {
+    svg.append('text').attr('x', 2).attr('y', padT + d * rowH + rowH * 0.75)
+      .attr('font-size', 7).attr('font-family', MONO).attr('fill', 'var(--ink-faint)').text(`d${d}`);
+  }
+  for (let i = 0; i < L; i += 10) {
+    svg.append('text').attr('x', i * cellW + 1).attr('y', H - 2)
+      .attr('font-size', 7).attr('font-family', MONO).attr('fill', 'var(--ink-faint)').text(i);
+  }
+  el.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.style.overflowX = 'auto';
+  wrap.appendChild(svg.node());
+  el.appendChild(wrap);
+}
+
+// ── genealogy tree ────────────────────────────────────────────────────────
+let selectedNodeId = null, treeCluster = null;
+
+function renderTree(cl) {
+  treeCluster = cl;
+  const el = document.getElementById('tree-canvas');
+  el.innerHTML = '';
+  if (!cl.nodes || cl.nodes.length <= 1) {
+    el.innerHTML = '<div style="padding:8px;color:var(--ink-faint);font-size:11px">no children</div>';
+    document.getElementById('gn-rowcount').textContent = '1 node';
+    return;
+  }
+  const edgeByTo = new Map();
+  for (const e of cl.edges) { if (!edgeByTo.has(e.to)) edgeByTo.set(e.to, e); }
+  const nodeObjs = new Map();
+  for (const n of cl.nodes) nodeObjs.set(n.id, {id: n.id, is_parent: !!n.is_parent, children: []});
+  for (const n of cl.nodes) {
+    if (!n.is_parent && n.parent !== undefined) {
+      const par = nodeObjs.get(n.parent);
+      if (par) par.children.push(nodeObjs.get(n.id));
+    }
+  }
+  const hierarchyRoot = d3.hierarchy(nodeObjs.get(0));
+  const nNodes = hierarchyRoot.descendants().length;
+  document.getElementById('gn-rowcount').textContent = `${nNodes} nodes`;
+  const nLeaves = hierarchyRoot.leaves().length;
+  const treeDepth = hierarchyRoot.height;
+  const mL = 24, mR = 90, mT = 14, mB = 10;
+  const spacingY = Math.max(18, Math.min(38, 380 / Math.max(nLeaves, 1)));
+  const treeH = Math.max(60, nLeaves * spacingY);
+  const treeW = Math.max(280, (treeDepth + 1) * 100);
+  const W = treeW + mL + mR, H = treeH + mT + mB;
+  const layout = d3.tree().size([treeH, treeW]);
+  layout(hierarchyRoot);
+  const svg = d3.create('svg').attr('width', W).attr('height', H)
+    .style('display', 'block').style('overflow', 'visible');
+  const g = svg.append('g').attr('transform', `translate(${mL},${mT})`);
+
+  g.selectAll('path.tree-link').data(hierarchyRoot.links()).join('path')
+    .attr('class', 'tree-link')
+    .attr('d', d3.linkHorizontal().x(d => d.y).y(d => d.x))
+    .attr('fill', 'none')
+    .attr('stroke', d => { const e = edgeByTo.get(d.target.data.id); return e ? COL_HEX[classifyEdge(e)] : 'var(--line)'; })
+    .attr('stroke-width', d => { const e = edgeByTo.get(d.target.data.id); return e ? Math.max(1, Math.min(4, 0.8 + (e.n_reads || 1) * 0.3)) : 1; })
+    .attr('stroke-opacity', 0.6);
+
+  g.selectAll('text.score-badge').data(hierarchyRoot.descendants().slice(1)).join('text')
+    .attr('class', 'score-badge')
+    .attr('x', d => (d.y + d.parent.y) / 2).attr('y', d => (d.x + d.parent.x) / 2 - 3)
+    .attr('text-anchor', 'middle').attr('font-size', 7).attr('font-family', MONO)
+    .attr('fill', 'var(--ink-faint)')
+    .text(d => { const e = edgeByTo.get(d.data.id); return (e && e.score_evaluated) ? `S=${(+e.score).toFixed(1)}` : ''; });
+
+  const nodeG = g.selectAll('g.tree-node').data(hierarchyRoot.descendants()).join('g')
+    .attr('class', 'tree-node')
+    .attr('transform', d => `translate(${d.y},${d.x})`)
+    .attr('cursor', 'pointer')
+    .on('click', (ev, d) => { ev.stopPropagation(); selectNode(d.data.id); })
+    .on('mouseenter', (ev, d) => {
+      const e = edgeByTo.get(d.data.id);
+      if (e) showTip(`node ${d.data.id} · ${e.ref}→${e.alt}@${e.pos} · ${classifyEdge(e)} · ${termZone(e.pos, cl.parent_len)} · n=${e.n_reads}${e.score_evaluated ? ` · S=${(+e.score).toFixed(2)}` : ''}`, ev);
+      else showTip('root (representative)', ev);
+    })
+    .on('mouseleave', hideTip);
+
+  nodeG.append('circle')
+    .attr('class', 'tree-node-circle')
+    .attr('r', d => d.data.is_parent ? 6 : 4)
+    .attr('fill', d => { if (d.data.is_parent) return 'var(--accent)'; const e = edgeByTo.get(d.data.id); return e ? COL_HEX[classifyEdge(e)] : 'var(--ink-faint)'; })
+    .attr('stroke', 'var(--bg-elev)').attr('stroke-width', 1.5);
+
+  nodeG.filter(d => !d.children).append('text')
+    .attr('x', 9).attr('dominant-baseline', 'middle').attr('font-size', 9).attr('font-family', MONO)
+    .attr('fill', 'var(--ink-muted)')
+    .text(d => { const e = edgeByTo.get(d.data.id); return e ? `${e.ref}→${e.alt}@${e.pos}` : ''; });
+
+  el.appendChild(svg.node());
+}
+
+function selectNode(nodeId) {
+  selectedNodeId = nodeId;
+  d3.selectAll('#tree-canvas .tree-node-circle')
+    .attr('stroke', d => d.data.id === nodeId ? 'var(--ink)' : 'var(--bg-elev)')
+    .attr('stroke-width', d => d.data.id === nodeId ? 2.5 : 1.5);
+  if (!treeCluster) return;
+  const e = treeCluster.edges.find(edge => edge.to === nodeId);
+  if (e) highlightLedgerRow(treeCluster.edges.indexOf(e));
+}
+
+// ── mutation class bar ────────────────────────────────────────────────────
+function renderClassBar(cl) {
+  const el = document.getElementById('class-bar');
+  const leg = document.getElementById('class-legend');
+  const counts = {};
+  for (const e of cl.edges) { const c = classifyEdge(e); counts[c] = (counts[c] || 0) + 1; }
+  const total = cl.edges.length || 1;
+  const W = el.clientWidth || 280, H = 16;
+  const svg = d3.create('svg').attr('width', W).attr('height', H);
+  let x = 0;
+  for (const cls of CLASS_ORDER) {
+    const n = counts[cls] || 0;
+    if (!n) continue;
+    const w = (n / total) * W;
+    svg.append('rect').attr('x', x).attr('y', 0).attr('width', Math.max(1, w)).attr('height', H)
+      .attr('fill', COL_HEX[cls])
+      .on('mouseenter', ev => showTip(`${CLASS_LABEL[cls]}: ${n} (${fmtPct(n/total)})`, ev))
+      .on('mouseleave', hideTip);
+    x += w;
+  }
+  el.innerHTML = '';
+  el.appendChild(svg.node());
+  leg.innerHTML = CLASS_ORDER.filter(c => counts[c]).map(c =>
+    `<span class="lg"><span class="sw" style="background:${COL_HEX[c]}"></span>${CLASS_LABEL[c]} (${counts[c]})</span>`
+  ).join('');
+}
+
+// ── evidence: LR histogram + stats ────────────────────────────────────────
+function renderEvidence(cl) {
+  const el = document.getElementById('evidence');
+  el.innerHTML = '';
+  const allEdges = cl.edges, L = cl.parent_len;
+  const scored = allEdges.filter(e => e.score_evaluated);
+
+  // column 1: LR score histogram (2fr)
+  const histCol = document.createElement('div');
+  if (!scored.length) {
+    histCol.innerHTML = '<div style="font-size:11px;color:var(--ink-faint)">No scored edges.</div>';
+  } else {
+    const scores = scored.map(e => +e.score);
+    const minS = Math.min(...scores), maxS = Math.max(...scores);
+    const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const elW = 300, H = 80, pad = {l: 26, r: 8, t: 6, b: 20};
+    const domain = [Math.min(minS - 0.5, -3), Math.max(maxS + 0.5, 3)];
+    const xScale = d3.scaleLinear().domain(domain).range([pad.l, elW - pad.r]);
+    const hist = d3.bin().domain(domain).thresholds(xScale.ticks(20))(scores);
+    const yMax = Math.max(...hist.map(b => b.length), 1);
+    const yScale = d3.scaleLinear().domain([0, yMax]).range([H - pad.b, pad.t]);
+    const svg = d3.create('svg').attr('width', elW).attr('height', H)
+      .style('display', 'block').style('overflow', 'visible');
+    svg.append('line').attr('x1', xScale(0)).attr('x2', xScale(0))
+      .attr('y1', pad.t).attr('y2', H - pad.b)
+      .attr('stroke', 'var(--line)').attr('stroke-dasharray', '3,2');
+    svg.selectAll('rect.bar').data(hist).join('rect')
+      .attr('x', d => xScale(d.x0) + 0.5).attr('y', d => yScale(d.length))
+      .attr('width', d => Math.max(0, xScale(d.x1) - xScale(d.x0) - 1))
+      .attr('height', d => yScale(0) - yScale(d.length))
+      .attr('fill', d => (d.x0 ?? 0) >= 0 ? COL_HEX.damage : COL_HEX.transition)
+      .attr('opacity', 0.75)
+      .on('mouseenter', (ev, d) => showTip(`S ∈ [${(+d.x0).toFixed(1)}, ${(+d.x1).toFixed(1)}): ${d.length} edges`, ev))
+      .on('mouseleave', hideTip);
+    svg.append('line').attr('x1', xScale(mean)).attr('x2', xScale(mean))
+      .attr('y1', pad.t).attr('y2', H - pad.b)
+      .attr('stroke', 'var(--ink-muted)').attr('stroke-dasharray', '2,2');
+    svg.append('g').attr('transform', `translate(0,${H - pad.b})`)
+      .call(d3.axisBottom(xScale).ticks(5).tickSize(3))
+      .call(g => g.select('.domain').remove())
+      .call(g => g.selectAll('text').attr('font-size', 8).attr('font-family', MONO).attr('fill', 'var(--ink-muted)'))
+      .call(g => g.selectAll('line').attr('stroke', 'var(--line)'));
+    svg.append('g').attr('transform', `translate(${pad.l},0)`)
+      .call(d3.axisLeft(yScale).ticks(3).tickSize(3))
+      .call(g => g.select('.domain').remove())
+      .call(g => g.selectAll('text').attr('font-size', 8).attr('font-family', MONO).attr('fill', 'var(--ink-muted)'))
+      .call(g => g.selectAll('line').attr('stroke', 'var(--line)'));
+    svg.append('text').attr('x', (pad.l + elW - pad.r) / 2).attr('y', H)
+      .attr('text-anchor', 'middle').attr('font-size', 8).attr('font-family', MONO)
+      .attr('fill', 'var(--ink-faint)').text('LR score');
+    histCol.appendChild(svg.node());
+    const sub = document.createElement('div');
+    sub.style.cssText = `font-family:${MONO};font-size:10px;color:var(--ink-muted);margin-top:4px`;
+    sub.textContent = `${scored.length}/${allEdges.length} scored · μ=${mean.toFixed(2)} · [${minS.toFixed(1)}, ${maxS.toFixed(1)}]`;
+    histCol.appendChild(sub);
+  }
+  el.appendChild(histCol);
+
+  // column 2: mutation class breakdown
+  const statCol1 = document.createElement('div');
+  const classCounts = {};
+  for (const e of allEdges) { const c = classifyEdge(e); classCounts[c] = (classCounts[c] || 0) + 1; }
+  statCol1.innerHTML = CLASS_ORDER.filter(c => classCounts[c]).map(c =>
+    `<div class="ev-stat"><span style="color:${COL_HEX[c]}">${c}</span><span>${classCounts[c]}</span></div>`
+  ).join('');
+  el.appendChild(statCol1);
+
+  // column 3: terminal zone breakdown
+  const statCol2 = document.createElement('div');
+  const zones = {"5'": 0, int: 0, "3'": 0};
+  for (const e of allEdges) zones[termZone(e.pos, L)]++;
+  const dmgEdges = allEdges.filter(e => classifyEdge(e) === 'damage');
+  statCol2.innerHTML =
+    `<div class="ev-stat"><span>5' edges</span><span>${zones["5'"]}</span></div>` +
+    `<div class="ev-stat"><span>3' edges</span><span>${zones["3'"]}</span></div>` +
+    `<div class="ev-stat"><span>int edges</span><span>${zones.int}</span></div>` +
+    `<div class="ev-stat" style="margin-top:5px"><span>5' damage</span><span>${dmgEdges.filter(e=>e.pos<DAMAGE_MASK).length}</span></div>` +
+    `<div class="ev-stat"><span>3' damage</span><span>${dmgEdges.filter(e=>e.pos>=L-DAMAGE_MASK).length}</span></div>`;
+  el.appendChild(statCol2);
+}
+
+// ── mutation ledger ───────────────────────────────────────────────────────
+let ledgerEdges = [];
+
+function renderLedger(cl) {
+  const el = document.getElementById('ledger');
+  ledgerEdges = cl.edges;
+  const L = cl.parent_len;
+  const sorted = cl.edges.map((e, i) => ({e, i})).sort((a, b) => a.e.pos - b.e.pos);
+  el.innerHTML = sorted.map(({e, i}) => {
+    const ec = classifyEdge(e), zone = termZone(e.pos, L);
+    const reason = e.damage_like ? 'damage' : (e.score_evaluated ? `S=${(+e.score).toFixed(2)}` : '—');
+    return `<div class="ledger-row" data-idx="${i}" onclick="selectLedgerRow(${i})">` +
+      `<div><span class="ledger-class-dot" style="background:${COL_HEX[ec]}"></span></div>` +
+      `<div>${ec}</div><div class="mono">${e.pos}</div><div class="mono">${e.ref}→${e.alt}</div>` +
+      `<div>${zone}</div><div>${reason}</div><div class="mono">${e.n_reads}</div>` +
+      `<div class="mono">${fmtPct(e.n_reads / Math.max(cl.n_members, 1))}</div></div>`;
+  }).join('');
+}
+
+function selectLedgerRow(idx) {
+  highlightLedgerRow(idx);
+  const e = ledgerEdges[idx];
+  if (e) highlightTreeNodeById(e.to);
+}
+function highlightLedgerRow(idx) {
+  document.querySelectorAll('#ledger .ledger-row').forEach(r => r.classList.remove('active'));
+  const row = document.querySelector(`#ledger .ledger-row[data-idx="${idx}"]`);
+  if (row) { row.classList.add('active'); row.scrollIntoView({behavior: 'smooth', block: 'nearest'}); }
+}
+function highlightTreeNodeById(nodeId) {
+  selectedNodeId = nodeId;
+  d3.selectAll('#tree-canvas .tree-node-circle')
+    .attr('stroke', d => d.data.id === nodeId ? 'var(--ink)' : 'var(--bg-elev)')
+    .attr('stroke-width', d => d.data.id === nodeId ? 2.5 : 1.5);
+}
+
+// ── export SVG ────────────────────────────────────────────────────────────
+document.getElementById('export-svg').addEventListener('click', () => {
+  const svg = document.querySelector('#tree-canvas svg');
+  if (!svg) return;
+  const blob = new Blob([svg.outerHTML], {type: 'image/svg+xml'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `fqcl-cluster-${activeId || 'tree'}.svg`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// ── color mode controls ───────────────────────────────────────────────────
+document.querySelectorAll('.ctrl-group [data-color]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.ctrl-group [data-color]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    if (currentCluster) renderTree(currentCluster);
+  });
+});
+
+// ── injected styles for new components ───────────────────────────────────
+(function() {
+  const s = document.createElement('style');
+  s.textContent = `
+    .ledger-row.active { background: var(--bg-sunk); outline: 1px solid var(--accent); }
+    .seq-wrap { overflow-x: auto; padding: 4px 0; }
+    .seq-ruler { font-size: 9px; color: var(--ink-faint); margin-bottom: 2px; white-space: nowrap; }
+    .rtick { display: inline-block; width: 80px; text-align: left; }
+    .seq-bases { font-size: 12px; line-height: 1.7; white-space: nowrap; letter-spacing: 0.04em; }
+    .sbase { display: inline-block; }
+    .sbase.mask { background: var(--c-mask); }
+    .sbase.variant { background: transparent; border-bottom: 2px solid var(--vc); cursor: help; box-shadow: inset 0 -12px 0 -8px var(--vc); }
+    #tree-canvas { overflow-x: auto; }
+    .score-badge { pointer-events: none; }
+  `;
+  document.head.appendChild(s);
+})();
+
+// ── init ──────────────────────────────────────────────────────────────────
+function init() {
+  const clusters = getTopClusters();
+  renderTopbar();
+  renderSizeHist(clusters);
+  renderNav(clusters);
+  if (clusters.length > 0) loadCluster(clusters[0].cluster_id);
+}
+init();
 
 )ASSET";
 
