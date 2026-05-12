@@ -530,6 +530,76 @@ document.querySelectorAll('.ctrl-group [data-color]').forEach(btn => {
   });
 });
 
+// ── panel help buttons ────────────────────────────────────────────────────
+const PANEL_HELP = {
+  'parent sequence':
+    '<b>Parent sequence</b> — the representative read fqdup kept as the cluster output. ' +
+    'All other reads in this cluster were identified as PCR duplicates or damage variants of this sequence and discarded. ' +
+    'Orange underline = damage position (C→T at 5\' or G→A at 3\'). ' +
+    'Blue = transition. Brown = transversion. Shaded zone = terminal damage mask (fqdup ignores C→T here when deciding absorption).',
+  'damage fingerprint':
+    '<b>Damage fingerprint</b> — each cell is one absorbed read, placed at its mismatch position (x-axis) and ' +
+    'tree depth (y-axis, d0=direct children of root, d1=grandchildren…). ' +
+    'Color = mutation class. Orange clusters near position 0 or the 3\' end = ancient deamination damage. ' +
+    'Blue interior = PCR/sequencing error.',
+  'genealogy tree':
+    '<b>Genealogy tree</b> — the absorption hierarchy for this cluster. ' +
+    'Root (red dot) = the parent sequence. Each child node = a read absorbed as a duplicate. ' +
+    'Link color = reason for absorption (orange=damage, blue=transition PCR error, brown=transversion). ' +
+    'Link width = number of reads represented. ' +
+    'S= label = LR score (log-likelihood ratio; higher = more confident this absorption is a true PCR duplicate). ' +
+    'Click a node to highlight its row in the mutation ledger below.',
+  'mutation class':
+    '<b>Mutation class breakdown</b> — proportion of absorbed edges by type across this cluster. ' +
+    'Damage = C→T at 5\' terminal or G→A at 3\' terminal (ancient DNA deamination). ' +
+    'Transition = A↔G or C↔T outside the mask zone (likely PCR/seq error). ' +
+    'Transversion = any other base change.',
+  'evidence':
+    '<b>LR score histogram</b> — distribution of log-likelihood ratio scores for all absorbed edges in this cluster. ' +
+    'Score > 0 (orange bars, right of dashed line) = absorption more likely a true PCR duplicate than a real variant. ' +
+    'Score < 0 (blue bars) = weaker evidence. Dashed vertical line = mean. ' +
+    'Right panels: edge counts by mutation class and by terminal zone (5\', interior, 3\').',
+  'mutation ledger':
+    '<b>Mutation ledger</b> — one row per absorbed edge, sorted by position. ' +
+    'Shows: mutation class · position in parent sequence · base change · terminal zone · ' +
+    'LR score (S=) · read count · fraction of cluster. ' +
+    'Click any row to highlight the corresponding node in the genealogy tree above.'
+};
+
+function addPanelHelp() {
+  document.querySelectorAll('.panel-head').forEach(head => {
+    const title = (head.querySelector('.ph-l1') || {}).textContent || '';
+    const key = title.trim().toLowerCase();
+    const helpText = PANEL_HELP[key];
+    if (!helpText) return;
+    const btn = document.createElement('button');
+    btn.className = 'help-btn';
+    btn.textContent = '?';
+    btn.title = 'About this panel';
+    btn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const existing = document.querySelector('.help-popover');
+      if (existing) { existing.remove(); return; }
+      const pop = document.createElement('div');
+      pop.className = 'help-popover';
+      pop.innerHTML = helpText;
+      const close = document.createElement('button');
+      close.textContent = '✕';
+      close.className = 'help-popover-close';
+      close.onclick = () => pop.remove();
+      pop.appendChild(close);
+      document.body.appendChild(pop);
+      const r = btn.getBoundingClientRect();
+      pop.style.top  = Math.min(window.innerHeight - pop.offsetHeight - 8, r.bottom + 6) + 'px';
+      pop.style.left = Math.max(8, Math.min(window.innerWidth - pop.offsetWidth - 8, r.left)) + 'px';
+    });
+    head.appendChild(btn);
+  });
+  document.addEventListener('click', () => {
+    document.querySelector('.help-popover')?.remove();
+  });
+}
+
 // ── injected styles for new components ───────────────────────────────────
 (function() {
   const s = document.createElement('style');
@@ -544,6 +614,26 @@ document.querySelectorAll('.ctrl-group [data-color]').forEach(btn => {
     .sbase.variant { background: transparent; border-bottom: 2px solid var(--vc); cursor: help; box-shadow: inset 0 -12px 0 -8px var(--vc); }
     #tree-canvas { overflow-x: auto; }
     .score-badge { pointer-events: none; }
+    .help-btn {
+      margin-left: auto; width: 16px; height: 16px; border-radius: 50%;
+      border: 1px solid var(--line); background: var(--bg-sunk);
+      color: var(--ink-muted); font-size: 10px; line-height: 1;
+      cursor: pointer; padding: 0; flex-shrink: 0;
+    }
+    .help-btn:hover { background: var(--accent); color: var(--bg-elev); border-color: var(--accent); }
+    .help-popover {
+      position: fixed; z-index: 200; max-width: 340px;
+      background: var(--bg-elev); border: 1px solid var(--line);
+      border-radius: 5px; padding: 12px 14px 10px;
+      font-size: 12px; line-height: 1.5; color: var(--ink);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    }
+    .help-popover b { color: var(--ink); }
+    .help-popover-close {
+      position: absolute; top: 6px; right: 8px;
+      background: none; border: none; cursor: pointer;
+      color: var(--ink-faint); font-size: 12px; padding: 0;
+    }
   `;
   document.head.appendChild(s);
 })();
@@ -555,5 +645,6 @@ function init() {
   renderSizeHist(clusters);
   renderNav(clusters);
   if (clusters.length > 0) loadCluster(clusters[0].cluster_id);
+  addPanelHelp();
 }
 init();
