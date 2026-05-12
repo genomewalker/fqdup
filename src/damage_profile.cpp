@@ -847,6 +847,8 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         lb.ca_stop_rate_terminal = pr.ca_stop_rate_terminal;
         lb.ca_uniformity_ratio   = pr.ca_uniformity_ratio;
         lb.channel_f_z           = pr.channel_f_z;
+        lb.channel_f_mh_z        = pr.channel_f_mh_z;
+        lb.channel_f_common_or   = pr.channel_f_common_or;
         lb.channel_f_valid       = pr.channel_f_valid;
         lb.cg_stop_rate_baseline = pr.cg_stop_rate_baseline;
         lb.cg_stop_rate_terminal = pr.cg_stop_rate_terminal;
