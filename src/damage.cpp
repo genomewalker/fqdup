@@ -1357,6 +1357,8 @@ int damage_main(int argc, char** argv) {
         j << "    \"ca_stop_rate_terminal\": " << dp.ca_stop_rate_terminal << ",\n";
         j << "    \"ca_uniformity_ratio\": " << dp.ca_uniformity_ratio << ",\n";
         j << "    \"channel_f_z\": " << dp.channel_f_z << ",\n";
+        j << "    \"channel_f_mh_z\": " << dp.channel_f_mh_z << ",\n";
+        j << "    \"channel_f_common_or\": " << dp.channel_f_common_or << ",\n";
         j << "    \"channel_f_applicable\": " << (!is_ss ? "true" : "false") << ",\n";
         j << "    \"ca_stop_rate_interior\": " << dp.ca_stop_rate_interior << ",\n";
         j << "    \"channel_f3_valid\": " << (dp.channel_f3_valid ? "true" : "false") << ",\n";
@@ -2012,6 +2014,8 @@ int damage_main(int argc, char** argv) {
             j << "      \"terminal_rate\": "; jfloat(dp.ca_stop_rate_terminal); j << ",\n";
             j << "      \"uniformity_ratio\": "; jfloat(dp.ca_uniformity_ratio); j << ",\n";
             j << "      \"z_score\": "; jfloat(dp.channel_f_z); j << ",\n";
+            j << "      \"mh_z\": "; jfloat(dp.channel_f_mh_z); j << ",\n";
+            j << "      \"common_or\": "; jfloat(dp.channel_f_common_or); j << ",\n";
             j << "      \"cf_ratio\": "; jfloat(cf_ratio); j << "\n";
             j << "    },\n";
 

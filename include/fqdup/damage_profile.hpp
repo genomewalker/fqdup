@@ -281,6 +281,8 @@ struct LengthBinDamageProfile {
     float ca_stop_rate_terminal  = 0.0f;
     float ca_uniformity_ratio    = 0.0f;
     float channel_f_z            = 0.0f;
+    float channel_f_mh_z         = 0.0f;
+    float channel_f_common_or    = 0.0f;
     bool  channel_f_valid        = false;
     float cg_stop_rate_baseline  = 0.0f;  // Channel G
     float cg_stop_rate_terminal  = 0.0f;
