@@ -10,6 +10,7 @@
 
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/damage_profile.hpp"
+#include "damage_html_assets.hpp"
 
 #include "taph/frame_selector_decl.hpp"
 #include "taph/library_interpretation.hpp"
@@ -320,6 +321,7 @@ static void print_usage(const char* prog) {
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
+        << "  --html FILE                Write interactive damage report as self-contained HTML\n"
         << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
         << "                             (default: 1000000; 0 = scan all reads)\n";
@@ -367,6 +369,7 @@ int damage_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    std::string html_path;
     bool        run_oxog      = true;
     LengthBinOptions lb_opts = []{ bool ok; return parse_length_bins("auto", ok); }();
     int64_t     adapter_scan_reads = 1'000'000;  // 0 = scan entire file
@@ -400,6 +403,8 @@ int damage_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--html" && i + 1 < argc) {
+            html_path = argv[++i];
         } else if (arg == "--no-oxog") {
             run_oxog = false;
         } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
@@ -640,6 +645,8 @@ int damage_main(int argc, char** argv) {
     double depur_ctrl_shift_5 = 0.0;
     double depur_ctrl_shift_3 = 0.0;
     double oxog_trinuc_cosine = std::numeric_limits<double>::quiet_NaN();
+    double oxog_eta_bar_val   = std::numeric_limits<double>::quiet_NaN();
+    double oxog_g_hat_val     = std::numeric_limits<double>::quiet_NaN();
 
     // Oxog second pass uses single-end reads; skip in paired mode.
     if (paired_mode) run_oxog = false;
@@ -1038,6 +1045,13 @@ int damage_main(int argc, char** argv) {
     }
 
     // ---- optional JSON -------------------------------------------------
+    if (!html_path.empty() && json_path.empty()) {
+        auto otr = taph::compute_oxog_trinuc(dp);
+        oxog_trinuc_cosine = otr.cosine;
+        oxog_eta_bar_val   = otr.eta_bar;
+        oxog_g_hat_val     = otr.g_hat;
+    }
+
     if (!json_path.empty()) {
         std::ofstream j(json_path);
         if (!j) {
@@ -1436,6 +1450,8 @@ int damage_main(int argc, char** argv) {
         {
             auto otr = taph::compute_oxog_trinuc(dp);
             oxog_trinuc_cosine = otr.cosine;
+            oxog_eta_bar_val   = otr.eta_bar;
+            oxog_g_hat_val     = otr.g_hat;
             if (std::isnan(otr.cosine))
                 j << "    \"oxog_trinuc_cosine\": null,\n";
             else
@@ -2058,6 +2074,152 @@ int damage_main(int argc, char** argv) {
         }
         j << "}\n";
         std::cout << "JSON written: " << json_path << "\n";
+    }
+
+    if (!html_path.empty()) {
+        std::ofstream h(html_path);
+        if (!h) {
+            std::cerr << "Error: cannot write HTML: " << html_path << "\n";
+            return 1;
+        }
+        // Derive sample name from input path basename, strip extension
+        auto sample_name = [&]() -> std::string {
+            std::string base = in_path;
+            auto sl = base.rfind('/');
+            if (sl != std::string::npos) base = base.substr(sl + 1);
+            for (const char* ext : {".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz"}) {
+                if (base.size() > strlen(ext) &&
+                    base.compare(base.size() - strlen(ext), strlen(ext), ext) == 0)
+                    base = base.substr(0, base.size() - strlen(ext));
+            }
+            return base;
+        }();
+
+        auto jv = [&](double v) -> std::string {
+            if (std::isnan(v) || std::isinf(v)) return "null";
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(6) << v;
+            return os.str();
+        };
+        auto jb = [](bool v) { return v ? "true" : "false"; };
+
+        h << fqdup_dmghtml::HTML_PRE;
+        h << "const D = {\n";
+        h << "  \"sample\": \"" << sample_name << "\",\n";
+        h << "  \"n_reads\": " << reads_scanned << ",\n";
+        h << "  \"library_type\": \"" << dp.library_type_str() << "\",\n";
+        h << "  \"d5\": " << jv(dp.d_max_5prime) << ",\n";
+        h << "  \"d3\": " << jv(dp.d_max_3prime) << ",\n";
+        h << "  \"lam5\": " << jv(dp.lambda_5prime) << ",\n";
+        h << "  \"lam3\": " << jv(dp.lambda_3prime) << ",\n";
+        h << "  \"bg5\": " << jv(dp.fit_baseline_5prime) << ",\n";
+        h << "  \"bg3\": " << jv(dp.fit_baseline_3prime) << ",\n";
+        h << "  \"s_gt\": " << jv(dp.s_gt) << ",\n";
+        h << "  \"oxog_eta_bar\": " << jv(oxog_eta_bar_val) << ",\n";
+        h << "  \"oxog_g_hat\": " << jv(oxog_g_hat_val) << ",\n";
+        h << "  \"oxog_cosine\": " << jv(oxog_trinuc_cosine) << ",\n";
+
+        // Per-position arrays (1-based positions)
+        h << "  \"pos\": [";
+        for (int p = 0; p < N_POS; ++p) { if (p) h << ","; h << (p + 1); }
+        h << "],\n";
+
+        h << "  \"ct5\": [";
+        for (int p = 0; p < N_POS; ++p) {
+            if (p) h << ",";
+            double v = (dp.tc_total_5prime[p] >= MIN_COV) ? dp.t_freq_5prime[p] : -1.0;
+            h << jv(v);
+        }
+        h << "],\n";
+
+        if (!is_ss) {
+            h << "  \"ga5\": [";
+            for (int p = 0; p < N_POS; ++p) {
+                if (p) h << ",";
+                double v = (dp.ag_total_3prime[p] >= MIN_COV) ? dp.a_freq_3prime[p] : -1.0;
+                h << jv(v);
+            }
+            h << "],\n";
+        } else {
+            h << "  \"ct3\": [";
+            for (int p = 0; p < N_POS; ++p) {
+                if (p) h << ",";
+                double tc3 = dp.tc_total_3prime[p];
+                double v = (tc3 >= MIN_COV) ? dp.t_freq_3prime[p] / tc3 : -1.0;
+                h << jv(v);
+            }
+            h << "],\n";
+        }
+
+        h << "  \"gt5\": [";
+        for (int p = 0; p < N_POS; ++p) {
+            if (p) h << ",";
+            double denom = dp.t_from_g_5prime[p] + dp.g_count_5prime[p];
+            double v = (denom >= MIN_COV) ? dp.t_from_g_5prime[p] / denom : -1.0;
+            h << jv(v);
+        }
+        h << "],\n";
+
+        // Channels array (A=deamination, B=stop-codon, C=8-oxoG top, D=Chargaff, F=complement, G=hydantoin, H=AT-stop)
+        {
+            bool ch_f_det = dp.channel_f_valid && dp.channel_f_z > kOxChannelZDetect;
+            bool ch_g_det = dp.channel_g_valid && dp.channel_g_z > kOxChannelZDetect;
+            bool ch_h_det = dp.channel_h_valid && (dp.channel_h_z > kOxChannelZDetect || dp.channel_h_z_p2plus > kOxChannelZDetect);
+            h << "  \"channels\": [\n";
+            // A: deamination
+            h << "    {\"id\":\"A\",\"name\":\"deamination\","
+              << "\"detected\":" << jb(dp.damage_validated) << ","
+              << "\"applicable\":true,"
+              << "\"d5\":" << jv(dp.d_max_5prime) << "},\n";
+            // B: stop-codon validator
+            h << "    {\"id\":\"B\",\"name\":\"stop_codon_conversion\","
+              << "\"detected\":" << jb(dp.channel_b_valid && !dp.channel_b_inverted) << ","
+              << "\"applicable\":true},\n";
+            // C: 8-oxoG top strand
+            h << "    {\"id\":\"C\",\"name\":\"8_oxog_top_strand\","
+              << "\"detected\":" << jb(dp.ox_damage_detected) << ","
+              << "\"applicable\":true},\n";
+            // D: Chargaff asymmetry
+            h << "    {\"id\":\"D\",\"name\":\"chargaff_gt_asymmetry\","
+              << "\"detected\":" << jb(std::abs(dp.ox_gt_asymmetry) > 0.01f) << ","
+              << "\"applicable\":true,"
+              << "\"d5\":" << jv(dp.s_gt) << "},\n";
+            // F: complement 8-oxoG
+            h << "    {\"id\":\"F\",\"name\":\"8_oxog_complement\","
+              << "\"detected\":" << jb(ch_f_det) << ","
+              << "\"applicable\":" << jb(!is_ss) << ","
+              << "\"z_score\":" << jv(dp.channel_f_z) << "},\n";
+            // G: hydantoin
+            h << "    {\"id\":\"G\",\"name\":\"hydantoin_oxidation\","
+              << "\"detected\":" << jb(ch_g_det) << ","
+              << "\"applicable\":" << jb(!is_ss) << ","
+              << "\"z_score\":" << jv(dp.channel_g_z) << "},\n";
+            // H: AT-stop (depurination)
+            h << "    {\"id\":\"H\",\"name\":\"depurination_at_stop\","
+              << "\"detected\":" << jb(ch_h_det) << ","
+              << "\"applicable\":true,"
+              << "\"z_score\":" << jv(dp.channel_h_z) << "}\n";
+            h << "  ],\n";
+        }
+
+        // Length bins
+        if (!lsd.bins.empty()) {
+            h << "  \"length_bins\": [\n";
+            for (size_t b = 0; b < lsd.bins.size(); ++b) {
+                const auto& lb = lsd.bins[b];
+                if (b) h << ",\n";
+                h << "    {\"lo\":" << lb.length_lo << ",\"hi\":" << lb.length_hi
+                  << ",\"d5\":" << jv(lb.d_max_5prime) << ",\"d3\":" << jv(lb.d_max_3prime)
+                  << ",\"n\":" << lb.n_reads << "}";
+            }
+            h << "\n  ]\n";
+        } else {
+            h << "  \"length_bins\": []\n";
+        }
+
+        h << "};\n";
+        h << fqdup_dmghtml::HTML_POST;
+        std::cout << "HTML written: " << html_path << "\n";
     }
 
     return 0;
