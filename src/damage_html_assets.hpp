@@ -161,6 +161,11 @@ return Plotly;
   function modelCurve(bg,dmax,lam){
     return pos.map(function(p){return bg+dmax*Math.exp(-lam*(p-1));});
   }
+  // 3' curves peak at the rightmost position (3' terminal) — smiley U-shape
+  function modelCurveRev(bg,dmax,lam){
+    var N=pos[pos.length-1];
+    return pos.map(function(p){return bg+dmax*Math.exp(-lam*(N-p));});
+  }
   function rawClean(arr){
     return arr?arr.map(function(v){return v<0?null:v;}):null;
   }
@@ -168,9 +173,9 @@ return Plotly;
   var traces=[];
   if(D.d5>0.001) traces.push({x:pos,y:modelCurve(bg5,D.d5,lam5),name:"5' C→T",
     mode:'lines+markers',line:{color:'#d97757',width:2.5},marker:{size:5}});
-  if(D.ga5&&D.d3>0.001) traces.push({x:pos,y:modelCurve(bg3,D.d3,lam3),name:"3' G→A",
+  if(D.ga5&&D.d3>0.001) traces.push({x:pos,y:modelCurveRev(bg3,D.d3,lam3),name:"3' G→A",
     mode:'lines+markers',line:{color:'#4a8db8',width:2.5,dash:'dot'},marker:{size:5}});
-  if(D.ct3&&D.d3>0.001) traces.push({x:pos,y:modelCurve(bg3,D.d3,lam3),name:"3' C→T",
+  if(D.ct3&&D.d3>0.001) traces.push({x:pos,y:modelCurveRev(bg3,D.d3,lam3),name:"3' C→T",
     mode:'lines+markers',line:{color:'#e09070',width:2.5,dash:'dot'},marker:{size:5}});
   if(D.gt5) traces.push({x:pos,y:rawClean(D.gt5),name:"5' G→T",
     mode:'lines+markers',line:{color:'#9b59b6',width:2},marker:{size:4}});
@@ -325,7 +330,7 @@ return Plotly;
       if(b.d5>0.001) lbTraces.push({x:pos,y:modelCurve(bg5b,b.d5,lam5b),
         name:"5' "+label,mode:'lines+markers',
         line:{color:c5,width:2,dash:i?'dot':'solid'},marker:{size:4}});
-      if(b.d3>0.001) lbTraces.push({x:pos,y:modelCurve(bg3b,b.d3,lam3b),
+      if(b.d3>0.001) lbTraces.push({x:pos,y:modelCurveRev(bg3b,b.d3,lam3b),
         name:"3' "+label,mode:'lines+markers',
         line:{color:c3,width:2,dash:i?'dot':'solid'},marker:{size:4}});
     });

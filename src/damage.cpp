@@ -2191,8 +2191,12 @@ int damage_main(int argc, char** argv) {
             bool ch_h_det = dp.channel_h_valid && (dp.channel_h_z > kOxChannelZDetect || dp.channel_h_z_p2plus > kOxChannelZDetect);
             h << "  \"channels\": [\n";
             // A: deamination
+            // Use presence (not strict validation) — validated=false fires when pos0 artifact
+            // forces offset correction but damage is still clearly real.
+            bool ch_a_det = !dp.damage_artifact &&
+                            (dp.d_max_5prime > 0.01 || dp.d_max_3prime > 0.01);
             h << "    {\"id\":\"A\",\"name\":\"deamination\","
-              << "\"detected\":" << jb(dp.damage_validated) << ","
+              << "\"detected\":" << jb(ch_a_det) << ","
               << "\"applicable\":true,"
               << "\"d5\":" << jv(dp.d_max_5prime) << "},\n";
             // B: stop-codon validator
