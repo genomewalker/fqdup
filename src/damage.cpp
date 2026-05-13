@@ -2210,6 +2210,8 @@ int damage_main(int argc, char** argv) {
                 if (b) h << ",\n";
                 h << "    {\"lo\":" << lb.length_lo << ",\"hi\":" << lb.length_hi
                   << ",\"d5\":" << jv(lb.d_max_5prime) << ",\"d3\":" << jv(lb.d_max_3prime)
+                  << ",\"lam5\":" << jv(lb.lambda_5prime) << ",\"lam3\":" << jv(lb.lambda_3prime)
+                  << ",\"bg5\":" << jv(lb.bg_5prime) << ",\"bg3\":" << jv(lb.bg_3prime)
                   << ",\"n\":" << lb.n_reads << "}";
             }
             h << "\n  ]\n";
