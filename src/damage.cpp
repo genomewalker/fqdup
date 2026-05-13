@@ -1441,6 +1441,11 @@ int damage_main(int argc, char** argv) {
             else
                 j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
             j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << ",\n";
+            if (std::isnan(otr.eta_bar))
+                j << "    \"oxog_eta_bar\": null,\n    \"oxog_g_hat\": null,\n";
+            else
+                j << "    \"oxog_eta_bar\": " << std::setprecision(6) << otr.eta_bar << ",\n"
+                  << "    \"oxog_g_hat\": "   << std::setprecision(6) << otr.g_hat   << ",\n";
         }
         if (!lsd.bins.empty()) {
             j << "    \"by_length\": [";
