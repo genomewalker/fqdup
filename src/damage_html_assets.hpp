@@ -183,25 +183,43 @@ return Plotly;
       '<div style="font-size:.75em;color:#999;margin-top:2px">g_hat (scaled ×500)</div>';
   }
 
-  // ── Length bins ─────────────────────────────────────────────────────────
+  // ── Length-stratified smiley curves ────────────────────────────────────
   if(D.length_bins && D.length_bins.length > 0){
     var lbCard = document.createElement('div');
     lbCard.className = 'card';
     lbCard.style.gridColumn = '1 / -1';
-    lbCard.innerHTML = '<h2>Length-stratified damage</h2><div id="lenbins"></div>';
+    lbCard.innerHTML = '<h2>Length-stratified damage curves</h2><div id="lenbins"></div>';
     document.body.appendChild(lbCard);
 
+    // Colour ramp: short=warm, long=cool
+    var ramp5 = ['#e07050','#c0785a','#8b6090'];
+    var ramp3 = ['#6aafd4','#4a8db8','#2a6090'];
     var lbTraces = [];
-    var labs = D.length_bins.map(function(b){ return b.lo+'-'+b.hi; });
-    lbTraces.push({name:'d5',x:labs,y:D.length_bins.map(function(b){return b.d5;}),type:'bar',marker:{color:'#d97757'}});
-    lbTraces.push({name:'d3',x:labs,y:D.length_bins.map(function(b){return b.d3;}),type:'bar',marker:{color:'#4a8db8'}});
-    Plotly.newPlot('lenbins', lbTraces, {
-      barmode:'group', height:220, margin:{t:10,b:50,l:50,r:10},
-      xaxis:{title:'Read length (bp)'},
-      yaxis:{title:'d_max',rangemode:'tozero'},
-      legend:{orientation:'h',y:-0.3},
-      paper_bgcolor:'#fff',plot_bgcolor:'#fff'
-    }, {responsive:true, displayModeBar:false});
+    D.length_bins.forEach(function(b, i){
+      var label = b.lo + '–' + b.hi + ' bp';
+      var bg5b  = b.bg5  || 0, bg3b  = b.bg3  || 0;
+      var lam5b = b.lam5 || 0.3, lam3b = b.lam3 || 0.3;
+      var col5  = ramp5[Math.min(i, ramp5.length-1)];
+      var col3  = ramp3[Math.min(i, ramp3.length-1)];
+      if(b.d5 > 0.001)
+        lbTraces.push({x:pos, y:modelCurve(bg5b, b.d5, lam5b),
+          name:"5' "+label, mode:'lines+markers',
+          line:{color:col5,width:2,dash:i>0?'dot':'solid'}, marker:{size:4}});
+      if(b.d3 > 0.001)
+        lbTraces.push({x:pos, y:modelCurve(bg3b, b.d3, lam3b),
+          name:"3' "+label, mode:'lines+markers',
+          line:{color:col3,width:2,dash:i>0?'dot':'solid'}, marker:{size:4}});
+    });
+    if(lbTraces.length > 0)
+      Plotly.newPlot('lenbins', lbTraces, {
+        height:260, margin:{t:10,b:50,l:50,r:10},
+        xaxis:{title:'Position from 5′ end',dtick:1},
+        yaxis:{title:'Rate',rangemode:'tozero'},
+        legend:{orientation:'h',y:-0.28},
+        paper_bgcolor:'#fff',plot_bgcolor:'#fff'
+      }, {responsive:true, displayModeBar:false});
+    else
+      lbCard.innerHTML += '<p style="color:#999;font-size:.82em">No bins with detectable damage.</p>';
   }
 
 })();
