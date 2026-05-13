@@ -2082,6 +2082,30 @@ int damage_main(int argc, char** argv) {
             std::cerr << "Error: cannot write HTML: " << html_path << "\n";
             return 1;
         }
+
+        // Compute summaries (may be re-computed if JSON was also written; cheap)
+        auto pres_h  = taph::compute_preservation_summary(dp, is_ss,
+            stubs.adapter_clipped, stubs.flag_hex_artifact,
+            cpg_score_z, oxog_score_z, oxog_trinuc_cosine, hex_shift_p);
+        auto flags_h = taph::compute_library_qc_flags(dp, is_ss,
+            stubs.flag_hex_artifact, hex_stats.jsd,
+            hex_stats.entropy_terminal, short_read_frac);
+        auto dcp_h   = taph::compute_damage_context_profile(
+            dp, cpg_score_z, hex_shift_z,
+            stubs.adapter_clipped, stubs.adapter3_clipped,
+            stubs.flag_hex_artifact);
+
+        // Adapter name lookup (mirrors JSON serialisation)
+        static const std::pair<const char*, const char*> kAdapters[] = {
+            {"ACACTC","TruSeq/P5"},{"AATGAT","TruSeq/Universal"},{"GATCGG","TruSeq/i7"},
+            {"CTGTCT","Nextera/Tn5"},{"AGATCG","TruSeq/R1"},{"TGGAAT","TruSeq/R2"},{"GCGAAT","TruSeq/R2alt"},
+        };
+        std::string adapter_top_seq = stubs.stubs5.empty() ? "" : stubs.stubs5[0];
+        std::string adapter_name_str = "unknown";
+        if (!adapter_top_seq.empty())
+            for (const auto& kv : kAdapters)
+                if (adapter_top_seq == kv.first) { adapter_name_str = kv.second; break; }
+
         // Derive sample name from input path basename, strip extension
         auto sample_name = [&]() -> std::string {
             std::string base = in_path;
@@ -2218,6 +2242,87 @@ int damage_main(int argc, char** argv) {
         } else {
             h << "  \"length_bins\": []\n";
         }
+
+        // ── Preservation ─────────────────────────────────────────────────────
+        h << "  ,\"pres_score\": "    << jv(dp.preservation_score)    << "\n";
+        h << "  ,\"pres_label\": \""  << pres_h.label                 << "\"\n";
+        h << "  ,\"auth_eff\": "      << jv(pres_h.authenticity_eff)  << "\n";
+        h << "  ,\"ox_eff\": "        << jv(pres_h.oxidation_eff)     << "\n";
+        h << "  ,\"qcr_eff\": "       << jv(pres_h.qc_risk_eff)       << "\n";
+
+        // ── Library typing ────────────────────────────────────────────────────
+        h << "  ,\"lib_p_ds\": "      << jv(dp.library_p_ds_final)        << "\n";
+        h << "  ,\"lib_p_ss\": "      << jv(dp.library_p_ss_final)        << "\n";
+        h << "  ,\"lib_bic_model\": \"" << dp.library_bic_winner_model    << "\"\n";
+        h << "  ,\"lib_bic_margin\": " << jv(dp.library_bic_margin)       << "\n";
+        h << "  ,\"lib_artifact\": "   << jb(dp.library_artifact_contaminated) << "\n";
+
+        // ── Damage context ────────────────────────────────────────────────────
+        h << "  ,\"dom_process\": \""  << dcp_h.dominant_process_str << "\"\n";
+        h << "  ,\"interpretation\": \"" << [&](std::string s) -> std::string {
+            // minimal JSON string escaping for the interpretation sentence
+            std::string out; out.reserve(s.size() + 8);
+            for (char c : s) { if (c == '"') out += "\\\""; else if (c == '\\') out += "\\\\"; else out += c; }
+            return out;
+        }(dcp_h.interpretation) << "\"\n";
+        h << "  ,\"dam_score\": "      << jv(dcp_h.terminal_deamination_score)  << "\n";
+        h << "  ,\"ox_score\": "       << jv(dcp_h.oxidative_context_score)     << "\n";
+        h << "  ,\"frag_score\": "     << jv(dcp_h.fragmentation_context_score) << "\n";
+        h << "  ,\"art_score\": "      << jv(dcp_h.library_artifact_score)      << "\n";
+        h << "  ,\"cpg_contrast\": "   << jv(dp.cpg_contrast)                   << "\n";
+        h << "  ,\"cpg_z\": "          << jv(cpg_score_z)                       << "\n";
+
+        // ── Depurination ──────────────────────────────────────────────────────
+        h << "  ,\"depur_detected\": " << jb(dp.depurination_detected)     << "\n";
+        h << "  ,\"depur_enrich5\": "  << jv(dp.purine_enrichment_5prime)  << "\n";
+        h << "  ,\"depur_enrich3\": "  << jv(dp.purine_enrichment_3prime)  << "\n";
+        h << "  ,\"depur_z\": "        << jv(depur_score_z)                << "\n";
+
+        // ── Library QC ────────────────────────────────────────────────────────
+        h << "  ,\"pos0_art5\": "      << jb(dp.position_0_artifact_5prime) << "\n";
+        h << "  ,\"pos0_art3\": "      << jb(dp.position_0_artifact_3prime) << "\n";
+        h << "  ,\"hex_ent5\": "       << jv(hex_stats.entropy_terminal)    << "\n";
+        h << "  ,\"hex_ent_int\": "    << jv(hex_stats.entropy_interior)    << "\n";
+        h << "  ,\"hex_jsd\": "        << jv(hex_stats.jsd)                 << "\n";
+        h << "  ,\"hex_shift_z\": "    << jv(hex_shift_z)                   << "\n";
+        h << "  ,\"short_frac\": "     << jv(short_read_frac < 0 ? 0.0 : short_read_frac) << "\n";
+        h << "  ,\"stubs5\": [";
+        for (size_t i = 0; i < stubs.stubs5.size(); ++i) { if (i) h << ","; h << "\"" << stubs.stubs5[i] << "\""; }
+        h << "]\n";
+        h << "  ,\"stubs3\": [";
+        for (size_t i = 0; i < stubs.stubs3.size(); ++i) { if (i) h << ","; h << "\"" << stubs.stubs3[i] << "\""; }
+        h << "]\n";
+        h << "  ,\"adapter_seq\": "    << (adapter_top_seq.empty() ? "null" : "\"" + adapter_top_seq + "\"") << "\n";
+        h << "  ,\"adapter_name\": "   << (adapter_top_seq.empty() ? "null" : "\"" + adapter_name_str + "\"") << "\n";
+        h << "  ,\"top_hex\": [";
+        {
+            int n_out = 0;
+            for (const auto& hr : stubs.top_enriched) {
+                if (n_out >= 5) break;
+                auto seq = taph::decode_hex(hr.idx);
+                if (n_out > 0) h << ",";
+                h << "{\"seq\":\"" << seq.data() << "\","
+                  << "\"log2fc\":" << jv(hr.log2fc) << ","
+                  << "\"dc\":" << jb(hr.damage_consistent) << "}";
+                ++n_out;
+            }
+        }
+        h << "]\n";
+        h << "  ,\"qc_flags\": [";
+        {
+            bool first = true;
+            auto ef = [&](const char* n) { if (!first) h << ","; h << "\"" << n << "\""; first = false; };
+            if (flags_h.adapter_remnant_5prime)   ef("adapter_remnant_5prime");
+            if (flags_h.adapter_remnant_3prime)   ef("adapter_remnant_3prime");
+            if (flags_h.hexamer_composition_bias) ef("hexamer_composition_bias");
+            if (flags_h.hexamer_terminal_shift)   ef("hexamer_terminal_shift");
+            if (flags_h.short_read_spike)         ef("short_read_spike");
+            if (flags_h.depurination)             ef("depurination");
+            if (flags_h.ds_3prime_signal_absent)  ef("ds_3prime_signal_absent");
+            if (flags_h.ga3_inward_displaced)     ef("ga3_inward_displaced");
+            if (flags_h.hexamer_artifact_bias)    ef("hexamer_artifact_bias");
+        }
+        h << "]\n";
 
         h << "};\n";
         h << fqdup_dmghtml::HTML_POST;
