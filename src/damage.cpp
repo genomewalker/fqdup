@@ -644,9 +644,9 @@ int damage_main(int argc, char** argv) {
     double depur_score_p      = 1.0;
     double depur_ctrl_shift_5 = 0.0;
     double depur_ctrl_shift_3 = 0.0;
-    double oxog_trinuc_cosine = std::numeric_limits<double>::quiet_NaN();
-    double oxog_eta_bar_val   = std::numeric_limits<double>::quiet_NaN();
-    double oxog_g_hat_val     = std::numeric_limits<double>::quiet_NaN();
+    double oxog_context_cosine = std::numeric_limits<double>::quiet_NaN();
+    double oxog_gt_asymmetry_val   = std::numeric_limits<double>::quiet_NaN();
+    double oxog_gt_rate_val     = std::numeric_limits<double>::quiet_NaN();
 
     // Oxog second pass uses single-end reads; skip in paired mode.
     if (paired_mode) run_oxog = false;
@@ -1047,9 +1047,9 @@ int damage_main(int argc, char** argv) {
     // ---- optional JSON -------------------------------------------------
     if (!html_path.empty() && json_path.empty()) {
         auto otr = taph::compute_oxog_trinuc(dp);
-        oxog_trinuc_cosine = otr.cosine;
-        oxog_eta_bar_val   = otr.eta_bar;
-        oxog_g_hat_val     = otr.g_hat;
+        oxog_context_cosine = otr.cosine;
+        oxog_gt_asymmetry_val   = otr.gt_asymmetry;
+        oxog_gt_rate_val     = otr.gt_rate;
     }
 
     if (!json_path.empty()) {
@@ -1449,19 +1449,19 @@ int damage_main(int argc, char** argv) {
         }
         {
             auto otr = taph::compute_oxog_trinuc(dp);
-            oxog_trinuc_cosine = otr.cosine;
-            oxog_eta_bar_val   = otr.eta_bar;
-            oxog_g_hat_val     = otr.g_hat;
+            oxog_context_cosine = otr.cosine;
+            oxog_gt_asymmetry_val   = otr.gt_asymmetry;
+            oxog_gt_rate_val     = otr.gt_rate;
             if (std::isnan(otr.cosine))
-                j << "    \"oxog_trinuc_cosine\": null,\n";
+                j << "    \"oxog_context_cosine\": null,\n";
             else
-                j << "    \"oxog_trinuc_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
+                j << "    \"oxog_context_cosine\": " << std::setprecision(6) << otr.cosine << ",\n";
             j << "    \"oxog_trinuc_n_context\": " << otr.n_ctx << ",\n";
-            if (std::isnan(otr.eta_bar))
-                j << "    \"oxog_eta_bar\": null,\n    \"oxog_g_hat\": null,\n";
+            if (std::isnan(otr.gt_asymmetry))
+                j << "    \"oxog_gt_asymmetry\": null,\n    \"oxog_gt_rate\": null,\n";
             else
-                j << "    \"oxog_eta_bar\": " << std::setprecision(6) << otr.eta_bar << ",\n"
-                  << "    \"oxog_g_hat\": "   << std::setprecision(6) << otr.g_hat   << ",\n";
+                j << "    \"oxog_gt_asymmetry\": " << std::setprecision(6) << otr.gt_asymmetry << ",\n"
+                  << "    \"oxog_gt_rate\": "   << std::setprecision(6) << otr.gt_rate   << ",\n";
         }
         if (!lsd.bins.empty()) {
             j << "    \"by_length\": [";
@@ -1599,7 +1599,7 @@ int damage_main(int argc, char** argv) {
         }
         auto pres = taph::compute_preservation_summary(dp, is_ss,
             stubs.adapter_clipped, stubs.flag_hex_artifact,
-            cpg_score_z, oxog_score_z, oxog_trinuc_cosine, hex_shift_p);
+            cpg_score_z, oxog_score_z, oxog_context_cosine, hex_shift_p);
 
         j << "  \"preservation\": {\n";
         j << "    \"score\": " << std::setprecision(6) << dp.preservation_score << ",\n";
@@ -2086,7 +2086,7 @@ int damage_main(int argc, char** argv) {
         // Compute summaries (may be re-computed if JSON was also written; cheap)
         auto pres_h  = taph::compute_preservation_summary(dp, is_ss,
             stubs.adapter_clipped, stubs.flag_hex_artifact,
-            cpg_score_z, oxog_score_z, oxog_trinuc_cosine, hex_shift_p);
+            cpg_score_z, oxog_score_z, oxog_context_cosine, hex_shift_p);
         auto flags_h = taph::compute_library_qc_flags(dp, is_ss,
             stubs.flag_hex_artifact, hex_stats.jsd,
             hex_stats.entropy_terminal, short_read_frac);
@@ -2139,9 +2139,9 @@ int damage_main(int argc, char** argv) {
         h << "  \"bg5\": " << jv(dp.fit_baseline_5prime) << ",\n";
         h << "  \"bg3\": " << jv(dp.fit_baseline_3prime) << ",\n";
         h << "  \"s_gt\": " << jv(dp.s_gt) << ",\n";
-        h << "  \"oxog_eta_bar\": " << jv(oxog_eta_bar_val) << ",\n";
-        h << "  \"oxog_g_hat\": " << jv(oxog_g_hat_val) << ",\n";
-        h << "  \"oxog_cosine\": " << jv(oxog_trinuc_cosine) << ",\n";
+        h << "  \"oxog_gt_asymmetry\": " << jv(oxog_gt_asymmetry_val) << ",\n";
+        h << "  \"oxog_gt_rate\": " << jv(oxog_gt_rate_val) << ",\n";
+        h << "  \"oxog_cosine\": " << jv(oxog_context_cosine) << ",\n";
 
         // Per-position arrays (1-based positions)
         h << "  \"pos\": [";
