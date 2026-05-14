@@ -1,5 +1,47 @@
 # Changelog
 
+## [2.0.2] - 2026-05-14
+
+### New features
+
+- **`--out-damaged` / `--out-undamaged`**: route each deduplicated read to a
+  separate FASTQ based on its per-read LLR ancient/modern score. Useful for
+  contamination estimation, variant calling on damaged reads only, and library
+  comparisons. `-o` is optional when both split outputs are given.
+
+- **`--split-model auto|bulk|empirical`**: controls the LLR classifier used for
+  the split.
+  - `auto` (default): runs a stripped per-bin empirical scan after the damage
+    fit when d_max > 0.01, using mixture-unmixed C→T curves per length bin.
+    Falls back to the bulk exponential model (zero extra I/O) on undamaged
+    samples.
+  - `bulk`: always uses the bulk exponential model already fitted during Pass 0.
+    No extra file pass; ~5% less accurate at length-distribution tails.
+  - `empirical`: forces the per-bin scan regardless of measured damage level.
+
+- **`DamageSplitModel`** (internal): precomputed per-bin LOD tables built once
+  from length-stratified empirical curves. Scoring during Pass 2 is pure array
+  lookups with no transcendental calls.
+
+- **`estimate_damage_split_model()`** (internal): stripped accumulation pass
+  that collects only T/TC counts per bin via precomputed additive classifier
+  coefficients. 7.7× faster than the full `estimate_damage_by_length()` pass
+  (150 s vs 1160 s on a 437 M-read SS library), achieved by eliminating CpG
+  context tracking, 8-oxoG counters, base-composition profiling, and per-read
+  `log()` calls.
+
+- **`DamageEstimate::lsd_hist`**: the bulk damage scan now accumulates a
+  log-length histogram, passed as `prebuilt_hist` to
+  `estimate_damage_split_model()` to skip its own histogram sub-pass.
+
+- **`--split-threshold F`**: LLR decision boundary (default 0.0). Positive
+  values require stronger damage evidence before classifying as ancient.
+
+### No breaking changes
+
+The split flags are purely additive. Existing pipelines that do not use
+`--out-damaged` / `--out-undamaged` are unaffected.
+
 ## [2.0.1] - 2026-05-11
 
 ### New features
