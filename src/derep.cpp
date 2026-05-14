@@ -256,6 +256,9 @@ private:
     // Higher score = more terminal deamination signal = more likely to be authentic ancient DNA.
     // Used to select the most-damaged read as cluster representative, maximising the
     // damage signal in the output.
+    // Per-read LLR ancient/modern classifier. Delegates to split_model_ which
+    // holds precomputed LOD tables (empirical per-bin or bulk exponential fallback).
+
     static uint8_t compute_damage_score(const std::string& seq,
                                         const DamageProfile& prof) {
         int score = 0;
@@ -2445,6 +2448,21 @@ private:
             writer_threads = std::max(1u, std::thread::hardware_concurrency());
         writer_threads = std::min(writer_threads, 16u);
 
+        std::unique_ptr<FastqWriter> writer_dam, writer_und;
+        if (!out_damaged_path_.empty()) {
+            bool c = out_damaged_path_.size() > 3 &&
+                     out_damaged_path_.substr(out_damaged_path_.size()-3) == ".gz";
+            writer_dam = std::make_unique<FastqWriter>(
+                out_damaged_path_, c, static_cast<int>(writer_threads));
+        }
+        if (!out_undamaged_path_.empty()) {
+            bool c = out_undamaged_path_.size() > 3 &&
+                     out_undamaged_path_.substr(out_undamaged_path_.size()-3) == ".gz";
+            writer_und = std::make_unique<FastqWriter>(
+                out_undamaged_path_, c, static_cast<int>(writer_threads));
+        }
+        bool do_split = writer_dam || writer_und;
+
         FastqWriter writer(out_path, compress, static_cast<int>(writer_threads));
 
         gzFile cluster_gz = nullptr;
@@ -2516,6 +2534,14 @@ private:
                 records_to_write[next_write].record_index == record_idx) {
                 const WriteEntry& entry = records_to_write[next_write];
                 writer.write(rec);
+                if (do_split) {
+                    float llr = split_model_.score(rec.seq);
+                    if (llr >= split_threshold_) {
+                        if (writer_dam) writer_dam->write(rec);
+                    } else {
+                        if (writer_und) writer_und->write(rec);
+                    }
+                }
 
                 if (cluster_gz) {
                     if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\n",
@@ -2627,6 +2653,24 @@ private:
     std::string prior_fqcl_path_;
     ska::flat_hash_map<uint64_t, uint32_t> prior_counts_;
 
+    // Optional split outputs: damaged / undamaged reads (LLR threshold = 0).
+    std::string out_damaged_path_;
+    std::string out_undamaged_path_;
+    float split_threshold_ = 0.0f;
+    DamageSplitModel split_model_;
+
+public:
+    void set_split_paths(std::string damaged, std::string undamaged,
+                         float threshold = 0.0f) {
+        out_damaged_path_   = std::move(damaged);
+        out_undamaged_path_ = std::move(undamaged);
+        split_threshold_    = threshold;
+    }
+    void set_split_model(DamageSplitModel model) {
+        split_model_ = std::move(model);
+    }
+private:
+
     // Loss counters surfaced into .fqcl metadata (T1.3, T1.2, T3.1).
     uint64_t loss_bucket_overflow_drops_   = 0;
     uint64_t loss_short_interior_skipped_  = 0;
@@ -2653,6 +2697,14 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  -o FILE              Output deduplicated FASTQ\n"
         << "\nOutput:\n"
         << "  -c FILE              Cluster statistics (gzipped TSV)\n"
+        << "  --out-damaged FILE   Write LLR-classified damaged reads to FILE (.fq.gz)\n"
+        << "  --out-undamaged FILE Write LLR-classified undamaged reads to FILE (.fq.gz)\n"
+        << "  --split-threshold F  LLR threshold for split (default 0.0)\n"
+        << "  --split-model MODE   auto (default) | bulk | empirical\n"
+        << "                         auto     — empirical per-bin if damage detected, else bulk\n"
+        << "                         bulk     — bulk exponential only, no extra file pass\n"
+        << "                         empirical — force per-bin scan (most accurate)\n"
+        << "                       -o is optional when --out-damaged/--out-undamaged given\n"
         << "  --cluster-format F   Write .fqcl genealogy (requires error correction)\n"
         << "  --prior-fqcl F       Load cluster counts from a derep_pairs --cluster-format output;\n"
         << "                       seeds Phase 3 count weights for correct PCR-error scoring\n"
@@ -2729,6 +2781,9 @@ int derep_main(int argc, char** argv) {
     }
 
     std::string in_path, out_path, cluster_path, fqcl_path, prior_fqcl_path;
+    std::string out_damaged_path, out_undamaged_path;
+    float split_threshold = 0.0f;
+    enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
     bool use_revcomp = true;
 
     ErrCorParams errcor;
@@ -2770,6 +2825,18 @@ int derep_main(int argc, char** argv) {
             in_path = argv[++i];
         } else if (arg == "-o" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--out-damaged" && i + 1 < argc) {
+            out_damaged_path = argv[++i];
+        } else if (arg == "--out-undamaged" && i + 1 < argc) {
+            out_undamaged_path = argv[++i];
+        } else if (arg == "--split-threshold" && i + 1 < argc) {
+            split_threshold = std::stof(argv[++i]);
+        } else if (arg == "--split-model" && i + 1 < argc) {
+            std::string m(argv[++i]);
+            if      (m == "auto")     split_model_mode = SplitModelMode::Auto;
+            else if (m == "bulk")     split_model_mode = SplitModelMode::Bulk;
+            else if (m == "empirical") split_model_mode = SplitModelMode::Empirical;
+            else { std::cerr << "Error: --split-model must be auto|bulk|empirical\n"; return 1; }
         } else if (arg == "-c" && i + 1 < argc) {
             cluster_path = argv[++i];
         } else if (arg == "--prior-fqcl" && i + 1 < argc) {
@@ -2948,6 +3015,8 @@ int derep_main(int argc, char** argv) {
         }
     }
 
+    if (out_path.empty() && out_damaged_path.empty() && out_undamaged_path.empty())
+        out_path = "/dev/null";  // allow omitting -o when only split outputs wanted
     if (in_path.empty() || out_path.empty()) {
         std::cerr << "Error: Missing required arguments (-i and -o)\n\n";
         print_usage(argv[0]);
@@ -3028,6 +3097,7 @@ int derep_main(int argc, char** argv) {
     profile.mask_threshold = mask_threshold;
     profile.pcr_error_rate = pcr_total_rate;
     DamageQcReport qc_report;
+    LengthStratifiedDamageProfile lsd_data;
 
     try {
         // Always fit deamination + run QC so the .fqcl header reports full damage
@@ -3063,6 +3133,33 @@ int derep_main(int argc, char** argv) {
             // clustering decisions. Default off — preserve damage signal.
             if (!damage_auto) profile.enabled = false;
             qc_report = est.qc;
+
+            // Build per-bin empirical split model when split output is requested.
+            // auto  = empirical if damage detected (d_max>0.01), else bulk fallback.
+            // bulk  = skip extra pass entirely.
+            // empirical = always run the extra pass.
+            const bool want_split = !out_damaged_path.empty() || !out_undamaged_path.empty();
+            const bool run_empirical =
+                want_split &&
+                split_model_mode != SplitModelMode::Bulk &&
+                (split_model_mode == SplitModelMode::Empirical ||
+                 est.profile.d_max_5prime > 0.01);
+            if (run_empirical) {
+                const std::vector<uint64_t>* hist_ptr =
+                    est.lsd_hist.empty() ? nullptr : &est.lsd_hist;
+                auto t_lsd = std::chrono::steady_clock::now();
+                lsd_data = estimate_damage_split_model(
+                    in_path, est.profile, hist_ptr);
+                double s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_lsd).count();
+                char tb[64];
+                std::snprintf(tb, sizeof(tb), "%.1f s", s);
+                log_info("Phase timer: length-stratified LLR model = " +
+                         std::string(tb) + " (" +
+                         std::to_string(lsd_data.bins.size()) + " bins)");
+            } else if (want_split) {
+                log_info("Split model: bulk exponential (--split-model bulk or no damage detected)");
+            }
         }
         if (damage_dmax5 >= 0.0) {
             profile.d_max_5prime  = damage_dmax5;
@@ -3142,6 +3239,9 @@ int derep_main(int argc, char** argv) {
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
                            false, bucket_cap_explicit, fqcl_path, in_path,
                            std::move(qc_json), library_type_str, prior_fqcl_path);
+        if (!out_damaged_path.empty() || !out_undamaged_path.empty())
+            engine.set_split_paths(out_damaged_path, out_undamaged_path, split_threshold);
+        engine.set_split_model(DamageSplitModel::build(lsd_data, profile));
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

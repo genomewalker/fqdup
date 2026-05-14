@@ -322,6 +322,38 @@ If both `d_max_5` and `d_max_3` are below 0.02 after estimation, damage is
 treated as negligible and standard exact hashing is used, no user intervention
 required.
 
+#### Damaged/undamaged split output (optional)
+
+Route each deduplicated read to a separate file based on its per-read
+ancient/modern LLR score. Useful for contamination estimation, variant calling
+on damaged reads only, or downstream library comparisons.
+
+```bash
+fqdup derep -i sorted.fq.gz \
+    --out-damaged   ancient.fq.gz \
+    --out-undamaged modern.fq.gz \
+    --damage collapse           # damage fit required for split scoring
+```
+
+`-o` is optional when both `--out-damaged` and `--out-undamaged` are provided.
+
+```
+  --out-damaged FILE    Write LLR-classified ancient reads to FILE
+  --out-undamaged FILE  Write LLR-classified modern reads to FILE
+  --split-threshold F   LLR decision boundary (default: 0.0)
+  --split-model MODE    auto (default) | bulk | empirical
+                          auto      — per-bin empirical if d_max > 0.01, else bulk
+                          bulk      — bulk exponential only, no extra file pass
+                          empirical — force per-bin scan regardless of damage level
+```
+
+`auto` runs a stripped length-stratified scan after the damage fit, building
+empirical per-bin C→T curves via mixture unmixing. Uses precomputed additive
+classifier coefficients (no transcendentals in the read loop) and 4 worker
+threads. Falls back to the free bulk exponential model on undamaged samples.
+See [wiki/Derep](wiki/Derep.md#damagedundamaged-split) for the LLR formula and
+per-mode performance numbers.
+
 #### PCR error correction: Phase 3 (default: on)
 
 ```

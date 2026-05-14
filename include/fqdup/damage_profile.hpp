@@ -364,6 +364,10 @@ struct DamageQcReport {
 struct DamageEstimate {
     DamageProfile  profile;
     DamageQcReport qc;
+    // Log-length histogram accumulated during the primary scan.
+    // Passed as prebuilt_hist to estimate_damage_by_length() to skip its
+    // own histogram sub-pass (saves one full file read).
+    std::vector<uint64_t> lsd_hist;
 };
 
 DamageEstimate estimate_damage_with_qc(const std::string& path,
@@ -377,3 +381,43 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     size_t reader_threads = 0,
     int64_t max_reads = 0,
     const DamageProfile* bulk_for_llr = nullptr);
+
+// Stripped-down per-bin T/TC accumulator for DamageSplitModel.
+// Avoids all CpG/oxoG/base-composition tracking and eliminates log() calls from
+// the read loop by precomputing additive LLR coefficients from the bulk model.
+// Use instead of estimate_damage_by_length() when only the split model is needed.
+LengthStratifiedDamageProfile estimate_damage_split_model(
+    const std::string& path,
+    const DamageProfile& bulk,
+    const std::vector<uint64_t>* prebuilt_hist = nullptr,
+    int n_workers = 4);
+
+// Precomputed per-bin LOD tables for per-read ancient/modern classification.
+// Built once from a LengthStratifiedDamageProfile; scoring is O(n_pos) with
+// no log/division per read. Falls back to bulk exponential when bins is empty.
+struct DamageSplitModel {
+    struct Bin {
+        int   lo = 0, hi = 0;
+        bool  ss_mode = false;
+        // lod_T[i] = log(p_dam[i] / p_und[i])   (observe T at 5' pos i → ancient)
+        // lod_C[i] = log((1-p_dam[i])/(1-p_und[i])) (observe C → modern)
+        std::array<float, LengthBinDamageProfile::N_POS> lod5_T{};
+        std::array<float, LengthBinDamageProfile::N_POS> lod5_C{};
+        std::array<float, LengthBinDamageProfile::N_POS> lod3_T{};
+        std::array<float, LengthBinDamageProfile::N_POS> lod3_C{};
+    };
+
+    std::vector<Bin> bins;
+    DamageProfile    fallback;
+
+    bool valid() const { return !bins.empty(); }
+
+    // Build from a finalized LengthStratifiedDamageProfile (must have n_damaged
+    // and per_pos_5prime_ct_damaged populated via bulk_for_llr in estimate_damage_by_length).
+    static DamageSplitModel build(const LengthStratifiedDamageProfile& lsd,
+                                  const DamageProfile& bulk);
+
+    // Score one read. Returns LLR > 0 for damaged, < 0 for undamaged.
+    // Uses per-bin empirical tables when valid(), else bulk exponential fallback.
+    float score(const std::string& seq, int n_pos = 14) const;
+};
