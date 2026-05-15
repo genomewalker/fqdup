@@ -192,13 +192,22 @@ library type, and which positions would be masked.
 
 ```
 fqdup profile -i INPUT [options]
+fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
 
-  -i FILE                    Input FASTQ (.gz or plain)
+  -i FILE                    Single-end / merged input FASTQ (.gz or plain)
+  -1 FILE -2 FILE            Raw paired-end reads (R1 → 5' counters, R2 → 3')
   -p N                       Worker threads (default: all cores)
   --library-type auto|ds|ss  Override library-type auto-detection (default: auto)
-  --mask-threshold FLOAT     Mask positions where excess P(deam) > T (default: 0.05)
+  --mask-threshold FLOAT     Flag positions where excess P(deamination) > T
+                             (default: 0.05, i.e. 5 pp above background).
+                             Output lists which positions exceed the threshold —
+                             these are the positions that would be masked in a
+                             subsequent fqdup derep --collapse-damage run.
   --tsv FILE                 Write per-position frequency table as TSV
   --json FILE                Write full damage profile as JSON
+  --html FILE                Write interactive damage report as self-contained HTML
+  --length-bins SPEC         Length-stratified damage curves: auto | N | e1,e2,...
+  --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
 ```
 
 Prints a human-readable report: library type with BIC scores, d_max/lambda per end,
@@ -246,8 +255,12 @@ fqdup extend -i INPUT -o OUTPUT [options]
   --no-damage            Skip damage estimation; no masking
   --mask-5 N             Manually mask N bp at 5' end (skips Pass 0)
   --mask-3 N             Manually mask N bp at 3' end (skips Pass 0)
-  --mask-threshold F     Excess damage threshold for terminal masking (default: 0.05)
-  --damage-sample N      Estimate damage from first N reads only (default: 500000; 0=all)
+  --mask-threshold F          Excess damage threshold for terminal masking (default: 0.05)
+  --damage-sample N           Estimate damage from first N reads only (default: 1000000; 0=all)
+  --bbhash                    Build BBHash MPHF for O(1) k-mer lookup (saves RAM, slower build)
+  --no-damage-qc              Disable adapter/hexamer QC report
+  --damage-qc-scan-reads N    Reads sampled for adapter-stub detection (default: 1000000; 0=all)
+  --damage-clip-pass MODE     off | report (default) | refit
 ```
 
 Added bases receive quality '#' (Phred 2); original bases keep their original quality scores.
@@ -278,9 +291,10 @@ Required:
   -o-ext FILE  Output extended FASTQ (representatives)
 
 Optional:
-  -c FILE              Cluster statistics (gzipped TSV)
-  --cluster-format FILE  Write a .fqcl cluster genealogy file (wire format v3)
-  --no-revcomp         Disable reverse-complement collapsing (default: enabled)
+  -c FILE               Cluster statistics (gzipped TSV)
+  --cluster-format FILE Write a .fqcl cluster genealogy file (wire format v3)
+  --no-revcomp          Disable reverse-complement collapsing (default: enabled)
+  --allow-id-mismatch   Warn instead of failing on read ID mismatches between -n and -e
 ```
 
 Representative selection: pair with the longest merged read.
@@ -314,8 +328,11 @@ run damage analysis on the fqdup output.
   --damage-lambda5 FLOAT    Decay constant for 5' end only
   --damage-lambda3 FLOAT    Decay constant for 3' end only
   --damage-bg     FLOAT     Background deamination rate (default: 0.02)
-  --mask-threshold FLOAT    Mask positions where excess P(deamination) > T
-                            (default: 0.05)
+  --mask-threshold FLOAT    Mask positions where excess P(deamination) > T (default: 0.05)
+  --library-type TYPE       auto (default) | ds | ss | unknown
+  --damage-scan N           Reads sampled for QC + adapter scan (default: 1000000; 0=all)
+  --damage-deam-sample N    Reads sampled for d_max/lambda fit (default: 5000000; 0=all)
+  --damage-clip-pass MODE   off | report (default) | refit
 ```
 
 If both `d_max_5` and `d_max_3` are below 0.02 after estimation, damage is
@@ -370,6 +387,7 @@ per-mode performance numbers.
   --errcor-bucket-cap    INT   Max pair-key bucket size (default: 0 = unlimited)
   --errcor-empirical           Empirical posterior-odds model (default: on)
   --errcor-legacy-veto         Revert to pre-T5.8 count-ratio veto
+  --errcor-max-h2-count INT    Max child count eligible for H=2 absorption (default: 2)
   --errcor-singleton-qual-min INT  Block absorption when mismatch Phred ≥ N (default: 25)
   --protect-transversions      Protect A↔T / C↔G (Channels H/G) from absorption (default: off)
   --errcor-rescue-indels       Syncmer-indexed indel rescue, ed≤2 (default: off)
@@ -379,6 +397,56 @@ per-mode performance numbers.
   --pcr-efficiency  FLOAT Amplification efficiency per cycle, 0–1 (default: 1.0)
   --pcr-error-rate  FLOAT Sub/base/doubling, Q5: 5.3e-7 (default),
                           Phusion: 3.9e-6, Taq: 1.5e-4
+```
+
+### `fqdup split`
+
+Classify reads as damaged or undamaged **without deduplication**. Runs damage
+profile estimation (Pass 0) and an optional length-stratified scan, then streams
+the input once. Input does **not** need to be sorted. Useful for splitting
+already-deduplicated reads or as a fast pre-filter before `fqdup derep`.
+
+```
+fqdup split -i INPUT [options]
+
+Required:
+  -i FILE                 Input FASTQ (raw or .gz); does not need to be sorted
+
+Outputs (at least one required):
+  --out-damaged  FILE     Write damaged reads here
+  --out-undamaged FILE    Write undamaged reads here
+
+Options:
+  --library-type STR      ds | ss | auto (default: auto)
+  --split-model STR       auto (default) | bulk | empirical
+                            auto      — empirical when d_max5 > 0.01, else bulk
+                            bulk      — bulk exponential model only
+                            empirical — always run length-stratified LSD scan
+  --split-threshold F     LLR threshold for damaged call (default: 0.0)
+  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000; 0=all)
+  -t N                    Threads (default: all available, capped at 16 for I/O)
+```
+
+### `fqdup view`
+
+Inspect `.fqcl` cluster genealogy files produced by `derep --cluster-format` or
+`derep_pairs --cluster-format`.
+
+```
+fqdup view FILE.fqcl [options]
+
+  (no flags)              Print summary header: total clusters, members, edges
+  --cluster N             Render ASCII tree for cluster N
+  --staircase N           Per-node mismatch grid for cluster N
+  --bundle [--end-k K]    Group clusters by start+end k-mer anchor (default K=16)
+  --bundle-staircase HEX  Render mismatch staircase across one bundle (hex key)
+  --min-bundle-size N     Skip bundles with fewer than N clusters (default: 2)
+  --top-members N         List top N clusters by member count
+  --top-edges N           List top N clusters by edge count
+  --dump-members          Emit TSV: cluster_id<TAB>member_id for all clusters
+  --member-of FASTQ       Emit TSV: read_name<TAB>cluster_id for every read in FASTQ
+  --json                  Emit structured JSON (schema fqdup.view.v1)
+  --html PATH             Write self-contained HTML visualisation (top 50 clusters)
 ```
 
 ---
