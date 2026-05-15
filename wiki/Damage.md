@@ -1,8 +1,8 @@
-# fqdup damage
+# fqdup profile
 
 ## Purpose
 
-`fqdup damage` profiles ancient DNA deamination damage and computes the
+`fqdup profile` profiles ancient DNA deamination damage and computes the
 per-position mask that would be applied by `fqdup extend` and `fqdup derep
 --collapse-damage`. It is a standalone diagnostic command, run it before the
 full pipeline to inspect the damage profile, verify that library-type
@@ -13,7 +13,7 @@ auto-detection is correct, and decide whether `--collapse-damage` is warranted.
 ## Usage
 
 ```bash
-fqdup damage -i FILE [options]
+fqdup profile -i FILE [options]
 ```
 
 ### Options
@@ -30,7 +30,7 @@ fqdup damage -i FILE [options]
 
 ## Algorithm
 
-`fqdup damage` is a fully multi-threaded single-pass profiler. The producer
+`fqdup profile` is a fully multi-threaded single-pass profiler. The producer
 streams the FASTQ into batches of 8,192 sequences; N worker threads each
 own their own `SampleDamageProfile` (no locking). After all reads are
 processed, the per-thread profiles are merged and finalized in a single call.
@@ -57,7 +57,7 @@ the classifier when the exponential fit is noisy.
 
 ### Paired-end mode
 
-When `fqdup damage` is given `-1/-2`, the profiler runs in native PE mode:
+When `fqdup profile` is given `-1/-2`, the profiler runs in native PE mode:
 `R1[i]` maps to top-strand 5'-end position `i` and the complement of `R2[i]`
 maps to top-strand 3'-end position `i` of the **same fragment**. Running SE
 on each mate separately would attribute R2's 5'-end signal to a non-existent
@@ -94,7 +94,7 @@ table.
 ### Human-readable report
 
 ```
-=== fqdup damage ===
+=== fqdup profile ===
 Input:   merged.fq.gz
 Threads: 16
 Reads:   5,582,073 scanned
@@ -174,11 +174,11 @@ The `dominant_process` label is one of `cytosine_deamination`, `cpg_enriched_dea
 
 ## Typical workflow
 
-Run `fqdup damage` first to inspect the profile before committing to
+Run `fqdup profile` first to inspect the profile before committing to
 `--collapse-damage`:
 
 ```bash
-fqdup damage -i merged.fq.gz --tsv damage_profile.tsv
+fqdup profile -i merged.fq.gz --tsv damage_profile.tsv
 ```
 
 Then use the output to decide:
@@ -187,11 +187,11 @@ Then use the output to decide:
    `--collapse-damage` in `fqdup derep` entirely.
 
 2. **Library type looks wrong**, override with `--library-type ds|ss` in
-   `fqdup damage` first to confirm, then pass the same flag to `fqdup extend`
+   `fqdup profile` first to confirm, then pass the same flag to `fqdup extend`
    and `fqdup derep`.
 
 3. **mask-threshold produces too many / too few masked positions**, adjust
-   `--mask-threshold` and re-run `fqdup damage` until the masked zone matches
+   `--mask-threshold` and re-run `fqdup profile` until the masked zone matches
    the damage plot. Then pass the same threshold to `fqdup extend` and
    `fqdup derep`.
 

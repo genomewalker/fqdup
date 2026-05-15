@@ -186,17 +186,21 @@ fqdup derep       ... --no-revcomp
 |------|-------------|---------|
 | `-i FILE` | Input merged FASTQ (.gz or plain) | required |
 | `-o FILE` | Output extended FASTQ | required |
-| `-k N` | k-mer size (max 31) | 17 |
+| `-k N` | k-mer size, odd 5–31 | 17 |
 | `--min-count N` | Minimum edge support to include a k-mer | 2 |
 | `--max-extend N` | Maximum bases added per side | 100 |
 | `--threads N` | Worker threads | all cores |
 | `--min-qual N` | Exclude bases below this Phred quality | 20 |
-| `--library-type TYPE` | Damage model library type: `auto`, `ds`, `ss` | auto |
+| `--library-type auto\|ds\|ss` | Damage model library type | auto |
 | `--no-damage` | Skip damage estimation; no masking | off |
 | `--mask-5 N` | Manually mask N bp at 5' end (skips Pass 0) | - |
 | `--mask-3 N` | Manually mask N bp at 3' end (skips Pass 0) | - |
-| `--mask-threshold F` | Excess damage threshold for terminal masking | 0.05 |
-| `--damage-deam-sample N` | Estimate damage from first N reads only (0=all) | 500000 |
+| `--mask-threshold FLOAT` | Excess damage threshold for terminal masking | 0.05 |
+| `--damage-sample N` | Reads sampled for damage estimation (0=all) | 1000000 |
+| `--bbhash` | Build BBHash MPHF for O(1) lookup (saves RAM, slower) | off |
+| `--no-damage-qc` | Disable adapter/hexamer QC report | off |
+| `--damage-qc-scan-reads N` | Reads sampled for adapter-stub detection (0=all) | 1000000 |
+| `--damage-clip-pass MODE` | `off` \| `report` \| `refit` | report |
 
 Added bases receive quality `#` (Phred 2). Reads with no clean interior k-mers
 are written unchanged.
@@ -222,48 +226,109 @@ are written unchanged.
 | `-o-non FILE` | Output merged FASTQ (representatives) | required |
 | `-o-ext FILE` | Output extended FASTQ (representatives) | required |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
+| `--cluster-format FILE` | Write cluster genealogy to `.fqcl` (use with `derep --prior-fqcl`) | off |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
+| `--allow-id-mismatch` | Warn instead of failing on read ID mismatches | off |
 
-### `fqdup damage`
+### `fqdup profile`
+
+Accepts single-end/merged input (`-i`) or raw paired-end reads (`-1`/`-2`).
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i FILE` | Input FASTQ (.gz or plain) | required |
+| `-i FILE` | Single-end / merged input FASTQ (.gz or plain) | — |
+| `-1 FILE -2 FILE` | Paired-end raw reads (R1 → 5' counters, R2 → 3' counters) | — |
 | `-p N` | Worker threads | all cores |
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
 | `--mask-threshold FLOAT` | Mask positions where excess P(deam) > T | 0.05 |
 | `--tsv FILE` | Write per-position frequency table as TSV | - |
+| `--json FILE` | Write full damage profile as JSON | - |
+| `--html FILE` | Write interactive damage report as self-contained HTML | - |
+| `--length-bins SPEC` | Length-stratified damage: `auto`, `N`, or `e1,e2,...` | off |
+| `--adapter-scan-reads N` | Reads sampled for adapter-stub detection (0=all) | 1000000 |
 
-See [[Damage]] for full output description and typical workflow.
+See [[Profile]] for full output description and typical workflow.
+
+### `fqdup split`
+
+Classify reads as damaged or undamaged **without deduplication**. Runs damage
+profile estimation (Pass 0), builds the LLR split model, then streams the
+input once. The input does **not** need to be sorted. Useful for splitting
+already-deduplicated reads or for a quick pre-filter before `fqdup derep`.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i FILE` | Input FASTQ (raw or .gz); does not need to be sorted | required |
+| `--out-damaged FILE` | Write damaged reads here | - |
+| `--out-undamaged FILE` | Write undamaged reads here | - |
+| `--library-type ds\|ss\|auto` | Override library-type detection | auto |
+| `--split-model auto\|bulk\|empirical` | Split model: auto uses empirical when d_max5>0.01, else bulk | auto |
+| `--split-threshold FLOAT` | LLR threshold for damaged call | 0.0 |
+| `--damage-deam-sample N` | Max reads scanned for Pass 0 damage estimation | 5000000 |
+| `-t N` | Threads (I/O capped at 16) | all cores |
+
+At least one of `--out-damaged` / `--out-undamaged` is required.
 
 ### `fqdup derep`
+
+`-o` is optional when `--out-damaged`/`--out-undamaged` are given. Use `--help-advanced` for the full errcor/damage/PCR knob list.
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-i FILE` | Sorted input FASTQ | required |
-| `-o FILE` | Output FASTQ | required |
+| `-o FILE` | Output deduplicated FASTQ | - |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
+| `--out-damaged FILE` | Write LLR-classified damaged reads | - |
+| `--out-undamaged FILE` | Write LLR-classified undamaged reads | - |
+| `--split-threshold FLOAT` | LLR threshold for damaged/undamaged split | 0.0 |
+| `--split-model auto\|bulk\|empirical` | Split model selection | auto |
+| `--cluster-format FILE` | Write `.fqcl` cluster genealogy | off |
+| `--prior-fqcl FILE` | Load cluster counts from `derep_pairs --cluster-format` output | - |
 | `--no-revcomp` | Disable reverse-complement collapsing | off |
-| `--collapse-damage` | Collapse damage variants into one cluster per molecule | off |
-| `--damage-dmax FLOAT` | d_max for both ends (manual model) | - |
-| `--damage-dmax5 FLOAT` | d_max for 5' end | - |
-| `--damage-dmax3 FLOAT` | d_max for 3' end | - |
-| `--damage-lambda FLOAT` | Decay constant for both ends | - |
-| `--damage-lambda5 FLOAT` | Decay constant for 5' end | - |
-| `--damage-lambda3 FLOAT` | Decay constant for 3' end | - |
+| `--damage off\|report\|collapse` | Damage mode (`collapse` = use in clustering; distorts per-pos rates) | report |
+| `--library-type auto\|ds\|ss\|unknown` | Library type for damage model | auto |
+| `--damage-dmax N[,N]` | Manual d_max override e.g. `0.21,0.13` for 5',3' (skips fit) | - |
+| `--damage-dmax5 FLOAT` | Manual d_max 5' end | - |
+| `--damage-dmax3 FLOAT` | Manual d_max 3' end | - |
+| `--damage-lambda FLOAT` | Manual decay constant both ends | - |
+| `--damage-lambda5 FLOAT` | Manual decay constant 5' end | - |
+| `--damage-lambda3 FLOAT` | Manual decay constant 3' end | - |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
-| `--pcr-cycles INT` | PCR cycles for D_eff log estimate | 0 (auto) |
+| `--damage-scan N` | Reads sampled for QC + adapter scan (0=all) | 1000000 |
+| `--damage-deam-sample N` | Reads sampled for d_max/lambda fit (0=all) | 5000000 |
+| `--damage-clip-pass MODE` | `off` \| `report` \| `refit` | report |
+| `--no-error-correct` | Disable Phase 3 PCR error correction | off |
+| `--errcor-rescue-indels` | Syncmer-indexed indel rescue (ed≤2) | off |
+| `--pcr-cycles INT` | PCR cycles for D_eff estimate | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Efficiency per cycle, 0–1 | 1.0 |
-| `--pcr-error-rate FLOAT` | Sub/base/doubling for log estimate | 5.3e-7 |
-| `--error-correct` | Enable Phase 3 PCR error correction | **on** |
-| `--no-error-correct` | Disable Phase 3 PCR error correction | - |
+| `--pcr-error-rate FLOAT` | Substitution rate per base per doubling | 5.3e-7 |
 | `--errcor-min-parent INT` | Min count to index as parent | 3 |
 | `--errcor-max-h2-count INT` | Max child count eligible for H=2 absorption | 2 |
 | `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
 | `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 1 |
 | `--errcor-bucket-cap INT` | Pair-key bucket size cap | 0 (unlimited) |
-| `--errcor-empirical` | Empirical posterior-odds model (T5.8) | **on** |
+| `--errcor-empirical` | Empirical posterior-odds model | **on** |
 | `--errcor-legacy-veto` | Revert to pre-T5.8 count-ratio veto | off |
 | `--errcor-singleton-qual-min INT` | Block absorption when mismatch Phred ≥ N (non-damage) | 25 |
-| `--errcor-rescue-indels` | Syncmer-indexed indel rescue (ed≤2) | off |
+
+### `fqdup view`
+
+Inspect `.fqcl` cluster genealogy files produced by `derep --cluster-format` or
+`derep_pairs --cluster-format`.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `FILE` | Input `.fqcl` file | required |
+| *(no flags)* | Print summary header (total clusters, members, edges) | — |
+| `--cluster N` | Render ASCII tree for cluster N | — |
+| `--staircase N` | Per-node mismatch grid for cluster N | — |
+| `--bundle [--end-k K]` | Group clusters by start+end k-mer; K controls anchor length | K=16 |
+| `--bundle-staircase HEX` | Render mismatch staircase across one bundle (hex bundle key) | — |
+| `--min-bundle-size N` | Skip bundles with fewer than N clusters | 2 |
+| `--top-members N` | List top N clusters by member count | — |
+| `--top-edges N` | List top N clusters by edge count | — |
+| `--dump-members` | Emit TSV: `cluster_id\tmember_id` for all clusters | — |
+| `--member-of FASTQ` | Emit TSV: `read_name\tcluster_id` for every read in FASTQ | — |
+| `--json` | Emit structured JSON (schema `fqdup.view.v1`) | — |
+| `--html PATH` | Write self-contained HTML visualisation (top 50 clusters) | — |
