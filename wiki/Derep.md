@@ -88,7 +88,7 @@ Optional:
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
 
-Run `fqdup damage -i FILE` first to inspect d_max and which positions would
+Run `fqdup profile -i FILE` first to inspect d_max and which positions would
 be masked before committing to `--collapse-damage`. See [[Damage]].
 
 ### Damaged/undamaged split
