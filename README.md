@@ -14,11 +14,11 @@ damage patterns.
 
 ## How it works
 
-`fqdup` runs four steps in order. An optional diagnostic command, `fqdup damage`,
+`fqdup` runs four steps in order. An optional diagnostic command, `fqdup profile`,
 can be run beforehand to inspect the damage profile and verify library-type
 detection.
 
-**0. `fqdup damage` (optional diagnostic)**: standalone multi-threaded damage
+**0. `fqdup profile` (optional diagnostic)**: standalone multi-threaded damage
 profiler. Scans the input reads and reports d_max, lambda, background rate, and
 per-position C→T/G→A frequencies. Classifies the library as double-stranded or
 single-stranded via a 7-model BIC competition before fitting. Run this before the
@@ -185,13 +185,13 @@ bash tests/smoke.sh $(pwd)/build/fqdup
 
 ## Options
 
-### `fqdup damage`
+### `fqdup profile`
 
 Standalone damage profiler. Run this before the full pipeline to inspect d_max,
 library type, and which positions would be masked.
 
 ```
-fqdup damage -i INPUT [options]
+fqdup profile -i INPUT [options]
 
   -i FILE                    Input FASTQ (.gz or plain)
   -p N                       Worker threads (default: all cores)
