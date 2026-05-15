@@ -18,6 +18,7 @@ static constexpr float kOxChannelZDetect = 3.0f;
 
 #include "fqdup/logger.hpp"
 #include "taph/library_interpretation.hpp"
+#include "taph/length_bin_damage_profile.hpp"
 #include "taph/sample_damage_profile.hpp"
 
 inline constexpr int LSD_L_MIN             = 30;
@@ -194,130 +195,9 @@ struct LengthBinOptions {
     bool enabled() const { return mode != Mode::DISABLED; }
 };
 
-struct LengthBinDamageProfile {
-    static constexpr int N_POS = 15;
-    int length_lo = 0;
-    int length_hi = 0;
-    int64_t n_reads = 0;
-    double d_max_5prime = 0.0;
-    double d_max_3prime = 0.0;
-    double lambda_5prime = 0.0;
-    double lambda_3prime = 0.0;
-    double bg_5prime = 0.0;
-    double bg_3prime = 0.0;
-    double cpg_contrast = std::numeric_limits<double>::quiet_NaN();
-    bool validated = false;
-    bool ss_mode = false;  // true if per_pos_3prime is C→T (SS), false if G→A (DS)
-    std::string source = "none";
-    // Per-position damage frequencies (positions 0..N_POS-1 from the 5'/3' end).
-    // -1.0 marks positions with insufficient coverage (<100 reads).
-    std::array<double, N_POS> per_pos_5prime_ct{};
-    std::array<double, N_POS> per_pos_3prime{};
-
-    // Per-length-bin K-component GC mixture (populated by libtaph finalize).
-    static constexpr int N_GC_BINS = 10;
-    double mixture_d_damaged   = 0.0;
-    double mixture_d_reference = 0.0;
-    double mixture_d_population = 0.0;
-    double mixture_pi_damaged  = 0.0;
-    int    mixture_n_components = 0;
-    bool   mixture_converged   = false;
-    bool   mixture_identifiable = false;
-    // Per-GC-bin d_max (10 bins, 0-10% ... 90-100%) within this length bin.
-    // -1.0 if bin not valid (insufficient reads / C-sites).
-    std::array<double,  N_GC_BINS> gc_d_max{};
-    std::array<int64_t, N_GC_BINS> gc_n_reads{};
-    std::array<double,  N_GC_BINS> gc_p_damaged{};
-
-    // Per-read LLR unmixing results (populated when bulk params are supplied).
-    // ancient = LLR(read | bulk ancient class) > LLR(read | bulk modern class).
-    int64_t n_damaged = 0;
-    int64_t n_undamaged  = 0;
-    double  d_max_5_damaged = -1.0;
-    double  d_max_3_damaged = -1.0;
-    // Per-position T/(T+C) at 5' end (always) and at 3' end (T/(T+C) for SS,
-    // A/(A+G) for DS) within the ancient-classified read subset.
-    std::array<double, N_POS> per_pos_5prime_ct_damaged{};
-    std::array<double, N_POS> per_pos_3prime_damaged{};
-    // CpG-split 5' C→T in the ancient subset (metaDMG-style split). CpG = C
-    // followed by G in the 5'→3' direction. -1 marks insufficient coverage.
-    std::array<double, N_POS> per_pos_5prime_ct_cpg_damaged{};
-    std::array<double, N_POS> per_pos_5prime_ct_noncpg_damaged{};
-    double d_max_5_cpg_damaged    = -1.0;
-    double d_max_5_noncpg_damaged = -1.0;
-    // 8-oxoG marker: T/(T+G) at 5' terminal positions, split by ancient/modern.
-    // s_gt_5_damaged_vs_undamaged = f_damaged(pos0) - f_modern(pos0); NaN if coverage low.
-    // CAUTION: at pos 0 this signal is contaminated by the C→T elevation that
-    // defines the ancient class. The clean 8-oxoG metric is g_to_t_5_damaged
-    // below (derived from G-base depletion, independent of C→T).
-    std::array<double, N_POS> per_pos_5prime_gt_damaged{};
-    std::array<double, N_POS> per_pos_5prime_gt_undamaged{};
-    double s_gt_5_damaged_vs_undamaged = std::numeric_limits<double>::quiet_NaN();
-
-    // Clean 8-oxoG rate: G-fraction depletion at terminal vs interior baseline
-    // within the ancient subset. Under pure C→T deamination, G-fraction at
-    // terminal equals G-fraction at interior. Under 8-oxoG, terminal G-fraction
-    // drops because G→T. g_to_t_5_damaged = p_G(interior) - p_G(terminal).
-    double g_to_t_5_damaged = std::numeric_limits<double>::quiet_NaN();
-    double pG_terminal_5_damaged = std::numeric_limits<double>::quiet_NaN();
-    double pG_interior_5_damaged = std::numeric_limits<double>::quiet_NaN();
-
-    // Reference-free trinucleotide spectrum (bulk, from libtaph).
-    // 64 contexts = prev*16 + mid*4 + next; A=0,C=1,G=2,T=3.
-    // Terminal = read pos 1..4 from that end; interior = pos 10..14 (null baseline).
-    // Downstream post-processing can contrast the terminal counters against
-    // their interior counterparts for reference-free context analysis.
-    std::array<int64_t, 64> tri_5prime_terminal{};
-    std::array<int64_t, 64> tri_5prime_interior{};
-    std::array<int64_t, 64> tri_3prime_terminal{};
-    std::array<int64_t, 64> tri_3prime_interior{};
-
-    // Oxidation channel metrics (Channels C / F / G / H) per length bin.
-    float ox_stop_rate_baseline  = 0.0f;  // Channel C
-    float ox_stop_rate_terminal  = 0.0f;
-    float ox_uniformity_ratio    = 0.0f;
-    bool  channel_c_valid        = false;
-    float ca_stop_rate_baseline  = 0.0f;  // Channel F
-    float ca_stop_rate_terminal  = 0.0f;
-    float ca_uniformity_ratio    = 0.0f;
-    float channel_f_z            = 0.0f;
-    float channel_f_mh_z         = 0.0f;
-    float channel_f_common_or    = 0.0f;
-    bool  channel_f_valid        = false;
-    float cg_stop_rate_baseline  = 0.0f;  // Channel G
-    float cg_stop_rate_terminal  = 0.0f;
-    float cg_uniformity_ratio    = 0.0f;
-    float channel_g_z            = 0.0f;
-    bool  channel_g_valid        = false;
-    float at_stop_rate_baseline  = 0.0f;  // Channel H
-    float at_stop_rate_terminal  = 0.0f;
-    float at_uniformity_ratio    = 0.0f;
-    float channel_h_z            = 0.0f;
-    float channel_h_z_p2plus     = 0.0f;
-    bool  channel_h_valid        = false;
-};
-
-struct LengthStratifiedDamageProfile {
-    std::string method = "single";
-    std::vector<int> edges;
-    std::vector<LengthBinDamageProfile> bins;
-    int64_t reads_scanned = 0;
-    int min_length = 0;
-    int max_length = 0;
-
-    // Joint length × GC 2-component mixture:
-    // shared d_ancient, shared pi_ancient, per-cell w_ancient(b,g).
-    // Treats each (length_bin, gc_bin) cell's d_max as an observation from
-    // a 2-component Gaussian (undamaged at μ=0 vs damaged at μ=d_joint_ancient).
-    double  d_joint_ancient   = 0.0;
-    double  pi_joint_ancient  = 0.0;
-    double  d_joint_population = 0.0;  // c_sites-weighted mean over all cells
-    bool    joint_converged   = false;
-    bool    joint_separated   = false;
-    // w_ancient(b,g) = posterior P(damaged | cell_d_max_{b,g});
-    // rows = length bins, cols = 10 GC bins. Empty if fit didn't run.
-    std::vector<std::array<double, LengthBinDamageProfile::N_GC_BINS>> cell_w_ancient;
-};
+// Use canonical definitions from libtaph (taph/length_bin_damage_profile.hpp).
+using LengthBinDamageProfile       = taph::LengthBinDamageProfile;
+using LengthStratifiedDamageProfile = taph::LengthStratifiedDamageProfile;
 
 // Run deamination damage estimation on a FASTQ file and return a populated DamageProfile.
 // max_reads: stop after this many reads (0 = use all reads).
