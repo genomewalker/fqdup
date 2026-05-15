@@ -217,22 +217,38 @@ call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
 
 The `--json` output includes the complete machine-readable profile:
 
-- **Deamination estimates**: `d_max_5prime`, `d_max_combined`, `d_metamatch` (channel-B
-  anchored blended estimate calibrated against metaDMG, r=0.818 on clean DS samples),
-  per-position CT/GA arrays, BIC scores for library-type classification.
-- **CpG-like context split** (`deamination.cpg_like`): 5' C→T amplitude fitted
-  separately for CpG-context (`xG`) vs non-CpG positions, with interior baselines as
-  reference. `cpg_ratio = dmax_cpg / dmax_noncpg`; values >1 indicate methylation-enhanced
-  deamination, as expected for most ancient organisms.
+- **Deamination** (`deamination`): `d_max_5prime`, `d_max_combined`, `d_metamatch`
+  (channel-B anchored blended estimate calibrated against metaDMG, r=0.818 on clean DS
+  samples), per-position CT/GA arrays (15 positions each end), BIC scores for
+  library-type classification, CpG vs non-CpG amplitude split (`cpg_like`), and
+  length-stratified d_max bins (`by_length`, populated when `--length-bins` is given).
+- **CpG context** (`deamination.cpg_like`): 5' C→T fitted separately for CpG (`xG`)
+  vs non-CpG positions. `cpg_ratio = dmax_cpg / dmax_noncpg`; values below 1.0 indicate
+  CpG protection consistent with methylation.
 - **Interior C→T clustering** (`interior_ct_cluster`): excess co-occurrence of T at
-  non-CpG `{C,T}` sites within the read interior, measured at separations d=1–10 bp.
-  `short_asym_log2oe` is the CT-track minus AG-control log₂ observed/expected; significant
-  positive values indicate clustered interior deamination. `short_z` is the normalised
-  contrast statistic.
-- **8-oxoG asymmetry**: `s_oxog` (overall strand asymmetry), plus `s_oxog_16ctx[16]` —
-  the G→T asymmetry split across all 16 flanking-dinucleotide contexts (NxN where x=G).
-- **Depurination enrichment** at 5′ and 3′ termini.
-- **Oxidative complement channels** (`complement_asymmetry`): binomial z-scores comparing terminal trinucleotide-context rates to far-interior baseline — `channel_f_z` (C→A, 8-oxoG bottom strand), `channel_g_z` (C→G, hydantoin products), `channel_h_z` / `channel_h_z_p2plus` (A→T; empirical, mechanism uncertain — 8-oxoadenine primarily causes A→C, not A→T). All three elevated together = genuine aDNA oxidative damage; F+/G+ with H flat = GC-rich bacterial contamination.
+  non-CpG `{C,T}` sites within the read interior at separations d=1-10 bp.
+  `short_asym_log2oe` is CT-track minus AG-control log2 observed/expected; positive values
+  indicate clustered interior deamination.
+- **8-oxoG asymmetry** (`complement_asymmetry`): `s_oxog` (overall strand asymmetry)
+  and `s_oxog_16ctx[16]` (G→T asymmetry across all 16 flanking-dinucleotide contexts).
+- **Depurination** (`depurination`): A/G enrichment at 5' and 3' termini; `detected`
+  flag with z-score and p-value.
+- **Damage-context summary** (`damage_context`): training-free, reference-free summary
+  with six damage-process scores (`terminal_deamination_score`, `cpg_context_score`,
+  `dipyrimidine_context_score`, `oxidative_context_score`, `fragmentation_context_score`,
+  `library_artifact_score`) and a `dominant_process` string indicating the most likely
+  damage mechanism. The `evidence` sub-object records the raw inputs used.
+- **Damage-type channels** (`damage_types`): array of 8 entries (channels A-H) each
+  covering an independent damage mechanism: A=cytosine deamination, B=stop-codon
+  deamination validator, C=8-oxoG top strand, D=Chargaff G→T asymmetry, E=purine
+  enrichment/depurination, F=8-oxoG bottom strand, G=hydantoin oxidation, H=adenine
+  oxidation. Each entry carries `detected`, mechanism-specific rates, and z-scores.
+  All eight channels are always present.
+- **Preservation score** (`preservation`): composite score (0-1) combining deamination
+  evidence, exponential fit quality, CpG age-bias, and oxidation evidence. The
+  `authenticity_eff` field is the deamination-only component.
+- **Library QC** (`library_qc`): adapter remnant flags, hexamer entropy, composition
+  bias z-scores, and a `flags` array listing detected artifacts.
 
 Library-type classification returns `unknown` when no damage signal is detectable
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
