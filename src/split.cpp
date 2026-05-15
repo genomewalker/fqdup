@@ -1,0 +1,189 @@
+// fqdup split — classify reads as damaged/undamaged without deduplication.
+// Runs damage profile estimation (Pass 0), builds the LLR split model,
+// then streams the input once routing each read to --out-damaged or --out-undamaged.
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+
+#include "fqdup/damage_profile.hpp"
+#include "fqdup/fastq_common.hpp"
+#include "fqdup/logger.hpp"
+#include "fqdup/version.hpp"
+
+static void usage(const char* prog) {
+    std::cerr <<
+        "Usage: fqdup split -i INPUT [options]\n"
+        "\nClassify reads as damaged or undamaged without deduplication.\n"
+        "Estimates damage profile, builds per-read LLR split model, streams\n"
+        "input once routing each read to --out-damaged / --out-undamaged.\n"
+        "\nRequired:\n"
+        "  -i FILE              Input FASTQ (raw or .gz); does NOT need to be sorted\n"
+        "\nOutputs (at least one required):\n"
+        "  --out-damaged  FILE  Write damaged reads here\n"
+        "  --out-undamaged FILE Write undamaged reads here\n"
+        "\nOptions:\n"
+        "  --library-type STR   ds (default), ss, or auto (inferred from profile)\n"
+        "  --split-model STR    auto (default), bulk, or empirical\n"
+        "                         auto: empirical when d_max5>0.01, else bulk\n"
+        "                         bulk: exponential model from Pass 0 estimate\n"
+        "                         empirical: always run length-stratified LSD scan\n"
+        "  --split-threshold F  LLR threshold for damaged call (default: 0.0)\n"
+        "  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000)\n"
+        "  -t N                 Threads (default: all available, capped at 16 for I/O)\n"
+        "  -h, --help           Show this help\n";
+}
+
+int split_main(int argc, char** argv) {
+    std::string in_path, out_damaged_path, out_undamaged_path;
+    float split_threshold = 0.0f;
+    int64_t damage_deam_max_reads = 5'000'000;
+    unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+
+    enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
+    auto forced_library_type = taph::SampleDamageProfile::LibraryType::UNKNOWN;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if ((a == "-i" || a == "--input") && i+1 < argc)       { in_path = argv[++i]; }
+        else if (a == "--out-damaged"  && i+1 < argc)           { out_damaged_path = argv[++i]; }
+        else if (a == "--out-undamaged" && i+1 < argc)          { out_undamaged_path = argv[++i]; }
+        else if (a == "--split-threshold" && i+1 < argc)        { split_threshold = std::stof(argv[++i]); }
+        else if (a == "--damage-deam-sample" && i+1 < argc)     { damage_deam_max_reads = std::stoll(argv[++i]); }
+        else if ((a == "-t" || a == "--threads") && i+1 < argc) { threads = static_cast<unsigned>(std::stoi(argv[++i])); }
+        else if (a == "--library-type" && i+1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "ds")   forced_library_type = taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+            else if (m == "ss")   forced_library_type = taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
+            else if (m == "auto") forced_library_type = taph::SampleDamageProfile::LibraryType::UNKNOWN;
+            else { std::cerr << "Error: unknown --library-type '" << m << "'\n"; return 1; }
+        }
+        else if (a == "--split-model" && i+1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "auto")      split_model_mode = SplitModelMode::Auto;
+            else if (m == "bulk")      split_model_mode = SplitModelMode::Bulk;
+            else if (m == "empirical") split_model_mode = SplitModelMode::Empirical;
+            else { std::cerr << "Error: unknown --split-model '" << m << "'\n"; return 1; }
+        }
+        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
+        else { std::cerr << "Error: unknown option '" << a << "'\n"; usage(argv[0]); return 1; }
+    }
+
+    if (in_path.empty()) {
+        std::cerr << "Error: -i INPUT required\n";
+        usage(argv[0]);
+        return 1;
+    }
+    if (out_damaged_path.empty() && out_undamaged_path.empty()) {
+        std::cerr << "Error: at least one of --out-damaged / --out-undamaged required\n";
+        usage(argv[0]);
+        return 1;
+    }
+
+    init_logger("");
+    log_info("=== fqdup split: damage-score classification (no deduplication) ===");
+    log_info("fqdup version: " FQDUP_VERSION);
+    log_info("Input: " + in_path);
+    if (!out_damaged_path.empty())   log_info("Output (damaged):   " + out_damaged_path);
+    if (!out_undamaged_path.empty()) log_info("Output (undamaged): " + out_undamaged_path);
+    if (damage_deam_max_reads > 0)
+        log_info("Damage scan: first " + std::to_string(damage_deam_max_reads) + " reads");
+
+    try {
+        // --- Pass 0: damage profile estimation ---
+        DamageEstimateOptions opts;
+        opts.forced_lib         = forced_library_type;
+        opts.qc_enabled         = false;
+        opts.max_reads          = damage_deam_max_reads;
+
+        auto t0 = std::chrono::steady_clock::now();
+        DamageEstimate est = estimate_damage_with_qc(in_path, opts);
+        double t0s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        {
+            char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t0s);
+            log_info("Phase timer: damage estimation = " + std::string(b));
+        }
+
+        DamageProfile profile = est.profile;
+        log_info("Split model: " +
+            std::string(profile.d_max_5prime > 0.01 ? "empirical candidate" : "bulk exponential"));
+
+        // --- Optional LSD scan for empirical per-length-bin model ---
+        LengthStratifiedDamageProfile lsd_data;
+        const bool run_empirical =
+            split_model_mode != SplitModelMode::Bulk &&
+            (split_model_mode == SplitModelMode::Empirical ||
+             est.profile.d_max_5prime > 0.01);
+
+        if (run_empirical) {
+            auto t1 = std::chrono::steady_clock::now();
+            const std::vector<uint64_t>* hist_ptr =
+                est.lsd_hist.empty() ? nullptr : &est.lsd_hist;
+            lsd_data = estimate_damage_split_model(in_path, est.profile, hist_ptr);
+            double t1s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+            char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t1s);
+            log_info("Phase timer: length-stratified LLR model = " +
+                std::string(b) + " (" + std::to_string(lsd_data.bins.size()) + " bins)");
+        } else {
+            log_info("Split model: bulk exponential (--split-model bulk or no damage detected)");
+        }
+
+        DamageSplitModel split_model = DamageSplitModel::build(lsd_data, profile);
+
+        // --- Streaming classification pass ---
+        unsigned writer_threads = std::min(threads, 16u);
+        auto is_gz = [](const std::string& p) {
+            return p.size() > 3 && p.substr(p.size()-3) == ".gz";
+        };
+
+        std::unique_ptr<FastqWriter> writer_dam, writer_und;
+        if (!out_damaged_path.empty())
+            writer_dam = std::make_unique<FastqWriter>(
+                out_damaged_path, is_gz(out_damaged_path), static_cast<int>(writer_threads));
+        if (!out_undamaged_path.empty())
+            writer_und = std::make_unique<FastqWriter>(
+                out_undamaged_path, is_gz(out_undamaged_path), static_cast<int>(writer_threads));
+
+        auto t2 = std::chrono::steady_clock::now();
+        auto reader = make_fastq_reader(in_path);
+        FastqRecord rec;
+        uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0;
+
+        while (reader->read(rec)) {
+            ++n_total;
+            float llr = split_model.score(rec.seq);
+            if (llr >= split_threshold) {
+                ++n_damaged;
+                if (writer_dam) writer_dam->write(rec);
+            } else {
+                ++n_undamaged;
+                if (writer_und) writer_und->write(rec);
+            }
+        }
+
+        double t2s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
+        {
+            char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t2s);
+            log_info("Phase timer: classification pass = " + std::string(b));
+        }
+
+        log_info("=== Split complete ===");
+        log_info("Total reads: " + std::to_string(n_total));
+        log_info("Damaged:     " + std::to_string(n_damaged) +
+                 " (" + [&]{ char b[16]; std::snprintf(b,sizeof(b),"%.1f%%",
+                     n_total ? 100.0*n_damaged/n_total : 0.0); return std::string(b); }() + ")");
+        log_info("Undamaged:   " + std::to_string(n_undamaged) +
+                 " (" + [&]{ char b[16]; std::snprintf(b,sizeof(b),"%.1f%%",
+                     n_total ? 100.0*n_undamaged/n_total : 0.0); return std::string(b); }() + ")");
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+
+    shutdown_logger();
+    return 0;
+}

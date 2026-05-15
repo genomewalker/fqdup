@@ -1353,7 +1353,13 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
     }
 
     // Bulk exponential fallback
-    if (!fallback.enabled) return 0.0f;
+    // No damage signal → all reads score below threshold → undamaged
+    if (!fallback.enabled) return -1.0f;
+    // d_max_5prime=0 → pd==pu at every 5' position → LLR=0 for all reads → uninformative.
+    // For DS only 5' matters; for SS both ends must be zero before we give up.
+    if (fallback.d_max_5prime <= 0.0 &&
+            (!fallback.ss_mode || fallback.d_max_3prime <= 0.0))
+        return -1.0f;
     for (int i = 1; i <= n_pos && i < L; ++i) {
         double pd = fallback.bg_5_tc + fallback.d_max_5prime *
                     std::exp(-fallback.lambda_5prime * i);
