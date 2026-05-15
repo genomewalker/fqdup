@@ -144,10 +144,10 @@ pos	end5	freq5	end3	freq3	mask	cov5	cov3
 
 ### Damage-context profile (JSON only)
 
-The `--json` output includes a `damage_context_profile` block, a training-free, reference-free, alignment-free summary computed by libtaph's `compute_damage_context_profile`. Six scores in `[0, 1]` (or `null` when not evaluable) plus a deterministic `dominant_process` label:
+The `--json` output includes a `damage_context` block: a training-free, reference-free, alignment-free summary computed by libtaph. Six scores in `[0, 1]` (or `null` when not evaluable) plus a deterministic `dominant_process` string:
 
 ```json
-"damage_context_profile": {
+"damage_context": {
   "method": "training_free",
   "reference_required": false,
   "alignment_required": false,
@@ -159,16 +159,35 @@ The `--json` output includes a `damage_context_profile` block, a training-free, 
   "oxidative_context_score": 0.03,
   "fragmentation_context_score": 0.31,
   "library_artifact_score": 0.04,
-  "evidence": { "d_max_5": 0.193, "d_max_3": 0.040, "lambda_5": 0.246,
-                "log2_cpg_ratio": 0.38, "dipyr_contrast": 0.004,
-                "ox_gt_asymmetry": 0.012, "s_oxog_mean": 0.003,
-                "purine_enrichment_5prime": 0.021, "hex_shift_z": 1.2,
-                "adapter_clipped": false, "flag_hex_artifact": false,
-                "n_reads": 5582073 }
+  "evidence": {
+    "d_max_5": 0.193, "d_max_3": 0.040, "lambda_5": 0.246,
+    "log2_cpg_ratio": 0.38, "dipyr_contrast": 0.004,
+    "ox_gt_asymmetry": 0.012, "s_oxog_mean": 0.003,
+    "purine_enrichment_5prime": 0.021, "hex_shift_z": 1.2,
+    "adapter_clipped": false, "flag_hex_artifact": false,
+    "n_reads": 5582073
+  }
 }
 ```
 
-The `dominant_process` label is one of `cytosine_deamination`, `cpg_enriched_deamination`, `dipyrimidine_biased`, `oxidative_like`, `fragmentation_bias`, `library_artifact_likely`, `low_damage`, or `none` (insufficient coverage). Rule order and the score formulas are documented in the libtaph methods page.
+`dominant_process` is one of: `cytosine_deamination`, `cpg_enriched_deamination`, `dipyrimidine_biased`, `oxidative_like`, `fragmentation_bias`, `library_artifact_likely`, `low_damage`, or `none` (insufficient coverage).
+
+### Damage-type channels (JSON only)
+
+The `--json` output also includes a `damage_types` array with one entry per channel (A through H). Each entry describes an independent damage mechanism detected reference-free from terminal trinucleotide context:
+
+| Channel | Name | Mechanism | Key fields |
+|---------|------|-----------|------------|
+| A | `cytosine_deamination` | Post-mortem C→T at terminal positions | `d_max_5prime`, `d_max_3prime`, `validated` |
+| B | `stop_codon_conversion` | CAA/CAG/CGA→TAA/TAG/TGA; reference-free deamination validator | `lrt_5prime`, `d_max_estimate` |
+| C | `8_oxog_top_strand` | G→T stop codons (GAA/GAG/GGA); top-strand 8-oxoguanine | `baseline_rate`, `terminal_rate`, `uniformity_ratio` |
+| D | `chargaff_gt_asymmetry` | Strand-asymmetric G→T / C→A excess; 8-oxoG cross-check | `D`, `s_gt` |
+| E | `purine_enrichment` | A/G enrichment at 5' read starts; depurination or fragmentation bias | `enrichment_5prime`, `enrichment_3prime` |
+| F | `8_oxog_complement` | C→A stop codons (TCA/TCG/TAC/TGC); bottom-strand 8-oxoguanine | `baseline_rate`, `terminal_rate`, `z_score` |
+| G | `hydantoin_oxidation` | C→G stop codons; spiroiminodihydantoin / guanidinohydantoin products | `baseline_rate`, `terminal_rate`, `z_score` |
+| H | `adenine_oxidation` | A→T stop codons (AAA/AAG/AGA); adenine oxidation or trans-lesion synthesis | `baseline_rate`, `terminal_rate`, `z_score`, `z_score_p2plus` |
+
+`detected: true` fires when the channel's z-score exceeds 3.0 (one-sided; depletion is not flagged). All eight entries are always present regardless of whether damage is detected.
 
 ---
 
