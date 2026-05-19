@@ -87,6 +87,8 @@ public:
             threads = std::max(1u, std::thread::hardware_concurrency());
         // Two readers run concurrently per pass; split budget evenly, cap at 8.
         decomp_threads_ = std::min(static_cast<size_t>(8), std::max(static_cast<size_t>(1), threads / 2));
+        // BGZF output: independent of read threads, cap at 16 (plateaus there).
+        write_threads_ = static_cast<int>(std::min(threads, static_cast<size_t>(16)));
     }
 
     void process(const std::string& ext_path,
@@ -204,8 +206,8 @@ private:
         bool compress_non = (out_non_path.size() > 3 &&
                              out_non_path.substr(out_non_path.size() - 3) == ".gz");
 
-        FastqWriter ext_writer(out_ext_path, compress_ext);
-        FastqWriter non_writer(out_non_path, compress_non);
+        FastqWriter ext_writer(out_ext_path, compress_ext, write_threads_);
+        FastqWriter non_writer(out_non_path, compress_non, write_threads_);
 
         gzFile cluster_gz = nullptr;
         if (write_clusters_ && !cluster_path.empty()) {
@@ -321,6 +323,7 @@ private:
     std::string fqcl_path_;
     bool allow_id_mismatch_;
     size_t decomp_threads_;
+    int    write_threads_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
     uint64_t total_reads_;
