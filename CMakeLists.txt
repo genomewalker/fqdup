@@ -169,7 +169,8 @@ target_compile_options(test_cluster_format PRIVATE -O2)
 add_test(NAME cluster_format COMMAND test_cluster_format)
 
 add_executable(test_syncmer_index tests/test_syncmer_index.cpp)
-target_include_directories(test_syncmer_index PRIVATE include src ${flat_hash_map_SOURCE_DIR})
+target_include_directories(test_syncmer_index PRIVATE include src ${flat_hash_map_SOURCE_DIR} ${XXHASH_INCLUDE_DIR} ${ZSTD_INCLUDE_DIR})
+target_link_libraries(test_syncmer_index PRIVATE ${XXHASH_LIB} ${ZSTD_LIB})
 target_compile_options(test_syncmer_index PRIVATE -O2)
 add_test(NAME syncmer_index COMMAND test_syncmer_index)
 
