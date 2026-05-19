@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <zlib.h>
@@ -36,10 +37,17 @@ extern "C" {
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
 #include "fqdup/version.hpp"
+#include "derep_detail/damage_keys.hpp"
 #include "flat_hash_map.hpp"
 #include <xxhash.h>
 
 namespace cf = fqdup::clusterfmt;
+
+static inline std::string_view trim_id_view(std::string_view header) {
+    size_t pos = (!header.empty() && header[0] == '@') ? 1 : 0;
+    size_t sp = header.find_first_of(" \t", pos);
+    return (sp == std::string_view::npos) ? header.substr(pos) : header.substr(pos, sp - pos);
+}
 
 namespace {
 
@@ -140,18 +148,18 @@ private:
         }
         if (!ext_ok) return false;
 
-        const std::string ext_id = trim_id(ext_rec.header);
-        const std::string non_id = trim_id(non_rec.header);
+        std::string_view ext_id = trim_id_view(ext_rec.header);
+        std::string_view non_id = trim_id_view(non_rec.header);
         if (ext_id != non_id) {
             if (allow_id_mismatch_) {
                 log_warn("Paired FASTQ ID mismatch in " + std::string(phase) +
                          " at record " + std::to_string(record_idx + 1) +
-                         ": ext=" + ext_id + ", non=" + non_id);
+                         ": ext=" + std::string(ext_id) + ", non=" + std::string(non_id));
             } else {
                 throw std::runtime_error(
                     "Paired FASTQ ID mismatch in " + std::string(phase) +
                     " at record " + std::to_string(record_idx + 1) +
-                    ": ext=" + ext_id + ", non=" + non_id +
+                    ": ext=" + std::string(ext_id) + ", non=" + std::string(non_id) +
                     " (ensure both files are sorted identically, or use --allow-id-mismatch)");
             }
         }
@@ -166,7 +174,10 @@ private:
 
         while (read_paired_checked(*ext_reader, *non_reader, ext_rec, non_rec,
                                    record_idx, "pass1")) {
-            XXH128_hash_t h = canonical_hash(ext_rec.seq, use_revcomp_);
+            if (ext_rec.seq.size() > rc_scratch_.size())
+                rc_scratch_.resize(ext_rec.seq.size());
+            XXH128_hash_t h = fqdup::derep_detail::canonical_hash_noalloc(
+                ext_rec.seq, use_revcomp_, rc_scratch_.data());
             SequenceFingerprint fp(h, ext_rec.seq.size());
 
             auto it = index_.find(fp);
@@ -324,6 +335,7 @@ private:
     bool allow_id_mismatch_;
     size_t decomp_threads_;
     int    write_threads_;
+    std::vector<char> rc_scratch_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
     uint64_t total_reads_;
