@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <zlib.h>
 
@@ -77,10 +78,16 @@ static std::vector<std::uint8_t> pack_2bit(const std::string& seq) {
 class DerepPairsEngine {
 public:
     DerepPairsEngine(bool use_revcomp, bool write_clusters,
-                     std::string fqcl_path, bool allow_id_mismatch = false)
+                     std::string fqcl_path, bool allow_id_mismatch = false,
+                     size_t threads = 0)
         : use_revcomp_(use_revcomp), write_clusters_(write_clusters),
           fqcl_path_(std::move(fqcl_path)),
-          allow_id_mismatch_(allow_id_mismatch), total_reads_(0) {}
+          allow_id_mismatch_(allow_id_mismatch), total_reads_(0) {
+        if (threads == 0)
+            threads = std::max(1u, std::thread::hardware_concurrency());
+        // Two readers run concurrently per pass; split budget evenly, cap at 8.
+        decomp_threads_ = std::min(static_cast<size_t>(8), std::max(static_cast<size_t>(1), threads / 2));
+    }
 
     void process(const std::string& ext_path,
                  const std::string& non_path,
@@ -90,6 +97,7 @@ public:
 
         log_info("=== Two-pass paired deduplication ===");
         log_info("Pass 1: Build lightweight index");
+        log_info("Decompression threads per reader: " + std::to_string(decomp_threads_));
         log_info("Decompression: " + std::string(
 #ifdef HAVE_RAPIDGZIP
             "rapidgzip (parallel multi-threaded)"
@@ -149,8 +157,8 @@ private:
     }
 
     void pass1(const std::string& ext_path, const std::string& non_path) {
-        auto ext_reader = make_fastq_reader(ext_path, 1);
-        auto non_reader = make_fastq_reader(non_path, 1);
+        auto ext_reader = make_fastq_reader(ext_path, decomp_threads_);
+        auto non_reader = make_fastq_reader(non_path, decomp_threads_);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 
@@ -228,8 +236,8 @@ private:
             records_to_write[entry.record_index] = fingerprint;
         const size_t n_to_write = records_to_write.size();
 
-        auto ext_reader = make_fastq_reader(ext_path, 1);
-        auto non_reader = make_fastq_reader(non_path, 1);
+        auto ext_reader = make_fastq_reader(ext_path, decomp_threads_);
+        auto non_reader = make_fastq_reader(non_path, decomp_threads_);
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
         size_t written = 0;
@@ -312,6 +320,7 @@ private:
     bool write_clusters_;
     std::string fqcl_path_;
     bool allow_id_mismatch_;
+    size_t decomp_threads_;
 
     ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
     uint64_t total_reads_;
@@ -339,6 +348,7 @@ static void print_usage(const char* prog) {
         << "  --cluster-format F  Write cluster genealogy to .fqcl (use with derep --prior-fqcl)\n"
         << "  --no-revcomp        Disable reverse-complement matching (default: enabled)\n"
         << "  --allow-id-mismatch Warn instead of failing on read ID mismatches\n"
+        << "  -t N, --threads N   Decompression threads (default: auto, capped at 8/reader)\n"
         << "  -h, --help          Show this help\n"
         << "\nMemory: ~24 bytes per input read pair.\n";
 }
@@ -352,6 +362,7 @@ int derep_pairs_main(int argc, char** argv) {
     std::string nonext_path, ext_path, out_ext_path, out_non_path, cluster_path, fqcl_path;
     bool use_revcomp = true;
     bool allow_id_mismatch = false;
+    size_t threads = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -370,6 +381,8 @@ int derep_pairs_main(int argc, char** argv) {
             cluster_path = argv[++i];
         } else if (arg == "--cluster-format" && i + 1 < argc) {
             fqcl_path = argv[++i];
+        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            threads = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-revcomp") {
             use_revcomp = false;
         } else if (arg == "--allow-id-mismatch") {
@@ -399,7 +412,7 @@ int derep_pairs_main(int argc, char** argv) {
     try {
         if (!fqcl_path.empty())
             log_info("Cluster fqcl output: " + fqcl_path);
-        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), fqcl_path, allow_id_mismatch);
+        DerepPairsEngine engine(use_revcomp, !cluster_path.empty(), fqcl_path, allow_id_mismatch, threads);
         engine.process(ext_path, nonext_path, out_ext_path, out_non_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
