@@ -6,10 +6,13 @@
 // REQUIRES: Both input files sorted by read ID (use 'fqdup sort' first).
 //
 // Strategy:
-//   Pass 1: Stream both files in lockstep, build hash → position index
-//   Pass 2: Stream again, write representative pairs
+//   Pass 1: Stream both files in lockstep, build hash → IndexEntry
+//           (count + representative record index).
+//   Pass 2: Stream again; re-hash; write record only when its index
+//           matches the stored representative index.
 //
 // Representative selection: longest non-extended mate per cluster.
+// Output order: preserves input (sorted) order; no extra sort needed.
 // Memory: ~24 bytes per input read pair.
 
 #include <cstdint>
@@ -52,17 +55,13 @@ static inline std::string_view trim_id_view(std::string_view header) {
 namespace {
 
 // ============================================================================
-// Index entry — no damage/error state needed here
+// Index entry — 24 bytes; no sequence data stored
 // ============================================================================
 
 struct IndexEntry {
-    uint64_t   count = 1;
-    FastqRecord rep_non;
-    FastqRecord rep_ext;
-
-    IndexEntry() = default;
-    IndexEntry(FastqRecord n, FastqRecord e)
-        : count(1), rep_non(std::move(n)), rep_ext(std::move(e)) {}
+    uint64_t count       = 1;
+    uint32_t max_non_len = 0;   // longest non-extended seq length seen
+    uint64_t rep_idx     = 0;   // 0-based record index of the representative
 };
 
 // ============================================================================
@@ -105,8 +104,6 @@ public:
                  const std::string& out_non_path,
                  const std::string& cluster_path) {
 
-        log_info("=== Single-pass paired deduplication (representatives in RAM) ===");
-        log_info("Pass 1: Build index, store representative records");
         log_info("Decompression threads per reader: " + std::to_string(decomp_threads_));
         log_info("Decompression: " + std::string(
 #ifdef HAVE_RAPIDGZIP
@@ -118,21 +115,17 @@ public:
 #endif
         ));
 
+        log_info("Pass 1: Build index");
         pass1(ext_path, non_path);
 
-        // Measure actual RAM: index structure + stored sequence data.
-        size_t rep_bytes = 0;
-        for (const auto& [fp, e] : index_)
-            rep_bytes += e.rep_non.header.size() + e.rep_non.seq.size() + e.rep_non.qual.size()
-                       + e.rep_ext.header.size() + e.rep_ext.seq.size() + e.rep_ext.qual.size();
-        size_t index_struct_mb = (index_.size() * sizeof(std::pair<SequenceFingerprint, IndexEntry>))
-                                 / (1024 * 1024);
-        log_info("Index: " + std::to_string(index_struct_mb) + " MB struct + " +
-                 std::to_string(rep_bytes / (1024 * 1024)) + " MB sequence data, " +
+        size_t index_mb = (index_.size() * sizeof(std::pair<SequenceFingerprint, IndexEntry>))
+                          / (1024 * 1024);
+        log_info("Index: " + std::to_string(index_mb) + " MB, " +
+                 std::to_string(index_.size()) + " unique clusters from " +
                  std::to_string(total_reads_) + " reads");
 
-        log_info("Sorting " + std::to_string(index_.size()) + " representatives by read ID");
-        write_representatives(non_path, out_ext_path, out_non_path, cluster_path, fqcl_path_);
+        log_info("Pass 2: Write representatives");
+        pass2(ext_path, non_path, out_ext_path, out_non_path, cluster_path, fqcl_path_);
 
         print_stats();
     }
@@ -186,12 +179,16 @@ private:
 
             auto it = index_.find(fp);
             if (it == index_.end()) {
-                index_.emplace(fp, IndexEntry(std::move(non_rec), std::move(ext_rec)));
+                IndexEntry e;
+                e.count       = 1;
+                e.max_non_len = static_cast<uint32_t>(non_rec.seq.size());
+                e.rep_idx     = record_idx;
+                index_.emplace(fp, e);
             } else {
                 it->second.count++;
-                if (non_rec.seq.size() > it->second.rep_non.seq.size()) {
-                    it->second.rep_non = std::move(non_rec);
-                    it->second.rep_ext = std::move(ext_rec);
+                if (non_rec.seq.size() > it->second.max_non_len) {
+                    it->second.max_non_len = static_cast<uint32_t>(non_rec.seq.size());
+                    it->second.rep_idx     = record_idx;
                 }
             }
 
@@ -209,14 +206,16 @@ private:
         }
 
         std::cerr << "\r";
-        log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
+        log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed, " +
+                 std::to_string(index_.size()) + " unique clusters");
     }
 
-    void write_representatives(const std::string& non_path,
-                               const std::string& out_ext_path,
-                               const std::string& out_non_path,
-                               const std::string& cluster_path,
-                               const std::string& fqcl_path) {
+    void pass2(const std::string& ext_path,
+               const std::string& non_path,
+               const std::string& out_ext_path,
+               const std::string& out_non_path,
+               const std::string& cluster_path,
+               const std::string& fqcl_path) {
         bool compress_ext = (out_ext_path.size() > 3 &&
                              out_ext_path.substr(out_ext_path.size() - 3) == ".gz");
         bool compress_non = (out_non_path.size() > 3 &&
@@ -246,56 +245,58 @@ private:
             fqcl_writer->reserve_clusters(index_.size());
         }
 
-        // Sort representatives by read ID to preserve output order.
-        using KV = std::pair<SequenceFingerprint, IndexEntry>;
-        std::vector<const KV*> order;
-        order.reserve(index_.size());
-        for (const auto& kv : index_) order.push_back(&kv);
-        std::sort(order.begin(), order.end(), [](const KV* a, const KV* b) {
-            return trim_id_view(a->second.rep_non.header) <
-                   trim_id_view(b->second.rep_non.header);
-        });
+        auto ext_reader = make_fastq_reader(ext_path, decomp_threads_);
+        auto non_reader = make_fastq_reader(non_path, decomp_threads_);
+        FastqRecord ext_rec, non_rec;
+        uint64_t record_idx = 0;
+        uint64_t written    = 0;
 
-        size_t written = 0;
-        const size_t n_to_write = order.size();
-        for (const KV* kv : order) {
-            const SequenceFingerprint& fp    = kv->first;
-            const IndexEntry&          entry = kv->second;
+        while (read_paired_checked(*ext_reader, *non_reader, ext_rec, non_rec,
+                                   record_idx, "pass2")) {
+            if (ext_rec.seq.size() > rc_scratch_.size())
+                rc_scratch_.resize(ext_rec.seq.size());
+            XXH128_hash_t h = fqdup::derep_detail::canonical_hash_noalloc(
+                ext_rec.seq, use_revcomp_, rc_scratch_.data());
+            SequenceFingerprint fp(h, ext_rec.seq.size());
 
-            ext_writer.write(entry.rep_ext);
-            non_writer.write(entry.rep_non);
+            auto it = index_.find(fp);
+            if (it != index_.end() && it->second.rep_idx == record_idx) {
+                ext_writer.write(ext_rec);
+                non_writer.write(non_rec);
 
-            if (fqcl_writer) {
-                cf::ClusterRecord rec;
-                rec.cluster_id     = XXH3_64bits(entry.rep_non.seq.data(),
-                                                  entry.rep_non.seq.size());
-                rec.n_members      = static_cast<uint32_t>(entry.count);
-                rec.n_after_damage = rec.n_members;
-                rec.parent_seq_len = static_cast<uint32_t>(entry.rep_non.seq.size());
-                rec.parent_seq     = pack_2bit(entry.rep_non.seq);
-                rec.flags          = 0;
-                fqcl_writer->write_cluster(rec);
+                if (fqcl_writer) {
+                    cf::ClusterRecord rec;
+                    rec.cluster_id     = XXH3_64bits(non_rec.seq.data(), non_rec.seq.size());
+                    rec.n_members      = static_cast<uint32_t>(it->second.count);
+                    rec.n_after_damage = rec.n_members;
+                    rec.parent_seq_len = static_cast<uint32_t>(non_rec.seq.size());
+                    rec.parent_seq     = pack_2bit(non_rec.seq);
+                    rec.flags          = 0;
+                    fqcl_writer->write_cluster(rec);
+                }
+                if (cluster_gz &&
+                    gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\t%zu\n",
+                             static_cast<unsigned long>(fp.hash_hi),
+                             static_cast<unsigned long>(fp.hash_lo),
+                             static_cast<unsigned long>(ext_rec.seq.size()),
+                             static_cast<unsigned long>(it->second.count),
+                             non_rec.seq.size()) < 0)
+                    throw std::runtime_error("gzprintf failed while writing cluster record");
+
+                ++written;
             }
-            if (cluster_gz &&
-                gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\t%zu\n",
-                         static_cast<unsigned long>(fp.hash_hi),
-                         static_cast<unsigned long>(fp.hash_lo),
-                         static_cast<unsigned long>(entry.rep_ext.seq.size()),
-                         static_cast<unsigned long>(entry.count),
-                         entry.rep_non.seq.size()) < 0)
-                throw std::runtime_error("gzprintf failed while writing cluster record");
 
-            ++written;
-            if ((written % 100000) == 0)
-                std::cerr << "\r[Write] " << written << " / " << n_to_write
-                          << " unique records written" << std::flush;
+            record_idx++;
+            if ((record_idx % 1000000) == 0)
+                std::cerr << "\r[Pass 2] " << record_idx << " / " << total_reads_
+                          << " reads, " << written << " written" << std::flush;
         }
 
         if (fqcl_writer) fqcl_writer->close();
         if (cluster_gz && gzclose(cluster_gz) != Z_OK)
             throw std::runtime_error("gzclose failed writing cluster file");
         std::cerr << "\r";
-        log_info("Write complete: " + std::to_string(written) + " unique reads written");
+        log_info("Pass 2 complete: " + std::to_string(written) + " unique reads written");
     }
 
     void print_stats() const {
@@ -353,7 +354,7 @@ static void print_usage(const char* prog) {
         << "  --cluster-format F  Write cluster genealogy to .fqcl (use with derep --prior-fqcl)\n"
         << "  --no-revcomp        Disable reverse-complement matching (default: enabled)\n"
         << "  --allow-id-mismatch Warn instead of failing on read ID mismatches\n"
-        << "  -t N, --threads N   Decompression threads (default: auto, capped at 8/reader)\n"
+        << "  -t N, --threads N   Decompression/output threads (default: auto)\n"
         << "  -h, --help          Show this help\n"
         << "\nMemory: ~24 bytes per input read pair.\n";
 }
