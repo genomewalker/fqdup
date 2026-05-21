@@ -111,6 +111,7 @@ add_executable(fqdup
     src/derep_pairs.cpp
     src/derep.cpp
     src/split.cpp
+    src/trim.cpp
     src/damage.cpp
     src/damage_profile.cpp
     src/gen.cpp
