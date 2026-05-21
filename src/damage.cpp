@@ -514,6 +514,40 @@ int damage_main(int argc, char** argv) {
         stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     }
 
+    // Per-read adapter stub fraction — fast second pass over pre-scan reads.
+    // Only runs when stubs were detected; adds ~same wall time as the pre-scan.
+    int64_t n_stub5_hits = 0, n_stub3_hits = 0, n_stub_reads_checked = 0;
+    if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
+        if (!paired_mode) {
+            auto rdr = make_fastq_reader(in_path, 1);
+            FastqRecord rec;
+            while (rdr->read(rec) && (pre_scan_reads == 0 || n_stub_reads_checked < pre_scan_reads)) {
+                int L = static_cast<int>(rec.seq.size());
+                if (L >= 6) {
+                    for (const auto& s : stubs.stubs5)
+                        if (rec.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
+                    for (const auto& s : stubs.stubs3)
+                        if (rec.seq.compare(L - 6, 6, s) == 0) { ++n_stub3_hits; break; }
+                }
+                ++n_stub_reads_checked;
+            }
+        } else {
+            auto rdr1 = make_fastq_reader(r1_path, 1);
+            auto rdr2 = make_fastq_reader(r2_path, 1);
+            FastqRecord rec1, rec2;
+            while (rdr1->read(rec1) && rdr2->read(rec2)
+                   && (pre_scan_reads == 0 || n_stub_reads_checked < pre_scan_reads)) {
+                if (static_cast<int>(rec1.seq.size()) >= 6)
+                    for (const auto& s : stubs.stubs5)
+                        if (rec1.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
+                if (static_cast<int>(rec2.seq.size()) >= 6)
+                    for (const auto& s : stubs.stubs3)
+                        if (rec2.seq.compare(0, 6, s) == 0) { ++n_stub3_hits; break; }
+                ++n_stub_reads_checked;
+            }
+        }
+    }
+
     // Build adapter prefix code sets for prefix-conditioned F/G/H recomputation.
     // Populated after detect_adapter_stubs; consumed after finalize_sample_profile.
     std::vector<uint32_t> adapter_pfx_codes_5p, adapter_pfx_codes_3p;
@@ -837,6 +871,20 @@ int damage_main(int argc, char** argv) {
                   << "  3' fit start=pos" << dp.fit_offset_3prime
                   << " (d_max corrected to peak of pos1-5)\n";
     }
+    if (n_stub_reads_checked > 0 && (!stubs.stubs5.empty() || !stubs.stubs3.empty())) {
+        std::cout << "  adapter stubs:";
+        if (!stubs.stubs5.empty())
+            std::cout << " 5'=" << stubs.stubs5[0]
+                      << " (" << std::fixed << std::setprecision(1)
+                      << (static_cast<double>(n_stub5_hits) / n_stub_reads_checked * 100.0)
+                      << "% of reads)";
+        if (!stubs.stubs3.empty())
+            std::cout << " 3'=" << stubs.stubs3[0]
+                      << " (" << std::fixed << std::setprecision(1)
+                      << (static_cast<double>(n_stub3_hits) / n_stub_reads_checked * 100.0)
+                      << "% of reads)";
+        std::cout << "\n";
+    }
     std::cout << "  5' terminal shift: " << std::showpos << std::fixed << std::setprecision(4)
               << dp.terminal_shift_5prime << std::noshowpos
               << "  (z=" << std::setprecision(1) << dp.terminal_z_5prime << ")\n";
@@ -1066,6 +1114,11 @@ int damage_main(int argc, char** argv) {
         pji.n_reads              = static_cast<uint64_t>(reads_scanned);
         pji.adapter_stubs_5prime = stubs.stubs5;
         pji.adapter_stubs_3prime = stubs.stubs3;
+        if (n_stub_reads_checked > 0) {
+            pji.adapter_stub5_read_fraction = static_cast<double>(n_stub5_hits) / n_stub_reads_checked;
+            pji.adapter_stub3_read_fraction = static_cast<double>(n_stub3_hits) / n_stub_reads_checked;
+            pji.adapter_stub_reads_checked  = n_stub_reads_checked;
+        }
         pji.top_hex_enriched     = stubs.top_enriched;
         pji.adapter_clipped      = stubs.adapter_clipped;
         pji.adapter3_clipped     = stubs.adapter3_clipped;
