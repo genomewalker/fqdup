@@ -464,21 +464,31 @@ int damage_main(int argc, char** argv) {
     std::array<uint32_t, 4096> hex3_terminal{};
     uint64_t n_hex3 = 0;
 
+    // SE only: reader opened here, kept alive through full pass (single-pass).
+    // se_scan_buf holds records buffered during hexamer analysis.
+    std::unique_ptr<FastqReaderBase> reader_se;
+    std::vector<FastqRecord> se_scan_buf;
+
     if (!paired_mode) {
         WorkerState scan_state;
-        auto reader_pre = make_fastq_reader(in_path, 1);
+        if (pre_scan_reads > 0)
+            se_scan_buf.reserve(static_cast<size_t>(pre_scan_reads));
+        reader_se = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         int64_t n = 0;
-        while (reader_pre->read(rec) && (pre_scan_reads == 0 || n < pre_scan_reads)) {
+        while (reader_se->read(rec) && (pre_scan_reads == 0 || n < pre_scan_reads)) {
             int L = static_cast<int>(rec.seq.size());
-            if (L < LSD_L_MIN) continue;
-            taph::FrameSelector::update_sample_profile(scan_state.profile, rec.seq);
-            if (L >= 12) {
-                int code = taph::encode_hex_at(rec.seq, L - 6);
-                if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
+            if (L >= LSD_L_MIN) {
+                taph::FrameSelector::update_sample_profile(scan_state.profile, rec.seq);
+                if (L >= 12) {
+                    int code = taph::encode_hex_at(rec.seq, L - 6);
+                    if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
+                }
+                ++n;
             }
-            ++n;
+            se_scan_buf.push_back(std::move(rec));
         }
+        // reader_se stays open — remaining records consumed in full pass below.
         stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     } else {
         // Paired pre-scan: 5' hexamer from R1[0..5], 3' terminal hexamer from
@@ -546,28 +556,31 @@ int damage_main(int argc, char** argv) {
                 workers.emplace_back(worker_fn, std::ref(queue), std::ref(states[t]));
         }
         try {
-            auto reader = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
             FastqRecord rec;
             std::vector<std::string> batch;
             batch.reserve(BATCH_SZ);
-            while (reader->read(rec)) {
+            auto enqueue = [&](std::string& seq) {
                 if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
-                    int L = static_cast<int>(rec.seq.size());
+                    int L = static_cast<int>(seq.size());
                     if (L >= 6) {
                         for (const auto& s : stubs.stubs5)
-                            if (rec.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
+                            if (seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
                         for (const auto& s : stubs.stubs3)
-                            if (rec.seq.compare(L - 6, 6, s) == 0) { ++n_stub3_hits; break; }
+                            if (seq.compare(L - 6, 6, s) == 0) { ++n_stub3_hits; break; }
                     }
                     ++n_stub_reads_checked;
                 }
-                batch.push_back(std::move(rec.seq));
+                batch.push_back(std::move(seq));
                 if ((int)batch.size() == BATCH_SZ) {
                     queue.push(std::move(batch));
                     batch.clear();
                     batch.reserve(BATCH_SZ);
                 }
-            }
+            };
+            for (auto& r : se_scan_buf) enqueue(r.seq);
+            se_scan_buf.clear();
+            se_scan_buf.shrink_to_fit();
+            while (reader_se->read(rec)) enqueue(rec.seq);
             if (!batch.empty()) queue.push(std::move(batch));
         } catch (...) {
             queue.set_done();
