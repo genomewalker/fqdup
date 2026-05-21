@@ -82,7 +82,7 @@ int trim_main(int argc, char** argv) {
         uint64_t n_hex3 = 0;
         int64_t n = 0;
 
-        auto rdr = make_fastq_reader(in_path, 1);
+        auto rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         while (rdr->read(rec) && (scan_reads == 0 || n < scan_reads)) {
             int L = static_cast<int>(rec.seq.size());
@@ -115,7 +115,7 @@ int trim_main(int argc, char** argv) {
                     out_path.compare(out_path.size() - 3, 3, ".gz") == 0;
     int write_threads = std::min(n_threads, 16);
 
-    auto rdr = make_fastq_reader(in_path, 1);
+    auto rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
     FastqWriter writer(out_path, compress, write_threads);
     FastqRecord rec;
 
