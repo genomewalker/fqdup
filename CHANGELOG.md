@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.0.3] - 2026-05-21
+
+### New features
+
+- **`fqdup trim`**: new subcommand to detect and remove 5′/3′ adapter stub
+  remnants from collapsed FASTQ. Uses hexamer frequency analysis on the first
+  `--scan-reads` (default 1 M) reads to identify enriched terminal 6-mers
+  consistent with known adapters, then clips matching reads via a parallel
+  work-queue pipeline with ordered BGZF output. Handles multi-stub libraries
+  (up to 10 detected candidates per end). Options: `--scan-reads`, `--min-length`,
+  `--stub5`/`--stub3` (manual override), `-p` (threads).
+
+- **`fqdup profile` adapter stub fractions**: the human-readable report now
+  includes per-stub read fractions over all reads (not just the scan window),
+  e.g. `adapter stubs: 5'=CTCTTC (1.2% of reads) 3'=TTTCCC (1.6% of reads)`.
+  Same fractions are serialised to JSON as `adapter_stub5_read_fraction`,
+  `adapter_stub3_read_fraction`, and `adapter_stub_reads_checked`.
+
+### Performance
+
+- **Single-pass I/O for `fqdup trim`**: the hexamer pre-scan buffers the first
+  `--scan-reads` records in memory rather than reading the file twice. After stub
+  detection, the buffer is replayed directly into the clip pipeline and the reader
+  continues from the current position — no second decompression pass.
+
+- **Single-pass I/O for `fqdup profile`** (SE mode): the adapter-stub pre-scan
+  now uses the same multi-threaded reader as the full damage-profiling pass.
+  Records are buffered during scanning and fed into the worker queue directly,
+  eliminating the previous single-threaded pre-scan pass. On a 94.7 M-read DS
+  library: `fqdup profile` 2m07s, `fqdup trim` 1m07s (96 threads, NFS).
+
 ## [2.0.2] - 2026-05-14
 
 ### New features

@@ -130,6 +130,12 @@ Fields:
 - **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libtaph classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
 - **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --collapse-damage`.
 - **Per-position table**, Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
+- **adapter stubs** (when detected), Per-end read fraction over all reads:
+  `adapter stubs: 5'=CTCTTC (1.2% of reads) 3'=TTTCCC (1.6% of reads)`.
+  If stubs are present at > ~0.5% run `fqdup trim` before `fqdup extend` to
+  remove them. The same fractions appear in `--json` as
+  `adapter_stub5_read_fraction`, `adapter_stub3_read_fraction`, and
+  `adapter_stub_reads_checked`.
 
 ### TSV output (`--tsv`)
 

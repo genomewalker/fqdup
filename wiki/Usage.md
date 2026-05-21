@@ -43,7 +43,22 @@ Omit it if disk is limited.
 
 ## Full ancient DNA pipeline
 
-The typical workflow runs four commands in sequence.
+The typical workflow runs four commands in sequence. Two optional commands can
+run beforehand: `fqdup profile` (diagnostic only) and `fqdup trim` (adapter
+stub removal — run when profile reports > ~0.5% of reads carry stub remnants).
+
+### Step 0 (optional): trim adapter stubs
+
+```bash
+fqdup profile -i merged.fq.gz   # check for adapter stubs first
+fqdup trim -i merged.fq.gz -o merged.trimmed.fq.gz
+```
+
+`fqdup profile` reports whether enriched terminal hexamers were detected and
+what fraction of reads carry them. If stubs are found, run `fqdup trim` to
+remove them before extension. Fastp trims the 3′ adapter from R1 but does not
+remove 5′ P5 tail remnants (e.g. `CTCTTC`) that survive into collapsed reads.
+`fqdup trim` handles both ends using the same hexamer frequency analysis.
 
 ### Step 1: extend
 
