@@ -193,6 +193,12 @@ int trim_main(int argc, char** argv) {
     // ---- stub detection or manual override ---------------------------------
     std::vector<std::string> stubs5, stubs3;
 
+    // Single reader opened before detection and kept alive for the trim pass.
+    // scan_buf holds records buffered during hexamer analysis (single-pass —
+    // no second file open needed). Empty in the forced-stubs branch.
+    std::unique_ptr<FastqReaderBase> rdr;
+    std::vector<FastqRecord> scan_buf;
+
     if (!forced_stub5.empty() || !forced_stub3.empty()) {
         if (!forced_stub5.empty()) stubs5.push_back(forced_stub5);
         if (!forced_stub3.empty()) stubs3.push_back(forced_stub3);
@@ -200,6 +206,7 @@ int trim_main(int argc, char** argv) {
         if (!stubs5.empty()) std::cerr << " 5'=" << stubs5[0];
         if (!stubs3.empty()) std::cerr << " 3'=" << stubs3[0];
         std::cerr << "\n";
+        rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
     } else {
         std::cerr << "Scanning " << (scan_reads ? std::to_string(scan_reads) : "all")
                   << " reads for adapter stubs...\n";
@@ -208,18 +215,22 @@ int trim_main(int argc, char** argv) {
         uint64_t n_hex3 = 0;
         int64_t  n      = 0;
 
-        auto rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
+        if (scan_reads > 0)
+            scan_buf.reserve(static_cast<size_t>(scan_reads));
+        rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         while (rdr->read(rec) && (scan_reads == 0 || n < scan_reads)) {
             int L = static_cast<int>(rec.seq.size());
-            if (L < LSD_L_MIN) { ++n; continue; }
-            taph::FrameSelector::update_sample_profile(scan_profile, rec.seq);
+            if (L >= LSD_L_MIN)
+                taph::FrameSelector::update_sample_profile(scan_profile, rec.seq);
             if (L >= 12) {
                 int code = taph::encode_hex_at(rec.seq, L - 6);
                 if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
             }
             ++n;
+            scan_buf.push_back(std::move(rec));
         }
+        // rdr stays open — remaining records consumed in producer below.
 
         auto detected = taph::detect_adapter_stubs(scan_profile, hex3_terminal.data(), n_hex3);
         stubs5 = detected.stubs5;
@@ -278,13 +289,27 @@ int trim_main(int argc, char** argv) {
         workers.emplace_back(clip_worker, std::ref(clip_q), std::ref(out_q),
                              std::cref(stubs5), std::cref(stubs3), min_length);
 
-    // Producer (main thread): read all records, push batches to clip_q.
+    // Producer (main thread): drain scan_buf first (buffered during detection),
+    // then continue reading remaining records from the already-open reader.
     {
-        auto rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         std::vector<FastqRecord> batch;
         batch.reserve(BATCH_SZ);
         uint64_t batch_id = 0;
+
+        for (auto& r : scan_buf) {
+            batch.push_back(std::move(r));
+            if ((int)batch.size() == BATCH_SZ) {
+                TrimBatch tb;
+                tb.id      = batch_id++;
+                tb.records = std::move(batch);
+                clip_q.push(std::move(tb));
+                batch.clear();
+                batch.reserve(BATCH_SZ);
+            }
+        }
+        scan_buf.clear();
+        scan_buf.shrink_to_fit();
 
         while (rdr->read(rec)) {
             batch.push_back(std::move(rec));

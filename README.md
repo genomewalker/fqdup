@@ -24,7 +24,16 @@ per-position C→T/G→A frequencies. Classifies the library as double-stranded 
 single-stranded via a 7-model BIC competition before fitting. Run this before the
 full pipeline to confirm that `--collapse-damage` is warranted, check the mask
 threshold, or obtain parameters for manual `--damage-dmax`/`--damage-lambda`
-overrides. It does not modify reads.
+overrides. It does not modify reads. When adapter stubs are detected it reports
+the fraction of reads affected (e.g. `5'=CTCTTC (1.2% of reads)`).
+
+**0a. `fqdup trim` (optional pre-processing)**: detect and remove 5′/3′ adapter
+stub remnants that upstream tools (fastp, cutadapt) may miss. Typical case: P5
+tail hexamers (`CTCTTC`) left at the 5′ end of collapsed reads when fastp trims
+only the 3′ adapter. Uses hexamer frequency analysis on the first `--scan-reads`
+reads; single-pass — the scan buffer is replayed into the clip pipeline with no
+second file open. Run when `fqdup profile` reports adapter stubs at &gt; ~0.5% of
+reads. Output is a trimmed FASTQ ready to feed into `fqdup extend`.
 
 **1. `fqdup extend`**: extend each merged read outward from both ends using a
 built-in de Bruijn graph assembler. The extended reads serve as deduplication
@@ -210,6 +219,11 @@ fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
   --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
 ```
 
+When adapter stubs are detected, the report includes a per-stub read fraction
+counted over all reads: `adapter stubs: 5'=CTCTTC (1.2% of reads) 3'=TTTCCC (1.6% of reads)`.
+The same values appear in `--json` as `adapter_stub5_read_fraction`, `adapter_stub3_read_fraction`,
+and `adapter_stub_reads_checked`.
+
 Prints a human-readable report: library type with BIC scores, d_max/lambda per end,
 per-position deamination frequencies, and the positions that exceed the mask threshold.
 Use the output to decide whether `--collapse-damage` is warranted, verify the library-type
@@ -253,6 +267,31 @@ The `--json` output includes the complete machine-readable profile:
 Library-type classification returns `unknown` when no damage signal is detectable
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
 call — downstream `fqdup derep` treats `unknown` as DS for masking purposes.
+
+### `fqdup trim`
+
+Detect and remove 5′/3′ adapter stub remnants from collapsed FASTQ. Run after
+`fqdup profile` reports adapter stubs at > ~0.5% of reads, before `fqdup extend`.
+
+```
+fqdup trim -i INPUT -o OUTPUT [options]
+
+Required:
+  -i FILE          Input FASTQ (.gz or plain)
+  -o FILE          Output FASTQ (.gz)
+
+Options:
+  -p N             Worker threads (default: all cores)
+  --scan-reads N   Reads sampled for stub detection (default: 1000000; 0=all)
+  --min-length N   Discard trimmed reads shorter than N bp (default: 15)
+  --stub5 SEQ      Force 5' stub hexamer (skip auto-detection)
+  --stub3 SEQ      Force 3' stub hexamer (skip auto-detection)
+```
+
+Single-pass: the scan window is buffered in memory and replayed directly into
+the parallel clip pipeline — no second decompression pass. 5′ stubs are clipped
+once (first 6 bp); 3′ stubs are clipped iteratively until no match remains.
+Reports the fraction of reads clipped at each end.
 
 ### `fqdup extend`
 
