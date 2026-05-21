@@ -517,36 +517,6 @@ int damage_main(int argc, char** argv) {
     // Per-read adapter stub fraction — fast second pass over pre-scan reads.
     // Only runs when stubs were detected; adds ~same wall time as the pre-scan.
     int64_t n_stub5_hits = 0, n_stub3_hits = 0, n_stub_reads_checked = 0;
-    if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
-        if (!paired_mode) {
-            auto rdr = make_fastq_reader(in_path, 1);
-            FastqRecord rec;
-            while (rdr->read(rec) && (pre_scan_reads == 0 || n_stub_reads_checked < pre_scan_reads)) {
-                int L = static_cast<int>(rec.seq.size());
-                if (L >= 6) {
-                    for (const auto& s : stubs.stubs5)
-                        if (rec.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
-                    for (const auto& s : stubs.stubs3)
-                        if (rec.seq.compare(L - 6, 6, s) == 0) { ++n_stub3_hits; break; }
-                }
-                ++n_stub_reads_checked;
-            }
-        } else {
-            auto rdr1 = make_fastq_reader(r1_path, 1);
-            auto rdr2 = make_fastq_reader(r2_path, 1);
-            FastqRecord rec1, rec2;
-            while (rdr1->read(rec1) && rdr2->read(rec2)
-                   && (pre_scan_reads == 0 || n_stub_reads_checked < pre_scan_reads)) {
-                if (static_cast<int>(rec1.seq.size()) >= 6)
-                    for (const auto& s : stubs.stubs5)
-                        if (rec1.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
-                if (static_cast<int>(rec2.seq.size()) >= 6)
-                    for (const auto& s : stubs.stubs3)
-                        if (rec2.seq.compare(0, 6, s) == 0) { ++n_stub3_hits; break; }
-                ++n_stub_reads_checked;
-            }
-        }
-    }
 
     // Build adapter prefix code sets for prefix-conditioned F/G/H recomputation.
     // Populated after detect_adapter_stubs; consumed after finalize_sample_profile.
@@ -581,6 +551,16 @@ int damage_main(int argc, char** argv) {
             std::vector<std::string> batch;
             batch.reserve(BATCH_SZ);
             while (reader->read(rec)) {
+                if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
+                    int L = static_cast<int>(rec.seq.size());
+                    if (L >= 6) {
+                        for (const auto& s : stubs.stubs5)
+                            if (rec.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
+                        for (const auto& s : stubs.stubs3)
+                            if (rec.seq.compare(L - 6, 6, s) == 0) { ++n_stub3_hits; break; }
+                    }
+                    ++n_stub_reads_checked;
+                }
                 batch.push_back(std::move(rec.seq));
                 if ((int)batch.size() == BATCH_SZ) {
                     queue.push(std::move(batch));
@@ -612,6 +592,15 @@ int damage_main(int argc, char** argv) {
             batch.r1.reserve(BATCH_SZ);
             batch.r2.reserve(BATCH_SZ);
             while (reader_r1->read(rec1) && reader_r2->read(rec2)) {
+                if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
+                    if (static_cast<int>(rec1.seq.size()) >= 6)
+                        for (const auto& s : stubs.stubs5)
+                            if (rec1.seq.compare(0, 6, s) == 0) { ++n_stub5_hits; break; }
+                    if (static_cast<int>(rec2.seq.size()) >= 6)
+                        for (const auto& s : stubs.stubs3)
+                            if (rec2.seq.compare(0, 6, s) == 0) { ++n_stub3_hits; break; }
+                    ++n_stub_reads_checked;
+                }
                 batch.r1.push_back(std::move(rec1.seq));
                 batch.r2.push_back(std::move(rec2.seq));
                 if ((int)batch.r1.size() == BATCH_SZ) {
