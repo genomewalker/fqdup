@@ -48,7 +48,7 @@ runs the same exponential decay model as DART and mapDamage2 together with a
 per-position frequencies and `--mask-threshold`; it does not re-implement the
 core terminal damage estimation or the library-type classifier. Length-stratified
 estimation and the context-aware C→T fit are available through libtaph and are
-exposed by the standalone `fqdup profile` subcommand, but the Pass 0 path used
+exposed by the standalone `fqdup damage` subcommand, but the Pass 0 path used
 by `fqdup derep` and `fqdup extend` runs a single global fit. See
 [[Damage-Aware-Deduplication]].
 
@@ -111,7 +111,7 @@ them on the original merged sequence.
 | [[Installation]] | Build from source, dependencies |
 | [[Usage]] | Tutorials and options for all subcommands |
 | [[Extend]] | fqdup extend: de Bruijn graph extension algorithm, CLI, benchmarks |
-| [[Profile]] | fqdup profile: standalone damage profiler, inspect d_max, library type, mask positions |
+| [[Damage]] | fqdup damage: standalone damage profiler, inspect d_max, library type, mask positions |
 | [[Algorithm]] | Internal mechanics of sort, derep_pairs, and derep |
 | [[Damage-Aware-Deduplication]] | The deamination model, empirical masking, and symmetry |
 | [[PCR-Error-Correction]] | Phase 3: 4-way pigeonhole H≤2 Hamming search |
