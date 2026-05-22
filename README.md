@@ -27,13 +27,12 @@ threshold, or obtain parameters for manual `--damage-dmax`/`--damage-lambda`
 overrides. It does not modify reads. When adapter stubs are detected it reports
 the fraction of reads affected (e.g. `5'=CTCTTC (1.2% of reads)`).
 
-**0a. `fqdup trim` (optional pre-processing, DS libraries only)**: detect and remove 5′/3′ adapter
-stub remnants that upstream tools (fastp, cutadapt) may miss. Typical case: P5
-tail hexamers (`CTCTTC`) left at the 5′ end of collapsed reads when fastp trims
-only the 3′ adapter from R1 but leaves the P5 tail intact at the 5′ read start.
-Uses hexamer frequency analysis on the first `--scan-reads` reads; single-pass —
-the scan buffer is replayed into the clip pipeline with no second file open. Run
-when `fqdup profile` reports adapter stubs at &gt; ~0.5% of reads.
+**0a. `fqdup trim` (optional pre-processing, DS libraries only)**: remove adapter
+stubs that end up at the start of ultra-short collapsed reads that have read into
+the ligation junction. fastp trims the 3′ adapter but doesn't catch these on the
+5′ end. Uses hexamer frequency analysis on the first `--scan-reads` reads;
+single-pass — the scan buffer is replayed into the clip pipeline with no second
+file open. Run when `fqdup profile` reports adapter stubs at &gt; ~0.5% of reads.
 
 **DS libraries only.** Single-stranded (SS) libraries prepared with the
 CircLigase protocol (Gansauge & Meyer) ligate only a 3′ adapter; the 5′ end of
