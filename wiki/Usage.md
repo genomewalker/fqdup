@@ -57,8 +57,15 @@ fqdup trim -i merged.fq.gz -o merged.trimmed.fq.gz
 `fqdup profile` reports whether enriched terminal hexamers were detected and
 what fraction of reads carry them. If stubs are found, run `fqdup trim` to
 remove them before extension. Fastp trims the 3′ adapter from R1 but does not
-remove 5′ P5 tail remnants (e.g. `CTCTTC`) that survive into collapsed reads.
+remove 5′ P5 tail remnants (e.g. `CTCTTC`) that survive into collapsed reads
+when a short insert is read through to the ligation junction.
 `fqdup trim` handles both ends using the same hexamer frequency analysis.
+
+**DS libraries only.** Single-stranded (SS) libraries built with the CircLigase
+protocol (Gansauge & Meyer) ligate only a 3′ adapter; the 5′ end of each
+molecule is native ancient DNA with no P5 ligation junction. No `CTCTTC` stub
+can form and `fqdup profile` will not detect 5′ stubs in SS data. Skip this
+step for SS libraries.
 
 ### Step 1: extend
 
