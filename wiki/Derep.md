@@ -52,10 +52,7 @@ child count to be ≤ `--errcor-max-h2-count` (default 2). Enabled by default;
 disable with `--no-error-correct`.
 
 **Pass 2: output**
-Streams reads again, writing one representative per cluster. When
-`--out-damaged` / `--out-undamaged` are given, each read is also scored by
-the damage split model (see [Damaged/undamaged split](#damagedundamaged-split))
-and routed to the appropriate output file.
+Streams reads again, writing one representative per cluster.
 
 ---
 
@@ -88,74 +85,8 @@ Optional:
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
 
-Run `fqdup profile -i FILE` first to inspect d_max and which positions would
+Run `fqdup damage -i FILE` first to inspect d_max and which positions would
 be masked before committing to `--collapse-damage`. See [[Damage]].
-
-### Damaged/undamaged split
-
-After deduplication, `derep` can route each representative read to one of two output
-files based on its per-read LLR ancient/modern score:
-
-```bash
-fqdup derep -i sorted.fq.gz -o dedup.fq.gz \
-    --out-damaged   ancient.fq.gz \
-    --out-undamaged modern.fq.gz \
-    --damage collapse
-```
-
-`-o` is optional when both split outputs are given (defaults to `/dev/null`).
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--out-damaged FILE` | Write reads with LLR ≥ threshold here | - |
-| `--out-undamaged FILE` | Write reads with LLR < threshold here | - |
-| `--split-threshold F` | LLR decision boundary | 0.0 |
-| `--split-model MODE` | `auto` \| `bulk` \| `empirical` | `auto` |
-
-#### `--split-model` modes
-
-| Mode | Extra file pass | Accuracy | When to use |
-|------|----------------|----------|-------------|
-| `auto` | only if d_max > 0.01 | empirical per-bin | **default** — optimal for most aDNA libraries |
-| `bulk` | never | bulk exponential | quick splits, exploratory work, very large files |
-| `empirical` | always | empirical per-bin | force even when damage is borderline |
-
-**`auto` (default):** runs a stripped length-stratified scan when damage is
-detected (d_max > 0.01), building per-bin empirical C→T rate curves via mixture
-unmixing. Falls back to the bulk exponential model (zero extra I/O) when no
-damage is detected. The empirical scan uses precomputed additive classifier
-coefficients (no log() calls in the read loop) and is capped at 4 worker threads
-to match the single FASTQ reader throughput.
-
-**`bulk`:** uses the exponential decay model already fitted during Pass 0
-(d_max, λ, bg). No extra file read. Slightly less accurate at very short
-(<50 bp) and very long (>150 bp) reads where the exponential approximation
-deviates from the empirical curves.
-
-**`empirical`:** same as `auto` but forces the per-bin scan even if damage
-appears low (e.g. heavily contaminated libraries where contamination suppresses
-the bulk d_max).
-
-#### LLR scoring
-
-For each read of length L, the model finds the matching length bin and computes:
-
-```
-LLR = Σ_{i=1}^{n_pos}  T_i·log(p_dam[i]/p_und[i])  +  C_i·log((1-p_dam[i])/(1-p_und[i]))
-```
-
-where `p_dam[i]` and `p_und[i]` are the empirical C→T rates at position i in
-the damaged and undamaged read classes respectively (recovered by mixture
-unmixing from bulk + per-class rates). For SS libraries the 3′ end is scored
-symmetrically. LLR > 0 → classified as damaged.
-
-Performance on a 437 M-read SS library (d_max ≈ 0.16, 3 length bins):
-
-| Phase | Time |
-|-------|------|
-| Bulk damage fit (Pass 0) | ~50 s |
-| Split model scan (`auto`) | ~150 s |
-| Derep pass 1 (index) | ~1650 s |
 
 ### PCR error correction (default: on)
 
