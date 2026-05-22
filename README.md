@@ -27,13 +27,19 @@ threshold, or obtain parameters for manual `--damage-dmax`/`--damage-lambda`
 overrides. It does not modify reads. When adapter stubs are detected it reports
 the fraction of reads affected (e.g. `5'=CTCTTC (1.2% of reads)`).
 
-**0a. `fqdup trim` (optional pre-processing)**: detect and remove 5′/3′ adapter
+**0a. `fqdup trim` (optional pre-processing, DS libraries only)**: detect and remove 5′/3′ adapter
 stub remnants that upstream tools (fastp, cutadapt) may miss. Typical case: P5
 tail hexamers (`CTCTTC`) left at the 5′ end of collapsed reads when fastp trims
-only the 3′ adapter. Uses hexamer frequency analysis on the first `--scan-reads`
-reads; single-pass — the scan buffer is replayed into the clip pipeline with no
-second file open. Run when `fqdup profile` reports adapter stubs at &gt; ~0.5% of
-reads. Output is a trimmed FASTQ ready to feed into `fqdup extend`.
+only the 3′ adapter from R1 but leaves the P5 tail intact at the 5′ read start.
+Uses hexamer frequency analysis on the first `--scan-reads` reads; single-pass —
+the scan buffer is replayed into the clip pipeline with no second file open. Run
+when `fqdup profile` reports adapter stubs at &gt; ~0.5% of reads.
+
+**DS libraries only.** Single-stranded (SS) libraries prepared with the
+CircLigase protocol (Gansauge & Meyer) ligate only a 3′ adapter; the 5′ end of
+every molecule is native ancient DNA with no P5 ligation junction. No `CTCTTC`
+stub can form. `fqdup profile` will not detect 5′ stubs in SS data; skip
+`fqdup trim` for SS libraries.
 
 **1. `fqdup extend`**: extend each merged read outward from both ends using a
 built-in de Bruijn graph assembler. The extended reads serve as deduplication
@@ -292,6 +298,9 @@ Single-pass: the scan window is buffered in memory and replayed directly into
 the parallel clip pipeline — no second decompression pass. 5′ stubs are clipped
 once (first 6 bp); 3′ stubs are clipped iteratively until no match remains.
 Reports the fraction of reads clipped at each end.
+
+**DS libraries only.** SS libraries (CircLigase-based prep) have no P5 adapter
+at the 5′ end of reads; `fqdup trim` is a no-op on such data.
 
 ### `fqdup extend`
 
