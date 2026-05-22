@@ -1,8 +1,8 @@
-# fqdup damage
+# fqdup profile
 
 ## Purpose
 
-`fqdup damage` profiles ancient DNA deamination damage and computes the
+`fqdup profile` profiles ancient DNA deamination damage and computes the
 per-position mask that would be applied by `fqdup extend` and `fqdup derep
 --collapse-damage`. It is a standalone diagnostic command, run it before the
 full pipeline to inspect the damage profile, verify that library-type
@@ -13,7 +13,7 @@ auto-detection is correct, and decide whether `--collapse-damage` is warranted.
 ## Usage
 
 ```bash
-fqdup damage -i FILE [options]
+fqdup profile -i FILE [options]
 ```
 
 ### Options
@@ -30,7 +30,7 @@ fqdup damage -i FILE [options]
 
 ## Algorithm
 
-`fqdup damage` is a fully multi-threaded single-pass profiler. The producer
+`fqdup profile` is a fully multi-threaded single-pass profiler. The producer
 streams the FASTQ into batches of 8,192 sequences; N worker threads each
 own their own `SampleDamageProfile` (no locking). After all reads are
 processed, the per-thread profiles are merged and finalized in a single call.
@@ -57,7 +57,7 @@ the classifier when the exponential fit is noisy.
 
 ### Paired-end mode
 
-When `fqdup damage` is given `-1/-2`, the profiler runs in native PE mode:
+When `fqdup profile` is given `-1/-2`, the profiler runs in native PE mode:
 `R1[i]` maps to top-strand 5'-end position `i` and the complement of `R2[i]`
 maps to top-strand 3'-end position `i` of the **same fragment**. Running SE
 on each mate separately would attribute R2's 5'-end signal to a non-existent
@@ -94,7 +94,7 @@ table.
 ### Human-readable report
 
 ```
-=== fqdup damage ===
+=== fqdup profile ===
 Input:   merged.fq.gz
 Threads: 16
 Reads:   5,582,073 scanned
@@ -130,6 +130,12 @@ Fields:
 - **\[validated\] / \[mixture\] / \[ARTIFACT\]**, Additional flags from the libtaph classifier. `[ARTIFACT]` signals the damage pattern is inconsistent with genuine ancient DNA.
 - **Mask threshold**, Which positions exceed the threshold and would be masked in `fqdup extend` / `fqdup derep --collapse-damage`.
 - **Per-position table**, Observed T/(T+C) and A/(A+G) frequencies at each of the first 15 positions; `*` marks masked positions.
+- **adapter stubs** (when detected), Per-end read fraction over all reads:
+  `adapter stubs: 5'=CTCTTC (1.2% of reads) 3'=TTTCCC (1.6% of reads)`.
+  If stubs are present at > ~0.5% run `fqdup trim` before `fqdup extend` to
+  remove them. The same fractions appear in `--json` as
+  `adapter_stub5_read_fraction`, `adapter_stub3_read_fraction`, and
+  `adapter_stub_reads_checked`.
 
 ### TSV output (`--tsv`)
 
@@ -144,10 +150,10 @@ pos	end5	freq5	end3	freq3	mask	cov5	cov3
 
 ### Damage-context profile (JSON only)
 
-The `--json` output includes a `damage_context_profile` block, a training-free, reference-free, alignment-free summary computed by libtaph's `compute_damage_context_profile`. Six scores in `[0, 1]` (or `null` when not evaluable) plus a deterministic `dominant_process` label:
+The `--json` output includes a `damage_context` block: a training-free, reference-free, alignment-free summary computed by libtaph. Six scores in `[0, 1]` (or `null` when not evaluable) plus a deterministic `dominant_process` string:
 
 ```json
-"damage_context_profile": {
+"damage_context": {
   "method": "training_free",
   "reference_required": false,
   "alignment_required": false,
@@ -159,26 +165,45 @@ The `--json` output includes a `damage_context_profile` block, a training-free, 
   "oxidative_context_score": 0.03,
   "fragmentation_context_score": 0.31,
   "library_artifact_score": 0.04,
-  "evidence": { "d_max_5": 0.193, "d_max_3": 0.040, "lambda_5": 0.246,
-                "log2_cpg_ratio": 0.38, "dipyr_contrast": 0.004,
-                "ox_gt_asymmetry": 0.012, "s_oxog_mean": 0.003,
-                "purine_enrichment_5prime": 0.021, "hex_shift_z": 1.2,
-                "adapter_clipped": false, "flag_hex_artifact": false,
-                "n_reads": 5582073 }
+  "evidence": {
+    "d_max_5": 0.193, "d_max_3": 0.040, "lambda_5": 0.246,
+    "log2_cpg_ratio": 0.38, "dipyr_contrast": 0.004,
+    "ox_gt_asymmetry": 0.012, "s_oxog_mean": 0.003,
+    "purine_enrichment_5prime": 0.021, "hex_shift_z": 1.2,
+    "adapter_clipped": false, "flag_hex_artifact": false,
+    "n_reads": 5582073
+  }
 }
 ```
 
-The `dominant_process` label is one of `cytosine_deamination`, `cpg_enriched_deamination`, `dipyrimidine_biased`, `oxidative_like`, `fragmentation_bias`, `library_artifact_likely`, `low_damage`, or `none` (insufficient coverage). Rule order and the score formulas are documented in the libtaph methods page.
+`dominant_process` is one of: `cytosine_deamination`, `cpg_enriched_deamination`, `dipyrimidine_biased`, `oxidative_like`, `fragmentation_bias`, `library_artifact_likely`, `low_damage`, or `none` (insufficient coverage).
+
+### Damage-type channels (JSON only)
+
+The `--json` output also includes a `damage_types` array with one entry per channel (A through H). Each entry describes an independent damage mechanism detected reference-free from terminal trinucleotide context:
+
+| Channel | Name | Mechanism | Key fields |
+|---------|------|-----------|------------|
+| A | `cytosine_deamination` | Post-mortem C→T at terminal positions | `d_max_5prime`, `d_max_3prime`, `validated` |
+| B | `stop_codon_conversion` | CAA/CAG/CGA→TAA/TAG/TGA; reference-free deamination validator | `lrt_5prime`, `d_max_estimate` |
+| C | `8_oxog_top_strand` | G→T stop codons (GAA/GAG/GGA); top-strand 8-oxoguanine | `baseline_rate`, `terminal_rate`, `uniformity_ratio` |
+| D | `chargaff_gt_asymmetry` | Strand-asymmetric G→T / C→A excess; 8-oxoG cross-check | `D`, `s_gt` |
+| E | `purine_enrichment` | A/G enrichment at 5' read starts; depurination or fragmentation bias | `enrichment_5prime`, `enrichment_3prime` |
+| F | `8_oxog_complement` | C→A stop codons (TCA/TCG/TAC/TGC); bottom-strand 8-oxoguanine | `baseline_rate`, `terminal_rate`, `z_score` |
+| G | `hydantoin_oxidation` | C→G stop codons; spiroiminodihydantoin / guanidinohydantoin products | `baseline_rate`, `terminal_rate`, `z_score` |
+| H | `adenine_oxidation` | A→T stop codons (AAA/AAG/AGA); adenine oxidation or trans-lesion synthesis | `baseline_rate`, `terminal_rate`, `z_score`, `z_score_p2plus` |
+
+`detected: true` fires when the channel's z-score exceeds 3.0 (one-sided; depletion is not flagged). All eight entries are always present regardless of whether damage is detected.
 
 ---
 
 ## Typical workflow
 
-Run `fqdup damage` first to inspect the profile before committing to
+Run `fqdup profile` first to inspect the profile before committing to
 `--collapse-damage`:
 
 ```bash
-fqdup damage -i merged.fq.gz --tsv damage_profile.tsv
+fqdup profile -i merged.fq.gz --tsv damage_profile.tsv
 ```
 
 Then use the output to decide:
@@ -187,11 +212,11 @@ Then use the output to decide:
    `--collapse-damage` in `fqdup derep` entirely.
 
 2. **Library type looks wrong**, override with `--library-type ds|ss` in
-   `fqdup damage` first to confirm, then pass the same flag to `fqdup extend`
+   `fqdup profile` first to confirm, then pass the same flag to `fqdup extend`
    and `fqdup derep`.
 
 3. **mask-threshold produces too many / too few masked positions**, adjust
-   `--mask-threshold` and re-run `fqdup damage` until the masked zone matches
+   `--mask-threshold` and re-run `fqdup profile` until the masked zone matches
    the damage plot. Then pass the same threshold to `fqdup extend` and
    `fqdup derep`.
 
