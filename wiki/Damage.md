@@ -135,7 +135,18 @@ Fields:
   If stubs are present at > ~0.5% run `fqdup trim` before `fqdup extend` to
   remove them. The same fractions appear in `--json` as
   `adapter_stub5_read_fraction`, `adapter_stub3_read_fraction`, and
-  `adapter_stub_reads_checked`.
+  `adapter_stub_reads_checked`. Stubs are a **DS-only** phenomenon; SS
+  libraries have no P5 adapter at the 5′ end and will never show a 5′ stub.
+
+- **`NOTE: adapter artifact — 5' fit start=posN  3' fit start=posN (d_max corrected to peak of pos1-5)`** (when present), printed when base-composition at the ligation junction suppresses the expected damage signal at position 0. This is **not** an untrimmed adapter stub. The adapter's terminal bases set the nucleotide composition at the first (5′) or last (3′) sequenced position of a read, creating a systematic deviation from the interior baseline that is unrelated to deamination chemistry.
+
+  Two patterns trigger the 5′ flag:
+  - *Classic*: pos-0 C→T rate is below the interior baseline while pos-1 is above — the adapter's terminal base is predominantly not a C, suppressing T at pos-0.
+  - *Jump*: pos-1 is clearly elevated (> 2%) and the pos-0 → pos-1 jump exceeds 3 percentage points — the ligation composition masks the depletion against an elevated baseline.
+
+  For the 3′ end, pos-0 G→A is always excluded from the main signal because SS ligation introduces an elevated A/(A+G) at 3′ pos-0 unrelated to deamination; the 3′ flag fires when this pos-0 spike is more than 5 percentage points above the pos-1–4 mean.
+
+  When flagged, libtaph searches for the BIC-optimal decay start position (1–10) and `d_max` is set to the peak damage rate over positions 1–5. The `fit start=posN` value is the position where the exponential decay fit begins. Reported d_max values remain biologically meaningful; only the fit anchor shifts.
 
 ### TSV output (`--tsv`)
 
