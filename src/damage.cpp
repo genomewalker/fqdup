@@ -239,6 +239,63 @@ static float per_read_damaged_weight(
 
 static constexpr int N_GC = taph::SampleDamageProfile::N_GC_BINS;
 
+// Pre-computed per-GC-bin LLR table: replaces exp+2×log+2×clamp inside the
+// oxoG worker inner loop. Populated once after pass-1 dp is finalized.
+struct LLRTable {
+    float addT[15];   // log(pd/bg)          at each position
+    float addC[15];   // log((1-pd)/(1-bg))  at each position
+    int   max_pos;    // first p where excess < 0.01 (loop break)
+    float logit_pi;
+};
+
+static void build_llr_tables(LLRTable* tables, const taph::SampleDamageProfile& dp) {
+    for (int b = 0; b < N_GC; ++b) {
+        auto& t = tables[b];
+        const auto& gc = dp.gc_bins[b];
+        float bg   = (gc.valid && gc.baseline_tc > 0.0f) ? gc.baseline_tc : dp.fit_baseline_5prime;
+        float dmax = (gc.valid && gc.d_max > 0.005f)     ? gc.d_max       : dp.d_max_5prime;
+        float lam  = dp.lambda_5prime;
+        float pi   = (gc.valid && gc.p_damaged > 0.0f)   ? gc.p_damaged   : dp.pi_damaged;
+        pi = std::clamp(pi, 0.001f, 0.999f);
+        t.logit_pi = std::log(pi / (1.0f - pi));
+        t.max_pos  = 0;
+        for (int p = 0; p < 15; ++p) {
+            float excess = dmax * std::exp(-lam * static_cast<float>(p));
+            if (excess < 0.01f) { t.max_pos = p; break; }
+            float pd = std::clamp(bg + (1.0f - bg) * excess, 1e-6f, 1.0f - 1e-6f);
+            t.addT[p] = std::log(pd / bg);
+            t.addC[p] = std::log((1.0f - pd) / (1.0f - bg));
+            t.max_pos  = p + 1;
+        }
+    }
+}
+
+// Forward scoring: T/C at positions 0..max_pos-1 via table lookup.
+static float weight_from_table(const std::string& seq, const LLRTable& t) {
+    int mp = std::min(t.max_pos, static_cast<int>(seq.size()));
+    float llr = 0.0f;
+    for (int p = 0; p < mp; ++p) {
+        char b = static_cast<char>(seq[p] & ~0x20u);
+        if      (b == 'T') llr += t.addT[p];
+        else if (b == 'C') llr += t.addC[p];
+    }
+    return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
+}
+
+// Reverse-complement scoring without allocating an rc string.
+// RC position p = complement(seq[L-1-p]): A→T, G→C.
+static float weight_rev_from_table(const std::string& seq, const LLRTable& t) {
+    int L  = static_cast<int>(seq.size());
+    int mp = std::min(t.max_pos, L);
+    float llr = 0.0f;
+    for (int p = 0; p < mp; ++p) {
+        char b = static_cast<char>(seq[L - 1 - p] & ~0x20u);
+        if      (b == 'A') llr += t.addT[p];   // A in original → T in RC
+        else if (b == 'G') llr += t.addC[p];   // G in original → C in RC
+    }
+    return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
+}
+
 struct OxBinAcc {
     double A = 0, B = 0, C = 0, D = 0;           // first moments
     double AA = 0, AB = 0, BB = 0;                 // second moments (anc)
@@ -259,6 +316,7 @@ struct OxogWorkerState {
 static void oxog_worker(WorkQueue& queue,
                         OxogWorkerState& state,
                         const taph::SampleDamageProfile& dp,
+                        const LLRTable* llr,
                         bool is_ss)
 {
     std::vector<std::string> batch;
@@ -267,28 +325,38 @@ static void oxog_worker(WorkQueue& queue,
             int L = static_cast<int>(seq.size());
             if (L < 30) continue;
             int bin = taph::SampleDamageProfile::get_gc_bin(seq);
-            std::string oriented;
+            const LLRTable& t = llr[bin];
             double q;
+            bool rev = false;
             if (is_ss) {
-                oriented = seq;
-                q = per_read_damaged_weight(seq, dp);
+                q = weight_from_table(seq, t);
             } else {
-                float w_fwd = per_read_damaged_weight(seq, dp);
-                std::string rc = revcomp(seq);
-                float w_rev = per_read_damaged_weight(rc, dp);
-                if (w_rev > w_fwd) { oriented = std::move(rc); q = w_rev; }
-                else               { oriented = seq;            q = w_fwd; }
+                float w_fwd = weight_from_table(seq, t);
+                float w_rev = weight_rev_from_table(seq, t);
+                if (w_rev > w_fwd) { rev = true; q = w_rev; }
+                else               {              q = w_fwd; }
             }
             int beg = L / 3, end = L - (L / 3);
             if (end <= beg) continue;
             int T = 0, G = 0, Cv = 0, Av = 0;
-            for (int j = beg; j < end; ++j) {
-                char b = static_cast<char>(std::toupper(
-                             static_cast<unsigned char>(oriented[j])));
-                if      (b == 'T') ++T;
-                else if (b == 'G') ++G;
-                else if (b == 'C') ++Cv;
-                else if (b == 'A') ++Av;
+            if (!rev) {
+                for (int j = beg; j < end; ++j) {
+                    char b = static_cast<char>(seq[j] & ~0x20u);
+                    if      (b == 'T') ++T;
+                    else if (b == 'G') ++G;
+                    else if (b == 'C') ++Cv;
+                    else if (b == 'A') ++Av;
+                }
+            } else {
+                // DS read oriented in reverse: complement-map the middle third
+                // without allocating an rc string (A→T, C→G, G→C, T→A).
+                for (int j = beg; j < end; ++j) {
+                    char b = static_cast<char>(seq[j] & ~0x20u);
+                    if      (b == 'A') ++T;
+                    else if (b == 'C') ++G;
+                    else if (b == 'G') ++Cv;
+                    else if (b == 'T') ++Av;
+                }
             }
             int M = T + G;
             if (M == 0) continue;
@@ -689,13 +757,16 @@ int damage_main(int argc, char** argv) {
     // Oxog second pass uses single-end reads; skip in paired mode.
     if (paired_mode) run_oxog = false;
     if (run_oxog && dp.d_max_5prime > 0.01f) {
+        LLRTable llr_tables[N_GC];
+        build_llr_tables(llr_tables, dp);
         WorkQueue queue2(2 * n_threads);
         std::vector<OxogWorkerState> ox_states(n_threads);
         std::vector<std::thread> workers2;
         workers2.reserve(n_threads);
         for (int t = 0; t < n_threads; ++t)
             workers2.emplace_back(oxog_worker, std::ref(queue2),
-                                   std::ref(ox_states[t]), std::cref(dp), is_ss);
+                                   std::ref(ox_states[t]), std::cref(dp),
+                                   llr_tables, is_ss);
         try {
             auto reader2 = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
             FastqRecord rec;
