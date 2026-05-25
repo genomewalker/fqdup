@@ -13,6 +13,7 @@
 #include "damage_html_assets.hpp"
 
 #include "taph/frame_selector_decl.hpp"
+#include "taph/length_stratified_profile.hpp"
 #include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
 #include "taph/profile_json.hpp"
@@ -311,14 +312,23 @@ struct OxBinAcc {
 
 struct OxogWorkerState {
     OxBinAcc bins[N_GC];
+    // Fix E: LSD data accumulated when fuse_lsd=true in oxog_worker.
+    taph::LengthBinStats        lbs;
+    std::vector<LsdLlrBinAccum> llr_acc;  // per length-bin, size = n_bins
 };
 
 static void oxog_worker(WorkQueue& queue,
                         OxogWorkerState& state,
                         const taph::SampleDamageProfile& dp,
                         const LLRTable* llr,
-                        bool is_ss)
+                        bool is_ss,
+                        bool fuse_lsd,
+                        const LsdClassifyParams* cls_params,
+                        const std::vector<int>* lsd_edges)
 {
+    const int n_lsd_bins = fuse_lsd && lsd_edges
+        ? 1 + static_cast<int>(lsd_edges->size()) : 0;
+
     std::vector<std::string> batch;
     while (queue.pop(batch)) {
         for (const std::string& seq : batch) {
@@ -372,6 +382,21 @@ static void oxog_worker(WorkQueue& queue,
             ++x.reads;
             x.T_all  += T;  x.TG_all += M;
             x.C_all  += Cv; x.CA_all += Cv + Av;
+
+            // Fix E: fused LSD accumulation.
+            if (fuse_lsd && L >= LSD_L_MIN && cls_params && n_lsd_bins > 0) {
+                int L_binned = std::min(L, LSD_L_MAX);
+                state.lbs.update(seq, L_binned);
+                // bin_index: count how many edges L_binned is >= 
+                int lb = 0;
+                for (int e : *lsd_edges) { if (L_binned >= e) ++lb; else break; }
+                if (lb >= 0 && lb < n_lsd_bins) {
+                    bool anc = lsd_classify_read(seq, *cls_params);
+                    if (anc) ++state.llr_acc[lb].n_damaged;
+                    else     ++state.llr_acc[lb].n_undamaged;
+                    lsd_accumulate(seq, state.llr_acc[lb], anc, cls_params->is_ss);
+                }
+            }
         }
     }
 }
@@ -756,17 +781,67 @@ int damage_main(int argc, char** argv) {
 
     // Oxog second pass uses single-end reads; skip in paired mode.
     if (paired_mode) run_oxog = false;
+
+    // Fix E: build bulk_dp here (needed by both the oxoG pass and LSD fusion).
+    // Fields come directly from the finalized dp; nothing between finalize and
+    // this point modifies the values used below.
+    DamageProfile bulk_dp;
+    bulk_dp.enabled              = true;
+    bulk_dp.d_max_5prime         = dp.d_max_5prime;
+    bulk_dp.d_max_3prime         = dp.d_max_3prime;
+    bulk_dp.lambda_5prime        = dp.lambda_5prime;
+    bulk_dp.lambda_3prime        = dp.lambda_3prime;
+    bulk_dp.background           = dp.fit_baseline_5prime;
+    bulk_dp.bg_5_tc              = dp.fit_baseline_5prime;
+    bulk_dp.bg_3_channel         = dp.fit_baseline_3prime;
+    bulk_dp.ss_mode              = is_ss;
+    bulk_dp.mixture_d_damaged    = dp.mixture_d_ancient;
+    bulk_dp.mixture_pi_damaged   = dp.mixture_pi_ancient;
+    bulk_dp.mixture_d_reference  = dp.mixture_d_reference;
+    bulk_dp.mixture_n_components = dp.mixture_n_components;
+    bulk_dp.mixture_converged    = dp.mixture_converged;
+    bulk_dp.mixture_identifiable = dp.mixture_identifiable;
+    bulk_dp.d_cpg_5prime         = dp.dmax_ct5_cpg_like;
+    bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
+
+    // Decide whether to fuse the LSD pass into the oxoG pass.
+    const bool fuse_lsd = lb_opts.enabled() && !paired_mode
+                          && run_oxog && dp.d_max_5prime > 0.01f;
+    std::vector<int>   lsd_fuse_edges;
+    LsdClassifyParams  lsd_cls_params{};
+    if (fuse_lsd) {
+        lsd_fuse_edges = compute_lsd_edges(merged_lsd_hist, lb_opts);
+        lsd_cls_params = make_lsd_classify_params(bulk_dp);
+    }
+
+    // Populated by the oxoG pass when fuse_lsd=true; passed to
+    // estimate_damage_by_length to skip its FASTQ reader entirely.
+    LsdPrebuilt lsd_prebuilt;
+    bool        lsd_prebuilt_ready = false;
+
     if (run_oxog && dp.d_max_5prime > 0.01f) {
         LLRTable llr_tables[N_GC];
         build_llr_tables(llr_tables, dp);
         WorkQueue queue2(2 * n_threads);
+        const int n_lsd_bins = fuse_lsd
+            ? 1 + static_cast<int>(lsd_fuse_edges.size()) : 0;
         std::vector<OxogWorkerState> ox_states(n_threads);
+        if (fuse_lsd) {
+            for (auto& s : ox_states) {
+                s.lbs.forced_library_type = forced_lib;
+                s.lbs.configure(lsd_fuse_edges);
+                s.llr_acc.assign(n_lsd_bins, {});
+            }
+        }
         std::vector<std::thread> workers2;
         workers2.reserve(n_threads);
         for (int t = 0; t < n_threads; ++t)
             workers2.emplace_back(oxog_worker, std::ref(queue2),
                                    std::ref(ox_states[t]), std::cref(dp),
-                                   llr_tables, is_ss);
+                                   llr_tables, is_ss,
+                                   fuse_lsd,
+                                   fuse_lsd ? &lsd_cls_params : nullptr,
+                                   fuse_lsd ? &lsd_fuse_edges : nullptr);
         try {
             auto reader2 = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
             FastqRecord rec;
@@ -849,6 +924,48 @@ int damage_main(int argc, char** argv) {
             }
         }
         if (w_dor > 0) D_oriented /= w_dor;
+
+        // Fix E: merge per-thread LSD state into LsdPrebuilt for injection below.
+        if (fuse_lsd) {
+            taph::LengthBinStats lsd_master;
+            lsd_master.forced_library_type = forced_lib;
+            lsd_master.configure(lsd_fuse_edges);
+            for (auto& os : ox_states) lsd_master.merge(os.lbs);
+
+            const int n_lsd_bins = 1 + static_cast<int>(lsd_fuse_edges.size());
+            std::vector<LsdLlrBinAccum> merged_llr(n_lsd_bins);
+            for (auto& os : ox_states) {
+                for (int b = 0; b < n_lsd_bins; ++b) {
+                    const auto& w = os.llr_acc[b];
+                    auto& m = merged_llr[b];
+                    m.n_damaged   += w.n_damaged;
+                    m.n_undamaged += w.n_undamaged;
+                    for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
+                        m.t_5_anc[p]          += w.t_5_anc[p];
+                        m.tc_5_anc[p]         += w.tc_5_anc[p];
+                        m.h_3_anc[p]          += w.h_3_anc[p];
+                        m.n_3_anc[p]          += w.n_3_anc[p];
+                        m.t_5_anc_cpg[p]      += w.t_5_anc_cpg[p];
+                        m.tc_5_anc_cpg[p]     += w.tc_5_anc_cpg[p];
+                        m.t_5_anc_noncpg[p]   += w.t_5_anc_noncpg[p];
+                        m.tc_5_anc_noncpg[p]  += w.tc_5_anc_noncpg[p];
+                        m.t_5_anc_g[p]        += w.t_5_anc_g[p];
+                        m.tg_5_anc[p]         += w.tg_5_anc[p];
+                        m.t_5_mod_g[p]        += w.t_5_mod_g[p];
+                        m.tg_5_mod[p]         += w.tg_5_mod[p];
+                        m.a_5_anc_all[p]      += w.a_5_anc_all[p];
+                        m.c_5_anc_all[p]      += w.c_5_anc_all[p];
+                        m.g_5_anc_all[p]      += w.g_5_anc_all[p];
+                        m.t_5_anc_all[p]      += w.t_5_anc_all[p];
+                    }
+                }
+            }
+
+            lsd_prebuilt.edges        = lsd_fuse_edges;
+            lsd_prebuilt.merged_stats = std::move(lsd_master);
+            lsd_prebuilt.llr_bins     = std::move(merged_llr);
+            lsd_prebuilt_ready        = true;
+        }
     }
 
     // ---- Score tests: oxog interior, depurination, damage mask (→ libtaph) ----
@@ -1068,32 +1185,15 @@ int damage_main(int argc, char** argv) {
     }
 
     // ---- optional length-stratified damage ----------------------------------------
-    DamageProfile bulk_dp;
-    bulk_dp.enabled              = true;
-    bulk_dp.d_max_5prime         = dp.d_max_5prime;
-    bulk_dp.d_max_3prime         = dp.d_max_3prime;
-    bulk_dp.lambda_5prime        = dp.lambda_5prime;
-    bulk_dp.lambda_3prime        = dp.lambda_3prime;
-    bulk_dp.background           = dp.fit_baseline_5prime;
-    bulk_dp.bg_5_tc              = dp.fit_baseline_5prime;
-    bulk_dp.bg_3_channel         = dp.fit_baseline_3prime;
-    bulk_dp.ss_mode              = is_ss;
-    bulk_dp.mixture_d_damaged    = dp.mixture_d_ancient;
-    bulk_dp.mixture_pi_damaged   = dp.mixture_pi_ancient;
-    bulk_dp.mixture_d_reference  = dp.mixture_d_reference;
-    bulk_dp.mixture_n_components = dp.mixture_n_components;
-    bulk_dp.mixture_converged    = dp.mixture_converged;
-    bulk_dp.mixture_identifiable = dp.mixture_identifiable;
-    bulk_dp.d_cpg_5prime         = dp.dmax_ct5_cpg_like;
-    bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
-
+    // bulk_dp was built before the oxoG pass; reuse it here.
     LengthStratifiedDamageProfile lsd;
     if (lb_opts.enabled() && paired_mode) {
         std::cerr << "Warning: --length-bins is not supported in paired mode; skipping.\n";
     } else if (lb_opts.enabled()) {
         lsd = estimate_damage_by_length(in_path, forced_lib, lb_opts,
                                         &merged_lsd_hist,
-                                        static_cast<size_t>(n_threads), 0, &bulk_dp);
+                                        static_cast<size_t>(n_threads), 0, &bulk_dp,
+                                        lsd_prebuilt_ready ? &lsd_prebuilt : nullptr);
         std::cout << "\nLength-stratified damage (method=" << lsd.method
                   << ", n_bins=" << lsd.bins.size() << "):\n";
         std::cout << "bin  L_lo  L_hi  n_reads  d5      d3      lam5    lam3    src\n";
