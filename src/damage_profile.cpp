@@ -394,6 +394,152 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
     return out;
 }
 
+// ---- helpers for Fix-E LSD fusion (also used by damage.cpp) -----------
+
+std::vector<int> compute_lsd_edges(const std::vector<uint64_t>& hist,
+                                   const LengthBinOptions& options)
+{
+    const double log_min = std::log(static_cast<double>(LSD_L_MIN));
+    const double log_max = std::log(static_cast<double>(LSD_L_MAX + 1));
+    std::vector<int> edges;
+    if (options.mode == LengthBinOptions::Mode::EXPLICIT) {
+        for (int e : options.explicit_edges)
+            if (e > LSD_L_MIN && e < LSD_L_MAX) edges.push_back(e);
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    } else if (options.mode == LengthBinOptions::Mode::QUANTILE) {
+        int nb = std::clamp(options.quantile_bins, 1,
+                            static_cast<int>(taph::LengthBinStats::MAX_BINS));
+        if (nb > 1)
+            edges = taph::detect_quantile_length_edges(hist, log_min, log_max,
+                                                       LSD_L_MIN, LSD_L_MAX, nb);
+    } else if (options.mode == LengthBinOptions::Mode::AUTO) {
+        taph::LogLengthGmmResult gr = taph::detect_log_length_gmm_edges(
+            hist, log_min, log_max, LSD_L_MIN, LSD_L_MAX,
+            static_cast<int>(taph::LengthBinStats::MAX_BINS));
+        edges = gr.edges;
+    }
+    const int max_edges = static_cast<int>(taph::LengthBinStats::MAX_BINS) - 1;
+    if (static_cast<int>(edges.size()) > max_edges)
+        edges.resize(max_edges);
+    return edges;
+}
+
+LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk)
+{
+    LsdClassifyParams p;
+    p.d_anc = (bulk.mixture_converged && bulk.mixture_d_damaged > 0.01)
+        ? bulk.mixture_d_damaged
+        : std::max(bulk.d_max_5prime, bulk.d_max_3prime);
+    p.lam_5 = bulk.lambda_5prime;
+    p.lam_3 = bulk.lambda_3prime;
+    p.bg_5  = bulk.bg_5_tc;
+    p.bg_3  = bulk.bg_3_channel;
+    p.is_ss = bulk.ss_mode;
+    const double d_cpg = bulk.d_cpg_5prime;
+    const double d_ncp = bulk.d_noncpg_5prime;
+    if (d_cpg > 0.01 && d_ncp > 0.01 && !std::isnan(d_cpg) && !std::isnan(d_ncp)) {
+        const double d_avg = 0.5 * (d_cpg + d_ncp);
+        if (d_avg > 1e-6) {
+            p.cpg_scale    = d_cpg / d_avg;
+            p.noncpg_scale = d_ncp / d_avg;
+        }
+    }
+    return p;
+}
+
+bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p)
+{
+    constexpr int    P_MAX = 5;
+    constexpr double EPS   = 1e-10;
+    const int L = static_cast<int>(seq.size());
+    double llr = 0.0;
+    const int np5 = std::min(P_MAX, L);
+    for (int i = 0; i < np5; ++i) {
+        char c = seq[i];
+        int hit = (c == 'T' || c == 't') ? 1
+                : (c == 'C' || c == 'c') ? 0 : -1;
+        if (hit < 0) continue;
+        double site_scale = 1.0;
+        if (i + 1 < L) {
+            char n = seq[i + 1];
+            bool cpg = (n == 'G' || n == 'g');
+            site_scale = cpg ? p.cpg_scale : p.noncpg_scale;
+        }
+        double d_site = p.d_anc * site_scale;
+        double pa = std::clamp(p.bg_5 + d_site * std::exp(-p.lam_5 * i) * (1.0 - p.bg_5),
+                               EPS, 1.0 - EPS);
+        double pm = std::clamp(p.bg_5, EPS, 1.0 - EPS);
+        llr += hit ? (std::log(pa) - std::log(pm))
+                   : (std::log(1.0 - pa) - std::log(1.0 - pm));
+    }
+    const int np3 = std::min(P_MAX, L);
+    for (int i = 0; i < np3; ++i) {
+        char c = seq[L - 1 - i];
+        int hit;
+        if (p.is_ss)
+            hit = (c == 'T' || c == 't') ? 1 : (c == 'C' || c == 'c') ? 0 : -1;
+        else
+            hit = (c == 'A' || c == 'a') ? 1 : (c == 'G' || c == 'g') ? 0 : -1;
+        if (hit < 0) continue;
+        double pa = std::clamp(p.bg_3 + p.d_anc * std::exp(-p.lam_3 * i) * (1.0 - p.bg_3),
+                               EPS, 1.0 - EPS);
+        double pm = std::clamp(p.bg_3, EPS, 1.0 - EPS);
+        llr += hit ? (std::log(pa) - std::log(pm))
+                   : (std::log(1.0 - pa) - std::log(1.0 - pm));
+    }
+    return llr > 0.0;
+}
+
+void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
+                    bool ancient, bool is_ss)
+{
+    const int L  = static_cast<int>(seq.size());
+    const int np = std::min<int>(LengthBinDamageProfile::N_POS, L);
+    for (int p = 0; p < np; ++p) {
+        char c  = seq[p];
+        char cU = (c == 'A' || c == 'C' || c == 'G' || c == 'T') ? c
+                : (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : 'N';
+        bool is_t = (cU == 'T');
+        bool is_c = (cU == 'C');
+        bool is_g = (cU == 'G');
+        if (ancient) {
+            if (is_t) { ++acc.t_5_anc[p]; ++acc.tc_5_anc[p]; }
+            else if (is_c) { ++acc.tc_5_anc[p]; }
+            if ((is_t || is_c) && (p + 1) < L) {
+                char n  = seq[p + 1];
+                char nU = (n == 'A' || n == 'C' || n == 'G' || n == 'T') ? n
+                        : (n >= 'a' && n <= 'z') ? static_cast<char>(n - 32) : 'N';
+                bool cpg = (nU == 'G');
+                if (cpg) { if (is_t) ++acc.t_5_anc_cpg[p]; ++acc.tc_5_anc_cpg[p]; }
+                else     { if (is_t) ++acc.t_5_anc_noncpg[p]; ++acc.tc_5_anc_noncpg[p]; }
+            }
+        }
+        if (is_t || is_g) {
+            if (ancient) { if (is_t) ++acc.t_5_anc_g[p]; ++acc.tg_5_anc[p]; }
+            else         { if (is_t) ++acc.t_5_mod_g[p]; ++acc.tg_5_mod[p]; }
+        }
+        if (ancient) {
+            if      (cU == 'A') ++acc.a_5_anc_all[p];
+            else if (cU == 'C') ++acc.c_5_anc_all[p];
+            else if (cU == 'G') ++acc.g_5_anc_all[p];
+            else if (cU == 'T') ++acc.t_5_anc_all[p];
+        }
+    }
+    if (ancient) {
+        for (int p = 0; p < np; ++p) {
+            char c = seq[L - 1 - p];
+            if (is_ss) {
+                if      (c == 'T' || c == 't') { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
+                else if (c == 'C' || c == 'c') { ++acc.n_3_anc[p]; }
+            } else {
+                if      (c == 'A' || c == 'a') { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
+                else if (c == 'G' || c == 'g') { ++acc.n_3_anc[p]; }
+            }
+        }
+    }
+}
+
 // ---- length-stratified damage estimation -------------------------------
 // Two-pass: pass 1 builds a log-length histogram and picks bin edges
 // (explicit | quantile | auto GMM+BIC); pass 2 routes each read to its
@@ -406,7 +552,8 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     const std::vector<uint64_t>* prebuilt_hist,
     size_t reader_threads,
     int64_t max_reads,
-    const DamageProfile* bulk_for_llr)
+    const DamageProfile* bulk_for_llr,
+    const LsdPrebuilt* prebuilt)
 {
     LengthStratifiedDamageProfile out;
     out.min_length = LSD_L_MIN;
@@ -485,7 +632,7 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     }
     out.edges = edges;
 
-    const int n_bins = 1 + static_cast<int>(edges.size());
+    int n_bins = 1 + static_cast<int>(edges.size());
 
     // ---- Pass 2: multi-threaded per-bin accumulation via LengthBinStats -----
     int n_threads = reader_threads > 0
@@ -532,31 +679,9 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     }
 
     // ---- Per-read LLR accumulator (optional, when bulk params supplied) -----
-    struct LlrBinAccum {
-        int64_t n_damaged = 0;
-        int64_t n_undamaged  = 0;
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> h_3_anc{};  // T (SS) or A (DS)
-        std::array<int64_t, LengthBinDamageProfile::N_POS> n_3_anc{};  // T+C or A+G
-        // CpG-split C→T at 5' in the ancient subset (metaDMG-style split).
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_cpg{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_cpg{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_noncpg{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_noncpg{};
-        // 8-oxoG marker (G→T) at 5' in both subsets (contrast = oxidation signal).
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_g{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_anc{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod_g{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_mod{};
-        // Per-position 4-base histograms at 5' end in the ancient subset.
-        // Used to compute the composition-based 8-oxoG rate via G-depletion
-        // (pG_terminal - pG_interior). Independent of the C→T signal.
-        std::array<int64_t, LengthBinDamageProfile::N_POS> a_5_anc_all{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> c_5_anc_all{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> g_5_anc_all{};
-        std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_all{};
-    };
+    // Use the public type so prebuilt data from damage.cpp can be injected
+    // directly without a copy (Fix E).
+    using LlrBinAccum = LsdLlrBinAccum;
     const bool do_llr = (bulk_for_llr != nullptr) && bulk_for_llr->enabled;
     const double llr_d_anc = do_llr
         ? (bulk_for_llr->mixture_converged && bulk_for_llr->mixture_d_damaged > 0.01
@@ -716,65 +841,89 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        workers.emplace_back([&, t]{
-            std::vector<std::string> batch;
-            while (pop_batch(batch)) {
-                for (const auto& seq : batch) {
-                    int L = static_cast<int>(seq.size());
-                    if (L < LSD_L_MIN) continue;
-                    int L_binned = std::min(L, LSD_L_MAX);
-                    worker_stats[t].update(seq, L_binned);
-                    if (do_llr) {
-                        int b = bin_index(L_binned);
-                        if (b >= 0 && b < n_bins) {
-                            bool anc = classify_read(seq);
-                            if (anc) {
-                                ++worker_llr[t][b].n_damaged;
-                                accumulate_damaged_terminals(seq, worker_llr[t][b]);
-                            } else {
-                                ++worker_llr[t][b].n_undamaged;
-                                accumulate_5prime_terminals(seq, worker_llr[t][b], /*damaged=*/false);
+    // ---- Fix E: prebuilt path — skip FASTQ reader entirely ---------------
+    // When the caller has already accumulated LSD data during the oxoG second
+    // pass, inject it here and skip the worker launch + file read entirely.
+    if (prebuilt != nullptr) {
+        // Override edges and n_bins with whatever was computed before the oxoG pass.
+        edges  = prebuilt->edges;
+        n_bins = 1 + static_cast<int>(edges.size());
+        out.edges = edges;
+        // Inject prebuilt LLR bins as a single synthetic "thread" so the
+        // merge loop below works unchanged (iterates worker_llr.size()).
+        if (do_llr && !prebuilt->llr_bins.empty()) {
+            worker_llr.assign(1, prebuilt->llr_bins);
+        }
+        // No workers were launched; just mark the queue done for cleanliness.
+        set_done();
+        // worker_stats is empty (no threads started); master is configured below.
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&, t]{
+                std::vector<std::string> batch;
+                while (pop_batch(batch)) {
+                    for (const auto& seq : batch) {
+                        int L = static_cast<int>(seq.size());
+                        if (L < LSD_L_MIN) continue;
+                        int L_binned = std::min(L, LSD_L_MAX);
+                        worker_stats[t].update(seq, L_binned);
+                        if (do_llr) {
+                            int b = bin_index(L_binned);
+                            if (b >= 0 && b < n_bins) {
+                                bool anc = classify_read(seq);
+                                if (anc) {
+                                    ++worker_llr[t][b].n_damaged;
+                                    accumulate_damaged_terminals(seq, worker_llr[t][b]);
+                                } else {
+                                    ++worker_llr[t][b].n_undamaged;
+                                    accumulate_5prime_terminals(seq, worker_llr[t][b], /*damaged=*/false);
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
-    }
-
-    try {
-        auto reader = make_fastq_reader(path, reader_threads);
-        FastqRecord rec;
-        std::vector<std::string> batch;
-        batch.reserve(BATCH_SZ);
-        int64_t record_pos = 0;
-        while (reader->read(rec)) {
-            ++record_pos;
-            if (max_reads > 0 && record_pos > max_reads) break;
-            batch.push_back(std::move(rec.seq));
-            if (static_cast<int>(batch.size()) == BATCH_SZ) {
-                push_batch(std::move(batch));
-                batch.clear();
-                batch.reserve(BATCH_SZ);
-            }
+            });
         }
-        if (!batch.empty()) push_batch(std::move(batch));
-    } catch (...) {
+
+        try {
+            auto reader = make_fastq_reader(path, reader_threads);
+            FastqRecord rec;
+            std::vector<std::string> batch;
+            batch.reserve(BATCH_SZ);
+            int64_t record_pos = 0;
+            while (reader->read(rec)) {
+                ++record_pos;
+                if (max_reads > 0 && record_pos > max_reads) break;
+                batch.push_back(std::move(rec.seq));
+                if (static_cast<int>(batch.size()) == BATCH_SZ) {
+                    push_batch(std::move(batch));
+                    batch.clear();
+                    batch.reserve(BATCH_SZ);
+                }
+            }
+            if (!batch.empty()) push_batch(std::move(batch));
+        } catch (...) {
+            set_done();
+            for (auto& w : workers) w.join();
+            throw;
+        }
         set_done();
         for (auto& w : workers) w.join();
-        throw;
     }
-    set_done();
-    for (auto& w : workers) w.join();
 
     // ---- merge + finalize ------------------------------------------------
     taph::LengthBinStats master;
     master.forced_library_type = forced_lib;
-    master.configure(edges);
-    for (auto& w : worker_stats) master.merge(w);
+    if (prebuilt != nullptr) {
+        // Prebuilt stats were accumulated in damage.cpp workers; take them as-is.
+        master = prebuilt->merged_stats;
+        master.forced_library_type = forced_lib;
+    } else {
+        master.configure(edges);
+        for (auto& w : worker_stats) master.merge(w);
+    }
     master.finalize_all();
 
     // ---- extract LengthBinDamageProfile ----------------------------------
@@ -871,7 +1020,7 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     if (do_llr) {
         for (int b = 0; b < n_bins; ++b) {
             LlrBinAccum merged;
-            for (int t = 0; t < n_threads; ++t) {
+            for (size_t t = 0; t < worker_llr.size(); ++t) {
                 const auto& w = worker_llr[t][b];
                 merged.n_damaged += w.n_damaged;
                 merged.n_undamaged  += w.n_undamaged;

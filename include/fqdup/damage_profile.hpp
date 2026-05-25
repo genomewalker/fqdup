@@ -19,6 +19,7 @@ static constexpr float kOxChannelZDetect = 3.0f;
 #include "fqdup/logger.hpp"
 #include "taph/library_interpretation.hpp"
 #include "taph/length_bin_damage_profile.hpp"
+#include "taph/length_stratified_profile.hpp"
 #include "taph/sample_damage_profile.hpp"
 
 inline constexpr int LSD_L_MIN             = 30;
@@ -199,6 +200,69 @@ struct LengthBinOptions {
 using LengthBinDamageProfile       = taph::LengthBinDamageProfile;
 using LengthStratifiedDamageProfile = taph::LengthStratifiedDamageProfile;
 
+// Per-bin ancient-subset accumulator used when fusing the LSD pass into the
+// oxoG second pass (Fix E).  Field layout is identical to the local
+// LlrBinAccum struct inside estimate_damage_by_length so that prebuilt data
+// can be injected without copying.
+struct LsdLlrBinAccum {
+    int64_t n_damaged   = 0;
+    int64_t n_undamaged = 0;
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> h_3_anc{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> n_3_anc{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_cpg{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_cpg{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_noncpg{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_noncpg{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_g{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_anc{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod_g{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_mod{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> a_5_anc_all{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> c_5_anc_all{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> g_5_anc_all{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_all{};
+};
+
+// Parameters for per-read ancient/modern classification (LLR scorer).
+struct LsdClassifyParams {
+    double d_anc        = 0.0;
+    double lam_5        = 0.3;
+    double lam_3        = 0.3;
+    double bg_5         = 0.5;
+    double bg_3         = 0.5;
+    bool   is_ss        = false;
+    double cpg_scale    = 1.0;
+    double noncpg_scale = 1.0;
+};
+
+// Build classify params from a finalized bulk DamageProfile.
+LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk);
+
+// Classify one read as ancient (true) or modern (false) using the LLR.
+bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p);
+
+// Accumulate terminal stats for one read into an LsdLlrBinAccum.
+// ancient=true: accumulate damage-channel + composition + oxoG counts.
+// ancient=false: accumulate only oxoG marker (T/G) for the modern subset.
+void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
+                    bool ancient, bool is_ss);
+
+// Compute bin edges from a log-length histogram + options (same logic as the
+// edge-picking block inside estimate_damage_by_length, extracted so damage.cpp
+// can call it before the oxoG pass to pre-configure worker LSD state).
+std::vector<int> compute_lsd_edges(const std::vector<uint64_t>& hist,
+                                   const LengthBinOptions& options);
+
+// Prebuilt LSD data produced by a fused oxoG+LSD pass.  Pass via the
+// prebuilt parameter of estimate_damage_by_length to skip the FASTQ reader.
+struct LsdPrebuilt {
+    std::vector<int>            edges;         // from compute_lsd_edges
+    taph::LengthBinStats        merged_stats;  // accumulated but NOT finalized
+    std::vector<LsdLlrBinAccum> llr_bins;      // per-bin, merged across threads
+};
+
 // Run deamination damage estimation on a FASTQ file and return a populated DamageProfile.
 // max_reads: stop after this many reads (0 = use all reads).
 DamageProfile estimate_damage(
@@ -260,7 +324,8 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     const std::vector<uint64_t>* prebuilt_hist = nullptr,
     size_t reader_threads = 0,
     int64_t max_reads = 0,
-    const DamageProfile* bulk_for_llr = nullptr);
+    const DamageProfile* bulk_for_llr = nullptr,
+    const LsdPrebuilt* prebuilt = nullptr);   // when set, skip FASTQ reader entirely
 
 // Stripped-down per-bin T/TC accumulator for DamageSplitModel.
 // Avoids all CpG/oxoG/base-composition tracking and eliminates log() calls from
