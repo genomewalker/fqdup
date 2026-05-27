@@ -324,7 +324,8 @@ static void oxog_worker(WorkQueue& queue,
                         bool is_ss,
                         bool fuse_lsd,
                         const LsdClassifyParams* cls_params,
-                        const std::vector<int>* lsd_edges)
+                        const std::vector<int>* lsd_edges,
+                        double lsd_log_prior_odds)
 {
     const int n_lsd_bins = fuse_lsd && lsd_edges
         ? 1 + static_cast<int>(lsd_edges->size()) : 0;
@@ -391,10 +392,13 @@ static void oxog_worker(WorkQueue& queue,
                 int lb = 0;
                 for (int e : *lsd_edges) { if (L_binned >= e) ++lb; else break; }
                 if (lb >= 0 && lb < n_lsd_bins) {
-                    bool anc = lsd_classify_read(seq, *cls_params);
+                    double llr_val = lsd_llr_score(seq, *cls_params);
+                    bool   anc     = llr_val > 0.0;
                     if (anc) ++state.llr_acc[lb].n_damaged;
                     else     ++state.llr_acc[lb].n_undamaged;
                     lsd_accumulate(seq, state.llr_acc[lb], anc, cls_params->is_ss);
+                    double post = 1.0 / (1.0 + std::exp(-(llr_val + lsd_log_prior_odds)));
+                    lsd_accumulate_soft(seq, state.llr_acc[lb], post, cls_params->is_ss);
                 }
             }
         }
@@ -804,14 +808,27 @@ int damage_main(int argc, char** argv) {
     bulk_dp.d_cpg_5prime         = dp.dmax_ct5_cpg_like;
     bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
 
-    // Decide whether to fuse the LSD pass into the oxoG pass.
-    const bool fuse_lsd = lb_opts.enabled() && !paired_mode
-                          && run_oxog && dp.d_max_5prime > 0.01f;
+    // Fuse per-read ancient/modern classification into the oxoG pass whenever
+    // damage is detectable. When --length-bins is also enabled, compute multi-bin
+    // LSD edges; otherwise a single global bin accumulates the ancient fraction.
+    const bool fuse_lsd = run_oxog && !paired_mode && dp.d_max_5prime > 0.01f;
     std::vector<int>   lsd_fuse_edges;
     LsdClassifyParams  lsd_cls_params{};
+    double             lsd_log_prior_odds = 0.0;  // log(π/(1-π)), default π=0.5
     if (fuse_lsd) {
-        lsd_fuse_edges = compute_lsd_edges(merged_lsd_hist, lb_opts);
         lsd_cls_params = make_lsd_classify_params(bulk_dp);
+        if (lb_opts.enabled())
+            lsd_fuse_edges = compute_lsd_edges(merged_lsd_hist, lb_opts);
+        // else lsd_fuse_edges stays empty → one global bin
+        // Estimate π (endogenous fraction) from bulk d_max / d_anc.
+        // Avoids using the hard-call threshold as the prior — crucial for
+        // samples with tiny endogenous fractions (PPV collapses at LLR>0).
+        if (lsd_cls_params.d_anc > 0.01) {
+            double pi_prior = std::clamp(
+                static_cast<double>(dp.d_max_5prime) / lsd_cls_params.d_anc,
+                1e-6, 1.0 - 1e-6);
+            lsd_log_prior_odds = std::log(pi_prior / (1.0 - pi_prior));
+        }
     }
 
     // Populated by the oxoG pass when fuse_lsd=true; passed to
@@ -841,7 +858,8 @@ int damage_main(int argc, char** argv) {
                                    llr_tables, is_ss,
                                    fuse_lsd,
                                    fuse_lsd ? &lsd_cls_params : nullptr,
-                                   fuse_lsd ? &lsd_fuse_edges : nullptr);
+                                   fuse_lsd ? &lsd_fuse_edges : nullptr,
+                                   lsd_log_prior_odds);
         try {
             auto reader2 = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
             FastqRecord rec;
@@ -953,11 +971,21 @@ int damage_main(int argc, char** argv) {
                         m.tg_5_anc[p]         += w.tg_5_anc[p];
                         m.t_5_mod_g[p]        += w.t_5_mod_g[p];
                         m.tg_5_mod[p]         += w.tg_5_mod[p];
+                        m.t_5_mod[p]          += w.t_5_mod[p];
+                        m.tc_5_mod[p]         += w.tc_5_mod[p];
+                        m.h_3_mod[p]          += w.h_3_mod[p];
+                        m.n_3_mod[p]          += w.n_3_mod[p];
                         m.a_5_anc_all[p]      += w.a_5_anc_all[p];
                         m.c_5_anc_all[p]      += w.c_5_anc_all[p];
                         m.g_5_anc_all[p]      += w.g_5_anc_all[p];
                         m.t_5_anc_all[p]      += w.t_5_anc_all[p];
                     }
+                    // Soft-EM fields (scalars, not per-position arrays).
+                    m.sw_t5_anc  += w.sw_t5_anc;
+                    m.sw_tc5_anc += w.sw_tc5_anc;
+                    m.sw_h3_anc  += w.sw_h3_anc;
+                    m.sw_n3_anc  += w.sw_n3_anc;
+                    m.sw_sum     += w.sw_sum;
                 }
             }
 
@@ -965,6 +993,57 @@ int damage_main(int argc, char** argv) {
             lsd_prebuilt.merged_stats = std::move(lsd_master);
             lsd_prebuilt.llr_bins     = std::move(merged_llr);
             lsd_prebuilt_ready        = true;
+
+            // Compute ancient-fraction d_max using posterior-weighted (soft-EM)
+            // accumulation. sw_* fields hold pos-0 counts weighted by
+            // P(ancient|read,π) where π is estimated from bulk d_max/d_anc,
+            // avoiding the selection-on-outcome bias of hard LLR>0 calls.
+            // Hard-call counts (n_damaged/n_undamaged) are preserved for
+            // informational use (n_reads in JSON).
+            {
+                int64_t hard_n_damaged = 0, hard_n_tot = 0;
+                double sw_sum = 0.0;
+                for (const auto& bin : lsd_prebuilt.llr_bins) {
+                    hard_n_damaged += bin.n_damaged;
+                    hard_n_tot     += bin.n_damaged + bin.n_undamaged;
+                    sw_sum += bin.sw_sum;
+                }
+                if (hard_n_tot >= 10000 && sw_sum >= 10.0) {
+                    dp.damaged_fraction_pi    = static_cast<float>(sw_sum / hard_n_tot);
+                    dp.damaged_fraction_n     = hard_n_damaged;
+                    dp.damaged_fraction_valid = true;
+                    // bulk_d_max = π × d_anc  →  d_anc = bulk_d_max / π
+                    // More robust than the sw_t5/sw_tc5 - bg5 approach, which
+                    // collapses to 0 when posteriors are all ≈ prior (low π).
+                    const double pi_est = dp.damaged_fraction_pi;
+                    if (pi_est > 0.0f) {
+                        dp.damaged_fraction_d5 = static_cast<float>(
+                            std::clamp(static_cast<double>(dp.d_max_5prime) / pi_est, 0.0, 1.0));
+                        dp.damaged_fraction_d3 = static_cast<float>(
+                            std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
+                    }
+                    // Modern d_max: hard-call counts from global.t_5_mod/tc_5_mod
+                    // are still computed via lsd_accumulate; aggregate them here.
+                    const double bg5 = lsd_cls_params.bg_5;
+                    const double bg3 = lsd_cls_params.bg_3;
+                    int64_t mod_t5 = 0, mod_tc5 = 0, mod_h3 = 0, mod_n3 = 0;
+                    for (const auto& bin : lsd_prebuilt.llr_bins) {
+                        for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
+                            mod_t5  += bin.t_5_mod[p];
+                            mod_tc5 += bin.tc_5_mod[p];
+                            mod_h3  += bin.h_3_mod[p];
+                            mod_n3  += bin.n_3_mod[p];
+                            if (p == 0) break;  // only pos 0 needed for d_max peak
+                        }
+                    }
+                    if (mod_tc5 >= 50)
+                        dp.modern_fraction_d5 = static_cast<float>(
+                            std::max(0.0, static_cast<double>(mod_t5) / mod_tc5 - bg5));
+                    if (mod_n3 >= 50)
+                        dp.modern_fraction_d3 = static_cast<float>(
+                            std::max(0.0, static_cast<double>(mod_h3) / mod_n3 - bg3));
+                }
+            }
         }
     }
 
@@ -1504,6 +1583,13 @@ int damage_main(int argc, char** argv) {
         }
 
         // ── Preservation ─────────────────────────────────────────────────────
+        h << "  ,\"anc_valid\": "      << jb(dp.damaged_fraction_valid)  << "\n";
+        h << "  ,\"anc_d5\": "        << jv(dp.damaged_fraction_d5)     << "\n";
+        h << "  ,\"anc_d3\": "        << jv(dp.damaged_fraction_d3)     << "\n";
+        h << "  ,\"anc_pi\": "        << jv(dp.damaged_fraction_pi)     << "\n";
+        h << "  ,\"anc_n\": "         << dp.damaged_fraction_n          << "\n";
+        h << "  ,\"mod_d5\": "        << jv(dp.modern_fraction_d5)      << "\n";
+        h << "  ,\"mod_d3\": "        << jv(dp.modern_fraction_d3)      << "\n";
         h << "  ,\"pres_score\": "    << jv(dp.preservation_score)    << "\n";
         h << "  ,\"pres_label\": \""  << pres_h.label                 << "\"\n";
         h << "  ,\"auth_eff\": "      << jv(pres_h.authenticity_eff)  << "\n";
