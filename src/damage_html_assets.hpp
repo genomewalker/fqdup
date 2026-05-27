@@ -207,15 +207,15 @@ return Plotly;
   appendCard(row1,'Damage channels',tbl+'</table>');
 
   var oxHtml='<div class="kv">'+
-    '<span><b>η̅ (RC log-ratio)</b> '+jv(D.oxog_gt_asymmetry,5)+'</span>'+
-    '<span><b>gt_rate</b> '+jv(D.oxog_gt_rate,5)+'</span>'+
+    '<span><b>η̅ (RC log-ratio)</b> '+jv(D.oxog_eta_bar,5)+'</span>'+
+    '<span><b>g_hat</b> '+jv(D.oxog_g_hat,5)+'</span>'+
     '<span><b>trinuc cosine</b> '+jv(D.oxog_cosine,4)+'</span>'+
     '<span><b>s_gt</b> '+jv(D.s_gt,5)+'</span>'+
     '</div>';
-  if(D.oxog_gt_rate!=null&&isFinite(D.oxog_gt_rate)){
-    var col2=D.oxog_gt_rate>0.01?'#9b59b6':'#ccc';
-    oxHtml+=scoreBar(D.oxog_gt_rate,col2,0.002)+
-      '<div style="font-size:.72em;color:#999">gt_rate (scaled \xd7500)</div>';
+  if(D.oxog_g_hat!=null&&isFinite(D.oxog_g_hat)){
+    var col2=D.oxog_g_hat>0.01?'#9b59b6':'#ccc';
+    oxHtml+=scoreBar(D.oxog_g_hat,col2,0.002)+
+      '<div style="font-size:.72em;color:#999">g_hat (scaled \xd7500)</div>';
   }
   appendCard(row1,'8-oxoG estimators',oxHtml);
 
