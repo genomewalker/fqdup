@@ -1292,7 +1292,10 @@ int damage_main(int argc, char** argv) {
             pji.adapter_stub3_read_fraction = static_cast<double>(n_stub3_hits) / n_stub_reads_checked;
             pji.adapter_stub_reads_checked  = n_stub_reads_checked;
         }
-        pji.top_hex_enriched     = stubs.top_enriched;
+        pji.top_hex_enriched        = stubs.top_enriched;
+        pji.top_hex_enriched_3prime = stubs.top_enriched_3prime;
+        pji.hex_end_asymmetry       = taph::compute_hex_end_asymmetry(
+            dp, stubs.top_enriched, stubs.top_enriched_3prime);
         pji.adapter_clipped      = stubs.adapter_clipped;
         pji.adapter3_clipped     = stubs.adapter3_clipped;
         pji.flag_hex_artifact    = stubs.flag_hex_artifact;
