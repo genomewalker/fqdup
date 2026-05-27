@@ -219,10 +219,23 @@ struct LsdLlrBinAccum {
     std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_anc{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod_g{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_mod{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_mod{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> h_3_mod{};
+    std::array<int64_t, LengthBinDamageProfile::N_POS> n_3_mod{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> a_5_anc_all{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> c_5_anc_all{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> g_5_anc_all{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_all{};
+    // Soft-EM posterior-weighted accumulators for ancient-fraction d_max.
+    // sw_t5_anc/sw_tc5_anc: pos-0 5' T and (C+T) weighted by P(ancient|read,π).
+    // sw_h3_anc/sw_n3_anc:  pos-0 3' C→T hit and (C+T) weighted similarly.
+    // sw_sum: sum of posteriors = soft π × n_reads processed.
+    double sw_t5_anc  = 0.0;
+    double sw_tc5_anc = 0.0;
+    double sw_h3_anc  = 0.0;
+    double sw_n3_anc  = 0.0;
+    double sw_sum     = 0.0;
 };
 
 // Parameters for per-read ancient/modern classification (LLR scorer).
@@ -240,6 +253,9 @@ struct LsdClassifyParams {
 // Build classify params from a finalized bulk DamageProfile.
 LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk);
 
+// Return raw LLR score for one read (positive = ancient-consistent).
+double lsd_llr_score(const std::string& seq, const LsdClassifyParams& p);
+
 // Classify one read as ancient (true) or modern (false) using the LLR.
 bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p);
 
@@ -248,6 +264,11 @@ bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p);
 // ancient=false: accumulate only oxoG marker (T/G) for the modern subset.
 void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
                     bool ancient, bool is_ss);
+
+// Soft-EM accumulation: add posterior-weighted pos-0 counts to sw_* fields.
+// w = P(ancient | read, π), computed as sigmoid(llr + log_prior_odds).
+void lsd_accumulate_soft(const std::string& seq, LsdLlrBinAccum& acc,
+                         double w, bool is_ss);
 
 // Compute bin edges from a log-length histogram + options (same logic as the
 // edge-picking block inside estimate_damage_by_length, extracted so damage.cpp
