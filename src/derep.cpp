@@ -1489,7 +1489,10 @@ private:
             // or sum(P) < b3_min_mass (events too rare to matter).
             int rep_L = 0;
             {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
                 std::vector<uint16_t> ls(arena_.lengths.begin(), arena_.lengths.end());
+#pragma GCC diagnostic pop
                 if (!ls.empty()) {
                     std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
                     rep_L = static_cast<int>(ls[ls.size() / 2]);
