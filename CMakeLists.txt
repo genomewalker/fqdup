@@ -222,6 +222,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh)
                      $<TARGET_FILE:fqdup>)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hexamer_confound.sh)
+    add_test(NAME hexamer_confound
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hexamer_confound.sh
+                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh)
     add_test(NAME pipeline
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh

@@ -90,6 +90,16 @@
 //                      per read (models QC quality/adapter trimming producing variable-
 //                      length copies of the same molecule).  Clamped at min_len.
 //
+//   Hexamer bias:
+//   --hex3-bias F      Fraction of reads with CircLigase-like 3'-terminal hexamer bias.
+//                      With probability F, last ≤6 bases are replaced with one of
+//                      {AAACCC, ATACCC, AGACCC} (models CircLigase CCC-terminus
+//                      selection). Used to exercise hexamer-confound detection.
+//   --hex5-bias F      Fraction of reads with enriched 5'-terminal hexamer.
+//                      With probability F, first ≤6 bases are replaced with one of
+//                      {CTCGAG, GAGCTC, GTCGAC} — not RC-complement of the hex3
+//                      set, so rc_overlap_topk stays 0 when both flags are active.
+//
 //   SNP-stress modes (emit two or more alleles at Hamming distance 1):
 //   --snp-pair         Two alleles differing at one position
 //   --snp-chain        Three alleles in chain: A–B H=1, B–C H=1, A–C H=2
@@ -272,6 +282,31 @@ static std::string apply_oxidative(const std::string& seq,
     return s;
 }
 
+// CircLigase 3'-terminal hexamer bias: overwrite last ≤6 bases with a CCC-ending
+// hexamer.  Applied after all other processing so the terminal composition signal
+// is clean regardless of damage model parameters.
+static void apply_hex3_bias(std::string& seq, double bias_prob, PCG32& rng) {
+    if (bias_prob <= 0.0 || rng.uniform() >= bias_prob) return;
+    static const char* kHex[3] = {"AAACCC", "ATACCC", "AGACCC"};
+    const char* h = kHex[rng.next() % 3u];
+    int L = (int)seq.size();
+    int n = std::min(6, L);
+    for (int i = 0; i < n; ++i) seq[L - n + i] = h[6 - n + i];
+}
+
+// 5'-terminal hexamer bias: overwrite first ≤6 bases with a restriction-site-like
+// hexamer (CTCGAG / GAGCTC / GTCGAC).  These are NOT reverse-complement partners of
+// the CCC 3' hexamers, so rc_overlap_topk remains 0 when both biases are active.
+// Starts with C so deamination signal at position 0 is preserved.
+static void apply_hex5_bias(std::string& seq, double bias_prob, PCG32& rng) {
+    if (bias_prob <= 0.0 || rng.uniform() >= bias_prob) return;
+    static const char* kHex[3] = {"CTCGAG", "GAGCTC", "GTCGAC"};
+    const char* h = kHex[rng.next() % 3u];
+    int L = (int)seq.size();
+    int n = std::min(6, L);
+    for (int i = 0; i < n; ++i) seq[i] = h[i];
+}
+
 static void write_read(const std::string& name, const std::string& seq, const std::string& qual) {
     std::cout << '@' << name << '\n' << seq << '\n' << '+' << '\n' << qual << '\n';
 }
@@ -295,6 +330,8 @@ int main(int argc, char** argv) {
     double   lambda3    = 0.35;
     bool     ss_mode    = false;
     bool     no_damage  = false;
+    double   hex3_bias  = 0.0;
+    double   hex5_bias  = 0.0;
     int      pcr_cycles = 0;
     double   pcr_eff    = 1.0;
     double   epsilon    = 5.3e-7;   // Q5
@@ -336,6 +373,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(a,"--seed"))       seed       = (uint64_t)n();
         else if (!strcmp(a,"--dup-pair"))    dup_pair    = true;
         else if (!strcmp(a,"--trim-sd"))     trim_sd     = n();
+        else if (!strcmp(a,"--hex3-bias"))  hex3_bias   = d();
+        else if (!strcmp(a,"--hex5-bias"))  hex5_bias   = d();
         else if (!strcmp(a,"--snp-pair"))   snp_mode    = SnpMode::Pair;
         else if (!strcmp(a,"--snp-chain"))  snp_mode    = SnpMode::Chain;
         else if (!strcmp(a,"--snp-star"))   snp_mode    = SnpMode::Star;
@@ -410,6 +449,10 @@ int main(int argc, char** argv) {
         std::cerr << " ox_rate=" << ox_rate;
     if (trim_sd > 0)
         std::cerr << " trim_sd=" << trim_sd;
+    if (hex5_bias > 0.0)
+        std::cerr << " hex5_bias=" << hex5_bias;
+    if (hex3_bias > 0.0)
+        std::cerr << " hex3_bias=" << hex3_bias;
     std::cerr << '\n';
 
     PCG32 rng(seed);
@@ -525,6 +568,8 @@ int main(int argc, char** argv) {
         if (mu_thermo > 0.0) seq = apply_thermo(seq, mu_thermo, rng);
         // 8-oxoG oxidative G→T (Channel C/D, uniform, independent per read)
         if (ox_rate > 0.0) seq = apply_oxidative(seq, ox_rate, rng);
+        // 5'-terminal hexamer bias (overwrite before damage so injected C can deaminate)
+        if (hex5_bias > 0.0) apply_hex5_bias(seq, hex5_bias, rng);
         // Ancient-DNA terminal deamination (independent per read)
         if (!no_damage)
             seq = apply_damage(seq, dmax5, lambda5, dmax3, lambda3, rng);
@@ -534,6 +579,11 @@ int main(int argc, char** argv) {
             int newlen = std::max(min_len, (int)seq.size() - trim);
             seq.resize(newlen);
             qual.resize(newlen);
+        }
+        // CircLigase 3'-hexamer bias: overwrite last ≤6 bases after all other processing
+        if (hex3_bias > 0.0) {
+            apply_hex3_bias(seq, hex3_bias, rng);
+            qual.assign(seq.size(), 'I');  // reset qual (bias overwrote bases, not errors)
         }
         return {seq, qual};
     };
