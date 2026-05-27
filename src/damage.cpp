@@ -1294,8 +1294,31 @@ int damage_main(int argc, char** argv) {
         }
         pji.top_hex_enriched        = stubs.top_enriched;
         pji.top_hex_enriched_3prime = stubs.top_enriched_3prime;
-        pji.hex_end_asymmetry       = taph::compute_hex_end_asymmetry(
-            dp, stubs.top_enriched, stubs.top_enriched_3prime);
+        {
+            auto hea = taph::compute_hex_end_asymmetry(
+                dp, stubs.top_enriched, stubs.top_enriched_3prime);
+            // Certify d_max_3: confounded when ends carry independent 6-mer families
+            // (rc_overlap_topk==0) and 3' enriched hexamers are mostly non-damage-consistent.
+            // When confounded on an SS library, override d_max_combined to 5prime_only so
+            // the combined estimate reflects the reliable end rather than the artifact-inflated one.
+            const auto& t3 = stubs.top_enriched_3prime;
+            int k3 = std::min(5, (int)t3.size());
+            double dmg_frac_3 = std::numeric_limits<double>::quiet_NaN();
+            if (k3 > 0) {
+                int m = 0;
+                for (int i = 0; i < k3; ++i) if (t3[i].damage_consistent) ++m;
+                dmg_frac_3 = static_cast<double>(m) / k3;
+            }
+            bool d3_confounded = (hea.rc_overlap_topk == 0)
+                              && (!std::isnan(dmg_frac_3) && dmg_frac_3 < 0.5)
+                              && (dp.fit_offset_3prime >= 1);
+            if (d3_confounded && is_ss
+                    && dp.d_max_source != taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY) {
+                dp.d_max_combined = dp.d_max_5prime;
+                dp.d_max_source   = taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
+            }
+            pji.hex_end_asymmetry = std::move(hea);
+        }
         pji.adapter_clipped      = stubs.adapter_clipped;
         pji.adapter3_clipped     = stubs.adapter3_clipped;
         pji.flag_hex_artifact    = stubs.flag_hex_artifact;
