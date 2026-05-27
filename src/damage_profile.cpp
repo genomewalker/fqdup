@@ -448,7 +448,7 @@ LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk)
     return p;
 }
 
-bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p)
+double lsd_llr_score(const std::string& seq, const LsdClassifyParams& p)
 {
     constexpr int    P_MAX = 5;
     constexpr double EPS   = 1e-10;
@@ -488,7 +488,12 @@ bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p)
         llr += hit ? (std::log(pa) - std::log(pm))
                    : (std::log(1.0 - pa) - std::log(1.0 - pm));
     }
-    return llr > 0.0;
+    return llr;
+}
+
+bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p)
+{
+    return lsd_llr_score(seq, p) > 0.0;
 }
 
 void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
@@ -519,6 +524,10 @@ void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
             if (ancient) { if (is_t) ++acc.t_5_anc_g[p]; ++acc.tg_5_anc[p]; }
             else         { if (is_t) ++acc.t_5_mod_g[p]; ++acc.tg_5_mod[p]; }
         }
+        if (!ancient) {
+            if (is_t) { ++acc.t_5_mod[p]; ++acc.tc_5_mod[p]; }
+            else if (is_c) { ++acc.tc_5_mod[p]; }
+        }
         if (ancient) {
             if      (cU == 'A') ++acc.a_5_anc_all[p];
             else if (cU == 'C') ++acc.c_5_anc_all[p];
@@ -526,18 +535,61 @@ void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
             else if (cU == 'T') ++acc.t_5_anc_all[p];
         }
     }
-    if (ancient) {
-        for (int p = 0; p < np; ++p) {
-            char c = seq[L - 1 - p];
-            if (is_ss) {
-                if      (c == 'T' || c == 't') { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
-                else if (c == 'C' || c == 'c') { ++acc.n_3_anc[p]; }
+    for (int p = 0; p < np; ++p) {
+        char c = seq[L - 1 - p];
+        if (is_ss) {
+            bool is_t3 = (c == 'T' || c == 't');
+            bool is_c3 = (c == 'C' || c == 'c');
+            if (ancient) {
+                if (is_t3) { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
+                else if (is_c3) { ++acc.n_3_anc[p]; }
             } else {
-                if      (c == 'A' || c == 'a') { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
-                else if (c == 'G' || c == 'g') { ++acc.n_3_anc[p]; }
+                if (is_t3) { ++acc.h_3_mod[p]; ++acc.n_3_mod[p]; }
+                else if (is_c3) { ++acc.n_3_mod[p]; }
+            }
+        } else {
+            bool is_a3 = (c == 'A' || c == 'a');
+            bool is_g3 = (c == 'G' || c == 'g');
+            if (ancient) {
+                if (is_a3) { ++acc.h_3_anc[p]; ++acc.n_3_anc[p]; }
+                else if (is_g3) { ++acc.n_3_anc[p]; }
+            } else {
+                if (is_a3) { ++acc.h_3_mod[p]; ++acc.n_3_mod[p]; }
+                else if (is_g3) { ++acc.n_3_mod[p]; }
             }
         }
     }
+}
+
+void lsd_accumulate_soft(const std::string& seq, LsdLlrBinAccum& acc,
+                         double w, bool is_ss)
+{
+    if (seq.empty()) return;
+    const int L = static_cast<int>(seq.size());
+    // 5' pos 0
+    {
+        char c = seq[0];
+        bool is_t = (c == 'T' || c == 't');
+        bool is_c = (c == 'C' || c == 'c');
+        if (is_t) { acc.sw_t5_anc += w; acc.sw_tc5_anc += w; }
+        else if (is_c) { acc.sw_tc5_anc += w; }
+    }
+    // 3' pos 0
+    {
+        char c = seq[L - 1];
+        bool hit;
+        if (is_ss)
+            hit = (c == 'T' || c == 't');
+        else
+            hit = (c == 'A' || c == 'a');
+        bool eligible = is_ss ? (c == 'T' || c == 't' || c == 'C' || c == 'c')
+                               : (c == 'A' || c == 'a' || c == 'G' || c == 'g');
+        if (eligible) {
+            if (hit) acc.sw_h3_anc += w;
+            acc.sw_n3_anc += w;
+        }
+    }
+    acc.sw_sum += w;
 }
 
 // ---- length-stratified damage estimation -------------------------------
