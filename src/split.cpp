@@ -133,6 +133,25 @@ int split_main(int argc, char** argv) {
 
         DamageSplitModel split_model = DamageSplitModel::build(lsd_data, profile);
 
+        // Posterior-weighted threshold: posterior ≥ 0.5  ↔  llr ≥ -log_prior_odds.
+        // Shifts the LLR cut by log(π/(1-π)) so low-π libraries aren't flooded
+        // with false-positive ancient reads that barely cross LLR=0.
+        float effective_threshold = split_threshold;
+        if (profile.d_max_5prime > 0.01f) {
+            LsdClassifyParams cls = make_lsd_classify_params(profile);
+            if (cls.d_anc > 0.01) {
+                double pi = std::clamp(
+                    static_cast<double>(profile.d_max_5prime) / cls.d_anc,
+                    1e-6, 1.0 - 1e-6);
+                double log_prior_odds = std::log(pi / (1.0 - pi));
+                effective_threshold = static_cast<float>(split_threshold - log_prior_odds);
+                char b[80];
+                std::snprintf(b, sizeof(b), "%.4f  (pi=%.4f  log_prior_odds=%.4f)",
+                              effective_threshold, pi, log_prior_odds);
+                log_info("Posterior-adjusted split threshold: " + std::string(b));
+            }
+        }
+
         // --- Streaming classification pass ---
         unsigned writer_threads = std::min(threads, 16u);
         auto is_gz = [](const std::string& p) {
@@ -155,7 +174,7 @@ int split_main(int argc, char** argv) {
         while (reader->read(rec)) {
             ++n_total;
             float llr = split_model.score(rec.seq);
-            if (llr >= split_threshold) {
+            if (llr >= effective_threshold) {
                 ++n_damaged;
                 if (writer_dam) writer_dam->write(rec);
             } else {

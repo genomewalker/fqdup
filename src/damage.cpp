@@ -823,6 +823,8 @@ int damage_main(int argc, char** argv) {
         // Estimate π (endogenous fraction) from bulk d_max / d_anc.
         // Avoids using the hard-call threshold as the prior — crucial for
         // samples with tiny endogenous fractions (PPV collapses at LLR>0).
+        // When bulk_d5 ≥ d_anc (all-ancient libraries), pi_prior clamps to
+        // 1-1e-6, giving pi_soft ≈ 1 — the correct interpretation.
         if (lsd_cls_params.d_anc > 0.01) {
             double pi_prior = std::clamp(
                 static_cast<double>(dp.d_max_5prime) / lsd_cls_params.d_anc,
@@ -980,12 +982,14 @@ int damage_main(int argc, char** argv) {
                         m.g_5_anc_all[p]      += w.g_5_anc_all[p];
                         m.t_5_anc_all[p]      += w.t_5_anc_all[p];
                     }
-                    // Soft-EM fields (scalars, not per-position arrays).
-                    m.sw_t5_anc  += w.sw_t5_anc;
-                    m.sw_tc5_anc += w.sw_tc5_anc;
-                    m.sw_h3_anc  += w.sw_h3_anc;
-                    m.sw_n3_anc  += w.sw_n3_anc;
-                    m.sw_sum     += w.sw_sum;
+                    // Soft-EM fields (per-position arrays + scalar sum).
+                    for (int sp = 0; sp < LsdLlrBinAccum::N_SOFT_POS; ++sp) {
+                        m.sw_t5_anc[sp]  += w.sw_t5_anc[sp];
+                        m.sw_tc5_anc[sp] += w.sw_tc5_anc[sp];
+                        m.sw_h3_anc[sp]  += w.sw_h3_anc[sp];
+                        m.sw_n3_anc[sp]  += w.sw_n3_anc[sp];
+                    }
+                    m.sw_sum += w.sw_sum;
                 }
             }
 
@@ -1003,27 +1007,37 @@ int damage_main(int argc, char** argv) {
             {
                 int64_t hard_n_damaged = 0, hard_n_tot = 0;
                 double sw_sum = 0.0;
+                double sw_t5[LsdLlrBinAccum::N_SOFT_POS]  = {};
+                double sw_tc5[LsdLlrBinAccum::N_SOFT_POS] = {};
+                double sw_h3[LsdLlrBinAccum::N_SOFT_POS]  = {};
+                double sw_n3[LsdLlrBinAccum::N_SOFT_POS]  = {};
                 for (const auto& bin : lsd_prebuilt.llr_bins) {
                     hard_n_damaged += bin.n_damaged;
                     hard_n_tot     += bin.n_damaged + bin.n_undamaged;
-                    sw_sum += bin.sw_sum;
+                    sw_sum         += bin.sw_sum;
+                    for (int sp = 0; sp < LsdLlrBinAccum::N_SOFT_POS; ++sp) {
+                        sw_t5[sp]  += bin.sw_t5_anc[sp];
+                        sw_tc5[sp] += bin.sw_tc5_anc[sp];
+                        sw_h3[sp]  += bin.sw_h3_anc[sp];
+                        sw_n3[sp]  += bin.sw_n3_anc[sp];
+                    }
                 }
                 if (hard_n_tot >= 10000 && sw_sum >= 10.0) {
                     dp.damaged_fraction_pi    = static_cast<float>(sw_sum / hard_n_tot);
                     dp.damaged_fraction_n     = hard_n_damaged;
                     dp.damaged_fraction_valid = true;
-                    // bulk_d_max = π × d_anc  →  d_anc = bulk_d_max / π
-                    // More robust than the sw_t5/sw_tc5 - bg5 approach, which
-                    // collapses to 0 when posteriors are all ≈ prior (low π).
                     const double pi_est = dp.damaged_fraction_pi;
-                    if (pi_est > 0.0f) {
+                    // bulk_d_max = π × d_anc  (mixture identity), so
+                    // d_anc = bulk_d_max / π.  This is robust to adapter
+                    // artifacts (bulk_d_max already accounts for masked positions)
+                    // and works for both DS and SS library conventions.
+                    if (pi_est > 0.0) {
                         dp.damaged_fraction_d5 = static_cast<float>(
                             std::clamp(static_cast<double>(dp.d_max_5prime) / pi_est, 0.0, 1.0));
                         dp.damaged_fraction_d3 = static_cast<float>(
                             std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
                     }
-                    // Modern d_max: hard-call counts from global.t_5_mod/tc_5_mod
-                    // are still computed via lsd_accumulate; aggregate them here.
+                    // Modern d_max: hard-call counts from global.t_5_mod/tc_5_mod.
                     const double bg5 = lsd_cls_params.bg_5;
                     const double bg3 = lsd_cls_params.bg_3;
                     int64_t mod_t5 = 0, mod_tc5 = 0, mod_h3 = 0, mod_n3 = 0;
