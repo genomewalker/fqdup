@@ -246,7 +246,8 @@ struct LsdClassifyParams {
     double lam_3        = 0.3;
     double bg_5         = 0.5;
     double bg_3         = 0.5;
-    bool   is_ss        = false;
+    bool   is_ss           = false;
+    bool   skip_pos0_5prime = false;  // skip pos 0 in 5' LLR (hexamer artifact)
     double cpg_scale    = 1.0;
     double noncpg_scale = 1.0;
 };

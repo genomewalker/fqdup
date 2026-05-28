@@ -455,7 +455,7 @@ double lsd_llr_score(const std::string& seq, const LsdClassifyParams& p)
     const int L = static_cast<int>(seq.size());
     double llr = 0.0;
     const int np5 = std::min(P_MAX, L);
-    for (int i = 0; i < np5; ++i) {
+    for (int i = (p.skip_pos0_5prime ? 1 : 0); i < np5; ++i) {
         char c = seq[i];
         int hit = (c == 'T' || c == 't') ? 1
                 : (c == 'C' || c == 'c') ? 0 : -1;
