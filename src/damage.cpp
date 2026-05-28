@@ -817,6 +817,7 @@ int damage_main(int argc, char** argv) {
     double             lsd_log_prior_odds = 0.0;  // log(π/(1-π)), default π=0.5
     if (fuse_lsd) {
         lsd_cls_params = make_lsd_classify_params(bulk_dp);
+        lsd_cls_params.skip_pos0_5prime = dp.position_0_artifact_5prime;
         if (lb_opts.enabled())
             lsd_fuse_edges = compute_lsd_edges(merged_lsd_hist, lb_opts);
         // else lsd_fuse_edges stays empty → one global bin
