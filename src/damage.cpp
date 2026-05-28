@@ -297,6 +297,31 @@ static float weight_rev_from_table(const std::string& seq, const LLRTable& t) {
     return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
 }
 
+// Log-linear regression: log(T/TC(p) - bg) = log(d_max) - lambda*p
+// Returns {d_max, lambda}; {0,0} if fit fails.
+static std::pair<double,double> fit_exp_decay(
+    const int64_t* t, const int64_t* tc, int n_pos, double bg)
+{
+    constexpr int64_t MIN_FIT_COV = 50;
+    double sx=0, sy=0, sxx=0, sxy=0; int n=0;
+    for (int p = 0; p < n_pos; ++p) {
+        if (tc[p] < MIN_FIT_COV) break;
+        double excess = static_cast<double>(t[p]) / tc[p] - bg;
+        if (excess <= 0.0) continue;
+        double logy = std::log(excess);
+        sx += p; sy += logy; sxx += p*(double)p; sxy += p*logy; ++n;
+    }
+    if (n < 2) return {0.0, 0.0};
+    double denom = n*sxx - sx*sx;
+    if (denom <= 0.0) return {0.0, 0.0};
+    double slope = (n*sxy - sx*sy) / denom;
+    double intercept = (sy - slope*sx) / n;
+    double lam  = -slope;
+    double dmax = std::exp(intercept);
+    if (lam < 0.0 || dmax <= 0.0 || dmax > 1.0) return {0.0, 0.0};
+    return {dmax, lam};
+}
+
 struct OxBinAcc {
     double A = 0, B = 0, C = 0, D = 0;           // first moments
     double AA = 0, AB = 0, BB = 0;                 // second moments (anc)
@@ -1038,25 +1063,44 @@ int damage_main(int argc, char** argv) {
                         dp.damaged_fraction_d3 = static_cast<float>(
                             std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
                     }
-                    // Modern d_max: hard-call counts from global.t_5_mod/tc_5_mod.
+                    // Independent per-fraction deamination profiles (all N_POS positions).
                     const double bg5 = lsd_cls_params.bg_5;
                     const double bg3 = lsd_cls_params.bg_3;
-                    int64_t mod_t5 = 0, mod_tc5 = 0, mod_h3 = 0, mod_n3 = 0;
+                    constexpr int NP = LengthBinDamageProfile::N_POS;
+                    int64_t anc_t5[NP]={}, anc_tc5[NP]={}, anc_h3[NP]={}, anc_n3[NP]={};
+                    int64_t mod_t5[NP]={}, mod_tc5[NP]={}, mod_h3[NP]={}, mod_n3[NP]={};
                     for (const auto& bin : lsd_prebuilt.llr_bins) {
-                        for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
-                            mod_t5  += bin.t_5_mod[p];
-                            mod_tc5 += bin.tc_5_mod[p];
-                            mod_h3  += bin.h_3_mod[p];
-                            mod_n3  += bin.n_3_mod[p];
-                            if (p == 0) break;  // only pos 0 needed for d_max peak
+                        for (int p = 0; p < NP; ++p) {
+                            anc_t5[p]  += bin.t_5_anc[p];
+                            anc_tc5[p] += bin.tc_5_anc[p];
+                            anc_h3[p]  += bin.h_3_anc[p];
+                            anc_n3[p]  += bin.n_3_anc[p];
+                            mod_t5[p]  += bin.t_5_mod[p];
+                            mod_tc5[p] += bin.tc_5_mod[p];
+                            mod_h3[p]  += bin.h_3_mod[p];
+                            mod_n3[p]  += bin.n_3_mod[p];
                         }
                     }
-                    if (mod_tc5 >= 50)
+                    // Pos-0 peak estimate for modern (matches previous behaviour)
+                    if (mod_tc5[0] >= 50)
                         dp.modern_fraction_d5 = static_cast<float>(
-                            std::max(0.0, static_cast<double>(mod_t5) / mod_tc5 - bg5));
-                    if (mod_n3 >= 50)
+                            std::max(0.0, static_cast<double>(mod_t5[0]) / mod_tc5[0] - bg5));
+                    if (mod_n3[0] >= 50)
                         dp.modern_fraction_d3 = static_cast<float>(
-                            std::max(0.0, static_cast<double>(mod_h3) / mod_n3 - bg3));
+                            std::max(0.0, static_cast<double>(mod_h3[0]) / mod_n3[0] - bg3));
+                    // Fitted profiles for both fractions
+                    auto [ad5, al5] = fit_exp_decay(anc_t5,  anc_tc5, NP, bg5);
+                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, bg3);
+                    auto [md5, ml5] = fit_exp_decay(mod_t5,  mod_tc5, NP, bg5);
+                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, bg3);
+                    dp.damaged_fraction_d5_fit  = static_cast<float>(ad5);
+                    dp.damaged_fraction_lambda5 = static_cast<float>(al5);
+                    dp.damaged_fraction_d3_fit  = static_cast<float>(ad3);
+                    dp.damaged_fraction_lambda3 = static_cast<float>(al3);
+                    dp.modern_fraction_d5_fit   = static_cast<float>(md5);
+                    dp.modern_fraction_lambda5  = static_cast<float>(ml5);
+                    dp.modern_fraction_d3_fit   = static_cast<float>(md3);
+                    dp.modern_fraction_lambda3  = static_cast<float>(ml3);
                 }
             }
         }
