@@ -566,17 +566,19 @@ void lsd_accumulate_soft(const std::string& seq, LsdLlrBinAccum& acc,
 {
     if (seq.empty()) return;
     const int L = static_cast<int>(seq.size());
-    // 5' pos 0
-    {
-        char c = seq[0];
+    // 5' end: positions 0..N_SOFT_POS-1
+    const int np5 = std::min(LsdLlrBinAccum::N_SOFT_POS, L);
+    for (int p = 0; p < np5; ++p) {
+        char c = seq[p];
         bool is_t = (c == 'T' || c == 't');
         bool is_c = (c == 'C' || c == 'c');
-        if (is_t) { acc.sw_t5_anc += w; acc.sw_tc5_anc += w; }
-        else if (is_c) { acc.sw_tc5_anc += w; }
+        if (is_t) { acc.sw_t5_anc[p] += w; acc.sw_tc5_anc[p] += w; }
+        else if (is_c) { acc.sw_tc5_anc[p] += w; }
     }
-    // 3' pos 0
-    {
-        char c = seq[L - 1];
+    // 3' end: positions 0..N_SOFT_POS-1 (pos 0 = last base, pos 1 = second-to-last)
+    const int np3 = std::min(LsdLlrBinAccum::N_SOFT_POS, L);
+    for (int p = 0; p < np3; ++p) {
+        char c = seq[L - 1 - p];
         bool hit;
         if (is_ss)
             hit = (c == 'T' || c == 't');
@@ -585,8 +587,8 @@ void lsd_accumulate_soft(const std::string& seq, LsdLlrBinAccum& acc,
         bool eligible = is_ss ? (c == 'T' || c == 't' || c == 'C' || c == 'c')
                                : (c == 'A' || c == 'a' || c == 'G' || c == 'g');
         if (eligible) {
-            if (hit) acc.sw_h3_anc += w;
-            acc.sw_n3_anc += w;
+            if (hit) acc.sw_h3_anc[p] += w;
+            acc.sw_n3_anc[p] += w;
         }
     }
     acc.sw_sum += w;
