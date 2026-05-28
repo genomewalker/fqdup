@@ -228,14 +228,15 @@ struct LsdLlrBinAccum {
     std::array<int64_t, LengthBinDamageProfile::N_POS> g_5_anc_all{};
     std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_all{};
     // Soft-EM posterior-weighted accumulators for ancient-fraction d_max.
-    // sw_t5_anc/sw_tc5_anc: pos-0 5' T and (C+T) weighted by P(ancient|read,π).
-    // sw_h3_anc/sw_n3_anc:  pos-0 3' C→T hit and (C+T) weighted similarly.
-    // sw_sum: sum of posteriors = soft π × n_reads processed.
-    double sw_t5_anc  = 0.0;
-    double sw_tc5_anc = 0.0;
-    double sw_h3_anc  = 0.0;
-    double sw_n3_anc  = 0.0;
-    double sw_sum     = 0.0;
+    // Soft-EM posterior-weighted C→T counts at N_SOFT_POS terminal positions.
+    // Using multiple positions lets d_anc estimation avoid adapter-artifact
+    // contamination at pos 0 by picking the peak over non-masked positions.
+    static constexpr int N_SOFT_POS = 4;
+    double sw_t5_anc[N_SOFT_POS]  = {};
+    double sw_tc5_anc[N_SOFT_POS] = {};
+    double sw_h3_anc[N_SOFT_POS]  = {};
+    double sw_n3_anc[N_SOFT_POS]  = {};
+    double sw_sum = 0.0;
 };
 
 // Parameters for per-read ancient/modern classification (LLR scorer).

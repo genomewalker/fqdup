@@ -3242,8 +3242,24 @@ int derep_main(int argc, char** argv) {
         DerepEngine engine(use_revcomp, !cluster_path.empty(), profile, errcor,
                            false, bucket_cap_explicit, fqcl_path, in_path,
                            std::move(qc_json), library_type_str, prior_fqcl_path);
-        if (!out_damaged_path.empty() || !out_undamaged_path.empty())
-            engine.set_split_paths(out_damaged_path, out_undamaged_path, split_threshold);
+        float effective_split_threshold = split_threshold;
+        if (!out_damaged_path.empty() || !out_undamaged_path.empty()) {
+            if (profile.d_max_5prime > 0.01f) {
+                LsdClassifyParams cls = make_lsd_classify_params(profile);
+                if (cls.d_anc > 0.01) {
+                    double pi = std::clamp(
+                        static_cast<double>(profile.d_max_5prime) / cls.d_anc,
+                        1e-6, 1.0 - 1e-6);
+                    double log_prior_odds = std::log(pi / (1.0 - pi));
+                    effective_split_threshold = static_cast<float>(split_threshold - log_prior_odds);
+                    char b[80];
+                    std::snprintf(b, sizeof(b), "%.4f  (pi=%.4f  log_prior_odds=%.4f)",
+                                  effective_split_threshold, pi, log_prior_odds);
+                    log_info("Posterior-adjusted split threshold: " + std::string(b));
+                }
+            }
+            engine.set_split_paths(out_damaged_path, out_undamaged_path, effective_split_threshold);
+        }
         engine.set_split_model(DamageSplitModel::build(lsd_data, profile));
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
