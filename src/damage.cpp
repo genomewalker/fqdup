@@ -1839,10 +1839,10 @@ int damage_main(int argc, char** argv) {
         h << "]\n";
         h << "  ,\"adapter_seq\": "    << (adapter_top_seq.empty() ? "null" : "\"" + adapter_top_seq + "\"") << "\n";
         h << "  ,\"adapter_name\": "   << (adapter_top_seq.empty() ? "null" : "\"" + adapter_name_str + "\"") << "\n";
-        h << "  ,\"top_hex\": [";
-        {
+        auto emit_hex_arr = [&](const char* key, const std::vector<taph::HexEnrichment>& v) {
+            h << "  ,\"" << key << "\": [";
             int n_out = 0;
-            for (const auto& hr : stubs.top_enriched) {
+            for (const auto& hr : v) {
                 if (n_out >= 5) break;
                 auto seq = taph::decode_hex(hr.idx);
                 if (n_out > 0) h << ",";
@@ -1851,8 +1851,10 @@ int damage_main(int argc, char** argv) {
                   << "\"dc\":" << jb(hr.damage_consistent) << "}";
                 ++n_out;
             }
-        }
-        h << "]\n";
+            h << "]\n";
+        };
+        emit_hex_arr("top_hex",  stubs.top_enriched);
+        emit_hex_arr("top_hex3", stubs.top_enriched_3prime);
         h << "  ,\"qc_flags\": [";
         {
             bool first = true;
