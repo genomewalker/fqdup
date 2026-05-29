@@ -263,6 +263,14 @@ The `--json` output includes the complete machine-readable profile:
   enrichment/depurination, F=8-oxoG bottom strand, G=hydantoin oxidation, H=adenine
   oxidation. Each entry carries `detected`, mechanism-specific rates, and z-scores.
   All eight channels are always present.
+- **Ancient fraction** (`ancient_fraction`): soft-EM mixture decomposition
+  separating damaged (ancient) from undamaged (modern) reads. `ancient.fraction`
+  is the posterior-weighted π estimate (sigmoid-weighted, not a hard-call
+  threshold). `ancient.d_max_5prime_fit`, `lambda_5prime`, `d_max_3prime_fit`,
+  `lambda_3prime` are WLS+IRLS exponential fits on the per-position rate arrays
+  for each class. `ancient.n_reads` is the hard-call read count. `modern`
+  carries the same fields for the non-damaged class. Requires bulk d_max > 0.01
+  to activate; `valid: false` when damage is below threshold.
 - **Preservation score** (`preservation`): composite score (0-1) combining deamination
   evidence, exponential fit quality, CpG age-bias, and oxidation evidence. The
   `authenticity_eff` field is the deamination-only component.
