@@ -394,7 +394,7 @@ return Plotly;
       var label=b.lo+'–'+b.hi+' bp';
       var c5=ramp5[Math.min(i,ramp5.length-1)],c3=ramp3[Math.min(i,ramp3.length-1)];
       if(b.d5>0.001)lbTraces.push({x:pos,y:modelCurve(b.bg5||0,b.d5,b.lam5||0.3),name:"5′ "+label,mode:'lines+markers',line:{color:c5,width:2,dash:i?'dot':'solid'},marker:{size:4},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>5′ '+label+'</extra>'});
-      if(b.d3>0.001)lbTraces.push({x:pos,y:modelCurveRev(b.bg3||0,b.d3,b.lam3||0.3),name:"3′ "+label,mode:'lines+markers',line:{color:c3,width:2,dash:i?'dot':'solid'},marker:{size:4},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>3′ '+label+'</extra>'});
+      if(b.d3>0.001)lbTraces.push({x:pos3x,y:modelCurve3(b.bg3||0,b.d3,b.lam3||0.3),name:"3′ "+label,mode:'lines+markers',line:{color:c3,width:2,dash:i?'dot':'solid'},marker:{size:4},hovertemplate:'pos %{x:.0f}<br>rate: %{y:.4f}<extra>3′ '+label+'</extra>'});
     });
     if(lbTraces.length)Plotly.newPlot('lenbins',lbTraces,lenLayout,{responsive:true,displayModeBar:false});
     else lenDiv.innerHTML='<p style="color:var(--muted);font-size:13px">No bins with detectable damage.</p>';

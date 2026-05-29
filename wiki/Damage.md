@@ -144,7 +144,15 @@ Fields:
   - *Classic*: pos-0 C→T rate is below the interior baseline while pos-1 is above — the adapter's terminal base is predominantly not a C, suppressing T at pos-0.
   - *Jump*: pos-1 is clearly elevated (> 2%) and the pos-0 → pos-1 jump exceeds 3 percentage points — the ligation composition masks the depletion against an elevated baseline.
 
-  For the 3′ end, pos-0 G→A is always excluded from the main signal because SS ligation introduces an elevated A/(A+G) at 3′ pos-0 unrelated to deamination; the 3′ flag fires when this pos-0 spike is more than 5 percentage points above the pos-1–4 mean.
+  For the 3′ end, two patterns set `position_0_artifact_3prime`:
+  - *SS ligation spike*: pos-0 A/(A+G) is more than 5 percentage points above
+    the pos-1–4 mean — the CircLigase ligation junction elevates A at the
+    terminal position unrelated to deamination.
+  - *DS blunting gap*: pos-0 G→A is depleted (shift < −0.005 vs interior)
+    while pos-1 is clearly elevated (shift > 0.01) and the pos-0 → pos-1 jump
+    exceeds 3 percentage points — adapter-mediated blunting suppresses the
+    terminal G→A signal in DS libraries. Only detectable by comparing pos-0
+    to pos-1 directly; averaging pos-1–4 dilutes the signal below threshold.
 
   When flagged, libtaph searches for the BIC-optimal decay start position (1–10) and `d_max` is set to the peak damage rate over positions 1–5. The `fit start=posN` value is the position where the exponential decay fit begins. Reported d_max values remain biologically meaningful; only the fit anchor shifts.
 
@@ -205,6 +213,66 @@ The `--json` output also includes a `damage_types` array with one entry per chan
 | H | `adenine_oxidation` | A→T stop codons (AAA/AAG/AGA); adenine oxidation or trans-lesion synthesis | `baseline_rate`, `terminal_rate`, `z_score`, `z_score_p2plus` |
 
 `detected: true` fires when the channel's z-score exceeds 3.0 (one-sided; depletion is not flagged). All eight entries are always present regardless of whether damage is detected.
+
+---
+
+## Ancient fraction estimation (JSON only)
+
+`fqdup profile --json` includes an `ancient_fraction` block when bulk d_max > 0.01.
+It decomposes reads into a damaged (ancient) and undamaged (modern) class using
+a soft-EM approach rather than a hard LLR threshold.
+
+### Method
+
+A per-read log-odds score (LLR) is computed from the per-position C→T and G→A
+rates. Instead of hard-classifying reads at LLR > 0, each read contributes to
+the fraction accumulators with a **posterior weight**:
+
+```
+P(ancient | read) = sigmoid(LLR + log(π / (1 − π)))
+```
+
+where π is a prior estimate derived from the ratio of bulk d_max to the
+per-fraction LSD d_max. This weighting is applied over the first `N_SOFT_POS`
+terminal positions for both 5′ and 3′ accumulators.
+
+The result is that at **high endogenous fractions** (high PPV), soft-EM and
+hard-call estimates agree closely. At **low endogenous fractions** where the
+hard-call ancient pool is dominated by false positives, soft-EM yields a
+lower, more accurate π and d_max.
+
+### JSON fields
+
+```json
+"ancient_fraction": {
+  "valid": true,
+  "ancient": {
+    "fraction": 0.850,
+    "n_reads": 28249793,
+    "d_max_5prime": 0.128,
+    "d_max_5prime_fit": 0.267,
+    "lambda_5prime": 0.475,
+    "d_max_3prime": 0.125,
+    "d_max_3prime_fit": 0.0,
+    "lambda_3prime": 0.0,
+    "rate_5prime": [...],
+    "rate_3prime": [...]
+  },
+  "modern": { ... }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `fraction` | Soft-EM π (posterior-weighted ancient fraction) |
+| `n_reads` | Hard-call read count (LLR > 0) |
+| `d_max_5prime` | Soft-EM d_max at 5′ terminus |
+| `d_max_5prime_fit` | WLS+IRLS exponential fit d_max on per-position rates |
+| `lambda_5prime` | Decay constant from per-fraction exponential fit |
+| `rate_5prime[15]` | Per-position T/(T+C) for reads in this fraction |
+
+`d_max_3prime_fit = 0` when the 3′ fit cannot converge (e.g. DS libraries with
+pos-0 artifact and insufficient gradient across positions 1–7).
 
 ---
 

@@ -1,5 +1,68 @@
 # Changelog
 
+## [2.0.4] - 2026-05-29
+
+### New features
+
+- **Damage report HTML redesign**: `fqdup profile --html` now produces a
+  tabbed dashboard (Bulk / Fractions / Length Bins / Library / QC) with white
+  cards on a light neutral background, a sticky stat strip (d₅, d₃, λ, π,
+  read count), and a symmetric smiley plot. The 5′ side is plotted left (0→14)
+  and the 3′ side is mirrored right (0→14); a center divider separates the
+  two termini. The data blob is emitted as `window.D` for cross-script access.
+
+- **Per-fraction exponential decay fitting**: `ancient_fraction.ancient` and
+  `ancient_fraction.modern` in `--json` now include `d_max_5prime_fit`,
+  `lambda_5prime`, `d_max_3prime_fit`, `lambda_3prime` — WLS+IRLS exponential
+  fits on the per-position hard-call rate arrays. Fraction cards in the HTML
+  report display these alongside `n_reads` for each class.
+
+- **Posterior-weighted (soft-EM) ancient-fraction estimation**: π and d₅/d₃
+  are now estimated via sigmoid-weighted accumulation rather than hard LLR > 0
+  thresholding. A per-read posterior `P(ancient | LLR, π_prior)` weights
+  contributions to the T/(T+C) and A/(A+G) soft accumulators over
+  `N_SOFT_POS` terminal positions. The π prior is derived from the ratio of
+  bulk d_max to the per-fraction LSD d_max. This eliminates PPV collapse at
+  low endogenous fractions where hard-call classification is dominated by
+  false positives. `ancient_fraction.ancient.fraction` now reflects soft-EM π.
+
+- **DS 3′ pos-0 artifact detection**: the pos-0 artifact flag for the 3′ end
+  now also fires on the DS adapter blunting gap pattern (pos-0 G→A depleted
+  while pos-1 is elevated), in addition to the existing SS ligation spike
+  check. This fixes false-zero `d_max_3prime` in DS libraries where blunting
+  suppresses the G→A rate at the terminal base.
+
+- **CircLigase 3′ hexamer-bias confound detection**: `fqdup profile` detects
+  when the ligation-site hexamer composition biases the 3′ G→A channel,
+  overrides `d_max_combined` to `5prime_only` when the 3′ end is confounded,
+  and adjusts `d_metamatch` accordingly.
+
+- **LSD classifier pos-0 exclusion on hexamer artifact**: when a pos-0
+  hexamer artifact is detected, the per-read LLR classifier skips that
+  terminal position in its damage sum, preventing the artifact spike from
+  inflating the ancient-class score for individual reads.
+
+### Performance
+
+- **LSD pass fused into oxoG second pass**: LSD per-read classification runs
+  within the same FASTQ iteration as the oxoG Pass 2, eliminating one full
+  FASTQ decompression for ancient libraries (~15–30 s per run on NFS).
+
+- **LLR envelope memoized; revcomp allocation eliminated**: per-position
+  `addT[p]`/`addC[p]` log-odds increments are precomputed once into a
+  300-float table. DS reverse-complement reads are scored in-place via
+  `complement_code[decoded[len-1-p]]`, removing one heap alloc + memcpy per
+  DS read in the oxoG pass.
+
+### Bug fixes
+
+- **Length-bins 3′ model curve**: the 3′ fit curve in the Length Bins HTML
+  panel referenced an undefined `modelCurveRev`. Fixed to `modelCurve3`
+  plotted against `pos3x` (mirrored 3′ x-axis), consistent with the smiley
+  and fractions panels.
+
+---
+
 ## [2.0.3] - 2026-05-21
 
 ### New features
