@@ -12,52 +12,85 @@ static const char HTML_PRE[] = R"DHASSET(
 <title>fqdup damage</title>
 <style>
 :root{
-  --bg:#fafaf8;--elev:#fff;--ink:#1a1a1a;--muted:#6b6960;--faint:#e0dfd8;
-  --c-ct:#d97757;--c-ga:#4a8db8;--c-gt:#9b59b6;
-  --c-ok:#27ae60;--c-bad:#e74c3c;--c-warn:#f39c12;--c-info:#3498db;
-  font-family:system-ui,sans-serif;font-size:14px;
+  --bg:#eef1f4;
+  --surface:#fff;
+  --border:#d0d7de;
+  --text:#1f2328;
+  --muted:#57606a;
+  --subtle:#f6f8fa;
+  --ancient:#c0392b;
+  --modern:#1971c2;
+  --bulk:#636c76;
+  --success:#1a7f37;
+  --warn:#9a6700;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,'SFMono-Regular','Cascadia Code',monospace;
 }
-*{box-sizing:border-box;}
-body{background:var(--bg);color:var(--ink);margin:0;padding:16px 20px;}
-h1{font-size:1.15em;font-weight:700;margin:0 0 2px;}
-.sub{color:var(--muted);font-size:.85em;margin-bottom:4px;}
-.interp{font-size:.85em;color:#444;margin-bottom:14px;font-style:italic;}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px;}
-.full{grid-column:1/-1;}
-.card{background:var(--elev);border-radius:8px;padding:12px 14px;
-      box-shadow:0 1px 4px #0001;border:1px solid var(--faint);}
-.card h2{font-size:.78em;font-weight:700;color:var(--muted);text-transform:uppercase;
-         letter-spacing:.06em;margin:0 0 10px;}
-table{border-collapse:collapse;width:100%;font-size:.82em;}
-th{text-align:left;color:var(--muted);padding:3px 8px 3px 0;
-   border-bottom:1px solid var(--faint);white-space:nowrap;}
-td{padding:3px 8px 3px 0;border-bottom:1px solid #f4f3ef;vertical-align:middle;}
-.badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:.76em;font-weight:600;}
-.det  {background:#d4efdf;color:#1a6035;}
-.notdet{background:#fdecea;color:#a93226;}
-.na   {background:#f0f0f0;color:#888;}
-.warn {background:#fef3cd;color:#7d6008;}
-.info {background:#d6eaf8;color:#1a5276;}
-.pl-excellent{background:#c8f4d8;color:#0d5c2b;}
-.pl-good     {background:#d4efdf;color:#1a6035;}
-.pl-moderate {background:#fef3cd;color:#7d6008;}
-.pl-weak     {background:#fde8c8;color:#8b4513;}
-.pl-poor     {background:#fdecea;color:#a93226;}
-.pl-none     {background:#f0f0f0;color:#888;}
-.kv{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:.82em;color:var(--muted);}
-.kv span b{color:var(--ink);}
-.bar-wrap{height:10px;background:#f0f0f0;border-radius:4px;overflow:hidden;margin-top:3px;}
-.bar-fill{height:100%;border-radius:4px;}
-.flags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:12px;}
-.flag-chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.76em;
-           font-weight:600;background:#fef3cd;color:#7d6008;border:1px solid #f0d080;}
-.mono{font-family:monospace;font-size:.88em;}
-.dc-yes{color:var(--c-ok);}
-.dc-no{color:var(--c-bad);}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.5}
+#top-bar{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:100}
+.sample-id{font-family:var(--mono);font-size:12px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lib-badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap}
+.lib-badge.ss{background:#ffebe9;color:var(--ancient);border:1px solid #ffc1bd}
+.lib-badge.ds{background:#ddf4ff;color:var(--modern);border:1px solid #54aeff66}
+#stat-strip{background:var(--surface);border-bottom:1px solid var(--border);display:flex;overflow-x:auto}
+.stat-item{padding:12px 20px;border-right:1px solid var(--border);flex-shrink:0;min-width:90px}
+.stat-item:last-child{border-right:none}
+.stat-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:2px}
+.stat-num{font-family:var(--mono);font-size:1.5rem;line-height:1;font-variant-numeric:tabular-nums}
+.stat-num.anc{color:var(--ancient)}
+#tab-nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 20px;display:flex}
+.tab-btn{font-family:var(--font);font-size:13px;font-weight:500;padding:10px 14px;border:none;border-bottom:2px solid transparent;background:none;cursor:pointer;color:var(--muted);margin-bottom:-1px;transition:color .1s}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--ancient);border-bottom-color:var(--ancient)}
+#panels{padding:20px 24px;max-width:1100px;margin:0 auto}
+.panel{display:none}.panel.active{display:block}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:14px;overflow:hidden}
+.card-hdr{padding:10px 14px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);background:var(--subtle)}
+.card-body{padding:16px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+@media(max-width:680px){.two-col,.three-col{grid-template-columns:1fr}}
+.frac-mini{background:var(--subtle);border:1px solid var(--border);border-radius:4px;padding:10px 12px}
+.frac-mini .fm-head{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.frac-mini.ancient .fm-head{color:var(--ancient)}
+.frac-mini.modern .fm-head{color:var(--modern)}
+.frac-mini.bulk .fm-head{color:var(--bulk)}
+.frac-kv{display:flex;justify-content:space-between;font-size:12px;padding:1px 0}
+.frac-kv .fk{color:var(--muted)}.frac-kv .fv{font-family:var(--mono)}
+.warn-box{background:#fff8c5;border:1px solid #d4a72c;border-radius:4px;padding:8px 12px;font-size:12px;color:#6e4700;margin-bottom:12px}
+.warn-box::before{content:'⚠ '}
+.err-box{background:#ffebe9;border:1px solid #ff818266;border-radius:4px;padding:8px 12px;font-size:12px;color:#82071e;margin-bottom:12px}
+.err-box::before{content:'✕ '}
+.qc-flags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.qc-flag{font-size:11px;font-weight:500;padding:2px 8px;border-radius:3px;background:#ffebe9;color:var(--ancient);border:1px solid #ffc1bd}
+.metric-table{border-collapse:collapse;width:100%;font-size:12px}
+.metric-table td{padding:5px 0;border-bottom:1px solid var(--border);vertical-align:top}
+.metric-table td:first-child{color:var(--muted);width:50%;padding-right:12px}
+.metric-table td:last-child{font-family:var(--mono)}
+.metric-table tr:last-child td{border-bottom:none}
+.hex-table{border-collapse:collapse;font-size:12px;width:100%}
+.hex-table th{text-align:left;padding:4px 12px 4px 0;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border)}
+.hex-table td{padding:4px 12px 4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px}
+.hex-table tr:last-child td{border-bottom:none}
+.channel-row{display:flex;align-items:baseline;gap:12px;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px}
+.channel-row:last-child{border-bottom:none}
+.channel-id{font-family:var(--mono);font-weight:600;min-width:18px}
+.channel-name{flex:1;color:var(--muted)}
+.channel-status.det{font-weight:600;color:var(--success)}
+.channel-status.notdet,.channel-status.na{color:var(--muted)}
+.channel-sig{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.pres-num{font-family:var(--mono);font-size:2.2rem;line-height:1}
+.pres-num.excellent{color:var(--success)}.pres-num.poor{color:var(--ancient)}
+.pres-lbl{font-size:12px;color:var(--muted);margin-top:2px}
+.plot-note{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:6px}
 </style>
 </head>
 <body>
+<div id="top-bar"></div>
+<div id="stat-strip"></div>
+<nav id="tab-nav"></nav>
+<div id="panels"></div>
 <script>
 
 )DHASSET";
@@ -113,241 +146,332 @@ object-assign/index.js:
 window.Plotly = Plotly;
 return Plotly;
 }));
+
 </script>
 <script>
 (function(){
-  function jv(v,d){ return (v===null||v===undefined||!isFinite(v))?'N/A':v.toFixed(d||4); }
-  function pct(v){ return isFinite(v)?(v*100).toFixed(1)+'%':'N/A'; }
-  function badge(cls,text){ return '<span class="badge '+cls+'">'+text+'</span>'; }
-  function presClass(label){
-    return {excellent:'pl-excellent',good:'pl-good',moderate:'pl-moderate',
-            weak:'pl-weak',poor:'pl-poor'}[label]||'pl-none';
-  }
-  function scoreBar(v,color,max){
-    var w=isFinite(v)?Math.min(100,v/(max||1)*100):0;
-    return '<div class="bar-wrap"><div class="bar-fill" style="width:'+w+'%;background:'+color+'"></div></div>';
-  }
-  function appendCard(parent,h2,html,extra){
-    var d=document.createElement('div');
-    d.className='card'+(extra?' '+extra:'');
-    d.innerHTML='<h2>'+h2+'</h2>'+html;
-    parent.appendChild(d); return d;
-  }
+  var D = window.D || {};
 
-  // ── Header ─────────────────────────────────────────────────────────────────
-  document.title='fqdup: '+(D.sample||'damage');
-  var pl=(D.pres_label||'').toLowerCase();
-  var header='<h1>'+(D.sample||'damage')+'  '+
-    (D.pres_label?badge(presClass(pl),D.pres_label):'')+'</h1>'+
-    '<div class="sub">'+D.n_reads.toLocaleString()+' reads &nbsp;\xb7&nbsp; '+
-    D.library_type+'&nbsp;\xb7&nbsp; d5='+jv(D.d5)+' &nbsp; d3='+jv(D.d3)+'</div>';
-  if(D.interpretation)
-    header+='<div class="interp">'+D.interpretation+'</div>';
-  document.body.insertAdjacentHTML('afterbegin',header);
-
-  if(D.qc_flags&&D.qc_flags.length){
-    var fhtml='<div class="flags">';
-    D.qc_flags.forEach(function(f){fhtml+='<span class="flag-chip">&#9873; '+f.replace(/_/g,' ')+'</span>';});
-    document.body.insertAdjacentHTML('beforeend',fhtml+'</div>');
+  function jv(v,dec){
+    if(v===null||v===undefined||(typeof v==='number'&&!isFinite(v)))return '—';
+    if(typeof v!=='number')return String(v);
+    return v.toFixed(dec!==undefined?dec:4);
   }
+  function pct(v){
+    if(v===null||v===undefined||!isFinite(v))return '—';
+    return (v*100).toFixed(1)+'%';
+  }
+  function rawClean(arr){return arr?arr.map(function(v){return v<0?null:v;}):null;}
 
-  // ── Damage curves (full width) ─────────────────────────────────────────────
-  var curvesWrap=document.createElement('div');
-  curvesWrap.style.marginBottom='12px';
-  appendCard(curvesWrap,'Per-position damage rates (fitted model)','<div id="curves"></div>');
-  document.body.appendChild(curvesWrap);
+  // D.pos is 1-based [1..N]; convert to 0-based for symmetric smiley arithmetic
+  var pos=(D.pos||[]).map(function(p){return p-1;});
+  var bg5=D.bg5||0,bg3=D.bg3||0;
+  var lam5=D.lam5||0.3,lam3=D.lam3||0.3;
 
-  var pos=D.pos, bg5=D.bg5||0, bg3=D.bg3||0, lam5=D.lam5||0.3, lam3=D.lam3||0.3;
+  var NP=pos.length;
+  // 3' smiley x-axis: p=0 → x=2*NP-1 (far right terminus), p=NP-1 → x=NP (near center)
+  var pos3x=pos.map(function(p){return 2*NP-1-p;});  // [2NP-1, 2NP-2, ..., NP]
+
   function modelCurve(bg,dmax,lam){
-    return pos.map(function(p){return bg+dmax*Math.exp(-lam*(p-1));});
+    return pos.map(function(p){return bg+dmax*Math.exp(-lam*p);});
   }
-  // 3' curves peak at the rightmost position (3' terminal) — smiley U-shape
-  function modelCurveRev(bg,dmax,lam){
-    var N=pos[pos.length-1];
-    return pos.map(function(p){return bg+dmax*Math.exp(-lam*(N-p));});
-  }
-  function rawClean(arr){
-    return arr?arr.map(function(v){return v<0?null:v;}):null;
+  function modelCurve3(bg,dmax,lam){
+    // same decay formula, paired with pos3x so p=0→x=2NP-1 (terminus, far right)
+    return pos.map(function(p){return bg+dmax*Math.exp(-lam*p);});
   }
 
-  var traces=[];
-  if(D.d5>0.001) traces.push({x:pos,y:modelCurve(bg5,D.d5,lam5),name:"5' C→T",
-    mode:'lines+markers',line:{color:'#d97757',width:2.5},marker:{size:5}});
-  if(D.ga5&&D.d3>0.001) traces.push({x:pos,y:modelCurveRev(bg3,D.d3,lam3),name:"3' G→A",
-    mode:'lines+markers',line:{color:'#4a8db8',width:2.5,dash:'dot'},marker:{size:5}});
-  if(D.ct3&&D.d3>0.001) traces.push({x:pos,y:modelCurveRev(bg3,D.d3,lam3),name:"3' C→T",
-    mode:'lines+markers',line:{color:'#e09070',width:2.5,dash:'dot'},marker:{size:5}});
-  if(D.gt5) traces.push({x:pos,y:rawClean(D.gt5),name:"5' G→T",
-    mode:'lines+markers',line:{color:'#9b59b6',width:2},marker:{size:4}});
-  if(!traces.length) traces.push({x:pos,y:pos.map(function(){return 0;}),
-    name:'(no damage)',mode:'lines',line:{color:'#ccc',width:1,dash:'dot'}});
-  Plotly.newPlot('curves',traces,{
-    height:240,margin:{t:8,b:40,l:50,r:10},
-    xaxis:{title:'Position from 5′ end',dtick:1},
-    yaxis:{title:'Rate',rangemode:'tozero'},
-    legend:{orientation:'h',y:-0.24},
-    paper_bgcolor:'#fff',plot_bgcolor:'#fff'
-  },{responsive:true,displayModeBar:false});
-
-  // ── Row 1: Channels · 8-oxoG · Library typing ─────────────────────────────
-  var row1=document.createElement('div'); row1.className='grid3';
-  document.body.appendChild(row1);
-
-  var tbl='<table><tr><th>Ch</th><th>Name</th><th>Status</th><th>Signal</th></tr>';
-  (D.channels||[]).forEach(function(c){
-    var appl=c.applicable!==undefined?c.applicable:true;
-    var b,sig='';
-    if(!appl) b=badge('na','N/A');
-    else if(c.detected) b=badge('det','detected');
-    else b=badge('notdet','not det.');
-    if(c.z_score!=null&&isFinite(c.z_score)) sig='z='+jv(c.z_score,1);
-    else if(c.d5!=null) sig='d5='+jv(c.d5);
-    tbl+='<tr><td><b>'+c.id+'</b></td><td>'+c.name.replace(/_/g,' ')+'</td><td>'+b+'</td><td>'+sig+'</td></tr>';
+  var plotLayout={
+    height:260,margin:{t:8,b:48,l:52,r:14},
+    xaxis:{title:{text:"Position from 5′ end",font:{size:11}},dtick:1,gridcolor:'#eaeef2',zerolinecolor:'#d0d7de',tickfont:{family:'monospace',size:10}},
+    yaxis:{title:{text:'Rate',font:{size:11}},rangemode:'tozero',gridcolor:'#eaeef2',tickfont:{family:'monospace',size:10}},
+    legend:{orientation:'h',y:-0.30,font:{size:11}},
+    paper_bgcolor:'#fff',plot_bgcolor:'#fff',font:{size:11}
+  };
+  // smiley x-axis: 5' on left [0..NP-1], 3' on right [NP..2*NP-1], center divider at NP-0.5
+  var smileyTicks=(function(){
+    var tv=[],tt=[],step=5;
+    for(var p=0;p<NP;p+=step){tv.push(p);tt.push(String(p));}
+    tv.push(NP-1);tt.push(String(NP-1));
+    tv.push(NP);tt.push(String(NP-1));
+    for(var p=step;p<NP;p+=step){tv.push(2*NP-1-p);tt.push(String(p));}
+    tv.push(2*NP-1);tt.push('0');
+    return {tickvals:tv,ticktext:tt,range:[-0.5,2*NP-0.5]};
+  })();
+  var smileyLayout={
+    height:280,margin:{t:8,b:48,l:52,r:14},
+    xaxis:{
+      tickvals:smileyTicks.tickvals,ticktext:smileyTicks.ticktext,
+      range:smileyTicks.range,
+      gridcolor:'#eaeef2',zeroline:false,
+      tickfont:{family:'monospace',size:10},
+      title:{text:"5′ end →        ← 3′ end",font:{size:11}}
+    },
+    yaxis:{title:{text:'Rate',font:{size:11}},rangemode:'tozero',gridcolor:'#eaeef2',tickfont:{family:'monospace',size:10}},
+    legend:{orientation:'h',y:-0.30,font:{size:11}},
+    shapes:[{type:'line',xref:'x',yref:'paper',x0:NP-0.5,x1:NP-0.5,y0:0,y1:1,line:{color:'#d0d7de',width:1,dash:'dot'}}],
+    paper_bgcolor:'#fff',plot_bgcolor:'#fff',font:{size:11}
+  };
+  var fracLayout=Object.assign({},plotLayout,{
+    height:280,margin:{t:8,b:56,l:52,r:14},
+    xaxis:Object.assign({},plotLayout.xaxis,{title:{text:"Position from terminus",font:{size:11}}}),
+    yaxis:Object.assign({},plotLayout.yaxis,{title:{text:"C→T rate",font:{size:11}}}),
+    legend:{orientation:'h',y:-0.36,font:{size:11}}
   });
-  appendCard(row1,'Damage channels',tbl+'</table>');
+  var lenLayout=Object.assign({},plotLayout,{legend:{orientation:'h',y:-0.34,font:{size:11}}});
 
-  var oxHtml='<div class="kv">'+
-    '<span><b>η̅ (RC log-ratio)</b> '+jv(D.oxog_eta_bar,5)+'</span>'+
-    '<span><b>g_hat</b> '+jv(D.oxog_g_hat,5)+'</span>'+
-    '<span><b>trinuc cosine</b> '+jv(D.oxog_cosine,4)+'</span>'+
-    '<span><b>s_gt</b> '+jv(D.s_gt,5)+'</span>'+
-    '</div>';
-  if(D.oxog_g_hat!=null&&isFinite(D.oxog_g_hat)){
-    var col2=D.oxog_g_hat>0.01?'#9b59b6':'#ccc';
-    oxHtml+=scoreBar(D.oxog_g_hat,col2,0.002)+
-      '<div style="font-size:.72em;color:#999">g_hat (scaled \xd7500)</div>';
+  // ── Tab system ──────────────────────────────────────────────────────────
+  var tabDefs=[
+    {id:'bulk',label:'Bulk Damage'},
+    {id:'frac',label:'Fractions',skip:!D.anc_valid},
+    {id:'len',label:'Length Bins',skip:!(D.length_bins&&D.length_bins.length)},
+    {id:'lib',label:'Library'},
+    {id:'qc',label:'QC'}
+  ];
+  var tabNavEl=document.getElementById('tab-nav');
+  var panelsEl=document.getElementById('panels');
+  tabDefs.forEach(function(t){
+    if(t.skip)return;
+    var btn=document.createElement('button');
+    btn.className='tab-btn';btn.textContent=t.label;
+    btn.onclick=function(){
+      document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});
+      document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('active');});
+      btn.classList.add('active');
+      var pp=document.getElementById('panel-'+t.id);
+      if(pp){pp.classList.add('active');pp.querySelectorAll('.js-plotly-plot').forEach(function(el){Plotly.relayout(el,{});});}
+    };
+    tabNavEl.appendChild(btn);
+    var panel=document.createElement('div');panel.id='panel-'+t.id;panel.className='panel';
+    panelsEl.appendChild(panel);
+  });
+  tabNavEl.querySelector('.tab-btn').classList.add('active');
+  panelsEl.querySelector('.panel').classList.add('active');
+
+  function getPanel(id){return document.getElementById('panel-'+id);}
+  function addCard(panelId,title){
+    var panel=getPanel(panelId);if(!panel)return null;
+    var card=document.createElement('div');card.className='card';
+    if(title){var h=document.createElement('div');h.className='card-hdr';h.textContent=title;card.appendChild(h);}
+    var body=document.createElement('div');body.className='card-body';card.appendChild(body);
+    panel.appendChild(card);return body;
   }
-  appendCard(row1,'8-oxoG estimators',oxHtml);
-
-  var libHtml='<div class="kv" style="margin-bottom:8px">'+
-    '<span><b>Model</b> '+(D.lib_bic_model||'—')+'</span>'+
-    '<span><b>BIC margin</b> '+jv(D.lib_bic_margin,1)+'</span>'+
-    '<span><b>p(DS)</b> '+jv(D.lib_p_ds,3)+'</span>'+
-    '<span><b>p(SS)</b> '+jv(D.lib_p_ss,3)+'</span>'+
-    '</div>';
-  if(D.lib_artifact) libHtml+=badge('warn','artifact contamination');
-  appendCard(row1,'Library typing',libHtml);
-
-  // ── Row 2: Damage context · Preservation · Depurination ───────────────────
-  var row2=document.createElement('div'); row2.className='grid3';
-  document.body.appendChild(row2);
-
-  function ctxBar(label,val,color){
-    var w=isFinite(val)?Math.min(100,val*100):0;
-    return '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;font-size:.82em">'+
-      '<span style="min-width:110px;color:var(--muted)">'+label+'</span>'+
-      '<div class="bar-wrap" style="flex:1"><div class="bar-fill" style="width:'+w+'%;background:'+color+'"></div></div>'+
-      '<span style="min-width:38px;text-align:right">'+jv(val,3)+'</span></div>';
+  function warnBox(msg,err){
+    var box=document.createElement('div');box.className=err?'err-box':'warn-box';box.textContent=msg;return box;
   }
-  var ctxHtml='';
-  if(D.dom_process) ctxHtml+='<div style="margin-bottom:8px">'+badge('info',D.dom_process.replace(/_/g,' '))+'</div>';
-  ctxHtml+=ctxBar('deamination',  D.dam_score, '#d97757');
-  ctxHtml+=ctxBar('oxidation',    D.ox_score,  '#9b59b6');
-  ctxHtml+=ctxBar('fragmentation',D.frag_score,'#4a8db8');
-  ctxHtml+=ctxBar('lib. artifact',D.art_score, '#e74c3c');
-  ctxHtml+='<div class="kv" style="margin-top:6px">'+
-    '<span><b>CpG contrast</b> '+jv(D.cpg_contrast,4)+'</span>'+
-    '<span><b>CpG z</b> '+jv(D.cpg_z,1)+'</span></div>';
-  appendCard(row2,'Damage context',ctxHtml);
-
-  var presHtml='';
-  if(D.pres_score!==undefined&&isFinite(D.pres_score)){
-    var sc=D.pres_score;
-    var scCol=sc>0.6?'#27ae60':sc>0.3?'#f39c12':'#e74c3c';
-    presHtml='<div style="font-size:1.6em;font-weight:700;color:'+scCol+'">'+jv(sc,3)+
-      '<span style="font-size:.5em;font-weight:400;color:var(--muted)"> score</span></div>';
-    presHtml+=scoreBar(sc,scCol,1)+'<div style="margin-bottom:8px"></div>';
-    presHtml+='<div class="kv">'+
-      '<span><b>authenticity</b> '+jv(D.auth_eff,3)+'</span>'+
-      '<span><b>oxidation</b> '+jv(D.ox_eff,3)+'</span>'+
-      '<span><b>QC risk</b> '+jv(D.qcr_eff,3)+'</span>'+
-      '</div>';
+  function metricTable(rows){
+    var tbl=document.createElement('table');tbl.className='metric-table';
+    rows.forEach(function(r){var tr=document.createElement('tr');tr.innerHTML='<td>'+r[0]+'</td><td>'+r[1]+'</td>';tbl.appendChild(tr);});
+    return tbl;
   }
-  appendCard(row2,'Preservation',presHtml);
 
-  var depHtml='<div style="margin-bottom:8px">'+
-    (D.depur_detected?badge('warn','detected'):badge('det','not detected'))+'</div>'+
-    '<div class="kv">'+
-    '<span><b>enrichment 5′</b> '+jv(D.depur_enrich5,5)+'</span>'+
-    '<span><b>enrichment 3′</b> '+jv(D.depur_enrich3,5)+'</span>'+
-    '<span><b>z-score</b> '+jv(D.depur_z,1)+'</span></div>';
-  appendCard(row2,'Depurination',depHtml);
+  // ── Top bar ──────────────────────────────────────────────────────────
+  document.title='fqdup: '+(D.sample||'damage');
+  var libType=D.library_type||'—';
+  var libCls=libType.toLowerCase().indexOf('single')!==-1?'ss':'ds';
+  document.getElementById('top-bar').innerHTML=
+    '<span class="sample-id">'+(D.sample||'unknown')+'</span>'+
+    '<span class="lib-badge '+libCls+'">'+libType+'</span>';
 
-  // ── Library QC (full width) ────────────────────────────────────────────────
-  var qcCard=appendCard(document.body,'Library QC &amp; adapter remnants','');
-  qcCard.style.marginBottom='12px';
-  var qcGrid=document.createElement('div');
-  qcGrid.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:16px';
+  // ── Stat strip ──────────────────────────────────────────────────────
+  var statStrip=document.getElementById('stat-strip');
+  var d5str=isFinite(D.d5)?jv(D.d5):'—';
+  var d3str=isFinite(D.d3)?jv(D.d3):'—';
+  var piStr=(D.anc_pi!==undefined&&isFinite(D.anc_pi))?jv(D.anc_pi,3):'—';
+  var presStr=(D.pres_score!==undefined&&isFinite(D.pres_score))?jv(D.pres_score,3):'—';
+  [{lbl:"d₅",num:d5str,hi:true},{lbl:"d₃",num:d3str},{lbl:"λ₅",num:isFinite(D.lam5)?jv(D.lam5,3):'—'},
+   {lbl:"λ₃",num:isFinite(D.lam3)?jv(D.lam3,3):'—'},{lbl:"π ancient",num:piStr},
+   {lbl:"reads",num:D.n_reads?D.n_reads.toLocaleString():'—'},{lbl:"preservation",num:presStr}
+  ].forEach(function(s){
+    var el=document.createElement('div');el.className='stat-item';
+    el.innerHTML='<div class="stat-lbl">'+s.lbl+'</div><div class="stat-num'+(s.hi?' anc':'')+'">'+s.num+'</div>';
+    statStrip.appendChild(el);
+  });
 
-  var leftDiv=document.createElement('div');
-  var leftHtml='';
-  if(D.adapter_seq)
-    leftHtml+='<div style="margin-bottom:8px">'+badge('warn',D.adapter_seq)+
-      ' <span style="font-size:.82em;color:var(--muted)">'+(D.adapter_name||'unknown')+'</span></div>';
-  else
-    leftHtml+='<div style="margin-bottom:8px">'+badge('det','no adapter stubs detected')+'</div>';
-  if(D.stubs5&&D.stubs5.length)
-    leftHtml+='<div style="font-size:.82em;margin-bottom:3px"><b>5′ stubs:</b> '+
-      D.stubs5.map(function(s){return '<span class="mono">'+s+'</span>';}).join(' ')+'</div>';
-  if(D.stubs3&&D.stubs3.length)
-    leftHtml+='<div style="font-size:.82em;margin-bottom:3px"><b>3′ stubs:</b> '+
-      D.stubs3.map(function(s){return '<span class="mono">'+s+'</span>';}).join(' ')+'</div>';
-  leftHtml+='<div class="kv" style="margin-top:8px">'+
-    '<span><b>pos0 art. 5′</b> '+(D.pos0_art5?badge('warn','yes'):badge('det','no'))+'</span>'+
-    '<span><b>pos0 art. 3′</b> '+(D.pos0_art3?badge('warn','yes'):badge('det','no'))+'</span>'+
-    '<span><b>hex entropy 5′</b> '+jv(D.hex_ent5,2)+'</span>'+
-    '<span><b>hex entropy int.</b> '+jv(D.hex_ent_int,2)+'</span>'+
-    '<span><b>hex JSD</b> '+jv(D.hex_jsd,4)+'</span>'+
-    '<span><b>hex shift z</b> '+jv(D.hex_shift_z,1)+'</span>'+
-    '<span><b>short-read frac.</b> '+pct(D.short_frac)+'</span>'+
-    '</div>';
-  leftDiv.innerHTML=leftHtml; qcGrid.appendChild(leftDiv);
+  // ── Panel: Bulk Damage ──────────────────────────────────────────────
+  (function(){
+    var plotBody=addCard('bulk','Bulk damage curves (smiley plot)');if(!plotBody)return;
+    if(D.pos0_art5||D.pos0_art3){
+      var msg='Position-0 adapter blunting artifact';
+      if(D.pos0_art5&&D.pos0_art3)msg+=' at both ends';else if(D.pos0_art5)msg+=' at 5′ end';else msg+=' at 3′ end';
+      msg+='. Position 0 excluded from fit.';
+      plotBody.appendChild(warnBox(msg));
+    }
+    var plotDiv=document.createElement('div');plotDiv.id='curves';plotDiv.style.width='100%';
+    plotBody.appendChild(plotDiv);
+    var traces=[];
+    if(D.d5>0.001)traces.push({x:pos,y:modelCurve(bg5,D.d5,lam5),name:"5′ C→T",mode:'lines+markers',line:{color:'#c0392b',width:2.5},marker:{size:5,color:'#c0392b'},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>5′ C→T</extra>'});
+    if(D.ga5&&D.d3>0.001)traces.push({x:pos3x,y:modelCurve3(bg3,D.d3,lam3),name:"3′ G→A",mode:'lines+markers',line:{color:'#1971c2',width:2,dash:'dot'},marker:{size:4,color:'#1971c2'},hovertemplate:'pos %{x:.0f}<br>rate: %{y:.4f}<extra>3′ G→A</extra>'});
+    if(D.ct3&&D.d3>0.001)traces.push({x:pos3x,y:modelCurve3(bg3,D.d3,lam3),name:"3′ C→T",mode:'lines+markers',line:{color:'#c0392b',width:2,dash:'dot'},marker:{size:4,color:'#c0392b'},hovertemplate:'pos %{x:.0f}<br>rate: %{y:.4f}<extra>3′ C→T</extra>'});
+    if(D.gt5)traces.push({x:pos,y:rawClean(D.gt5),name:"5′ G→T",mode:'lines+markers',line:{color:'#7a5c9e',width:1.5},marker:{size:4,color:'#7a5c9e'},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>5′ G→T</extra>'});
+    if(!traces.length)traces.push({x:pos,y:pos.map(function(){return 0;}),name:'(no damage)',mode:'lines',line:{color:'#d0d7de',width:1,dash:'dot'}});
+    Plotly.newPlot('curves',traces,smileyLayout,{responsive:true,displayModeBar:false});
 
-  var rightDiv=document.createElement('div');
-  if(D.top_hex&&D.top_hex.length){
-    var htbl='<div style="font-size:.82em;color:var(--muted);margin-bottom:4px">'+
-      'Top enriched 5′ hexamers vs. interior</div>'+
-      '<table><tr><th>Hexamer</th><th>log₂ FC</th><th>damage-consistent</th></tr>';
-    D.top_hex.forEach(function(h){
-      htbl+='<tr><td class="mono">'+h.seq+'</td><td>'+jv(h.log2fc,2)+'</td>'+
-        '<td>'+(h.dc?'<span class="dc-yes">yes</span>':'<span class="dc-no">no</span>')+'</td></tr>';
-    });
-    rightDiv.innerHTML=htbl+'</table>';
-  }
-  qcGrid.appendChild(rightDiv); qcCard.appendChild(qcGrid);
+    var sumBody=addCard('bulk','Summary');if(!sumBody)return;
+    sumBody.appendChild(metricTable([
+      ['5′ C→T d_max',jv(D.d5)],['3′ damage d_max',jv(D.d3)],
+      ['λ₅',jv(D.lam5,3)],['λ₃',jv(D.lam3,3)],
+      ['Background 5′',jv(D.bg5)],['Background 3′',jv(D.bg3)],
+      ['Source',D.d_src||'—'],['Reads',D.n_reads?D.n_reads.toLocaleString():'—'],
+      ['Mean length',isFinite(D.mean_len)?jv(D.mean_len,1):'—']
+    ]));
+    if(D.interpretation){var p=document.createElement('p');p.style.cssText='font-size:12px;color:var(--muted);margin-top:10px;font-style:italic';p.textContent=D.interpretation;sumBody.appendChild(p);}
+  })();
 
-  // ── Length-stratified smiley curves ────────────────────────────────────────
-  if(D.length_bins&&D.length_bins.length){
-    var lbCard=appendCard(document.body,'Length-stratified damage curves','<div id="lenbins"></div>');
-    lbCard.style.marginBottom='12px';
-    var ramp5=['#e07050','#c0785a','#8b6090'];
-    var ramp3=['#6aafd4','#4a8db8','#2a6090'];
+  // ── Panel: Fractions ────────────────────────────────────────────────
+  if(D.anc_valid)(function(){
+    var sumBody=addCard('frac','Fraction summary');if(!sumBody)return;
+    var three=document.createElement('div');three.className='three-col';
+    function fracMini(cls,label,kvs){
+      var el=document.createElement('div');el.className='frac-mini '+cls;
+      el.innerHTML='<div class="fm-head">'+label+'</div>'+
+        kvs.map(function(kv){return '<div class="frac-kv"><span class="fk">'+kv[0]+'</span><span class="fv">'+kv[1]+'</span></div>';}).join('');
+      return el;
+    }
+    var ancN=D.anc_n||0;
+    var modN=(D.n_reads&&ancN)?D.n_reads-ancN:null;
+    three.appendChild(fracMini('bulk','Bulk',[
+      ['d₅',jv(D.d5)],['d₃',jv(D.d3)],['λ₅',jv(D.lam5,3)],
+      ['n reads',D.n_reads?D.n_reads.toLocaleString():'—']
+    ]));
+    three.appendChild(fracMini('ancient','Ancient',[
+      ['d₅(1)',jv(D.anc_d5_fit)],['d₃(1)',jv(D.anc_d3_fit)],
+      ['λ₅',jv(D.anc_lam5,3)],['π',jv(D.anc_pi,3)],
+      ['n reads',ancN?ancN.toLocaleString():'—']
+    ]));
+    three.appendChild(fracMini('modern','Modern',[
+      ['d₅',jv(D.mod_d5_fit)],['d₃',jv(D.mod_d3_fit)],
+      ['λ₅',jv(D.mod_lam5,3)],
+      ['leakage',(D.mod_leakage_5||D.mod_leakage_3)?'⚠ yes':'no'],
+      ['n reads',modN?modN.toLocaleString():'—']
+    ]));
+    sumBody.appendChild(three);
+
+    var plotBody=addCard('frac','Fraction damage curves');if(!plotBody)return;
+    var fracDiv=document.createElement('div');fracDiv.id='fracplot';fracDiv.style.width='100%';
+    plotBody.appendChild(fracDiv);
+    var fpTraces=[];
+    var p0art5=D.pos0_art5===true,p0art3=D.pos0_art3===true;
+    // 5' uses global pos=[0..NP-1], 3' uses global pos3x=[2NP-1..NP] — no local posArr needed
+    if(D.d5>0.001)fpTraces.push({x:pos,y:modelCurve(D.bg5||0,D.d5,D.lam5||0.3),name:"Bulk 5′",mode:'lines',line:{color:'#adb5bd',width:1.5,dash:'dash'},hovertemplate:'pos %{x}<br>bulk: %{y:.4f}<extra>Bulk 5′</extra>'});
+    if(D.d3>0.001)fpTraces.push({x:pos3x,y:modelCurve3(D.bg3||0,D.d3,D.lam3||0.3),name:"Bulk 3′",mode:'lines',line:{color:'#adb5bd',width:1.5,dash:'dot'},hovertemplate:'pos %{x}<br>bulk: %{y:.4f}<extra>Bulk 3′</extra>'});
+    if(D.anc_rate5&&D.anc_rate5.some(function(v){return v>0;})){
+      fpTraces.push({x:p0art5?pos.slice(1):pos,y:p0art5?D.anc_rate5.slice(1):D.anc_rate5,name:"Ancient 5′",mode:'markers',marker:{color:'#c0392b',size:7,symbol:'circle'},hovertemplate:'<b>pos %{x}</b><br>rate: %{y:.4f}<extra>Ancient 5′</extra>'});
+      if(p0art5)fpTraces.push({x:[0],y:[D.anc_rate5[0]],name:'pos 0 (excl.)',mode:'markers',showlegend:false,marker:{color:'#adb5bd',size:6,symbol:'circle-open'},hovertemplate:'<b>pos 0</b><br>rate: %{y:.4f}<br><i>excluded — adapter blunting</i><extra></extra>'});
+      if(D.anc_d5_fit>0.001){var d5ols=D.anc_d5_ols||D.anc_d5_fit;fpTraces.push({x:pos,y:pos.map(function(p){return(p0art5&&p===0)?null:(D.bg5||0)+d5ols*Math.exp(-(D.anc_lam5||0.3)*p);}),name:"Ancient 5′ fit",mode:'lines',line:{color:'#c0392b',width:2},connectgaps:false,hovertemplate:'pos %{x}<br>fitted: %{y:.4f}<extra>Ancient 5′ fit</extra>'});}
+    }
+    if(D.anc_rate3&&D.anc_rate3.some(function(v){return v>0;})){
+      var anc3x=p0art3?pos3x.slice(1):pos3x;
+      fpTraces.push({x:anc3x,y:p0art3?D.anc_rate3.slice(1):D.anc_rate3,name:"Ancient 3′",mode:'markers',marker:{color:'#c0392b',size:7,symbol:'circle-open'},hovertemplate:'<b>pos %{x}</b><br>rate: %{y:.4f}<extra>Ancient 3′</extra>'});
+      if(p0art3)fpTraces.push({x:[pos3x[0]],y:[D.anc_rate3[0]],name:'3′ pos 0 (excl.)',mode:'markers',showlegend:false,marker:{color:'#adb5bd',size:6,symbol:'circle-open'},hovertemplate:'<b>pos 0</b><br>rate: %{y:.4f}<br><i>excluded</i><extra></extra>'});
+      if(D.anc_d3_fit>0.001){var d3ols=D.anc_d3_ols||D.anc_d3_fit;fpTraces.push({x:pos3x,y:pos.map(function(p){return(p0art3&&p===0)?null:(D.bg3||0)+d3ols*Math.exp(-(D.anc_lam3||0.3)*p);}),name:"Ancient 3′ fit",mode:'lines',line:{color:'#c0392b',width:2,dash:'dot'},connectgaps:false,hovertemplate:'pos %{x}<br>fitted: %{y:.4f}<extra>Ancient 3′ fit</extra>'});}
+    }
+    var ml5=D.mod_leakage_5===true,ml3=D.mod_leakage_3===true;
+    if(D.mod_rate5&&D.mod_rate5.some(function(v){return v>0;})){
+      fpTraces.push({x:pos,y:D.mod_rate5,name:"Modern 5′"+(ml5?' ⚠':''),mode:'markers',marker:{color:'#1971c2',size:6,symbol:'diamond'},opacity:ml5?0.4:1,hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>Modern 5′</extra>'});
+      if(D.mod_d5_fit>0.001)fpTraces.push({x:pos,y:modelCurve(D.bg5||0,D.mod_d5_ols||D.mod_d5_fit,D.mod_lam5||0.3),name:"Modern 5′ fit",mode:'lines',line:{color:'#1971c2',width:1.5,dash:'dot'},opacity:ml5?0.4:1,hovertemplate:'pos %{x}<br>fitted: %{y:.4f}<extra>Modern 5′ fit</extra>'});
+    }
+    if(D.mod_rate3&&D.mod_rate3.some(function(v){return v>0;})){
+      fpTraces.push({x:pos3x,y:D.mod_rate3,name:"Modern 3′"+(ml3?' ⚠':''),mode:'markers',marker:{color:'#1971c2',size:6,symbol:'diamond-open'},opacity:ml3?0.4:1,hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>Modern 3′</extra>'});
+      if(D.mod_d3_fit>0.001)fpTraces.push({x:pos3x,y:modelCurve3(D.bg3||0,D.mod_d3_ols||D.mod_d3_fit,D.mod_lam3||0.3),name:"Modern 3′ fit",mode:'lines',line:{color:'#1971c2',width:1.5,dash:'dot'},opacity:ml3?0.4:1,hovertemplate:'pos %{x}<br>fitted: %{y:.4f}<extra>Modern 3′ fit</extra>'});
+    }
+    if(fpTraces.length)Plotly.newPlot('fracplot',fpTraces,smileyLayout,{responsive:true,displayModeBar:false});
+    else fracDiv.innerHTML='<p style="color:var(--muted);font-size:13px">Fraction curves not available.</p>';
+    var annParts=[];
+    if(D.anc_d5_fit>0.001)annParts.push('d₅(1) = '+jv(D.anc_d5_fit));
+    if(D.anc_lam5&&isFinite(D.anc_lam5))annParts.push('λ₅ = '+jv(D.anc_lam5,3));
+    if(D.anc_pi!==undefined&&isFinite(D.anc_pi))annParts.push('π = '+jv(D.anc_pi,3));
+    if(annParts.length){var note=document.createElement('p');note.className='plot-note';note.textContent=annParts.join(' | ');plotBody.appendChild(note);}
+  })();
+
+  // ── Panel: Length Bins ──────────────────────────────────────────────
+  if(D.length_bins&&D.length_bins.length)(function(){
+    var plotBody=addCard('len','Length-stratified damage');if(!plotBody)return;
+    var lenDiv=document.createElement('div');lenDiv.id='lenbins';lenDiv.style.width='100%';
+    plotBody.appendChild(lenDiv);
+    var ramp5=['#c0392b','#9e3226','#7a2520'],ramp3=['#1971c2','#134e8a','#0b2e54'];
     var lbTraces=[];
     D.length_bins.forEach(function(b,i){
       var label=b.lo+'–'+b.hi+' bp';
-      var bg5b=b.bg5||0,bg3b=b.bg3||0,lam5b=b.lam5||0.3,lam3b=b.lam3||0.3;
       var c5=ramp5[Math.min(i,ramp5.length-1)],c3=ramp3[Math.min(i,ramp3.length-1)];
-      if(b.d5>0.001) lbTraces.push({x:pos,y:modelCurve(bg5b,b.d5,lam5b),
-        name:"5' "+label,mode:'lines+markers',
-        line:{color:c5,width:2,dash:i?'dot':'solid'},marker:{size:4}});
-      if(b.d3>0.001) lbTraces.push({x:pos,y:modelCurveRev(bg3b,b.d3,lam3b),
-        name:"3' "+label,mode:'lines+markers',
-        line:{color:c3,width:2,dash:i?'dot':'solid'},marker:{size:4}});
+      if(b.d5>0.001)lbTraces.push({x:pos,y:modelCurve(b.bg5||0,b.d5,b.lam5||0.3),name:"5′ "+label,mode:'lines+markers',line:{color:c5,width:2,dash:i?'dot':'solid'},marker:{size:4},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>5′ '+label+'</extra>'});
+      if(b.d3>0.001)lbTraces.push({x:pos,y:modelCurveRev(b.bg3||0,b.d3,b.lam3||0.3),name:"3′ "+label,mode:'lines+markers',line:{color:c3,width:2,dash:i?'dot':'solid'},marker:{size:4},hovertemplate:'pos %{x}<br>rate: %{y:.4f}<extra>3′ '+label+'</extra>'});
     });
-    if(lbTraces.length)
-      Plotly.newPlot('lenbins',lbTraces,{
-        height:240,margin:{t:8,b:50,l:50,r:10},
-        xaxis:{title:'Position from 5′ end',dtick:1},
-        yaxis:{title:'Rate',rangemode:'tozero'},
-        legend:{orientation:'h',y:-0.3},
-        paper_bgcolor:'#fff',plot_bgcolor:'#fff'
-      },{responsive:true,displayModeBar:false});
-    else
-      lbCard.insertAdjacentHTML('beforeend',
-        '<p style="color:#999;font-size:.82em">No bins with detectable damage.</p>');
-  }
+    if(lbTraces.length)Plotly.newPlot('lenbins',lbTraces,lenLayout,{responsive:true,displayModeBar:false});
+    else lenDiv.innerHTML='<p style="color:var(--muted);font-size:13px">No bins with detectable damage.</p>';
+  })();
+
+  // ── Panel: Library ──────────────────────────────────────────────────
+  (function(){
+    var libBody=addCard('lib','Library classification');if(!libBody)return;
+    libBody.appendChild(metricTable([
+      ['Library type',D.library_type||'—'],['BIC model',D.lib_bic_model||'—'],
+      ['BIC margin',jv(D.lib_bic_margin,1)],['p(DS)',jv(D.lib_p_ds,3)],['p(SS)',jv(D.lib_p_ss,3)],
+      ['Adapter',D.adapter_seq?(D.adapter_seq+(D.adapter_name?' ('+D.adapter_name+')':'')):'none detected'],
+      ['pos-0 artifact 5′',D.pos0_art5?'yes':'no'],['pos-0 artifact 3′',D.pos0_art3?'yes':'no'],
+      ['5′ stubs',(D.stubs5&&D.stubs5.length)?D.stubs5.join(', '):'—'],
+      ['3′ stubs',(D.stubs3&&D.stubs3.length)?D.stubs3.join(', '):'—'],
+      ['Short-read fraction',pct(D.short_frac)]
+    ]));
+    if(D.lib_artifact)libBody.appendChild(warnBox('Artifact contamination detected.',true));
+
+    if(D.channels&&D.channels.length){
+      var chanBody=addCard('lib','Damage channels');if(!chanBody)return;
+      D.channels.forEach(function(ch){
+        var appl=ch.applicable!==undefined?ch.applicable:true;
+        var stCls=!appl?'na':(ch.detected?'det':'notdet');
+        var stTxt=!appl?'N/A':(ch.detected?'detected':'not detected');
+        var sig='';
+        if(ch.z_score!=null&&isFinite(ch.z_score))sig='z = '+jv(ch.z_score,1);
+        else if(ch.d5!=null&&isFinite(ch.d5))sig='d₅ = '+jv(ch.d5);
+        var row=document.createElement('div');row.className='channel-row';
+        row.innerHTML='<span class="channel-id">'+ch.id+'</span><span class="channel-name">'+ch.name.replace(/_/g,' ')+'</span><span class="channel-status '+stCls+'">'+stTxt+'</span>'+(sig?'<span class="channel-sig">'+sig+'</span>':'');
+        chanBody.appendChild(row);
+      });
+    }
+
+    var oxBody=addCard('lib','Oxidation & depurination');if(!oxBody)return;
+    oxBody.appendChild(metricTable([
+      ['s_GT',jv(D.s_gt,5)],['G→T asymmetry',jv(D.oxog_gt_asymmetry,4)],['G→T rate',jv(D.oxog_gt_rate,4)],
+      ['OxoG trinuc cosine',jv(D.oxog_cosine,4)],['Dominant process',D.dom_process?D.dom_process.replace(/_/g,' '):'—'],
+      ['CpG contrast',jv(D.cpg_contrast,4)],['CpG z',jv(D.cpg_z,1)],
+      ['Depurination',D.depur_detected?'detected':'not detected'],
+      ['Depur. enrichment 5′',jv(D.depur_enrich5,5)],['Depur. enrichment 3′',jv(D.depur_enrich3,5)],
+      ['Depur. z-score',jv(D.depur_z,1)]
+    ]));
+  })();
+
+  // ── Panel: QC ────────────────────────────────────────────────────────
+  (function(){
+    if(D.qc_flags&&D.qc_flags.length){
+      var panel=getPanel('qc');
+      if(panel){var flags=document.createElement('div');flags.className='qc-flags';D.qc_flags.forEach(function(f){var chip=document.createElement('span');chip.className='qc-flag';chip.textContent=f.replace(/_/g,' ');flags.appendChild(chip);});panel.appendChild(flags);}
+    }
+    var scoreBody=addCard('qc','Preservation score');if(!scoreBody)return;
+    var two=document.createElement('div');two.className='two-col';
+    var left=document.createElement('div');
+    if(D.pres_score!==undefined&&isFinite(D.pres_score)){
+      var sc=D.pres_score,scCls=sc>0.6?'excellent':sc<0.3?'poor':'';
+      left.innerHTML='<div class="pres-num '+scCls+'">'+jv(sc,3)+'</div><div class="pres-lbl">'+(D.pres_label||'')+'</div><br>';
+    }
+    left.appendChild(metricTable([
+      ['Authenticity eff.',jv(D.auth_eff,3)],['Oxidation eff.',jv(D.ox_eff,3)],['QC risk eff.',jv(D.qcr_eff,3)],
+      ['Hex entropy 5′',jv(D.hex_ent5,2)],['Hex entropy interior',jv(D.hex_ent_int,2)],
+      ['Hex JSD',jv(D.hex_jsd,4)],['Hex shift z',jv(D.hex_shift_z,1)]
+    ]));
+    two.appendChild(left);
+    var right=document.createElement('div');
+    if(D.top_hex&&D.top_hex.length){
+      right.innerHTML='<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px">Top enriched 5′ hexamers</div>';
+      var htbl=document.createElement('table');htbl.className='hex-table';
+      htbl.innerHTML='<tr><th>Hexamer</th><th>log₂ FC</th><th>Damage-consistent</th></tr>';
+      D.top_hex.forEach(function(h){var tr=document.createElement('tr');tr.innerHTML='<td>'+h.seq+'</td><td>'+jv(h.log2fc,2)+'</td><td>'+(h.dc?'✓':'✕')+'</td>';htbl.appendChild(tr);});
+      right.appendChild(htbl);
+    }
+    two.appendChild(right);scoreBody.appendChild(two);
+  })();
 
 })();
+
 </script>
 </body>
 </html>
