@@ -1157,11 +1157,20 @@ int damage_main(int argc, char** argv) {
                                != dp.library_artifact_reasons.end();
                     };
                     bool p0a5 = dp.position_0_artifact_5prime || has_artifact("position0_artifact_5prime");
-                    bool p0a3 = dp.position_0_artifact_3prime || has_artifact("position0_artifact_3prime");
+                    bool bulk_p0a3 = dp.position_0_artifact_3prime || has_artifact("position0_artifact_3prime");
+                    // For fraction 3' fit, only skip pos0 if the fraction data itself shows
+                    // depletion at pos0 — the bulk artifact flag fires on modern-read adapter
+                    // blunting, but the ancient fraction may have genuine peak signal at pos0.
+                    auto frac_p0a3 = [&](const int64_t* h, const int64_t* n, double frac_bg) -> bool {
+                        if (!bulk_p0a3) return false;
+                        if (n[0] < 10) return bulk_p0a3;
+                        double rate0 = static_cast<double>(h[0]) / n[0];
+                        return rate0 < frac_bg;  // only skip if actually depleted in this fraction
+                    };
                     auto [ad5, al5] = fit_exp_decay(anc_t5,  anc_tc5, NP, anc_bg5, p0a5);
-                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, anc_bg3, p0a3);
+                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, anc_bg3, frac_p0a3(anc_h3, anc_n3, anc_bg3));
                     auto [md5, ml5] = fit_exp_decay(mod_t5,  mod_tc5, NP, mod_bg5, p0a5);
-                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, mod_bg3, p0a3);
+                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, mod_bg3, frac_p0a3(mod_h3, mod_n3, mod_bg3));
                     dp.damaged_fraction_d5_fit  = static_cast<float>(ad5);
                     dp.damaged_fraction_lambda5 = static_cast<float>(al5);
                     dp.damaged_fraction_d3_fit  = static_cast<float>(ad3);
