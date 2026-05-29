@@ -297,29 +297,87 @@ static float weight_rev_from_table(const std::string& seq, const LLRTable& t) {
     return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
 }
 
-// Log-linear regression: log(T/TC(p) - bg) = log(d_max) - lambda*p
-// Returns {d_max, lambda}; {0,0} if fit fails.
+// Estimate interior background rate from positions [start_pos, n_pos).
+// Returns bg if fewer than 2 covered positions found.
+static double pool_interior_bg(const int64_t* t, const int64_t* tc,
+                                int n_pos, double fallback_bg,
+                                int start_pos = 8)
+{
+    constexpr int64_t MIN_COV = 50;
+    double sum = 0.0; int cnt = 0;
+    for (int p = start_pos; p < n_pos; ++p) {
+        if (tc[p] < MIN_COV) continue;
+        sum += static_cast<double>(t[p]) / tc[p];
+        ++cnt;
+    }
+    return cnt >= 2 ? sum / cnt : fallback_bg;
+}
+
+// Fits excess(p) = d_max·exp(−λp) where excess = T/TC(p) − bg.
+// Uses WLS with one IRLS step (weights ∝ fitted_excess²·tc/(rate·(1−rate))).
+// Fits only positions p=1..6 (pos 0 always skipped: adapter artifact).
+// skip_pos0_report: when true, return d(1)=d_max·exp(−λ) as peak instead of
+//   extrapolated d(0). Use for SS/blunted libraries.
 static std::pair<double,double> fit_exp_decay(
-    const int64_t* t, const int64_t* tc, int n_pos, double bg)
+    const int64_t* t, const int64_t* tc, int n_pos, double bg,
+    bool skip_pos0_report = false)
 {
     constexpr int64_t MIN_FIT_COV = 50;
-    double sx=0, sy=0, sxx=0, sxy=0; int n=0;
-    for (int p = 0; p < n_pos; ++p) {
-        if (tc[p] < MIN_FIT_COV) break;
-        double excess = static_cast<double>(t[p]) / tc[p] - bg;
-        if (excess <= 0.0) continue;
-        double logy = std::log(excess);
-        sx += p; sy += logy; sxx += p*(double)p; sxy += p*logy; ++n;
+    constexpr int FIT_START = 1;   // skip pos 0 always
+    constexpr int FIT_END   = 7;   // fit positions 1..6 (exclusive end)
+
+    // ── pass 1: unweighted OLS for initial slope/intercept ──────────────────
+    auto ols = [&](const double* w) -> std::pair<double,double> {
+        double sx=0,sy=0,sxx=0,sxy=0,sw=0;
+        for (int p = FIT_START; p < FIT_END && p < n_pos; ++p) {
+            if (tc[p] < MIN_FIT_COV) continue;
+            double rate = static_cast<double>(t[p]) / tc[p];
+            double excess = rate - bg;
+            double se2 = rate * (1.0 - rate) / tc[p];
+            if (se2 <= 0.0) continue;
+            if (excess <= 2.0 * std::sqrt(se2)) continue; // 2-SE floor
+            double logy = std::log(excess);
+            double wi = (w ? w[p - FIT_START] : 1.0);
+            sx  += wi * p;
+            sy  += wi * logy;
+            sxx += wi * p * p;
+            sxy += wi * p * logy;
+            sw  += wi;
+        }
+        if (sw <= 0.0) return {0.0, 0.0};
+        double denom = sw * sxx - sx * sx;
+        if (denom <= 0.0) return {0.0, 0.0};
+        double slope     = (sw * sxy - sx * sy) / denom;
+        double intercept = (sy - slope * sx) / sw;
+        double lam  = -slope;
+        double dmax = std::exp(intercept);
+        if (lam < 0.0 || dmax <= 0.0 || dmax > 1.0) return {0.0, 0.0};
+        return {dmax, lam};
+    };
+
+    // pass 1: unweighted
+    auto [dmax0, lam0] = ols(nullptr);
+    if (dmax0 == 0.0) return {0.0, 0.0};
+
+    // ── pass 2: IRLS — reweight by fitted excess² ────────────────────────────
+    double w2[FIT_END - FIT_START] = {};
+    for (int p = FIT_START; p < FIT_END && p < n_pos; ++p) {
+        if (tc[p] < MIN_FIT_COV) { w2[p - FIT_START] = 0.0; continue; }
+        double rate = static_cast<double>(t[p]) / tc[p];
+        double exc_fit = dmax0 * std::exp(-lam0 * p);  // fitted excess (unbiased)
+        double var_rate = rate * (1.0 - rate) / tc[p];
+        if (var_rate <= 0.0 || exc_fit <= 0.0) { w2[p - FIT_START] = 0.0; continue; }
+        w2[p - FIT_START] = (exc_fit * exc_fit) * tc[p] / var_rate;
     }
-    if (n < 2) return {0.0, 0.0};
-    double denom = n*sxx - sx*sx;
-    if (denom <= 0.0) return {0.0, 0.0};
-    double slope = (n*sxy - sx*sy) / denom;
-    double intercept = (sy - slope*sx) / n;
-    double lam  = -slope;
-    double dmax = std::exp(intercept);
-    if (lam < 0.0 || dmax <= 0.0 || dmax > 1.0) return {0.0, 0.0};
-    return {dmax, lam};
+    auto [dmax1, lam1] = ols(w2);
+    if (dmax1 == 0.0) return {0.0, 0.0};
+
+    // ── reporting: for SS libraries return d(1) not extrapolated d(0) ────────
+    if (skip_pos0_report) {
+        double d1 = dmax1 * std::exp(-lam1);   // d(0)·exp(−λ·1) = d at pos 1
+        return {d1, lam1};
+    }
+    return {dmax1, lam1};
 }
 
 struct OxBinAcc {
@@ -1089,10 +1147,21 @@ int damage_main(int argc, char** argv) {
                         dp.modern_fraction_d3 = static_cast<float>(
                             std::max(0.0, static_cast<double>(mod_h3[0]) / mod_n3[0] - bg3));
                     // Fitted profiles for both fractions
-                    auto [ad5, al5] = fit_exp_decay(anc_t5,  anc_tc5, NP, bg5);
-                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, bg3);
-                    auto [md5, ml5] = fit_exp_decay(mod_t5,  mod_tc5, NP, bg5);
-                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, bg3);
+                    double anc_bg5 = pool_interior_bg(anc_t5,  anc_tc5, NP, bg5);
+                    double anc_bg3 = pool_interior_bg(anc_h3,  anc_n3,  NP, bg3);
+                    double mod_bg5 = pool_interior_bg(mod_t5,  mod_tc5, NP, bg5);
+                    double mod_bg3 = pool_interior_bg(mod_h3,  mod_n3,  NP, bg3);
+                    auto has_artifact = [&dp](const char* r) {
+                        return std::find(dp.library_artifact_reasons.begin(),
+                                         dp.library_artifact_reasons.end(), r)
+                               != dp.library_artifact_reasons.end();
+                    };
+                    bool p0a5 = dp.position_0_artifact_5prime || has_artifact("position0_artifact_5prime");
+                    bool p0a3 = dp.position_0_artifact_3prime || has_artifact("position0_artifact_3prime");
+                    auto [ad5, al5] = fit_exp_decay(anc_t5,  anc_tc5, NP, anc_bg5, p0a5);
+                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, anc_bg3, p0a3);
+                    auto [md5, ml5] = fit_exp_decay(mod_t5,  mod_tc5, NP, mod_bg5, p0a5);
+                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, mod_bg3, p0a3);
                     dp.damaged_fraction_d5_fit  = static_cast<float>(ad5);
                     dp.damaged_fraction_lambda5 = static_cast<float>(al5);
                     dp.damaged_fraction_d3_fit  = static_cast<float>(ad3);
@@ -1101,6 +1170,32 @@ int damage_main(int argc, char** argv) {
                     dp.modern_fraction_lambda5  = static_cast<float>(ml5);
                     dp.modern_fraction_d3_fit   = static_cast<float>(md3);
                     dp.modern_fraction_lambda3  = static_cast<float>(ml3);
+                    // Leakage: modern 5'/3' fit matches ancient → hard-classified reads just
+                    // below LLR=0 carry the same C→T gradient. Only flag when ancient signal
+                    // is real (>0.01) to avoid noise-on-noise.
+                    constexpr float LEAKAGE_THRESH = 0.5f;
+                    constexpr float MIN_ANC_SIGNAL = 0.01f;
+                    dp.modern_fraction_leakage_5prime =
+                        dp.damaged_fraction_d5_fit > MIN_ANC_SIGNAL &&
+                        dp.modern_fraction_d5_fit >= LEAKAGE_THRESH * dp.damaged_fraction_d5_fit;
+                    dp.modern_fraction_leakage_3prime =
+                        dp.damaged_fraction_d3_fit > MIN_ANC_SIGNAL &&
+                        dp.modern_fraction_d3_fit >= LEAKAGE_THRESH * dp.damaged_fraction_d3_fit;
+                    // Per-position rates for HTML fraction curves
+                    for (int p = 0; p < NP; ++p) {
+                        if (anc_tc5[p] >= 10)
+                            dp.damaged_fraction_rate5[p] = static_cast<float>(
+                                static_cast<double>(anc_t5[p]) / anc_tc5[p]);
+                        if (anc_n3[p] >= 10)
+                            dp.damaged_fraction_rate3[p] = static_cast<float>(
+                                static_cast<double>(anc_h3[p]) / anc_n3[p]);
+                        if (mod_tc5[p] >= 10)
+                            dp.modern_fraction_rate5[p] = static_cast<float>(
+                                static_cast<double>(mod_t5[p]) / mod_tc5[p]);
+                        if (mod_n3[p] >= 10)
+                            dp.modern_fraction_rate3[p] = static_cast<float>(
+                                static_cast<double>(mod_h3[p]) / mod_n3[p]);
+                    }
                 }
             }
         }
@@ -1522,7 +1617,7 @@ int damage_main(int argc, char** argv) {
         auto jb = [](bool v) { return v ? "true" : "false"; };
 
         h << fqdup_dmghtml::HTML_PRE;
-        h << "const D = {\n";
+        h << "window.D = {\n";
         h << "  \"sample\": \"" << sample_name << "\",\n";
         h << "  \"n_reads\": " << reads_scanned << ",\n";
         h << "  \"library_type\": \"" << dp.library_type_str() << "\",\n";
@@ -1649,6 +1744,42 @@ int damage_main(int argc, char** argv) {
         h << "  ,\"anc_n\": "         << dp.damaged_fraction_n          << "\n";
         h << "  ,\"mod_d5\": "        << jv(dp.modern_fraction_d5)      << "\n";
         h << "  ,\"mod_d3\": "        << jv(dp.modern_fraction_d3)      << "\n";
+        // Per-position rates for fraction damage curves
+        h << "  ,\"anc_rate5\": [";
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.damaged_fraction_rate5[p]); }
+        h << "]\n";
+        h << "  ,\"anc_rate3\": [";
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.damaged_fraction_rate3[p]); }
+        h << "]\n";
+        h << "  ,\"anc_d5_fit\": "   << jv(dp.damaged_fraction_d5_fit)  << "\n";
+        h << "  ,\"anc_lam5\": "     << jv(dp.damaged_fraction_lambda5) << "\n";
+        h << "  ,\"anc_d3_fit\": "   << jv(dp.damaged_fraction_d3_fit)  << "\n";
+        h << "  ,\"anc_lam3\": "     << jv(dp.damaged_fraction_lambda3) << "\n";
+        h << "  ,\"mod_rate5\": [";
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.modern_fraction_rate5[p]); }
+        h << "]\n";
+        h << "  ,\"mod_rate3\": [";
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.modern_fraction_rate3[p]); }
+        h << "]\n";
+        h << "  ,\"mod_d5_fit\": "   << jv(dp.modern_fraction_d5_fit)   << "\n";
+        h << "  ,\"mod_lam5\": "     << jv(dp.modern_fraction_lambda5)  << "\n";
+        h << "  ,\"mod_d3_fit\": "   << jv(dp.modern_fraction_d3_fit)   << "\n";
+        h << "  ,\"mod_lam3\": "     << jv(dp.modern_fraction_lambda3)  << "\n";
+        h << "  ,\"mod_leakage_5\": " << jb(dp.modern_fraction_leakage_5prime) << "\n";
+        h << "  ,\"mod_leakage_3\": " << jb(dp.modern_fraction_leakage_3prime) << "\n";
+        // OLS amplitude (curve parameter) vs reported d(1) (summary statistic).
+        // When pos0_art5/3, d*_fit = d(1) = d_ols*exp(-lam); recover d_ols for rendering.
+        {
+            auto ols_amp = [](float dfit, float lam, bool art) -> float {
+                return (art && lam > 0.0f) ? dfit * std::exp(lam) : dfit;
+            };
+            bool a5 = dp.position_0_artifact_5prime;
+            bool a3 = dp.position_0_artifact_3prime;
+            h << "  ,\"anc_d5_ols\": " << jv(ols_amp(dp.damaged_fraction_d5_fit, dp.damaged_fraction_lambda5, a5)) << "\n";
+            h << "  ,\"anc_d3_ols\": " << jv(ols_amp(dp.damaged_fraction_d3_fit, dp.damaged_fraction_lambda3, a3)) << "\n";
+            h << "  ,\"mod_d5_ols\": " << jv(ols_amp(dp.modern_fraction_d5_fit,  dp.modern_fraction_lambda5,  a5)) << "\n";
+            h << "  ,\"mod_d3_ols\": " << jv(ols_amp(dp.modern_fraction_d3_fit,  dp.modern_fraction_lambda3,  a3)) << "\n";
+        }
         h << "  ,\"pres_score\": "    << jv(dp.preservation_score)    << "\n";
         h << "  ,\"pres_label\": \""  << pres_h.label                 << "\"\n";
         h << "  ,\"auth_eff\": "      << jv(pres_h.authenticity_eff)  << "\n";
