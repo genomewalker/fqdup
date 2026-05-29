@@ -460,13 +460,16 @@ return Plotly;
     ]));
     two.appendChild(left);
     var right=document.createElement('div');
-    if(D.top_hex&&D.top_hex.length){
-      right.innerHTML='<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px">Top enriched 5′ hexamers</div>';
+    function hexTable(arr,label){
+      if(!arr||!arr.length)return;
+      var hdr=document.createElement('div');hdr.style.cssText='font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px;margin-top:12px';hdr.textContent=label;right.appendChild(hdr);
       var htbl=document.createElement('table');htbl.className='hex-table';
       htbl.innerHTML='<tr><th>Hexamer</th><th>log₂ FC</th><th>Damage-consistent</th></tr>';
-      D.top_hex.forEach(function(h){var tr=document.createElement('tr');tr.innerHTML='<td>'+h.seq+'</td><td>'+jv(h.log2fc,2)+'</td><td>'+(h.dc?'✓':'✕')+'</td>';htbl.appendChild(tr);});
+      arr.forEach(function(h){var tr=document.createElement('tr');tr.innerHTML='<td>'+h.seq+'</td><td>'+jv(h.log2fc,2)+'</td><td>'+(h.dc?'✓':'✕')+'</td>';htbl.appendChild(tr);});
       right.appendChild(htbl);
     }
+    hexTable(D.top_hex,  "Top enriched 5′ hexamers");
+    hexTable(D.top_hex3, "Top enriched 3′ hexamers");
     two.appendChild(right);scoreBody.appendChild(two);
   })();
 
