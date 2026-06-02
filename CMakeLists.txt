@@ -85,7 +85,7 @@ FetchContent_MakeAvailable(librapidarchive)
 # finalize}_sample_profile and taph::SampleDamageProfile with d_max_combined,
 # all channels, GC bins. Library target: `taph`.
 # To pin against a local checkout during development, set FETCHCONTENT_SOURCE_DIR_LIBTAPH.
-set(FQDUP_MARCH "cascadelake" CACHE STRING "Value passed to -march= (override for CI/portability)")
+set(FQDUP_MARCH "native" CACHE STRING "Value passed to -march= (override for CI/portability)")
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
