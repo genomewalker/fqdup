@@ -1,2 +1,2 @@
 #pragma once
-#define FQDUP_VERSION "2.0.3"
+#define FQDUP_VERSION "2.1.0"
