@@ -24,7 +24,8 @@ set -euo pipefail
 
 FQDUP="${1:-/maps/projects/fernandezguerra/apps/repos/fqdup/build/fqdup}"
 GEN="${2:-/maps/projects/fernandezguerra/apps/repos/fqdup/build/gen_genome_frags}"
-TMPDIR_LOCAL="${TMPDIR:-/scratch/tmp}"
+TMPDIR_LOCAL=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_LOCAL"' EXIT
 GENOME_LEN=10000
 N_READS=2000     # ~11x coverage on 10kb genome for reads of mean length 55bp
 
