@@ -85,12 +85,14 @@ FetchContent_MakeAvailable(librapidarchive)
 # finalize}_sample_profile and taph::SampleDamageProfile with d_max_combined,
 # all channels, GC bins. Library target: `taph`.
 # To pin against a local checkout during development, set FETCHCONTENT_SOURCE_DIR_LIBTAPH.
+set(FQDUP_MARCH "cascadelake" CACHE STRING "Value passed to -march= (override for CI/portability)")
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
     GIT_TAG        main
     GIT_SHALLOW    FALSE
 )
+set(TAPH_MARCH "${FQDUP_MARCH}" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(libtaph)
 
 # BBHash (header-only MPHF — O(1) pass2 lookup for extend, ~3.7 bits/key)
@@ -138,7 +140,6 @@ target_link_libraries(fqdup PRIVATE
     taph
 )
 target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP HAVE_BBHASH)
-set(FQDUP_MARCH "cascadelake" CACHE STRING "Value passed to -march= (override for CI/portability)")
 target_compile_options(fqdup PRIVATE -O2 -march=${FQDUP_MARCH})
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
