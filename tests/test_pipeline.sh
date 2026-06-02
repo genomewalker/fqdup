@@ -69,8 +69,8 @@ TADPOLE=$(command -v tadpole.sh 2>/dev/null || \
              /maps/projects/fernandezguerra/apps/opt/conda/pkgs/bbmap-*/bin/tadpole.sh \
              2>/dev/null | head -1 || echo "")
 if [[ -z "$TADPOLE" ]]; then
-    echo "ERROR: tadpole.sh not found in PATH or conda pkgs" >&2
-    exit 1
+    echo "SKIP: tadpole.sh not found in PATH or conda pkgs" >&2
+    exit 0
 fi
 
 TMPDIR=$(mktemp -d)

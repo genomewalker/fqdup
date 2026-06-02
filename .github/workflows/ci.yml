@@ -24,8 +24,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/_deps
-          key: deps-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: deps-
+          key: deps-v2-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-v2-
 
       - name: Configure
         run: |
