@@ -138,7 +138,8 @@ target_link_libraries(fqdup PRIVATE
     taph
 )
 target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP HAVE_BBHASH)
-target_compile_options(fqdup PRIVATE -O2 -march=cascadelake)
+set(FQDUP_MARCH "cascadelake" CACHE STRING "Value passed to -march= (override for CI/portability)")
+target_compile_options(fqdup PRIVATE -O2 -march=${FQDUP_MARCH})
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
     target_include_directories(fqdup PRIVATE ${ISAL_INCLUDE_DIR})

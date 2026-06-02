@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.1.0] - 2026-06-02
+
+First tagged release since v2.0.2. Includes all v2.0.3 and v2.0.4 development
+(see those sections below), plus:
+
+### New subcommands
+
+- **`fqdup split`**: splits a deduplication output into damaged and undamaged
+  FASTQ streams using the `DamageSplitModel` posterior. Reads are routed to
+  `--out-damaged` / `--out-undamaged` based on their per-read ancient-fraction
+  LLR score. Handles both DS and SS libraries; zero-damage edge case fixed.
+
+### Performance
+
+- **`fqdup derep-pairs` threading and throughput**: added `-t N` for
+  multi-threaded decompression; enabled BGZF multi-threaded output in pass 2;
+  eliminated per-read heap allocations in the hot path. Reverted a single-pass
+  experiment back to two-pass+BGZF (3× faster on NFS).
+
+### Build
+
+- **libtaph tracked via `GIT_TAG main`**: fqdup now always builds against the
+  latest libtaph, eliminating manual pin bumps and stale-pin build failures.
+- **`-DFQDUP_MARCH=<arch>` CMake option**: the target architecture flag
+  (default `cascadelake`) is now configurable, enabling CI builds on standard
+  x86-64 runners (`-DFQDUP_MARCH=x86-64-v3`).
+
 ## [2.0.4] - 2026-05-29
 
 ### New features
