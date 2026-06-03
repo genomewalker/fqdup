@@ -1031,7 +1031,11 @@ int damage_main(int argc, char** argv) {
 
         // Fix E: merge per-thread LSD state into LsdPrebuilt for injection below.
         if (fuse_lsd) {
-            taph::LengthBinStats lsd_master;
+            // heap-allocate: LengthBinStats embeds ~2.6 MB of SampleDamageProfile
+            // arrays; declaring it as a local variable overflows constrained stacks
+            // (SSH sessions on HPC compute nodes).
+            auto lsd_master_ptr = std::make_unique<taph::LengthBinStats>();
+            auto& lsd_master = *lsd_master_ptr;
             lsd_master.forced_library_type = forced_lib;
             lsd_master.configure(lsd_fuse_edges);
             for (auto& os : ox_states) lsd_master.merge(os.lbs);
