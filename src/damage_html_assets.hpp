@@ -433,7 +433,7 @@ return Plotly;
     oxBody.appendChild(metricTable([
       ['s_GT',jv(D.s_gt,5)],['G→T asymmetry',jv(D.oxog_gt_asymmetry,4)],['G→T rate',jv(D.oxog_gt_rate,4)],
       ['OxoG trinuc cosine',jv(D.oxog_cosine,4)],['Dominant process',D.dom_process?D.dom_process.replace(/_/g,' '):'—'],
-      ['CpG contrast',jv(D.cpg_contrast,4)],['CpG z',jv(D.cpg_z,1)],
+      ['CpG z',jv(D.cpg_z,1)],
       ['Depurination',D.depur_detected?'detected':'not detected'],
       ['Depur. enrichment 5′',jv(D.depur_enrich5,5)],['Depur. enrichment 3′',jv(D.depur_enrich3,5)],
       ['Depur. z-score',jv(D.depur_z,1)]

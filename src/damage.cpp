@@ -1814,7 +1814,7 @@ int damage_main(int argc, char** argv) {
         h << "  ,\"ox_score\": "       << jv(dcp_h.oxidative_context_score)     << "\n";
         h << "  ,\"frag_score\": "     << jv(dcp_h.fragmentation_context_score) << "\n";
         h << "  ,\"art_score\": "      << jv(dcp_h.library_artifact_score)      << "\n";
-        h << "  ,\"cpg_contrast\": "   << jv(dp.cpg_contrast)                   << "\n";
+
         h << "  ,\"cpg_z\": "          << jv(cpg_score_z)                       << "\n";
 
         // ── Depurination ──────────────────────────────────────────────────────
