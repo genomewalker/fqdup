@@ -999,7 +999,6 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         lb.lambda_3prime = pr.lambda_3prime;
         lb.bg_5prime     = pr.fit_baseline_5prime;
         lb.bg_3prime     = pr.fit_baseline_3prime;
-        lb.cpg_contrast  = pr.cpg_contrast;
         lb.validated     = pr.damage_validated;
         lb.source        = pr.d_max_source_str();
         bool bin_is_ss = (pr.library_type ==
