@@ -1036,6 +1036,10 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
             const auto& gb = pr.gc_bins[g];
             lb.gc_d_max[g]     = gb.valid ? gb.d_max : -1.0;
             lb.gc_n_reads[g]   = static_cast<int64_t>(gb.n_reads);
+            // C1: gc_p_damaged is a probability in [0,1]; -1.0 is the
+            // "no-coverage / not-computed" sentinel for an invalid bin and is
+            // emitted as JSON null by profile_json.cpp (guarded `< 0.0`). A
+            // genuine P(damaged)=0 stays numeric and is preserved.
             lb.gc_p_damaged[g] = gb.valid ? gb.p_damaged : -1.0;
             for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
                 uint64_t t = gb.t_counts[p], c = gb.c_counts[p];

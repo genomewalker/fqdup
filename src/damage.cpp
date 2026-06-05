@@ -357,7 +357,11 @@ static std::pair<double,double> fit_exp_decay(
 
     // pass 1: unweighted
     auto [dmax0, lam0] = ols(nullptr);
-    if (dmax0 == 0.0) return {0.0, 0.0};
+    // C1: a failed fit is reported as NaN (not 0.0) so a genuine zero-decay fit is
+    // distinguishable from "fit did not converge"; the emitter nulls NaN.
+    if (dmax0 == 0.0)
+        return {std::numeric_limits<double>::quiet_NaN(),
+                std::numeric_limits<double>::quiet_NaN()};
 
     // ── pass 2: IRLS — reweight by fitted excess² ────────────────────────────
     double w2[FIT_END - FIT_START] = {};
@@ -370,7 +374,9 @@ static std::pair<double,double> fit_exp_decay(
         w2[p - FIT_START] = (exc_fit * exc_fit) * tc[p] / var_rate;
     }
     auto [dmax1, lam1] = ols(w2);
-    if (dmax1 == 0.0) return {0.0, 0.0};
+    if (dmax1 == 0.0)
+        return {std::numeric_limits<double>::quiet_NaN(),
+                std::numeric_limits<double>::quiet_NaN()};
 
     // ── reporting: for SS libraries return d(1) not extrapolated d(0) ────────
     if (skip_pos0_report) {
@@ -503,6 +509,7 @@ static void print_usage(const char* prog) {
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
+        << "  --count-table-json FILE    Write Layer-0 stop-channel count tables as JSONL (golden-gate source of truth)\n"
         << "  --html FILE                Write interactive damage report as self-contained HTML\n"
         << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
@@ -551,6 +558,7 @@ int damage_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    std::string count_table_path;
     std::string html_path;
     bool        run_oxog      = true;
     LengthBinOptions lb_opts = []{ bool ok; return parse_length_bins("auto", ok); }();
@@ -585,6 +593,8 @@ int damage_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--count-table-json" && i + 1 < argc) {
+            count_table_path = argv[++i];
         } else if (arg == "--html" && i + 1 < argc) {
             html_path = argv[++i];
         } else if (arg == "--no-oxog") {
@@ -1111,20 +1121,14 @@ int damage_main(int argc, char** argv) {
                     }
                 }
                 if (hard_n_tot >= 10000 && sw_sum >= 10.0) {
-                    dp.damaged_fraction_pi    = static_cast<float>(sw_sum / hard_n_tot);
                     dp.damaged_fraction_n     = hard_n_damaged;
                     dp.damaged_fraction_valid = true;
-                    const double pi_est = dp.damaged_fraction_pi;
-                    // bulk_d_max = π × d_anc  (mixture identity), so
-                    // d_anc = bulk_d_max / π.  This is robust to adapter
-                    // artifacts (bulk_d_max already accounts for masked positions)
-                    // and works for both DS and SS library conventions.
-                    if (pi_est > 0.0) {
-                        dp.damaged_fraction_d5 = static_cast<float>(
-                            std::clamp(static_cast<double>(dp.d_max_5prime) / pi_est, 0.0, 1.0));
-                        dp.damaged_fraction_d3 = static_cast<float>(
-                            std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
-                    }
+                    // π (endogenous fraction) and the identity-based ancient d_max are
+                    // computed AFTER the OLS fit below (see "endogenous fraction π" block).
+                    // The old sw_sum/hard_n_tot estimate railed to ~1 on heavily-damaged
+                    // libraries: its soft prior log-odds = log(bulk_d_max / d_anc), and d_anc
+                    // (the bulk mixture's damaged d_max) collapses toward bulk_d_max there,
+                    // saturating every posterior so mean(post) ≈ 1.
                     // Independent per-fraction deamination profiles (all N_POS positions).
                     const double bg5 = lsd_cls_params.bg_5;
                     const double bg3 = lsd_cls_params.bg_3;
@@ -1144,12 +1148,16 @@ int damage_main(int argc, char** argv) {
                         }
                     }
                     // Pos-0 peak estimate for modern (matches previous behaviour)
-                    if (mod_tc5[0] >= 50)
+                    if (mod_tc5[0] >= 50) {
                         dp.modern_fraction_d5 = static_cast<float>(
                             std::max(0.0, static_cast<double>(mod_t5[0]) / mod_tc5[0] - bg5));
-                    if (mod_n3[0] >= 50)
+                        dp.modern_fraction_d5_computed = true;
+                    }
+                    if (mod_n3[0] >= 50) {
                         dp.modern_fraction_d3 = static_cast<float>(
                             std::max(0.0, static_cast<double>(mod_h3[0]) / mod_n3[0] - bg3));
+                        dp.modern_fraction_d3_computed = true;
+                    }
                     // Fitted profiles for both fractions
                     double anc_bg5 = pool_interior_bg(anc_t5,  anc_tc5, NP, bg5);
                     double anc_bg3 = pool_interior_bg(anc_h3,  anc_n3,  NP, bg3);
@@ -1183,6 +1191,30 @@ int damage_main(int argc, char** argv) {
                     dp.modern_fraction_lambda5  = static_cast<float>(ml5);
                     dp.modern_fraction_d3_fit   = static_cast<float>(md3);
                     dp.modern_fraction_lambda3  = static_cast<float>(ml3);
+                    // ── endogenous fraction π (breaks the circular soft prior) ──────────
+                    // Estimate π from the mixture identity using the OLS fit on hard-
+                    // classified ancient reads (damaged_fraction_d5_fit = d_anc), which is
+                    // independent of the railing prior. This makes the identity-based ancient
+                    // d_max self-consistent with the fit (metaDMG-validated). Fall back to the
+                    // prior-free hard fraction when the fit is unusable (NaN / not > bulk).
+                    {
+                        const double d_bulk5   = dp.d_max_5prime;
+                        const double d_anc_fit = dp.damaged_fraction_d5_fit;
+                        const double hard_frac = static_cast<double>(hard_n_damaged) / hard_n_tot;
+                        double pi_est;
+                        if (std::isfinite(d_anc_fit) && d_anc_fit > 0.02 &&
+                            d_anc_fit >= d_bulk5 && d_bulk5 > 0.005)
+                            pi_est = std::clamp(d_bulk5 / d_anc_fit, 0.01, 1.0);
+                        else
+                            pi_est = std::clamp(hard_frac, 0.0, 1.0);
+                        dp.damaged_fraction_pi = static_cast<float>(pi_est);
+                        if (pi_est > 0.0) {
+                            dp.damaged_fraction_d5 = static_cast<float>(
+                                std::clamp(static_cast<double>(dp.d_max_5prime) / pi_est, 0.0, 1.0));
+                            dp.damaged_fraction_d3 = static_cast<float>(
+                                std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
+                        }
+                    }
                     // Leakage: modern 5'/3' fit matches ancient → hard-classified reads just
                     // below LLR=0 carry the same C→T gradient. Only flag when ancient signal
                     // is real (>0.01) to avoid noise-on-noise.
@@ -1194,6 +1226,11 @@ int damage_main(int argc, char** argv) {
                     dp.modern_fraction_leakage_3prime =
                         dp.damaged_fraction_d3_fit > MIN_ANC_SIGNAL &&
                         dp.modern_fraction_d3_fit >= LEAKAGE_THRESH * dp.damaged_fraction_d3_fit;
+                    // C3 validity-contract: a fraction whose "modern" reads carry the same
+                    // C→T gradient as the ancient reads is a failed separation, not a
+                    // certified ancient fraction. Do not certify valid under leakage.
+                    if (dp.modern_fraction_leakage_5prime || dp.modern_fraction_leakage_3prime)
+                        dp.damaged_fraction_valid = false;
                     // Per-position rates for HTML fraction curves
                     for (int p = 0; p < NP; ++p) {
                         if (anc_tc5[p] >= 10)
@@ -1578,6 +1615,16 @@ int damage_main(int argc, char** argv) {
         std::cout << "JSON written: " << json_path << "\n";
     }
 
+    if (!count_table_path.empty()) {
+        std::ofstream ct(count_table_path);
+        if (!ct) {
+            std::cerr << "Error: cannot write count-table JSONL: " << count_table_path << "\n";
+            return 1;
+        }
+        taph::count_tables_to_jsonl(dp, ct);
+        std::cout << "Count-table JSONL written: " << count_table_path << "\n";
+    }
+
     if (!html_path.empty()) {
         std::ofstream h(html_path);
         if (!h) {
@@ -1750,9 +1797,19 @@ int damage_main(int argc, char** argv) {
         }
 
         // ── Preservation ─────────────────────────────────────────────────────
+        // C1: anc_d5/anc_d3 use the mixture identity d_anc = bulk_d_max / pi.
+        // When pi < 0.1 this ratio amplifies noise in d_max, so the value is not
+        // trustworthy — emit null and flag the regime. The OLS-fitted anc_d*_fit
+        // fields (emitted below) are the reliable source in that case.
+        const bool frac_too_low_for_identity =
+            dp.damaged_fraction_valid && dp.damaged_fraction_pi < 0.1f;
         h << "  ,\"anc_valid\": "      << jb(dp.damaged_fraction_valid)  << "\n";
-        h << "  ,\"anc_d5\": "        << jv(dp.damaged_fraction_d5)     << "\n";
-        h << "  ,\"anc_d3\": "        << jv(dp.damaged_fraction_d3)     << "\n";
+        h << "  ,\"fraction_too_low_for_identity_estimate\": "
+          << jb(frac_too_low_for_identity) << "\n";
+        h << "  ,\"anc_d5_method\": \"mixture_identity\"\n";
+        h << "  ,\"anc_d3_method\": \"mixture_identity\"\n";
+        h << "  ,\"anc_d5\": "        << (frac_too_low_for_identity ? "null" : jv(dp.damaged_fraction_d5)) << "\n";
+        h << "  ,\"anc_d3\": "        << (frac_too_low_for_identity ? "null" : jv(dp.damaged_fraction_d3)) << "\n";
         h << "  ,\"anc_pi\": "        << jv(dp.damaged_fraction_pi)     << "\n";
         h << "  ,\"anc_n\": "         << dp.damaged_fraction_n          << "\n";
         h << "  ,\"mod_d5\": "        << jv(dp.modern_fraction_d5)      << "\n";
@@ -1764,6 +1821,10 @@ int damage_main(int argc, char** argv) {
         h << "  ,\"anc_rate3\": [";
         for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.damaged_fraction_rate3[p]); }
         h << "]\n";
+        // anc_d*_fit come from the OLS exponential fit (independent of the mixture
+        // identity used for anc_d5/anc_d3); label the source so consumers can choose.
+        h << "  ,\"anc_d5_fit_method\": \"ols_fit\"\n";
+        h << "  ,\"anc_d3_fit_method\": \"ols_fit\"\n";
         h << "  ,\"anc_d5_fit\": "   << jv(dp.damaged_fraction_d5_fit)  << "\n";
         h << "  ,\"anc_lam5\": "     << jv(dp.damaged_fraction_lambda5) << "\n";
         h << "  ,\"anc_d3_fit\": "   << jv(dp.damaged_fraction_d3_fit)  << "\n";
