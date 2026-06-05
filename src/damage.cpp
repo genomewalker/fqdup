@@ -884,7 +884,7 @@ int damage_main(int argc, char** argv) {
     bulk_dp.ss_mode              = is_ss;
     bulk_dp.mixture_d_damaged    = dp.mixture_d_ancient;
     bulk_dp.mixture_pi_damaged   = dp.mixture_pi_ancient;
-    bulk_dp.mixture_d_reference  = dp.mixture_d_reference;
+    bulk_dp.mixture_d_population_highgc = dp.mixture_d_population_highgc;
     bulk_dp.mixture_n_components = dp.mixture_n_components;
     bulk_dp.mixture_converged    = dp.mixture_converged;
     bulk_dp.mixture_identifiable = dp.mixture_identifiable;

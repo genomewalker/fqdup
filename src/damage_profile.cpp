@@ -163,7 +163,7 @@ static DamageProfile estimate_damage_impl(
     profile.bg_3_channel   = deam_profile.fit_baseline_3prime;
     profile.mixture_d_damaged = deam_profile.mixture_d_ancient;
     profile.mixture_pi_damaged = deam_profile.mixture_pi_ancient;
-    profile.mixture_d_reference = deam_profile.mixture_d_reference;
+    profile.mixture_d_population_highgc = deam_profile.mixture_d_population_highgc;
     profile.mixture_K = deam_profile.mixture_K;
     profile.mixture_n_components = deam_profile.mixture_n_components;
     profile.mixture_converged = deam_profile.mixture_converged;
@@ -1026,7 +1026,7 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
             lb.per_pos_3prime[p] = v3;
         }
         lb.mixture_d_damaged    = pr.mixture_d_ancient;
-        lb.mixture_d_reference  = pr.mixture_d_reference;
+        lb.mixture_d_population_highgc = pr.mixture_d_population_highgc;
         lb.mixture_d_population = pr.mixture_d_population;
         lb.mixture_pi_damaged   = pr.mixture_pi_ancient;
         lb.mixture_n_components = pr.mixture_n_components;
@@ -1037,6 +1037,10 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
             lb.gc_d_max[g]     = gb.valid ? gb.d_max : -1.0;
             lb.gc_n_reads[g]   = static_cast<int64_t>(gb.n_reads);
             lb.gc_p_damaged[g] = gb.valid ? gb.p_damaged : -1.0;
+            for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
+                uint64_t t = gb.t_counts[p], c = gb.c_counts[p];
+                lb.gc_per_pos_ct[g][p] = (t + c >= 100) ? static_cast<double>(t) / (t + c) : -1.0;
+            }
         }
         for (int i = 0; i < 64; ++i) {
             lb.tri_5prime_terminal[i] = static_cast<int64_t>(pr.tri_5prime_terminal[i]);
