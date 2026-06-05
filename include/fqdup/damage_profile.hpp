@@ -69,7 +69,7 @@ struct DamageProfile {
     double pcr_error_rate = 0.0;
     double mixture_d_damaged = 0.0;
     double mixture_pi_damaged = 0.0;
-    double mixture_d_reference = 0.0;
+    double mixture_d_population_highgc = 0.0;
     int    mixture_K = 0;
     int    mixture_n_components = 0;
     bool   mixture_converged = false;
