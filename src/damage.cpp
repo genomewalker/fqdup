@@ -17,6 +17,8 @@
 #include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
 #include "taph/profile_json.hpp"
+#include "taph/ancient_fraction.hpp"
+#include "taph/llr_table.hpp"
 #include "fqdup/version.hpp"
 
 #include <sstream>
@@ -239,152 +241,7 @@ static float per_read_damaged_weight(
 }
 
 static constexpr int N_GC = taph::SampleDamageProfile::N_GC_BINS;
-
-// Pre-computed per-GC-bin LLR table: replaces exp+2×log+2×clamp inside the
-// oxoG worker inner loop. Populated once after pass-1 dp is finalized.
-struct LLRTable {
-    float addT[15];   // log(pd/bg)          at each position
-    float addC[15];   // log((1-pd)/(1-bg))  at each position
-    int   max_pos;    // first p where excess < 0.01 (loop break)
-    float logit_pi;
-};
-
-static void build_llr_tables(LLRTable* tables, const taph::SampleDamageProfile& dp) {
-    for (int b = 0; b < N_GC; ++b) {
-        auto& t = tables[b];
-        const auto& gc = dp.gc_bins[b];
-        float bg   = (gc.valid && gc.baseline_tc > 0.0f) ? gc.baseline_tc : dp.fit_baseline_5prime;
-        float dmax = (gc.valid && gc.d_max > 0.005f)     ? gc.d_max       : dp.d_max_5prime;
-        float lam  = dp.lambda_5prime;
-        float pi   = (gc.valid && gc.p_damaged > 0.0f)   ? gc.p_damaged   : dp.pi_damaged;
-        pi = std::clamp(pi, 0.001f, 0.999f);
-        t.logit_pi = std::log(pi / (1.0f - pi));
-        t.max_pos  = 0;
-        for (int p = 0; p < 15; ++p) {
-            float excess = dmax * std::exp(-lam * static_cast<float>(p));
-            if (excess < 0.01f) { t.max_pos = p; break; }
-            float pd = std::clamp(bg + (1.0f - bg) * excess, 1e-6f, 1.0f - 1e-6f);
-            t.addT[p] = std::log(pd / bg);
-            t.addC[p] = std::log((1.0f - pd) / (1.0f - bg));
-            t.max_pos  = p + 1;
-        }
-    }
-}
-
-// Forward scoring: T/C at positions 0..max_pos-1 via table lookup.
-static float weight_from_table(const std::string& seq, const LLRTable& t) {
-    int mp = std::min(t.max_pos, static_cast<int>(seq.size()));
-    float llr = 0.0f;
-    for (int p = 0; p < mp; ++p) {
-        char b = static_cast<char>(seq[p] & ~0x20u);
-        if      (b == 'T') llr += t.addT[p];
-        else if (b == 'C') llr += t.addC[p];
-    }
-    return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
-}
-
-// Reverse-complement scoring without allocating an rc string.
-// RC position p = complement(seq[L-1-p]): A→T, G→C.
-static float weight_rev_from_table(const std::string& seq, const LLRTable& t) {
-    int L  = static_cast<int>(seq.size());
-    int mp = std::min(t.max_pos, L);
-    float llr = 0.0f;
-    for (int p = 0; p < mp; ++p) {
-        char b = static_cast<char>(seq[L - 1 - p] & ~0x20u);
-        if      (b == 'A') llr += t.addT[p];   // A in original → T in RC
-        else if (b == 'G') llr += t.addC[p];   // G in original → C in RC
-    }
-    return 1.0f / (1.0f + std::exp(-(t.logit_pi + llr)));
-}
-
-// Estimate interior background rate from positions [start_pos, n_pos).
-// Returns bg if fewer than 2 covered positions found.
-static double pool_interior_bg(const int64_t* t, const int64_t* tc,
-                                int n_pos, double fallback_bg,
-                                int start_pos = 8)
-{
-    constexpr int64_t MIN_COV = 50;
-    double sum = 0.0; int cnt = 0;
-    for (int p = start_pos; p < n_pos; ++p) {
-        if (tc[p] < MIN_COV) continue;
-        sum += static_cast<double>(t[p]) / tc[p];
-        ++cnt;
-    }
-    return cnt >= 2 ? sum / cnt : fallback_bg;
-}
-
-// Fits excess(p) = d_max·exp(−λp) where excess = T/TC(p) − bg.
-// Uses WLS with one IRLS step (weights ∝ fitted_excess²·tc/(rate·(1−rate))).
-// Fits only positions p=1..6 (pos 0 always skipped: adapter artifact).
-// skip_pos0_report: when true, return d(1)=d_max·exp(−λ) as peak instead of
-//   extrapolated d(0). Use for SS/blunted libraries.
-static std::pair<double,double> fit_exp_decay(
-    const int64_t* t, const int64_t* tc, int n_pos, double bg,
-    bool skip_pos0_report = false)
-{
-    constexpr int64_t MIN_FIT_COV = 50;
-    constexpr int FIT_START = 1;   // skip pos 0 always
-    constexpr int FIT_END   = 7;   // fit positions 1..6 (exclusive end)
-
-    // ── pass 1: unweighted OLS for initial slope/intercept ──────────────────
-    auto ols = [&](const double* w) -> std::pair<double,double> {
-        double sx=0,sy=0,sxx=0,sxy=0,sw=0;
-        for (int p = FIT_START; p < FIT_END && p < n_pos; ++p) {
-            if (tc[p] < MIN_FIT_COV) continue;
-            double rate = static_cast<double>(t[p]) / tc[p];
-            double excess = rate - bg;
-            double se2 = rate * (1.0 - rate) / tc[p];
-            if (se2 <= 0.0) continue;
-            if (excess <= 2.0 * std::sqrt(se2)) continue; // 2-SE floor
-            double logy = std::log(excess);
-            double wi = (w ? w[p - FIT_START] : 1.0);
-            sx  += wi * p;
-            sy  += wi * logy;
-            sxx += wi * p * p;
-            sxy += wi * p * logy;
-            sw  += wi;
-        }
-        if (sw <= 0.0) return {0.0, 0.0};
-        double denom = sw * sxx - sx * sx;
-        if (denom <= 0.0) return {0.0, 0.0};
-        double slope     = (sw * sxy - sx * sy) / denom;
-        double intercept = (sy - slope * sx) / sw;
-        double lam  = -slope;
-        double dmax = std::exp(intercept);
-        if (lam < 0.0 || dmax <= 0.0 || dmax > 1.0) return {0.0, 0.0};
-        return {dmax, lam};
-    };
-
-    // pass 1: unweighted
-    auto [dmax0, lam0] = ols(nullptr);
-    // C1: a failed fit is reported as NaN (not 0.0) so a genuine zero-decay fit is
-    // distinguishable from "fit did not converge"; the emitter nulls NaN.
-    if (dmax0 == 0.0)
-        return {std::numeric_limits<double>::quiet_NaN(),
-                std::numeric_limits<double>::quiet_NaN()};
-
-    // ── pass 2: IRLS — reweight by fitted excess² ────────────────────────────
-    double w2[FIT_END - FIT_START] = {};
-    for (int p = FIT_START; p < FIT_END && p < n_pos; ++p) {
-        if (tc[p] < MIN_FIT_COV) { w2[p - FIT_START] = 0.0; continue; }
-        double rate = static_cast<double>(t[p]) / tc[p];
-        double exc_fit = dmax0 * std::exp(-lam0 * p);  // fitted excess (unbiased)
-        double var_rate = rate * (1.0 - rate) / tc[p];
-        if (var_rate <= 0.0 || exc_fit <= 0.0) { w2[p - FIT_START] = 0.0; continue; }
-        w2[p - FIT_START] = (exc_fit * exc_fit) * tc[p] / var_rate;
-    }
-    auto [dmax1, lam1] = ols(w2);
-    if (dmax1 == 0.0)
-        return {std::numeric_limits<double>::quiet_NaN(),
-                std::numeric_limits<double>::quiet_NaN()};
-
-    // ── reporting: for SS libraries return d(1) not extrapolated d(0) ────────
-    if (skip_pos0_report) {
-        double d1 = dmax1 * std::exp(-lam1);   // d(0)·exp(−λ·1) = d at pos 1
-        return {d1, lam1};
-    }
-    return {dmax1, lam1};
-}
+using LLRTable = taph::LLRTable;
 
 struct OxBinAcc {
     double A = 0, B = 0, C = 0, D = 0;           // first moments
@@ -429,10 +286,10 @@ static void oxog_worker(WorkQueue& queue,
             double q;
             bool rev = false;
             if (is_ss) {
-                q = weight_from_table(seq, t);
+                q = taph::llr_table_weight_fwd(seq.data(), static_cast<int>(seq.size()), t);
             } else {
-                float w_fwd = weight_from_table(seq, t);
-                float w_rev = weight_rev_from_table(seq, t);
+                float w_fwd = taph::llr_table_weight_fwd(seq.data(), static_cast<int>(seq.size()), t);
+                float w_rev = taph::llr_table_weight_rev(seq.data(), static_cast<int>(seq.size()), t);
                 if (w_rev > w_fwd) { rev = true; q = w_rev; }
                 else               {              q = w_fwd; }
             }
@@ -934,7 +791,7 @@ int damage_main(int argc, char** argv) {
 
     if (run_oxog && dp.d_max_5prime > 0.01f) {
         LLRTable llr_tables[N_GC];
-        build_llr_tables(llr_tables, dp);
+        taph::llr_table_build(llr_tables, N_GC, dp);
         WorkQueue queue2(2 * n_threads);
         const int n_lsd_bins = fuse_lsd
             ? 1 + static_cast<int>(lsd_fuse_edges.size()) : 0;
@@ -1096,157 +953,42 @@ int damage_main(int argc, char** argv) {
             lsd_prebuilt.llr_bins     = std::move(merged_llr);
             lsd_prebuilt_ready        = true;
 
-            // Compute ancient-fraction d_max using posterior-weighted (soft-EM)
-            // accumulation. sw_* fields hold pos-0 counts weighted by
-            // P(ancient|read,π) where π is estimated from bulk d_max/d_anc,
-            // avoiding the selection-on-outcome bias of hard LLR>0 calls.
-            // Hard-call counts (n_damaged/n_undamaged) are preserved for
-            // informational use (n_reads in JSON).
+            // Ancient-fraction decomposition delegated to libtaph.
             {
-                int64_t hard_n_damaged = 0, hard_n_tot = 0;
-                double sw_sum = 0.0;
-                double sw_t5[LsdLlrBinAccum::N_SOFT_POS]  = {};
-                double sw_tc5[LsdLlrBinAccum::N_SOFT_POS] = {};
-                double sw_h3[LsdLlrBinAccum::N_SOFT_POS]  = {};
-                double sw_n3[LsdLlrBinAccum::N_SOFT_POS]  = {};
-                for (const auto& bin : lsd_prebuilt.llr_bins) {
-                    hard_n_damaged += bin.n_damaged;
-                    hard_n_tot     += bin.n_damaged + bin.n_undamaged;
-                    sw_sum         += bin.sw_sum;
-                    for (int sp = 0; sp < LsdLlrBinAccum::N_SOFT_POS; ++sp) {
-                        sw_t5[sp]  += bin.sw_t5_anc[sp];
-                        sw_tc5[sp] += bin.sw_tc5_anc[sp];
-                        sw_h3[sp]  += bin.sw_h3_anc[sp];
-                        sw_n3[sp]  += bin.sw_n3_anc[sp];
+                std::vector<taph::AncientFractionBins> af_bins;
+                af_bins.reserve(lsd_prebuilt.llr_bins.size());
+                for (const auto& b : lsd_prebuilt.llr_bins) {
+                    taph::AncientFractionBins ab{};
+                    ab.n_damaged   = b.n_damaged;
+                    ab.n_undamaged = b.n_undamaged;
+                    ab.sw_sum      = b.sw_sum;
+                    for (int i = 0; i < taph::TAPH_FRAC_N_SOFT_POS; ++i) {
+                        ab.sw_t5_anc[i]  = b.sw_t5_anc[i];
+                        ab.sw_tc5_anc[i] = b.sw_tc5_anc[i];
+                        ab.sw_h3_anc[i]  = b.sw_h3_anc[i];
+                        ab.sw_n3_anc[i]  = b.sw_n3_anc[i];
                     }
+                    for (int p = 0; p < taph::TAPH_FRAC_N_POS; ++p) {
+                        ab.t_5_anc[p]  = b.t_5_anc[p];
+                        ab.tc_5_anc[p] = b.tc_5_anc[p];
+                        ab.h_3_anc[p]  = b.h_3_anc[p];
+                        ab.n_3_anc[p]  = b.n_3_anc[p];
+                        ab.t_5_mod[p]  = b.t_5_mod[p];
+                        ab.tc_5_mod[p] = b.tc_5_mod[p];
+                        ab.h_3_mod[p]  = b.h_3_mod[p];
+                        ab.n_3_mod[p]  = b.n_3_mod[p];
+                    }
+                    af_bins.push_back(ab);
                 }
-                if (hard_n_tot >= 10000 && sw_sum >= 10.0) {
-                    dp.damaged_fraction_n     = hard_n_damaged;
-                    dp.damaged_fraction_valid = true;
-                    // π (endogenous fraction) and the identity-based ancient d_max are
-                    // computed AFTER the OLS fit below (see "endogenous fraction π" block).
-                    // The old sw_sum/hard_n_tot estimate railed to ~1 on heavily-damaged
-                    // libraries: its soft prior log-odds = log(bulk_d_max / d_anc), and d_anc
-                    // (the bulk mixture's damaged d_max) collapses toward bulk_d_max there,
-                    // saturating every posterior so mean(post) ≈ 1.
-                    // Independent per-fraction deamination profiles (all N_POS positions).
-                    const double bg5 = lsd_cls_params.bg_5;
-                    const double bg3 = lsd_cls_params.bg_3;
-                    constexpr int NP = LengthBinDamageProfile::N_POS;
-                    int64_t anc_t5[NP]={}, anc_tc5[NP]={}, anc_h3[NP]={}, anc_n3[NP]={};
-                    int64_t mod_t5[NP]={}, mod_tc5[NP]={}, mod_h3[NP]={}, mod_n3[NP]={};
-                    for (const auto& bin : lsd_prebuilt.llr_bins) {
-                        for (int p = 0; p < NP; ++p) {
-                            anc_t5[p]  += bin.t_5_anc[p];
-                            anc_tc5[p] += bin.tc_5_anc[p];
-                            anc_h3[p]  += bin.h_3_anc[p];
-                            anc_n3[p]  += bin.n_3_anc[p];
-                            mod_t5[p]  += bin.t_5_mod[p];
-                            mod_tc5[p] += bin.tc_5_mod[p];
-                            mod_h3[p]  += bin.h_3_mod[p];
-                            mod_n3[p]  += bin.n_3_mod[p];
-                        }
-                    }
-                    // Pos-0 peak estimate for modern (matches previous behaviour)
-                    if (mod_tc5[0] >= 50) {
-                        dp.modern_fraction_d5 = static_cast<float>(
-                            std::max(0.0, static_cast<double>(mod_t5[0]) / mod_tc5[0] - bg5));
-                        dp.modern_fraction_d5_computed = true;
-                    }
-                    if (mod_n3[0] >= 50) {
-                        dp.modern_fraction_d3 = static_cast<float>(
-                            std::max(0.0, static_cast<double>(mod_h3[0]) / mod_n3[0] - bg3));
-                        dp.modern_fraction_d3_computed = true;
-                    }
-                    // Fitted profiles for both fractions
-                    double anc_bg5 = pool_interior_bg(anc_t5,  anc_tc5, NP, bg5);
-                    double anc_bg3 = pool_interior_bg(anc_h3,  anc_n3,  NP, bg3);
-                    double mod_bg5 = pool_interior_bg(mod_t5,  mod_tc5, NP, bg5);
-                    double mod_bg3 = pool_interior_bg(mod_h3,  mod_n3,  NP, bg3);
-                    auto has_artifact = [&dp](const char* r) {
-                        return std::find(dp.library_artifact_reasons.begin(),
-                                         dp.library_artifact_reasons.end(), r)
-                               != dp.library_artifact_reasons.end();
-                    };
-                    bool p0a5 = dp.position_0_artifact_5prime || has_artifact("position0_artifact_5prime");
-                    bool bulk_p0a3 = dp.position_0_artifact_3prime || has_artifact("position0_artifact_3prime");
-                    // For fraction 3' fit, only skip pos0 if the fraction data itself shows
-                    // depletion at pos0 — the bulk artifact flag fires on modern-read adapter
-                    // blunting, but the ancient fraction may have genuine peak signal at pos0.
-                    auto frac_p0a3 = [&](const int64_t* h, const int64_t* n, double frac_bg) -> bool {
-                        if (!bulk_p0a3) return false;
-                        if (n[0] < 10) return bulk_p0a3;
-                        double rate0 = static_cast<double>(h[0]) / n[0];
-                        return rate0 < frac_bg;  // only skip if actually depleted in this fraction
-                    };
-                    auto [ad5, al5] = fit_exp_decay(anc_t5,  anc_tc5, NP, anc_bg5, p0a5);
-                    auto [ad3, al3] = fit_exp_decay(anc_h3,  anc_n3,  NP, anc_bg3, frac_p0a3(anc_h3, anc_n3, anc_bg3));
-                    auto [md5, ml5] = fit_exp_decay(mod_t5,  mod_tc5, NP, mod_bg5, p0a5);
-                    auto [md3, ml3] = fit_exp_decay(mod_h3,  mod_n3,  NP, mod_bg3, frac_p0a3(mod_h3, mod_n3, mod_bg3));
-                    dp.damaged_fraction_d5_fit  = static_cast<float>(ad5);
-                    dp.damaged_fraction_lambda5 = static_cast<float>(al5);
-                    dp.damaged_fraction_d3_fit  = static_cast<float>(ad3);
-                    dp.damaged_fraction_lambda3 = static_cast<float>(al3);
-                    dp.modern_fraction_d5_fit   = static_cast<float>(md5);
-                    dp.modern_fraction_lambda5  = static_cast<float>(ml5);
-                    dp.modern_fraction_d3_fit   = static_cast<float>(md3);
-                    dp.modern_fraction_lambda3  = static_cast<float>(ml3);
-                    // ── endogenous fraction π (breaks the circular soft prior) ──────────
-                    // Estimate π from the mixture identity using the OLS fit on hard-
-                    // classified ancient reads (damaged_fraction_d5_fit = d_anc), which is
-                    // independent of the railing prior. This makes the identity-based ancient
-                    // d_max self-consistent with the fit (metaDMG-validated). Fall back to the
-                    // prior-free hard fraction when the fit is unusable (NaN / not > bulk).
-                    {
-                        const double d_bulk5   = dp.d_max_5prime;
-                        const double d_anc_fit = dp.damaged_fraction_d5_fit;
-                        const double hard_frac = static_cast<double>(hard_n_damaged) / hard_n_tot;
-                        double pi_est;
-                        if (std::isfinite(d_anc_fit) && d_anc_fit > 0.02 &&
-                            d_anc_fit >= d_bulk5 && d_bulk5 > 0.005)
-                            pi_est = std::clamp(d_bulk5 / d_anc_fit, 0.01, 1.0);
-                        else
-                            pi_est = std::clamp(hard_frac, 0.0, 1.0);
-                        dp.damaged_fraction_pi = static_cast<float>(pi_est);
-                        if (pi_est > 0.0) {
-                            dp.damaged_fraction_d5 = static_cast<float>(
-                                std::clamp(static_cast<double>(dp.d_max_5prime) / pi_est, 0.0, 1.0));
-                            dp.damaged_fraction_d3 = static_cast<float>(
-                                std::clamp(static_cast<double>(dp.d_max_3prime) / pi_est, 0.0, 1.0));
-                        }
-                    }
-                    // Leakage: modern 5'/3' fit matches ancient → hard-classified reads just
-                    // below LLR=0 carry the same C→T gradient. Only flag when ancient signal
-                    // is real (>0.01) to avoid noise-on-noise.
-                    constexpr float LEAKAGE_THRESH = 0.5f;
-                    constexpr float MIN_ANC_SIGNAL = 0.01f;
-                    dp.modern_fraction_leakage_5prime =
-                        dp.damaged_fraction_d5_fit > MIN_ANC_SIGNAL &&
-                        dp.modern_fraction_d5_fit >= LEAKAGE_THRESH * dp.damaged_fraction_d5_fit;
-                    dp.modern_fraction_leakage_3prime =
-                        dp.damaged_fraction_d3_fit > MIN_ANC_SIGNAL &&
-                        dp.modern_fraction_d3_fit >= LEAKAGE_THRESH * dp.damaged_fraction_d3_fit;
-                    // C3 validity-contract: a fraction whose "modern" reads carry the same
-                    // C→T gradient as the ancient reads is a failed separation, not a
-                    // certified ancient fraction. Do not certify valid under leakage.
-                    if (dp.modern_fraction_leakage_5prime || dp.modern_fraction_leakage_3prime)
-                        dp.damaged_fraction_valid = false;
-                    // Per-position rates for HTML fraction curves
-                    for (int p = 0; p < NP; ++p) {
-                        if (anc_tc5[p] >= 10)
-                            dp.damaged_fraction_rate5[p] = static_cast<float>(
-                                static_cast<double>(anc_t5[p]) / anc_tc5[p]);
-                        if (anc_n3[p] >= 10)
-                            dp.damaged_fraction_rate3[p] = static_cast<float>(
-                                static_cast<double>(anc_h3[p]) / anc_n3[p]);
-                        if (mod_tc5[p] >= 10)
-                            dp.modern_fraction_rate5[p] = static_cast<float>(
-                                static_cast<double>(mod_t5[p]) / mod_tc5[p]);
-                        if (mod_n3[p] >= 10)
-                            dp.modern_fraction_rate3[p] = static_cast<float>(
-                                static_cast<double>(mod_h3[p]) / mod_n3[p]);
-                    }
-                }
+                // Sort by n_damaged for deterministic float reduction across thread counts.
+                std::sort(af_bins.begin(), af_bins.end(),
+                          [](const auto& a, const auto& b){ return a.n_damaged < b.n_damaged; });
+                taph::compute_ancient_fraction(
+                    af_bins.data(), static_cast<int>(af_bins.size()),
+                    lsd_cls_params.bg_5, lsd_cls_params.bg_3,
+                    dp.position_0_artifact_5prime,
+                    dp.position_0_artifact_3prime,
+                    dp);
             }
         }
     }
