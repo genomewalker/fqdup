@@ -189,16 +189,24 @@ static int draw_length(PCG32& rng, int read_len, double len_sd, int min_len, int
 static std::string apply_damage(const std::string& seq,
                                 double dmax5, double lambda5,
                                 double dmax3, double lambda3,
+                                double cpg_factor,   // >1.0 enriches C→T at CpG (methylation damage)
                                 PCG32& rng) {
     std::string s = seq;
     int L = (int)s.size();
     for (int p = 0; p < std::min(15, L); ++p) {
-        double prob = dmax5 * std::exp(-lambda5 * p);
+        bool is_cpg = (p + 1 < L && s[p] == 'C' && s[p+1] == 'G');
+        double prob = dmax5 * std::exp(-lambda5 * p) * (is_cpg ? cpg_factor : 1.0);
+        if (prob > 1.0) prob = 1.0;
         if (s[p] == 'C' && rng.uniform() < prob) s[p] = 'T';
     }
     for (int p = 0; p < std::min(15, L); ++p) {
-        double prob = dmax3 * std::exp(-lambda3 * p);
-        if (s[L - 1 - p] == 'G' && rng.uniform() < prob) s[L - 1 - p] = 'A';
+        int i = L - 1 - p;
+        // CpG context for 3' G→A: damaged C is on the complementary strand opposite G;
+        // in read coordinates the G at position i is in CpG context if s[i-1]=='C'.
+        bool is_cpg_3 = (i >= 1 && s[i-1] == 'C' && s[i] == 'G');
+        double prob3 = dmax3 * std::exp(-lambda3 * p) * (is_cpg_3 ? cpg_factor : 1.0);
+        if (prob3 > 1.0) prob3 = 1.0;
+        if (s[i] == 'G' && rng.uniform() < prob3) s[i] = 'A';
     }
     return s;
 }
@@ -282,6 +290,43 @@ static std::string apply_oxidative(const std::string& seq,
     return s;
 }
 
+// Inject stop codons at both terminal and interior positions.
+// Needed to test libtaph's ox_is_artifact detector (stop-codon G→T channel).
+// Places TGA at positions 0-2 (terminal) AND L/3..L/3+2 (interior) so both
+// ox_stop_rate_terminal and ox_stop_rate_interior have non-zero denominators.
+// Apply --ox-rate-terminal for the terminal G→T and --ox-rate for the interior G→T.
+static std::string apply_stop_terminal(const std::string& seq, double prob, PCG32& rng) {
+    if (prob <= 0.0 || seq.size() < 9 || rng.uniform() >= prob) return seq;
+    std::string s = seq;
+    int L = (int)s.size();
+    // Two terminal TGA windows (p=0 and p=3) → doubles ox_stop_terminal numerator
+    s[0]='T'; s[1]='G'; s[2]='A';
+    if (L >= 6) { s[3]='T'; s[4]='G'; s[5]='A'; }
+    // Interior: inject GGA (pre-converted → adds to denominator, lowers ox_stop_rate_interior)
+    int im = L / 3;
+    if (im + 2 < L) { s[im]='G'; s[im+1]='G'; s[im+2]='A'; }
+    return s;
+}
+
+// Terminal-enriched G→T (5' only): models an OBSERVED-READ 5' artifact, not
+// post-mortem oxidation. Post-mortem 8-oxoG arises uniformly (use --ox-rate).
+// This primitive injects a 5'-terminal G→T that triggers log_ox_gt_uniformity > 0;
+// it does NOT trigger ox_is_artifact (stop-codon channel) on random reads because
+// the stop-codon channel only fires on G in stop-codon trinucleotide contexts.
+// Use codon-aware reads (see tests/gen_genome_frags.cpp) to exercise ox_is_artifact.
+static std::string apply_oxidative_terminal(const std::string& seq,
+                                             double ox_rate_term, double ox_lambda_term,
+                                             PCG32& rng) {
+    if (ox_rate_term <= 0.0) return seq;
+    std::string s = seq;
+    int L = (int)s.size();
+    for (int p = 0; p < std::min(15, L); ++p) {
+        double prob = ox_rate_term * std::exp(-ox_lambda_term * p);
+        if (s[p] == 'G' && rng.uniform() < prob) s[p] = 'T';
+    }
+    return s;
+}
+
 // CircLigase 3'-terminal hexamer bias: overwrite last ≤6 bases with a CCC-ending
 // hexamer.  Applied after all other processing so the terminal composition signal
 // is clean regardless of damage model parameters.
@@ -336,7 +381,12 @@ int main(int argc, char** argv) {
     double   pcr_eff    = 1.0;
     double   epsilon    = 5.3e-7;   // Q5
     double   pcr_rate   = -1.0;     // <0 = use polymerase model; ≥0 = direct per-base prob
-    double   ox_rate    = 0.0;      // per-G-base G→T probability (Channel C/D, 8-oxoG)
+    double   ox_rate    = 0.0;      // per-G-base G→T probability (Channel C/D, uniform 8-oxoG)
+    double   ox_rate_terminal   = 0.0;  // terminal G→T (5' enriched, triggers artifact band)
+    double   ox_lambda_terminal = 0.3;  // decay rate for terminal oxidation
+    double   cpg_factor  = 1.0;         // CpG context C→T enrichment (1.0 = no enrichment)
+    double   frac_ancient = 1.0;        // fraction of reads receiving ancient damage [0,1]
+    double   inject_stop_terminal = 0.0; // inject TGA at 5' terminus + L/3 for artifact test
     bool     pcr_thermo = false;
     uint64_t seed       = 42;
     bool     dup_pair   = false;
@@ -369,7 +419,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(a,"--pcr-eff"))    pcr_eff    = d();
         else if (!strcmp(a,"--pcr-thermo")) pcr_thermo = true;
         else if (!strcmp(a,"--pcr-rate"))   pcr_rate   = d();
-        else if (!strcmp(a,"--ox-rate"))    ox_rate    = d();
+        else if (!strcmp(a,"--ox-rate"))              ox_rate              = d();
+        else if (!strcmp(a,"--ox-rate-terminal"))   ox_rate_terminal     = d();
+        else if (!strcmp(a,"--ox-lambda-terminal")) ox_lambda_terminal   = d();
+        else if (!strcmp(a,"--cpg-factor"))         cpg_factor           = d();
+        else if (!strcmp(a,"--fraction-ancient"))    frac_ancient         = std::clamp(d(), 0.0, 1.0);
+        else if (!strcmp(a,"--inject-stop-terminal")) inject_stop_terminal = std::clamp(d(), 0.0, 1.0);
         else if (!strcmp(a,"--seed"))       seed       = (uint64_t)n();
         else if (!strcmp(a,"--dup-pair"))    dup_pair    = true;
         else if (!strcmp(a,"--trim-sd"))     trim_sd     = n();
@@ -568,11 +623,19 @@ int main(int argc, char** argv) {
         if (mu_thermo > 0.0) seq = apply_thermo(seq, mu_thermo, rng);
         // 8-oxoG oxidative G→T (Channel C/D, uniform, independent per read)
         if (ox_rate > 0.0) seq = apply_oxidative(seq, ox_rate, rng);
+        // Inject stop codons before oxidative damage so the injected G positions are present
+        if (inject_stop_terminal > 0.0)
+            seq = apply_stop_terminal(seq, inject_stop_terminal, rng);
         // 5'-terminal hexamer bias (overwrite before damage so injected C can deaminate)
         if (hex5_bias > 0.0) apply_hex5_bias(seq, hex5_bias, rng);
-        // Ancient-DNA terminal deamination (independent per read)
-        if (!no_damage)
-            seq = apply_damage(seq, dmax5, lambda5, dmax3, lambda3, rng);
+        // Fraction-ancient gate (applies to both deamination and terminal oxidation).
+        // --no-damage suppresses CT deamination only, not oxidative damage.
+        double u_anc = rng.uniform();  // always draw — keeps RNG stream identical across frac_ancient values
+        bool is_ancient = (frac_ancient >= 1.0 || u_anc < frac_ancient);
+        if (!no_damage && is_ancient)
+            seq = apply_damage(seq, dmax5, lambda5, dmax3, lambda3, cpg_factor, rng);
+        if (is_ancient && ox_rate_terminal > 0.0)
+            seq = apply_oxidative_terminal(seq, ox_rate_terminal, ox_lambda_terminal, rng);
         // QC trimming simulation: trim [0, trim_sd] bases from 3' end per read
         if (trim_sd > 0) {
             int trim = (int)(rng.next() % (unsigned)(trim_sd + 1));
