@@ -115,7 +115,9 @@ add_executable(fqdup
     src/split.cpp
     src/trim.cpp
     src/damage.cpp
-    src/damage_profile.cpp
+    src/damage_profile_estimate.cpp
+    src/damage_profile_lsd.cpp
+    src/damage_profile_lengthstrat.cpp
     src/gen.cpp
     src/fastq_io_backend.cpp
     src/logger.cpp
