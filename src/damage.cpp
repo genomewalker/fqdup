@@ -40,318 +40,9 @@
 static constexpr int    N_POS     = 15;
 static constexpr double MIN_COV   = 100.0;
 static constexpr int    BATCH_SZ  = 8192;   // sequences per work unit
+#include "damage_worker.hpp"
+#include "damage_oxog.hpp"
 
-// ---- bounded work queue ------------------------------------------------
-struct WorkQueue {
-    std::mutex              mtx;
-    std::condition_variable cv_not_empty;
-    std::condition_variable cv_not_full;
-    std::vector<std::vector<std::string>> batches;
-    bool   done      = false;
-    int    max_depth;
-
-    explicit WorkQueue(int max_depth) : max_depth(max_depth) {}
-
-    void push(std::vector<std::string>&& batch) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_not_full.wait(lk, [&]{ return (int)batches.size() < max_depth; });
-        batches.push_back(std::move(batch));
-        cv_not_empty.notify_one();
-    }
-
-    bool pop(std::vector<std::string>& batch) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_not_empty.wait(lk, [&]{ return !batches.empty() || done; });
-        if (batches.empty()) return false;
-        batch = std::move(batches.back());
-        batches.pop_back();
-        cv_not_full.notify_one();
-        return true;
-    }
-
-    void set_done() {
-        std::unique_lock<std::mutex> lk(mtx);
-        done = true;
-        cv_not_empty.notify_all();
-    }
-};
-
-// ---- per-thread state --------------------------------------------------
-struct WorkerState {
-    taph::SampleDamageProfile           profile;
-    std::array<uint64_t, LSD_HIST_BINS> lsd_hist{};
-    int64_t reads_scanned = 0;
-    int64_t reads_skipped = 0;
-    int     len_min       = INT_MAX;
-    int     len_max       = 0;
-    int64_t len_sum       = 0;
-};
-
-static void worker_fn(WorkQueue& queue, WorkerState& state) {
-    std::vector<std::string> batch;
-    while (queue.pop(batch)) {
-        for (const std::string& seq : batch) {
-            int L = static_cast<int>(seq.size());
-            if (L < LSD_L_MIN) { ++state.reads_skipped; continue; }
-            taph::FrameSelector::update_sample_profile(state.profile, seq);
-            ++state.lsd_hist[lsd_hist_bin(L)];
-            if (L < state.len_min) state.len_min = L;
-            if (L > state.len_max) state.len_max = L;
-            state.len_sum += L;
-            ++state.reads_scanned;
-        }
-    }
-}
-
-// ---- paired-end work queue + worker -------------------------------------
-struct PairedBatch {
-    std::vector<std::string> r1;
-    std::vector<std::string> r2;
-};
-
-struct PairedWorkQueue {
-    std::mutex              mtx;
-    std::condition_variable cv_not_empty;
-    std::condition_variable cv_not_full;
-    std::vector<PairedBatch> batches;
-    bool   done      = false;
-    int    max_depth;
-
-    explicit PairedWorkQueue(int max_depth) : max_depth(max_depth) {}
-
-    void push(PairedBatch&& batch) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_not_full.wait(lk, [&]{ return (int)batches.size() < max_depth; });
-        batches.push_back(std::move(batch));
-        cv_not_empty.notify_one();
-    }
-    bool pop(PairedBatch& batch) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv_not_empty.wait(lk, [&]{ return !batches.empty() || done; });
-        if (batches.empty()) return false;
-        batch = std::move(batches.back());
-        batches.pop_back();
-        cv_not_full.notify_one();
-        return true;
-    }
-    void set_done() {
-        std::unique_lock<std::mutex> lk(mtx);
-        done = true;
-        cv_not_empty.notify_all();
-    }
-};
-
-static void paired_worker_fn(PairedWorkQueue& queue, WorkerState& state) {
-    PairedBatch batch;
-    while (queue.pop(batch)) {
-        const size_t n = std::min(batch.r1.size(), batch.r2.size());
-        for (size_t k = 0; k < n; ++k) {
-            const std::string& s1 = batch.r1[k];
-            const std::string& s2 = batch.r2[k];
-            int L1 = static_cast<int>(s1.size());
-            int L2 = static_cast<int>(s2.size());
-            if (L1 < LSD_L_MIN || L2 < LSD_L_MIN) { ++state.reads_skipped; continue; }
-            const bool ok = taph::FrameSelector::update_sample_profile_paired(
-                state.profile, s1, s2);
-            if (!ok) { ++state.reads_skipped; continue; }
-            // Length tracking: use R1 as the canonical insert proxy.
-            ++state.lsd_hist[lsd_hist_bin(L1)];
-            if (L1 < state.len_min) state.len_min = L1;
-            if (L1 > state.len_max) state.len_max = L1;
-            state.len_sum += L1;
-            ++state.reads_scanned;
-        }
-    }
-}
-
-// ---- clip pass: re-profile after stripping 5' and/or 3' adapter stubs ------
-static void clip_worker_fn(WorkQueue& queue, WorkerState& state,
-                           const std::vector<std::string>& stubs5,
-                           const std::vector<std::string>& stubs3) {
-    std::vector<std::string> batch;
-    while (queue.pop(batch)) {
-        for (std::string& seq : batch) {
-            if (!stubs5.empty() && (int)seq.size() >= 6) {
-                for (const auto& stub : stubs5) {
-                    if (seq.compare(0, 6, stub) == 0) { seq.erase(0, 6); break; }
-                }
-            }
-            if (!stubs3.empty()) {
-                bool trimmed;
-                do {
-                    trimmed = false;
-                    int L = static_cast<int>(seq.size());
-                    if (L < 12) break;
-                    for (const auto& stub : stubs3) {
-                        if (seq.compare(L - 6, 6, stub) == 0) {
-                            seq.erase(L - 6, 6);
-                            trimmed = true;
-                            break;
-                        }
-                    }
-                } while (trimmed);
-            }
-            int L = static_cast<int>(seq.size());
-            if (L < LSD_L_MIN) { ++state.reads_skipped; continue; }
-            taph::FrameSelector::update_sample_profile(state.profile, seq);
-            ++state.lsd_hist[lsd_hist_bin(L)];
-            if (L < state.len_min) state.len_min = L;
-            if (L > state.len_max) state.len_max = L;
-            state.len_sum += L;
-            ++state.reads_scanned;
-        }
-    }
-}
-
-// ---- second pass: oxidation-compatible composition score (S_DS / S_SS) -----
-//
-// For each read, compute q = P(ancient|read) via 5' C→T LLR from pass-1 priors.
-// For DS, dual-orient: score both seq and rc(seq), use the orientation with higher q.
-// After orientation, accumulate weighted T/(T+G) in the middle third by GC bin:
-//   p_anc = Σ(q·T) / Σ(q·M)      (ancient-enriched)
-//   p_bg  = Σ((1-q)·T) / Σ((1-q)·M)  (background)
-//   S = Σ_b α_b (p_anc,b − p_bg,b)    (GC-weighted across bins)
-//
-// Unlike D = T/(T+G) − A/(A+C), S does not cancel in DS because both strands
-// contribute to the same T/(T+G) numerator after orientation.
-
-static float per_read_damaged_weight(
-    const std::string& seq,
-    const taph::SampleDamageProfile& dp)
-{
-    int L = static_cast<int>(seq.size());
-    int bin = taph::SampleDamageProfile::get_gc_bin(seq);
-    const auto& gc = dp.gc_bins[bin];
-    float bg   = (gc.valid && gc.baseline_tc > 0.0f) ? gc.baseline_tc : dp.fit_baseline_5prime;
-    float dmax = (gc.valid && gc.d_max > 0.005f)     ? gc.d_max       : dp.d_max_5prime;
-    float lam  = dp.lambda_5prime;
-    float pi   = (gc.valid && gc.p_damaged > 0.0f)   ? gc.p_damaged   : dp.pi_damaged;
-    pi = std::clamp(pi, 0.001f, 0.999f);
-    float llr = 0.0f;
-    for (int p = 0; p < L; ++p) {
-        float expected_excess = dmax * std::exp(-lam * static_cast<float>(p));
-        if (expected_excess < 0.01f) break;
-        char b = static_cast<char>(std::toupper(static_cast<unsigned char>(seq[p])));
-        float pd = std::clamp(bg + (1.0f - bg) * expected_excess, 1e-6f, 1.0f - 1e-6f);
-        if      (b == 'T') llr += std::log(pd / bg);
-        else if (b == 'C') llr += std::log((1.0f - pd) / (1.0f - bg));
-    }
-    float logit_pi = std::log(pi / (1.0f - pi));
-    return 1.0f / (1.0f + std::exp(-(logit_pi + llr)));
-}
-
-static constexpr int N_GC = taph::SampleDamageProfile::N_GC_BINS;
-using LLRTable = taph::LLRTable;
-
-struct OxBinAcc {
-    double A = 0, B = 0, C = 0, D = 0;           // first moments
-    double AA = 0, AB = 0, BB = 0;                 // second moments (anc)
-    double CC = 0, CD = 0, DD = 0;                 // second moments (bg)
-    double AC = 0, AD = 0, BC = 0, BD = 0;         // cross moments
-    double M_total = 0;
-    uint64_t reads = 0;
-    // Orientation-corrected Chargaff contrast (Option 2: D_oriented).
-    // Accumulated unweighted from all oriented reads; not split by q.
-    double T_all = 0, TG_all = 0;   // T count and T+G total in middle third
-    double C_all = 0, CA_all = 0;   // C count and C+A total in middle third
-};
-
-struct OxogWorkerState {
-    OxBinAcc bins[N_GC];
-    // Fix E: LSD data accumulated when fuse_lsd=true in oxog_worker.
-    taph::LengthBinStats        lbs;
-    std::vector<LsdLlrBinAccum> llr_acc;  // per length-bin, size = n_bins
-};
-
-static void oxog_worker(WorkQueue& queue,
-                        OxogWorkerState& state,
-                        const taph::SampleDamageProfile& dp,
-                        const LLRTable* llr,
-                        bool is_ss,
-                        bool fuse_lsd,
-                        const LsdClassifyParams* cls_params,
-                        const std::vector<int>* lsd_edges,
-                        double lsd_log_prior_odds)
-{
-    const int n_lsd_bins = fuse_lsd && lsd_edges
-        ? 1 + static_cast<int>(lsd_edges->size()) : 0;
-
-    std::vector<std::string> batch;
-    while (queue.pop(batch)) {
-        for (const std::string& seq : batch) {
-            int L = static_cast<int>(seq.size());
-            if (L < 30) continue;
-            int bin = taph::SampleDamageProfile::get_gc_bin(seq);
-            const LLRTable& t = llr[bin];
-            double q;
-            bool rev = false;
-            if (is_ss) {
-                q = taph::llr_table_weight_fwd(seq.data(), static_cast<int>(seq.size()), t);
-            } else {
-                float w_fwd = taph::llr_table_weight_fwd(seq.data(), static_cast<int>(seq.size()), t);
-                float w_rev = taph::llr_table_weight_rev(seq.data(), static_cast<int>(seq.size()), t);
-                if (w_rev > w_fwd) { rev = true; q = w_rev; }
-                else               {              q = w_fwd; }
-            }
-            int beg = L / 3, end = L - (L / 3);
-            if (end <= beg) continue;
-            int T = 0, G = 0, Cv = 0, Av = 0;
-            if (!rev) {
-                for (int j = beg; j < end; ++j) {
-                    char b = static_cast<char>(seq[j] & ~0x20u);
-                    if      (b == 'T') ++T;
-                    else if (b == 'G') ++G;
-                    else if (b == 'C') ++Cv;
-                    else if (b == 'A') ++Av;
-                }
-            } else {
-                // DS read oriented in reverse: complement-map the middle third
-                // without allocating an rc string (A→T, C→G, G→C, T→A).
-                for (int j = beg; j < end; ++j) {
-                    char b = static_cast<char>(seq[j] & ~0x20u);
-                    if      (b == 'A') ++T;
-                    else if (b == 'C') ++G;
-                    else if (b == 'G') ++Cv;
-                    else if (b == 'T') ++Av;
-                }
-            }
-            int M = T + G;
-            if (M == 0) continue;
-            double a = q * T, b_ = q * M;
-            double c = (1.0 - q) * T, d = (1.0 - q) * M;
-            auto& x = state.bins[bin];
-            x.A += a;  x.B += b_;
-            x.C += c;  x.D += d;
-            x.AA += a*a; x.AB += a*b_; x.BB += b_*b_;
-            x.CC += c*c; x.CD += c*d;  x.DD += d*d;
-            x.AC += a*c; x.AD += a*d;  x.BC += b_*c; x.BD += b_*d;
-            x.M_total += M;
-            ++x.reads;
-            x.T_all  += T;  x.TG_all += M;
-            x.C_all  += Cv; x.CA_all += Cv + Av;
-
-            // Fix E: fused LSD accumulation.
-            if (fuse_lsd && L >= LSD_L_MIN && cls_params && n_lsd_bins > 0) {
-                int L_binned = std::min(L, LSD_L_MAX);
-                state.lbs.update(seq, L_binned);
-                // bin_index: count how many edges L_binned is >= 
-                int lb = 0;
-                for (int e : *lsd_edges) { if (L_binned >= e) ++lb; else break; }
-                if (lb >= 0 && lb < n_lsd_bins) {
-                    double llr_val = lsd_llr_score(seq, *cls_params);
-                    bool   anc     = llr_val > 0.0;
-                    if (anc) ++state.llr_acc[lb].n_damaged;
-                    else     ++state.llr_acc[lb].n_undamaged;
-                    lsd_accumulate(seq, state.llr_acc[lb], anc, cls_params->is_ss);
-                    double post = 1.0 / (1.0 + std::exp(-(llr_val + lsd_log_prior_odds)));
-                    lsd_accumulate_soft(seq, state.llr_acc[lb], post, cls_params->is_ss);
-                }
-            }
-        }
-    }
-}
-
-// ---- helpers -----------------------------------------------------------
 static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " damage (-i FILE | -1 R1.fq -2 R2.fq) [options]\n"
@@ -720,6 +411,7 @@ int damage_main(int argc, char** argv) {
     // ---- second pass: oxidation-compatible composition score -----------
     // Run when pass-1 found non-trivial 5' damage (gives meaningful q weights).
     double S_oxog = 0.0, SE_oxog = 0.0;
+    double S_ca   = 0.0;   // C→A co-movement score (complement of G→T)
     double D_oriented = 0.0;
     double oxog_score_z = 0.0, oxog_score_p = 1.0;
     bool has_oxog_score = false;
@@ -836,65 +528,19 @@ int damage_main(int argc, char** argv) {
         for (auto& w : workers2) w.join();
 
         // merge per-thread accumulators
-        OxBinAcc merged[N_GC] = {};
+        taph::OxBinAcc merged[N_GC] = {};
         for (auto& os : ox_states)
-            for (int b = 0; b < N_GC; ++b) {
-                merged[b].A += os.bins[b].A;  merged[b].B += os.bins[b].B;
-                merged[b].C += os.bins[b].C;  merged[b].D += os.bins[b].D;
-                merged[b].AA += os.bins[b].AA; merged[b].AB += os.bins[b].AB; merged[b].BB += os.bins[b].BB;
-                merged[b].CC += os.bins[b].CC; merged[b].CD += os.bins[b].CD; merged[b].DD += os.bins[b].DD;
-                merged[b].AC += os.bins[b].AC; merged[b].AD += os.bins[b].AD;
-                merged[b].BC += os.bins[b].BC; merged[b].BD += os.bins[b].BD;
-                merged[b].M_total += os.bins[b].M_total;
-                merged[b].reads   += os.bins[b].reads;
-                merged[b].T_all   += os.bins[b].T_all;
-                merged[b].TG_all  += os.bins[b].TG_all;
-                merged[b].C_all   += os.bins[b].C_all;
-                merged[b].CA_all  += os.bins[b].CA_all;
-            }
+            for (int b = 0; b < N_GC; ++b)
+                taph::merge_ox_bins(merged[b], os.bins[b]);
 
-        // aggregate across GC bins
-        double M_all = 0.0;
-        for (int b = 0; b < N_GC; ++b) {
-            if (merged[b].B > 0 && merged[b].D > 0)
-                M_all += merged[b].M_total;
-        }
+        // compute all three scores via libtaph
+        {   auto ox = taph::compute_ox_scores(merged, N_GC);
+            S_oxog = ox.s_oxog; SE_oxog = ox.se_s_oxog;
+            S_ca = ox.s_ca; D_oriented = ox.d_oriented; has_oxog_score = ox.has_score; }
 
-        if (M_all > 0) {
-            double var_S = 0.0;
-            for (int b = 0; b < N_GC; ++b) {
-                const auto& x = merged[b];
-                if (x.B <= 0 || x.D <= 0) continue;
-                double alpha = x.M_total / M_all;
-                double p_anc = x.A / x.B;
-                double p_bg  = x.C / x.D;
-                S_oxog += alpha * (p_anc - p_bg);
-
-                double v_anc = (x.AA - 2*p_anc*x.AB + p_anc*p_anc*x.BB) / (x.B*x.B);
-                double v_bg  = (x.CC - 2*p_bg *x.CD + p_bg *p_bg *x.DD) / (x.D*x.D);
-                double cov   = (x.AC - p_bg*x.AD - p_anc*x.BC + p_anc*p_bg*x.BD) / (x.B*x.D);
-                double var_b = v_anc + v_bg - 2*cov;
-                if (var_b < 0) var_b = 0;
-                var_S += alpha * alpha * var_b;
-            }
-            SE_oxog = std::sqrt(var_S);
-            has_oxog_score = true;
-        }
-
-        // Orientation-corrected Chargaff contrast D_oriented = T/(T+G) - C/(C+A)
-        // on oriented reads (DS rotated by max-q orientation, SS as-is).
-        // Unlike the deamination D field, this breaks the DS Chargaff cancellation because
-        // both strands are measured from the same oriented direction after rotation.
-        double w_dor = 0.0;
-        for (int b = 0; b < N_GC; ++b) {
-            const auto& x = merged[b];
-            if (x.TG_all > 0 && x.CA_all > 0) {
-                double w = x.TG_all;
-                D_oriented += w * (x.T_all / x.TG_all - x.C_all / x.CA_all);
-                w_dor += w;
-            }
-        }
-        if (w_dor > 0) D_oriented /= w_dor;
+        // DELETE: old inline score computation (now in libtaph/oxog_score.cpp)
+        // Keep this marker so git diff is readable. Remove at next cleanup.
+                // (score computation moved to taph::compute_ox_scores above)
 
         // Fix E: merge per-thread LSD state into LsdPrebuilt for injection below.
         if (fuse_lsd) {
@@ -1350,6 +996,7 @@ int damage_main(int argc, char** argv) {
         pji.short_read_frac      = short_read_frac;
         pji.s_oxog               = S_oxog;
         pji.se_s_oxog            = SE_oxog;
+        pji.s_ca                 = S_ca;
         pji.d_oriented           = D_oriented;
         pji.has_oxog_score       = has_oxog_score;
         pji.lsd                  = lsd.bins.empty() ? nullptr : &lsd;
