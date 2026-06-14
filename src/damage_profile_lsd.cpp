@@ -6,6 +6,7 @@
 #include "fqdup/damage_profile.hpp"
 #include "fqdup/fastq_common.hpp"
 
+#include "taph/damage_estimate.hpp"
 #include "taph/frame_selector_decl.hpp"
 #include "taph/length_gc_joint_mixture.hpp"
 #include "taph/length_stratified_profile.hpp"
@@ -74,6 +75,10 @@ LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk)
             p.noncpg_scale = d_ncp / d_avg;
         }
     }
+    // Step-2 shadow (SOLUTION §6.7): contract amplitude = cohort per-ancient A_b (D_MAX_CONSERVED),
+    // gated off when the library is not pi-DETECTED. Measured against the current d_anc; drives nothing.
+    p.d_anc_contract     = taph::D_MAX_CONSERVED;
+    p.contract_gated_off = !bulk.pi_detected;
     return p;
 }
 
