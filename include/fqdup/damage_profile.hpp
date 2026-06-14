@@ -74,6 +74,10 @@ struct DamageProfile {
     int    mixture_n_components = 0;
     bool   mixture_converged = false;
     bool   mixture_identifiable = false;
+    // Validated reference-free ancient fraction (libtaph SampleDamageProfile::pi, SOLUTION §6.3).
+    // Shadow-mode step 2: carried for the contract-vs-mixture divergence shadow; not yet a verdict source.
+    double pi_point    = -1.0;
+    bool   pi_detected = false;
     bool   enabled        = false;
     bool   ss_mode        = false;  // true = single-stranded library (C→T at both ends)
 
@@ -250,6 +254,11 @@ struct LsdClassifyParams {
     bool   skip_pos0_5prime = false;  // skip pos 0 in 5' LLR (hexamer artifact)
     double cpg_scale    = 1.0;
     double noncpg_scale = 1.0;
+    // Step-2 shadow (SOLUTION §6.7): contract per-read amplitude (D_MAX_CONSERVED) + UNDETERMINED gate.
+    // When d_anc_contract >= 0 the oxoG pass computes the contract class alongside the current one and
+    // logs divergence; it never drives a verdict. contract_gated_off = library is not pi-DETECTED.
+    double d_anc_contract     = -1.0;
+    bool   contract_gated_off = false;
 };
 
 // Build classify params from a finalized bulk DamageProfile.

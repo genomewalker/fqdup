@@ -59,6 +59,9 @@ struct OxogWorkerState {
     // Fix E: LSD data accumulated when fuse_lsd=true in oxog_worker.
     taph::LengthBinStats        lbs;
     std::vector<LsdLlrBinAccum> llr_acc;  // per length-bin, size = n_bins
+    // Step-2 shadow counters (SOLUTION §6.7): contract per-read class vs current d_anc class. Merged and
+    // logged in damage.cpp; never drives a verdict.
+    uint64_t shadow_n = 0, shadow_anc_old = 0, shadow_anc_new = 0, shadow_flip = 0;
 };
 
 inline static void oxog_worker(WorkQueue& queue,
@@ -127,6 +130,20 @@ inline static void oxog_worker(WorkQueue& queue,
                 if (lb >= 0 && lb < n_lsd_bins) {
                     double llr_val = lsd_llr_score(seq, *cls_params);
                     bool   anc     = llr_val > 0.0;
+                    // Step-2 shadow (SOLUTION §6.7): contract class = LLR under the cohort amplitude
+                    // (D_MAX_CONSERVED), gated off when the library is not pi-DETECTED. Counted only.
+                    if (cls_params->d_anc_contract >= 0.0) {
+                        bool anc_new = false;
+                        if (!cls_params->contract_gated_off) {
+                            LsdClassifyParams qc = *cls_params;
+                            qc.d_anc = cls_params->d_anc_contract;
+                            anc_new = lsd_llr_score(seq, qc) > 0.0;
+                        }
+                        ++state.shadow_n;
+                        if (anc)               ++state.shadow_anc_old;
+                        if (anc_new)           ++state.shadow_anc_new;
+                        if (anc != anc_new)    ++state.shadow_flip;
+                    }
                     if (anc) ++state.llr_acc[lb].n_damaged;
                     else     ++state.llr_acc[lb].n_undamaged;
                     lsd_accumulate(seq, state.llr_acc[lb], anc, cls_params->is_ss);

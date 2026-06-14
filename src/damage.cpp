@@ -449,6 +449,8 @@ int damage_main(int argc, char** argv) {
     bulk_dp.mixture_identifiable = dp.mixture_identifiable;
     bulk_dp.d_cpg_5prime         = dp.dmax_ct5_cpg_like;
     bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
+    bulk_dp.pi_point             = dp.pi.point;  // SOLUTION §6.3 validated pi (shadow step 2)
+    bulk_dp.pi_detected          = (dp.pi.state == taph::DamageConfidence::DETECTED);
 
     // Fuse per-read ancient/modern classification into the oxoG pass whenever
     // damage is detectable. When --length-bins is also enabled, compute multi-bin
@@ -552,6 +554,32 @@ int damage_main(int argc, char** argv) {
             lsd_master.forced_library_type = forced_lib;
             lsd_master.configure(lsd_fuse_edges);
             for (auto& os : ox_states) lsd_master.merge(os.lbs);
+
+            // Step-2 shadow (SOLUTION §6.7): per-read divergence between the current mixture-derived
+            // d_anc class and the contract class (cohort amplitude D_MAX_CONSERVED, pi-gated). Reported
+            // only — drives no split/derep/damage verdict this build. Validates the contract amplitude
+            // change before fqdup is flipped onto it (steps 4-5).
+            {
+                uint64_t sh_n = 0, sh_old = 0, sh_new = 0, sh_flip = 0;
+                for (auto& os : ox_states) {
+                    sh_n += os.shadow_n; sh_old += os.shadow_anc_old;
+                    sh_new += os.shadow_anc_new; sh_flip += os.shadow_flip;
+                }
+                if (sh_n > 0) {
+                    const double inv = 100.0 / static_cast<double>(sh_n);
+                    char sb[256];
+                    std::snprintf(sb, sizeof(sb),
+                        "[shadow] contract-vs-mixture split: reads=%llu  anc_old=%llu (%.2f%%)  "
+                        "anc_new=%llu (%.2f%%)  flips=%llu (%.2f%%)  pi=%.4f  pi_detected=%d",
+                        (unsigned long long)sh_n,
+                        (unsigned long long)sh_old, sh_old * inv,
+                        (unsigned long long)sh_new, sh_new * inv,
+                        (unsigned long long)sh_flip, sh_flip * inv,
+                        dp.pi.point,
+                        (int)(dp.pi.state == taph::DamageConfidence::DETECTED));
+                    std::cerr << sb << "\n";
+                }
+            }
 
             const int n_lsd_bins = 1 + static_cast<int>(lsd_fuse_edges.size());
             std::vector<LsdLlrBinAccum> merged_llr(n_lsd_bins);
