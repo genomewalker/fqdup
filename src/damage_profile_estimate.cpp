@@ -165,10 +165,11 @@ static DamageProfile estimate_damage_impl(
     profile.mixture_d_damaged = deam_profile.mixture_d_ancient;
     profile.mixture_pi_damaged = deam_profile.mixture_pi_ancient;
     profile.mixture_d_population_highgc = deam_profile.mixture_d_population_highgc;
-    profile.mixture_K = deam_profile.mixture_K;
     profile.mixture_n_components = deam_profile.mixture_n_components;
     profile.mixture_converged = deam_profile.mixture_converged;
     profile.mixture_identifiable = deam_profile.mixture_identifiable;
+    profile.pi_point          = deam_profile.pi.point;  // SOLUTION §6.3 validated pi (shadow step 2)
+    profile.pi_detected       = (deam_profile.pi.state == taph::DamageConfidence::DETECTED);
     profile.mode_3prime    = mode_3p;
     profile.ss_mode        = (mode_3p == Damage3PrimeMode::ss_ct);  // back-compat
     profile.enabled        = (d_max_combined > 0.02 || d_max_5 > 0.02 || d_max_3 > 0.02
