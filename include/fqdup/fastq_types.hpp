@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // ============================================================================
 // FASTQ Record — global scope, safe to cross TU boundaries
@@ -48,3 +49,8 @@ public:
 // oversubscription. Implemented in src/fastq_io_backend.cpp.
 std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
                                                     size_t threads = 0);
+
+// Chains multiple files into a single sequential reader.
+// If paths.size() == 1 this is identical to make_fastq_reader(paths[0], threads).
+std::unique_ptr<FastqReaderBase> make_chained_fastq_reader(
+    const std::vector<std::string>& paths, size_t threads = 0);
