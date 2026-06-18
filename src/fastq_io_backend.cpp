@@ -124,3 +124,39 @@ std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
     // Plain text (or non-gz): zlib gzopen handles both transparently
     return std::make_unique<FastqReader>(path);
 }
+
+namespace {
+class ChainedFastqReader : public FastqReaderBase {
+public:
+    ChainedFastqReader(std::vector<std::string> paths, size_t threads)
+        : paths_(std::move(paths)), idx_(0), threads_(threads), total_(0) {
+        if (!paths_.empty())
+            cur_ = make_fastq_reader(paths_[0], threads_);
+    }
+
+    bool read(FastqRecord& rec) override {
+        while (cur_) {
+            if (cur_->read(rec)) { ++total_; return true; }
+            if (++idx_ < paths_.size())
+                cur_ = make_fastq_reader(paths_[idx_], threads_);
+            else
+                cur_.reset();
+        }
+        return false;
+    }
+
+    uint64_t record_count() const override { return total_; }
+
+private:
+    std::vector<std::string> paths_;
+    size_t idx_, threads_;
+    uint64_t total_;
+    std::unique_ptr<FastqReaderBase> cur_;
+};
+}  // namespace
+
+std::unique_ptr<FastqReaderBase> make_chained_fastq_reader(
+    const std::vector<std::string>& paths, size_t threads) {
+    if (paths.size() == 1) return make_fastq_reader(paths[0], threads);
+    return std::make_unique<ChainedFastqReader>(paths, threads);
+}

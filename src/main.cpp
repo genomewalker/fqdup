@@ -17,6 +17,7 @@ int damage_main(int argc, char** argv);
 int gen_main(int argc, char** argv);
 int view_main(int argc, char** argv);
 int trim_main(int argc, char** argv);
+int merge_main(int argc, char** argv);
 // consensus_main: TEMP DISABLED — WIP refactor (task #20). Stubbed to keep linker happy.
 static int consensus_main(int, char**) {
     std::cerr << "fqdup consensus: temporarily disabled (WIP refactor, task #20)\n";
@@ -35,6 +36,7 @@ static void usage(const char* prog) {
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
               << "  view        Inspect .fqcl cluster genealogy files\n"
               << "  trim        Remove 5'/3' adapter stubs (hexamer-detected)\n"
+              << "  merge       Overlap-detect and merge paired-end reads (aDNA-optimised)\n"
               << "  consensus   Emit per-cluster consensus FASTQ from .fqcl\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
               << "\nTypical workflow:\n"
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
     if (sub == "view")        return view_main(argc - 1, argv + 1);
     if (sub == "trim")        return trim_main(argc - 1, argv + 1);
+    if (sub == "merge")       return merge_main(argc - 1, argv + 1);
     if (sub == "consensus")   return consensus_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {
