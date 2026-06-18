@@ -29,6 +29,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -108,7 +109,16 @@ int damage_main(int argc, char** argv) {
     std::string json_path;
     std::string count_table_path;
     std::string html_path;
+    std::string subst_in_path;
     bool        run_oxog      = true;
+    // bsubst arrays shared between early pseudo-count injection and late JSON output
+    static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
+    static const uint8_t BMAGIC_V2[8] = {'B','S','U','B','S','T',0x02,0x00};
+    // alias for the check below
+    const uint8_t* BMAGIC = BMAGIC_V1; (void)BMAGIC;
+    int64_t bsubst_fwd[30][4][4] = {}, bsubst_rev[30][4][4] = {}, bsubst_all[4][4] = {};
+    int64_t bsubst_n_pairs = 0, bsubst_n_bases = 0;
+    bool    bsubst_loaded  = false;
     LengthBinOptions lb_opts = []{ bool ok; return parse_length_bins("auto", ok); }();
     int64_t     adapter_scan_reads = 1'000'000;  // 0 = scan entire file
     taph::SampleDamageProfile::LibraryType forced_lib =
@@ -145,6 +155,8 @@ int damage_main(int argc, char** argv) {
             count_table_path = argv[++i];
         } else if (arg == "--html" && i + 1 < argc) {
             html_path = argv[++i];
+        } else if (arg == "--subst-in" && i + 1 < argc) {
+            subst_in_path = argv[++i];
         } else if (arg == "--no-oxog") {
             run_oxog = false;
         } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
@@ -391,6 +403,44 @@ int damage_main(int argc, char** argv) {
         len_sum += s.len_sum;
     }
     dp.forced_library_type = forced_lib;  // ensure forced_lib survives merge
+
+    // Load bsubst early to inject CT/GA pseudo-counts before finalization.
+    // Weighted 1/3 to avoid over-weighting the paired-overlap signal.
+    if (!subst_in_path.empty()) {
+        uint8_t magic[8];
+        int32_t npos = 0;
+        FILE* bf = fopen(subst_in_path.c_str(), "rb");
+        if (!bf) {
+            std::cerr << "Warning: cannot open --subst-in: " << subst_in_path << "\n";
+        } else {
+            bool ok = fread(magic, 1, 8, bf) == 8
+                   && (memcmp(magic, BMAGIC_V1, 8) == 0 || memcmp(magic, BMAGIC_V2, 8) == 0)
+                   && fread(&bsubst_n_pairs, 8, 1, bf) == 1
+                   && fread(&bsubst_n_bases, 8, 1, bf) == 1
+                   && fread(&npos,           4, 1, bf) == 1 && npos == 30
+                   && fread(bsubst_fwd,  sizeof(bsubst_fwd),  1, bf) == 1
+                   && fread(bsubst_rev,  sizeof(bsubst_rev),  1, bf) == 1
+                   && fread(bsubst_all,  sizeof(bsubst_all),  1, bf) == 1;
+            fclose(bf);
+            if (!ok) {
+                std::cerr << "Warning: corrupt or wrong-version .bsubst: " << subst_in_path << "\n";
+            } else {
+                bsubst_loaded = true;
+                constexpr double W = 1.0 / 3.0;
+                for (int p = 0; p < 15; ++p) {
+                    dp.t_freq_5prime[p]  += W * static_cast<double>(bsubst_fwd[p][3][1]);
+                    dp.c_freq_5prime[p]  += W * static_cast<double>(bsubst_fwd[p][1][1]);
+                    dp.tc_total_5prime[p]+= W * static_cast<double>(bsubst_fwd[p][3][1]
+                                                                   + bsubst_fwd[p][1][1]);
+                    dp.a_freq_3prime[p]  += W * static_cast<double>(bsubst_rev[p][2][0]);
+                    dp.g_freq_3prime[p]  += W * static_cast<double>(bsubst_rev[p][2][2]);
+                    dp.ag_total_3prime[p]+= W * static_cast<double>(bsubst_rev[p][2][0]
+                                                                   + bsubst_rev[p][2][2]);
+                }
+            }
+        }
+    }
+
     taph::FrameSelector::finalize_sample_profile(dp);
 
     // Recompute F/G/H z-scores excluding reads whose first (5') or last (3')
@@ -1028,6 +1078,31 @@ int damage_main(int argc, char** argv) {
         pji.d_oriented           = D_oriented;
         pji.has_oxog_score       = has_oxog_score;
         pji.lsd                  = lsd.bins.empty() ? nullptr : &lsd;
+
+        // Compute paired overlap substitution decay from bsubst arrays loaded earlier.
+        if (!subst_in_path.empty() && bsubst_loaded) {
+            for (int p = 0; p < 30; ++p) {
+                int64_t ct = bsubst_fwd[p][3][1];
+                int64_t dc = bsubst_fwd[p][0][1]+bsubst_fwd[p][1][1]+bsubst_fwd[p][2][1]+bsubst_fwd[p][3][1];
+                pji.paired_ct_decay.push_back(dc > 0 ? (double)ct/dc : 0.0);
+            }
+            for (int p = 0; p < 30; ++p) {
+                int64_t ga = bsubst_rev[p][2][0];
+                int64_t dg = bsubst_rev[p][2][0]+bsubst_rev[p][2][1]+bsubst_rev[p][2][2]+bsubst_rev[p][2][3];
+                pji.paired_ga_decay.push_back(dg > 0 ? (double)ga/dg : 0.0);
+            }
+            int64_t tg = 0, dg_all = 0, ca = 0, da_all = 0;
+            for (int p = 0; p < 30; ++p) {
+                tg += bsubst_fwd[p][3][2]; ca += bsubst_fwd[p][1][0];
+                for (int b = 0; b < 4; ++b) { dg_all += bsubst_fwd[p][b][2]; da_all += bsubst_fwd[p][b][0]; }
+            }
+            pji.paired_tg_count  = tg;      pji.paired_tg_denom  = dg_all;
+            pji.paired_ca_count  = ca;      pji.paired_ca_denom  = da_all;
+            pji.paired_oxog_rate = dg_all > 0 ? (double)tg/dg_all : -1.0;
+            pji.paired_n_pairs   = bsubst_n_pairs;
+            pji.paired_n_bases   = bsubst_n_bases;
+        }
+
         taph::profile_to_json(dp, j, pji);
         std::cout << "JSON written: " << json_path << "\n";
     }
