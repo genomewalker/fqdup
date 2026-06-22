@@ -8,3 +8,4 @@ bench/*.fq
 bench/*.fq.gz
 bench/*.fastq
 bench/*.fastq.gz
+CMakeUserPresets.json

@@ -107,9 +107,10 @@ int damage_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    int         json_level        = 2;  // 1=summary, 2=standard, 3=full
     std::string count_table_path;
     std::string html_path;
-    std::string subst_in_path;
+    std::vector<std::string> subst_in_paths;
     bool        run_oxog      = true;
     // bsubst arrays shared between early pseudo-count injection and late JSON output
     static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
@@ -151,12 +152,22 @@ int damage_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--json-level" && i + 1 < argc) {
+            std::string lvl(argv[++i]);
+            if (lvl == "summary")       json_level = 1;
+            else if (lvl == "standard") json_level = 2;
+            else if (lvl == "full")     json_level = 3;
+            else {
+                std::cerr << "Error: unknown --json-level: " << lvl
+                          << " (choices: summary, standard, full)\n";
+                return 1;
+            }
         } else if (arg == "--count-table-json" && i + 1 < argc) {
             count_table_path = argv[++i];
         } else if (arg == "--html" && i + 1 < argc) {
             html_path = argv[++i];
         } else if (arg == "--subst-in" && i + 1 < argc) {
-            subst_in_path = argv[++i];
+            subst_in_paths.push_back(argv[++i]);
         } else if (arg == "--no-oxog") {
             run_oxog = false;
         } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
@@ -406,39 +417,44 @@ int damage_main(int argc, char** argv) {
 
     // Load bsubst early to inject CT/GA pseudo-counts before finalization.
     // Weighted 1/3 to avoid over-weighting the paired-overlap signal.
-    if (!subst_in_path.empty()) {
+    // Multiple --subst-in files (one per lane) are accumulated by summing counts.
+    if (!subst_in_paths.empty()) {
+        for (const auto& subst_in_path : subst_in_paths) {
         uint8_t magic[8];
         int32_t npos = 0;
+        int64_t tmp_fwd[30][4][4] = {}, tmp_rev[30][4][4] = {}, tmp_all[4][4] = {};
+        int64_t tmp_pairs = 0, tmp_bases = 0;
         FILE* bf = fopen(subst_in_path.c_str(), "rb");
         if (!bf) {
             std::cerr << "Warning: cannot open --subst-in: " << subst_in_path << "\n";
         } else {
             bool ok = fread(magic, 1, 8, bf) == 8
                    && (memcmp(magic, BMAGIC_V1, 8) == 0 || memcmp(magic, BMAGIC_V2, 8) == 0)
-                   && fread(&bsubst_n_pairs, 8, 1, bf) == 1
-                   && fread(&bsubst_n_bases, 8, 1, bf) == 1
-                   && fread(&npos,           4, 1, bf) == 1 && npos == 30
-                   && fread(bsubst_fwd,  sizeof(bsubst_fwd),  1, bf) == 1
-                   && fread(bsubst_rev,  sizeof(bsubst_rev),  1, bf) == 1
-                   && fread(bsubst_all,  sizeof(bsubst_all),  1, bf) == 1;
+                   && fread(&tmp_pairs, 8, 1, bf) == 1
+                   && fread(&tmp_bases, 8, 1, bf) == 1
+                   && fread(&npos,      4, 1, bf) == 1 && npos == 30
+                   && fread(tmp_fwd,  sizeof(tmp_fwd),  1, bf) == 1
+                   && fread(tmp_rev,  sizeof(tmp_rev),  1, bf) == 1
+                   && fread(tmp_all,  sizeof(tmp_all),  1, bf) == 1;
             fclose(bf);
             if (!ok) {
                 std::cerr << "Warning: corrupt or wrong-version .bsubst: " << subst_in_path << "\n";
             } else {
+                bsubst_n_pairs += tmp_pairs;
+                bsubst_n_bases += tmp_bases;
+                for (int p = 0; p < 30; ++p)
+                    for (int a = 0; a < 4; ++a)
+                        for (int b = 0; b < 4; ++b) {
+                            bsubst_fwd[p][a][b] += tmp_fwd[p][a][b];
+                            bsubst_rev[p][a][b] += tmp_rev[p][a][b];
+                        }
+                for (int a = 0; a < 4; ++a)
+                    for (int b = 0; b < 4; ++b)
+                        bsubst_all[a][b] += tmp_all[a][b];
                 bsubst_loaded = true;
-                constexpr double W = 1.0 / 3.0;
-                for (int p = 0; p < 15; ++p) {
-                    dp.t_freq_5prime[p]  += W * static_cast<double>(bsubst_fwd[p][3][1]);
-                    dp.c_freq_5prime[p]  += W * static_cast<double>(bsubst_fwd[p][1][1]);
-                    dp.tc_total_5prime[p]+= W * static_cast<double>(bsubst_fwd[p][3][1]
-                                                                   + bsubst_fwd[p][1][1]);
-                    dp.a_freq_3prime[p]  += W * static_cast<double>(bsubst_rev[p][2][0]);
-                    dp.g_freq_3prime[p]  += W * static_cast<double>(bsubst_rev[p][2][2]);
-                    dp.ag_total_3prime[p]+= W * static_cast<double>(bsubst_rev[p][2][0]
-                                                                   + bsubst_rev[p][2][2]);
-                }
             }
         }
+        } // end per-file loop
     }
 
     taph::FrameSelector::finalize_sample_profile(dp);
@@ -1080,7 +1096,7 @@ int damage_main(int argc, char** argv) {
         pji.lsd                  = lsd.bins.empty() ? nullptr : &lsd;
 
         // Compute paired overlap substitution decay from bsubst arrays loaded earlier.
-        if (!subst_in_path.empty() && bsubst_loaded) {
+        if (!subst_in_paths.empty() && bsubst_loaded) {
             for (int p = 0; p < 30; ++p) {
                 int64_t ct = bsubst_fwd[p][3][1];
                 int64_t dc = bsubst_fwd[p][0][1]+bsubst_fwd[p][1][1]+bsubst_fwd[p][2][1]+bsubst_fwd[p][3][1];
@@ -1101,6 +1117,12 @@ int damage_main(int argc, char** argv) {
             pji.paired_oxog_rate = dg_all > 0 ? (double)tg/dg_all : -1.0;
             pji.paired_n_pairs   = bsubst_n_pairs;
             pji.paired_n_bases   = bsubst_n_bases;
+            for (int p = 0; p < 30; ++p) {
+                int64_t sum_p = 0;
+                for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) sum_p += bsubst_fwd[p][a][b];
+                pji.paired_tg_pos.push_back(sum_p > 0 ? (double)bsubst_fwd[p][3][2] / sum_p : 0.0);
+                pji.paired_ca_pos.push_back(sum_p > 0 ? (double)bsubst_fwd[p][1][0] / sum_p : 0.0);
+            }
         }
 
         taph::profile_to_json(dp, j, pji);
