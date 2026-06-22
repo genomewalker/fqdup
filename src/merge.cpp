@@ -1000,7 +1000,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             if (do_profile)
                 taph::FrameSelector::update_sample_profile_paired(local_prof, r1.seq, r2.seq);
             if (do_subst)
-                accum_overlap_subst(local_subst, r1.seq, rc2_seq, r2_offset, best_ov, opts.skip_terminal);
+                accum_overlap_subst(local_subst, r1.seq, rc2_seq, r2_offset, best_ov, 0);
             MergeRecord mr;
             mr.is_merged = true;
             consensus_merge(r1, rc2_seq, rc2_qual, best_ov, r2_offset, mr.merged);
