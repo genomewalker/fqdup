@@ -457,6 +457,34 @@ int damage_main(int argc, char** argv) {
         } // end per-file loop
     }
 
+    // Partition likelihood: replace FASTQ counts with pre-consensus bsubst counts.
+    // bsubst is accumulated before consensus_merge, so it captures both Case A
+    // (damage T wins, merged FASTQ also sees T) and Case B (consensus suppresses
+    // damage T → merged FASTQ loses the event). This removes Case-B downward bias
+    // from d_max and the interior λ/background tail.
+    //
+    // Convention (merge.cpp fwd[p][b1][b2], b1=R1 base, b2=RC(R2) base, A=0,C=1,G=2,T=3):
+    //   fwd[p][T][C] = [3][1] = C→T deamination at p from 5' end
+    //   fwd[p][C][C] = [1][1] = intact C at p from 5' end
+    //   rev[p][G][A] = [2][0] = G→A (3' C→T on bottom strand) at p from 3' end
+    //   rev[p][G][G] = [2][2] = intact G at p from 3' end
+    if (bsubst_loaded) {
+        for (int p = 0; p < 30; ++p) {
+            int64_t tc5 = bsubst_fwd[p][3][1], cc5 = bsubst_fwd[p][1][1];
+            if (tc5 + cc5 > 0) {
+                dp.t_freq_5prime[p]   = static_cast<double>(tc5);
+                dp.c_freq_5prime[p]   = static_cast<double>(cc5);
+                dp.tc_total_5prime[p] = static_cast<double>(tc5 + cc5);
+            }
+            int64_t ga3 = bsubst_rev[p][2][0], gg3 = bsubst_rev[p][2][2];
+            if (ga3 + gg3 > 0) {
+                dp.a_freq_3prime[p]   = static_cast<double>(ga3);
+                dp.g_freq_3prime[p]   = static_cast<double>(gg3);
+                dp.ag_total_3prime[p] = static_cast<double>(ga3 + gg3);
+            }
+        }
+    }
+
     taph::FrameSelector::finalize_sample_profile(dp);
 
     // Recompute F/G/H z-scores excluding reads whose first (5') or last (3')
