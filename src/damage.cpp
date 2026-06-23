@@ -231,7 +231,10 @@ int damage_main(int argc, char** argv) {
     std::vector<FastqRecord> se_scan_buf;
 
     if (!paired_mode) {
-        WorkerState scan_state;
+        // WorkerState is ~4MB on stack (SampleDamageProfile 823KB × LengthBinStats 4× = 3.3MB);
+        // heap-allocate to avoid stack overflow.
+        auto scan_state_ptr = std::make_unique<WorkerState>();
+        WorkerState& scan_state = *scan_state_ptr;
         if (pre_scan_reads > 0)
             se_scan_buf.reserve(static_cast<size_t>(pre_scan_reads));
         reader_se = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
@@ -254,7 +257,8 @@ int damage_main(int argc, char** argv) {
     } else {
         // Paired pre-scan: 5' hexamer from R1[0..5], 3' terminal hexamer from
         // RC(R2[0..5]) (R2's 5' = molecule 3' end, complement-mapped).
-        WorkerState scan_state;
+        auto scan_state_ptr = std::make_unique<WorkerState>();
+        WorkerState& scan_state = *scan_state_ptr;
         auto reader_r1 = make_fastq_reader(r1_path, 1);
         auto reader_r2 = make_fastq_reader(r2_path, 1);
         FastqRecord rec1, rec2;
@@ -305,6 +309,30 @@ int damage_main(int argc, char** argv) {
     std::vector<WorkerState> states(n_threads);
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
+
+    // Provision LSD sig-histogram accumulation for single-pass LSD (no reader2).
+    // Uses pre-scan reads to compute provisional edges; avoids a second FASTQ pass.
+    {
+        std::vector<uint64_t> prescan_lsd_hist(LSD_HIST_BINS, 0);
+        for (const auto& r : se_scan_buf) {
+            const int L = static_cast<int>(r.seq.size());
+            if (L >= LSD_L_MIN) ++prescan_lsd_hist[lsd_hist_bin(L)];
+        }
+        std::vector<int> prov_edges;
+        if (lb_opts.enabled()) {
+            uint64_t n_prov = 0;
+            for (auto v : prescan_lsd_hist) n_prov += v;
+            if (n_prov >= 1000)
+                prov_edges = compute_lsd_edges(prescan_lsd_hist, lb_opts);
+        }
+        const int n_prov_bins = 1 + static_cast<int>(prov_edges.size());
+        for (auto& s : states) {
+            s.lbs.forced_library_type = forced_lib;
+            s.lbs.configure(prov_edges);
+            s.lsd_prov_edges = prov_edges;
+            s.lsd_cnt.assign(n_prov_bins * N_LSD_SIG5, 0);
+        }
+    }
 
     if (!paired_mode) {
         WorkQueue queue(2 * n_threads);
@@ -528,8 +556,8 @@ int damage_main(int argc, char** argv) {
     if (fuse_lsd) {
         lsd_cls_params = make_lsd_classify_params(bulk_dp);
         lsd_cls_params.skip_pos0_5prime = dp.position_0_artifact_5prime;
-        if (lb_opts.enabled())
-            lsd_fuse_edges = compute_lsd_edges(merged_lsd_hist, lb_opts);
+        if (lb_opts.enabled() && !states.empty())
+            lsd_fuse_edges = states[0].lsd_prov_edges;
         // else lsd_fuse_edges stays empty → one global bin
         // Estimate π (endogenous fraction) from bulk d_max / d_anc.
         // Avoids using the hard-call threshold as the prior — crucial for
@@ -552,140 +580,70 @@ int damage_main(int argc, char** argv) {
     if (run_oxog && dp.d_max_5prime > 0.01f) {
         LLRTable llr_tables[N_GC];
         taph::llr_table_build(llr_tables, N_GC, dp);
-        WorkQueue queue2(2 * n_threads);
-        const int n_lsd_bins = fuse_lsd
-            ? 1 + static_cast<int>(lsd_fuse_edges.size()) : 0;
-        std::vector<OxogWorkerState> ox_states(n_threads);
-        if (fuse_lsd) {
-            for (auto& s : ox_states) {
-                s.lbs.forced_library_type = forced_lib;
-                s.lbs.configure(lsd_fuse_edges);
-                s.llr_acc.assign(n_lsd_bins, {});
+
+        // Merge per-thread OxoG sig histograms accumulated during pass 1
+        const int N_SIG = N_SIG10;
+        std::vector<OxSigCell> merged_fwd(N_GC * N_SIG);
+        std::vector<OxSigCell> merged_rev(N_GC * N_SIG);
+        for (auto& s : states) {
+            for (int i = 0; i < N_GC * N_SIG; ++i) {
+                auto& mf = merged_fwd[i]; const auto& sf = s.ox_fwd[i];
+                mf.t  += sf.t;  mf.g  += sf.g;  mf.cv += sf.cv; mf.av += sf.av;
+                mf.n  += sf.n;  mf.t2 += sf.t2; mf.tm += sf.tm; mf.m2 += sf.m2;
+                auto& mr = merged_rev[i]; const auto& sr = s.ox_rev[i];
+                mr.t  += sr.t;  mr.g  += sr.g;  mr.cv += sr.cv; mr.av += sr.av;
+                mr.n  += sr.n;  mr.t2 += sr.t2; mr.tm += sr.tm; mr.m2 += sr.m2;
             }
         }
-        std::vector<std::thread> workers2;
-        workers2.reserve(n_threads);
-        for (int t = 0; t < n_threads; ++t)
-            workers2.emplace_back(oxog_worker, std::ref(queue2),
-                                   std::ref(ox_states[t]), std::cref(dp),
-                                   llr_tables, is_ss,
-                                   fuse_lsd,
-                                   fuse_lsd ? &lsd_cls_params : nullptr,
-                                   fuse_lsd ? &lsd_fuse_edges : nullptr,
-                                   lsd_log_prior_odds);
-        try {
-            auto reader2 = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
-            FastqRecord rec;
-            std::vector<std::string> batch;
-            batch.reserve(BATCH_SZ);
-            while (reader2->read(rec)) {
-                batch.push_back(std::move(rec.seq));
-                if ((int)batch.size() == BATCH_SZ) {
-                    queue2.push(std::move(batch));
-                    batch.clear();
-                    batch.reserve(BATCH_SZ);
-                }
-            }
-            if (!batch.empty()) queue2.push(std::move(batch));
-        } catch (...) {
-            queue2.set_done();
-            for (auto& w : workers2) w.join();
-            throw;
-        }
-        queue2.set_done();
-        for (auto& w : workers2) w.join();
 
-        // merge per-thread accumulators
-        taph::OxBinAcc merged[N_GC] = {};
-        for (auto& os : ox_states)
-            for (int b = 0; b < N_GC; ++b)
-                taph::merge_ox_bins(merged[b], os.bins[b]);
-
-        // compute all three scores via libtaph
-        {   auto ox = taph::compute_ox_scores(merged, N_GC);
+        // Reweight with fitted dp → OxoG scores (no second FASTQ read)
+        taph::OxBinAcc ox_bins_arr[N_GC] = {};
+        oxog_from_sig_hist(ox_bins_arr, N_GC, merged_fwd, merged_rev, llr_tables, is_ss);
+        {   auto ox = taph::compute_ox_scores(ox_bins_arr, N_GC);
             S_oxog = ox.s_oxog; SE_oxog = ox.se_s_oxog;
             S_ca = ox.s_ca; D_oriented = ox.d_oriented; has_oxog_score = ox.has_score; }
 
-        // DELETE: old inline score computation (now in libtaph/oxog_score.cpp)
-        // Keep this marker so git diff is readable. Remove at next cleanup.
-                // (score computation moved to taph::compute_ox_scores above)
-
-        // Fix E: merge per-thread LSD state into LsdPrebuilt for injection below.
+        // LSD single-pass: reconstruct LsdLlrBinAccum from pass-1 sig histograms.
+        // reader2 eliminated — lsd_cnt + lbs were accumulated alongside OxoG in pass 1.
         if (fuse_lsd) {
-            // heap-allocate: LengthBinStats embeds ~2.6 MB of SampleDamageProfile
-            // arrays; declaring it as a local variable overflows constrained stacks
-            // (SSH sessions on HPC compute nodes).
+            const int n_lsd_bins = 1 + static_cast<int>(lsd_fuse_edges.size());
+
+            // Merge per-thread lbs and lsd_cnt
             auto lsd_master_ptr = std::make_unique<taph::LengthBinStats>();
             auto& lsd_master = *lsd_master_ptr;
             lsd_master.forced_library_type = forced_lib;
             lsd_master.configure(lsd_fuse_edges);
-            for (auto& os : ox_states) lsd_master.merge(os.lbs);
+            for (auto& s : states) lsd_master.merge(s.lbs);
 
-            // Step-2 shadow (SOLUTION §6.7): per-read divergence between the current mixture-derived
-            // d_anc class and the contract class (cohort amplitude D_MAX_CONSERVED, pi-gated). Reported
-            // only — drives no split/derep/damage verdict this build. Validates the contract amplitude
-            // change before fqdup is flipped onto it (steps 4-5).
-            {
-                uint64_t sh_n = 0, sh_old = 0, sh_new = 0, sh_flip = 0;
-                for (auto& os : ox_states) {
-                    sh_n += os.shadow_n; sh_old += os.shadow_anc_old;
-                    sh_new += os.shadow_anc_new; sh_flip += os.shadow_flip;
-                }
-                if (sh_n > 0) {
-                    const double inv = 100.0 / static_cast<double>(sh_n);
-                    char sb[256];
-                    std::snprintf(sb, sizeof(sb),
-                        "[shadow] contract-vs-mixture split: reads=%llu  anc_old=%llu (%.2f%%)  "
-                        "anc_new=%llu (%.2f%%)  flips=%llu (%.2f%%)  pi=%.4f  pi_detected=%d",
-                        (unsigned long long)sh_n,
-                        (unsigned long long)sh_old, sh_old * inv,
-                        (unsigned long long)sh_new, sh_new * inv,
-                        (unsigned long long)sh_flip, sh_flip * inv,
-                        dp.pi.point,
-                        (int)(dp.pi.state == taph::DamageConfidence::DETECTED));
-                    std::cerr << sb << "\n";
-                }
+            std::vector<int32_t> merged_cnt(n_lsd_bins * N_LSD_SIG5, 0);
+            for (auto& s : states) {
+                for (int i = 0; i < n_lsd_bins * N_LSD_SIG5; ++i)
+                    merged_cnt[i] += s.lsd_cnt[i];
             }
 
-            const int n_lsd_bins = 1 + static_cast<int>(lsd_fuse_edges.size());
-            std::vector<LsdLlrBinAccum> merged_llr(n_lsd_bins);
-            for (auto& os : ox_states) {
-                for (int b = 0; b < n_lsd_bins; ++b) {
-                    const auto& w = os.llr_acc[b];
-                    auto& m = merged_llr[b];
-                    m.n_damaged   += w.n_damaged;
-                    m.n_undamaged += w.n_undamaged;
-                    for (int p = 0; p < LengthBinDamageProfile::N_POS; ++p) {
-                        m.t_5_anc[p]          += w.t_5_anc[p];
-                        m.tc_5_anc[p]         += w.tc_5_anc[p];
-                        m.h_3_anc[p]          += w.h_3_anc[p];
-                        m.n_3_anc[p]          += w.n_3_anc[p];
-                        m.t_5_anc_cpg[p]      += w.t_5_anc_cpg[p];
-                        m.tc_5_anc_cpg[p]     += w.tc_5_anc_cpg[p];
-                        m.t_5_anc_noncpg[p]   += w.t_5_anc_noncpg[p];
-                        m.tc_5_anc_noncpg[p]  += w.tc_5_anc_noncpg[p];
-                        m.t_5_anc_g[p]        += w.t_5_anc_g[p];
-                        m.tg_5_anc[p]         += w.tg_5_anc[p];
-                        m.t_5_mod_g[p]        += w.t_5_mod_g[p];
-                        m.tg_5_mod[p]         += w.tg_5_mod[p];
-                        m.t_5_mod[p]          += w.t_5_mod[p];
-                        m.tc_5_mod[p]         += w.tc_5_mod[p];
-                        m.h_3_mod[p]          += w.h_3_mod[p];
-                        m.n_3_mod[p]          += w.n_3_mod[p];
-                        m.a_5_anc_all[p]      += w.a_5_anc_all[p];
-                        m.c_5_anc_all[p]      += w.c_5_anc_all[p];
-                        m.g_5_anc_all[p]      += w.g_5_anc_all[p];
-                        m.t_5_anc_all[p]      += w.t_5_anc_all[p];
-                    }
-                    // Soft-EM fields (per-position arrays + scalar sum).
-                    for (int sp = 0; sp < LsdLlrBinAccum::N_SOFT_POS; ++sp) {
-                        m.sw_t5_anc[sp]  += w.sw_t5_anc[sp];
-                        m.sw_tc5_anc[sp] += w.sw_tc5_anc[sp];
-                        m.sw_h3_anc[sp]  += w.sw_h3_anc[sp];
-                        m.sw_n3_anc[sp]  += w.sw_n3_anc[sp];
-                    }
-                    m.sw_sum += w.sw_sum;
-                }
+            uint64_t sh_n = 0, sh_old = 0, sh_new = 0, sh_flip = 0;
+            uint64_t* sh_ptr = (lsd_cls_params.d_anc_contract >= 0.0)
+                               ? &sh_n : nullptr;
+            auto merged_llr = reconstruct_lsd_llr_accum(
+                merged_cnt, n_lsd_bins, lsd_master,
+                lsd_cls_params, is_ss, lsd_log_prior_odds,
+                sh_ptr, sh_ptr ? &sh_old : nullptr,
+                sh_ptr ? &sh_new : nullptr,
+                sh_ptr ? &sh_flip : nullptr);
+
+            if (sh_n > 0) {
+                const double inv = 100.0 / static_cast<double>(sh_n);
+                char sb[256];
+                std::snprintf(sb, sizeof(sb),
+                    "[shadow] contract-vs-mixture split: reads=%llu  anc_old=%llu (%.2f%%)  "
+                    "anc_new=%llu (%.2f%%)  flips=%llu (%.2f%%)  pi=%.4f  pi_detected=%d",
+                    (unsigned long long)sh_n,
+                    (unsigned long long)sh_old, sh_old * inv,
+                    (unsigned long long)sh_new, sh_new * inv,
+                    (unsigned long long)sh_flip, sh_flip * inv,
+                    dp.pi.point,
+                    (int)(dp.pi.state == taph::DamageConfidence::DETECTED));
+                std::cerr << sb << "\n";
             }
 
             lsd_prebuilt.edges        = lsd_fuse_edges;
