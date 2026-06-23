@@ -1097,49 +1097,56 @@ int damage_main(int argc, char** argv) {
 
         // Compute paired overlap substitution decay from bsubst arrays loaded earlier.
         if (!subst_in_paths.empty() && bsubst_loaded) {
+            std::vector<double> ct_denom(30), ga_denom(30);
             for (int p = 0; p < 30; ++p) {
                 int64_t ct = bsubst_fwd[p][3][1];
                 int64_t dc = bsubst_fwd[p][0][1]+bsubst_fwd[p][1][1]+bsubst_fwd[p][2][1]+bsubst_fwd[p][3][1];
+                ct_denom[p] = static_cast<double>(dc);
                 pji.paired_ct_decay.push_back(dc > 0 ? (double)ct/dc : 0.0);
             }
             for (int p = 0; p < 30; ++p) {
                 int64_t ga = bsubst_rev[p][2][0];
                 int64_t dg = bsubst_rev[p][2][0]+bsubst_rev[p][2][1]+bsubst_rev[p][2][2]+bsubst_rev[p][2][3];
+                ga_denom[p] = static_cast<double>(dg);
                 pji.paired_ga_decay.push_back(dg > 0 ? (double)ga/dg : 0.0);
             }
-            // Fit bg + d_max * exp(-lambda * p) to per-C-site bsubst rates.
-            // Grid search 101 steps over lambda ∈ [0.05, 3.0]; linear LS for bg and d_max.
-            // Skips zero entries (positions censored by skip_terminal in v19 bsubst).
+            // Fit bg + d_max * exp(-lambda * p) by variable-projection (VARPRO):
+            // grid search over lambda, weighted linear LS (weight=N_p) for bg and d_max.
+            // Valid positions: dc[p] > 0 (observed C sites), not rates[p] > 0 (avoids
+            // conflating no-data with measured-zero at low-damage interior positions).
+            // Identifiability guard: exp(-lambda * p_min) < 0.10 → exponential negligible
+            // at first observed position (v19 bsubst, skip_terminal=4 → p=0-3 censored).
             auto fit_bsubst_decay = [](const std::vector<double>& rates,
+                                        const std::vector<double>& denom,
                                         double& dm, double& lam, double& bg) {
                 std::vector<int> valid;
-                for (int p = 0; p < (int)rates.size(); ++p)
-                    if (rates[p] > 0.0) valid.push_back(p);
+                for (int p = 0; p < (int)denom.size(); ++p)
+                    if (denom[p] > 0.0) valid.push_back(p);
                 if ((int)valid.size() < 3) { dm = lam = bg = -1.0; return; }
                 double best = 1e18;
-                int n = (int)valid.size();
                 for (int li = 0; li <= 100; ++li) {
                     double l = 0.05 + li * (3.0 - 0.05) / 100.0;
-                    double se = 0, se2 = 0, sy = 0, sey = 0;
-                    for (int p : valid) { double e = std::exp(-l*p); se+=e; se2+=e*e; sy+=rates[p]; sey+=rates[p]*e; }
-                    double det = n*se2 - se*se;
+                    double sw = 0, swe = 0, swe2 = 0, swy = 0, swey = 0;
+                    for (int p : valid) {
+                        double w = denom[p], e = std::exp(-l*p);
+                        sw+=w; swe+=w*e; swe2+=w*e*e; swy+=w*rates[p]; swey+=w*rates[p]*e;
+                    }
+                    double det = sw*swe2 - swe*swe;
                     if (std::abs(det) < 1e-15) continue;
-                    double d = (n*sey - se*sy) / det;
-                    double b = (sy*se2 - se*sey) / det;
+                    double d = (sw*swey - swe*swy) / det;
+                    double b = (swy*swe2 - swe*swey) / det;
                     if (d < 0.0 || d > 1.0 || b < 0.0 || b > 1.0) continue;
                     double sse = 0;
-                    for (int p : valid) { double r = rates[p]-(b+d*std::exp(-l*p)); sse+=r*r; }
+                    for (int p : valid) { double r = rates[p]-(b+d*std::exp(-l*p)); sse+=denom[p]*r*r; }
                     if (sse < best) { best=sse; dm=d; lam=l; bg=b; }
                 }
                 if (best >= 1e18) { dm = lam = bg = -1.0; return; }
-                // Unidentifiable if exponential is negligible at the first observed position.
-                // Happens when skip_terminal > 0 censors the terminal positions (v19 bsubst).
-                if (!valid.empty() && valid[0] > 0 && std::exp(-lam * valid[0]) < 0.10)
+                if (valid[0] > 0 && std::exp(-lam * valid[0]) < 0.10)
                     dm = lam = bg = -1.0;
             };
-            fit_bsubst_decay(pji.paired_ct_decay,
+            fit_bsubst_decay(pji.paired_ct_decay, ct_denom,
                              pji.paired_ct_d_max_5prime, pji.paired_ct_lambda_5prime, pji.paired_ct_bg_5prime);
-            fit_bsubst_decay(pji.paired_ga_decay,
+            fit_bsubst_decay(pji.paired_ga_decay, ga_denom,
                              pji.paired_ga_d_max_3prime, pji.paired_ga_lambda_3prime, pji.paired_ga_bg_3prime);
             int64_t tg = 0, dg_all = 0, ca = 0, da_all = 0;
             for (int p = 0; p < 30; ++p) {
