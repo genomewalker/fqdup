@@ -4,12 +4,21 @@
 #include "fqdup/damage_profile.hpp"
 #include "taph/frame_selector_decl.hpp"
 #include "taph/sample_damage_profile.hpp"
+#include "taph/length_stratified_profile.hpp"
 #include <array>
 #include <climits>
 #include <condition_variable>
 #include <mutex>
 #include <string>
 #include <vector>
+
+// LSD sig5 encoding:
+//   5' ternary (T=1,C=2,other=0) — 5 positions = 3^5 = 243 values
+//   3' quinary (A=1,G=2,T=3,C=4,other=0) — 5 positions = 5^5 = 3125 values
+// ceiling: CpG context not encoded (needs next-base); upgrade via quinary 5' sig
+static constexpr int N_LSD_SIG5_5P   = 243;   // 3^5 ternary
+static constexpr int N_LSD_SIG5_3R   = 3125;  // 5^5 quinary
+static constexpr int N_LSD_SIG5      = N_LSD_SIG5_5P * N_LSD_SIG5_3R;  // 759375
 // ---- bounded work queue ------------------------------------------------
 struct WorkQueue {
     std::mutex              mtx;
@@ -45,6 +54,17 @@ struct WorkQueue {
     }
 };
 
+// ---- Single-pass OxoG + LSD accumulation structs -----------------------
+// Ternary 10-position signature histogram cell. Second moments allow
+// exact SE computation without re-reading the FASTQ.
+struct OxSigCell {
+    int64_t t=0, g=0, cv=0, av=0, n=0;  // first moments + count
+    int64_t t2=0, tm=0, m2=0;            // Σ T^2, Σ T*M, Σ M^2 for SE
+};
+
+static constexpr int N_SIG10 = 59049;  // 3^10: ternary 10-position space
+
+
 // ---- per-thread state --------------------------------------------------
 struct WorkerState {
     taph::SampleDamageProfile           profile;
@@ -54,7 +74,81 @@ struct WorkerState {
     int     len_min       = INT_MAX;
     int     len_max       = 0;
     int64_t len_sum       = 0;
+    // OxoG ternary sig hists indexed [gc_bin * N_SIG10 + sig]
+    std::vector<OxSigCell> ox_fwd;
+    std::vector<OxSigCell> ox_rev;
+    // LSD single-pass: per-(prov_bin, lsd_sig5) read counts.
+    // Populated only when lsd_cnt is non-empty (set by damage.cpp before pass 1).
+    taph::LengthBinStats    lbs;
+    std::vector<int32_t>    lsd_cnt;        // size = n_prov_bins × N_LSD_SIG5
+    std::vector<int>        lsd_prov_edges; // provisional bin boundaries (copy)
+    WorkerState()
+        : ox_fwd(taph::SampleDamageProfile::N_GC_BINS * N_SIG10)
+        , ox_rev(taph::SampleDamageProfile::N_GC_BINS * N_SIG10) {}
 };
+
+// Accumulate one read into the OxoG sig histograms and LSD reservoir.
+// Called after update_sample_profile inside worker loops.
+inline static void worker_ox_accumulate(WorkerState& state, const std::string& seq, int L) {
+    const int gc  = taph::SampleDamageProfile::get_gc_bin(seq);
+    const int beg = L / 3, end_ = L - (L / 3);
+    int T = 0, G = 0, Cv = 0, Av = 0;
+    for (int j = beg; j < end_; ++j) {
+        const char b = seq[j] & ~0x20u;
+        if      (b == 'T') ++T;
+        else if (b == 'G') ++G;
+        else if (b == 'C') ++Cv;
+        else if (b == 'A') ++Av;
+    }
+    // Compute both ternary sigs in one endpoint pass.
+    // ALL reads go into BOTH ox_fwd and ox_rev — no proxy orientation decision.
+    // is_ss is unknown during pass 1; oxog_from_sig_hist applies only merged_fwd
+    // for SS (all reads, correct fwd counts) and both for DS (q-weighting selects
+    // the dominant orientation per cell naturally post-fit).
+    uint32_t fsig = 0, rsig = 0, fb = 1, rb = 1;
+    const int k = (L < 10) ? L : 10;
+    for (int i = 0; i < k; ++i) {
+        const char fc = seq[i]     & ~0x20u;
+        const char rc = seq[L-1-i] & ~0x20u;
+        const int  fv = (fc == 'T') ? 1 : (fc == 'C') ? 2 : 0;
+        const int  rv = (rc == 'A') ? 1 : (rc == 'G') ? 2 : 0;
+        fsig += fv * fb; fb *= 3;
+        rsig += rv * rb; rb *= 3;
+    }
+    // Fwd histogram: original orientation (correct for SS and DS fwd reads)
+    {
+        auto& cell = state.ox_fwd[gc * N_SIG10 + fsig];
+        const int M = T + G;
+        cell.t += T; cell.g += G; cell.cv += Cv; cell.av += Av; ++cell.n;
+        cell.t2 += (int64_t)T * T; cell.tm += (int64_t)T * M; cell.m2 += (int64_t)M * M;
+    }
+    // Rev histogram: complement-mapped orientation (correct for DS rev reads)
+    {
+        const int Tr = Av, Gr = Cv, Cvr = G, Avr = T;
+        auto& cell = state.ox_rev[gc * N_SIG10 + rsig];
+        const int M = Tr + Gr;
+        cell.t += Tr; cell.g += Gr; cell.cv += Cvr; cell.av += Avr; ++cell.n;
+        cell.t2 += (int64_t)Tr*Tr; cell.tm += (int64_t)Tr*M; cell.m2 += (int64_t)M*M;
+    }
+    // LSD sig5: joint (5' ternary, 3' quinary) for single-pass reconstruction.
+    if (!state.lsd_cnt.empty()) {
+        // sig5f: first 5 trits of fsig (T=1, C=2, other=0)
+        const uint32_t sig5f = fsig % N_LSD_SIG5_5P;
+        // sig5r_4: 3' end with 5-way encoding (A=1, G=2, T=3, C=4, other=0)
+        uint32_t sig5r_4 = 0, q5 = 1;
+        const int k5 = (L < 5) ? L : 5;
+        for (int i = 0; i < k5; ++i) {
+            const char rc4 = seq[L-1-i] & ~0x20u;
+            const int rv4 = (rc4=='A') ? 1 : (rc4=='G') ? 2 : (rc4=='T') ? 3 : (rc4=='C') ? 4 : 0;
+            sig5r_4 += rv4 * q5; q5 *= 5;
+        }
+        const uint32_t lsd_sig = sig5f * N_LSD_SIG5_3R + sig5r_4;
+        int cb = 0;
+        const int Lcap = (L < LSD_L_MAX) ? L : LSD_L_MAX;
+        for (int e : state.lsd_prov_edges) { if (Lcap >= e) ++cb; else break; }
+        ++state.lsd_cnt[cb * N_LSD_SIG5 + lsd_sig];
+    }
+}
 
 inline static void worker_fn(WorkQueue& queue, WorkerState& state) {
     std::vector<std::string> batch;
@@ -68,6 +162,9 @@ inline static void worker_fn(WorkQueue& queue, WorkerState& state) {
             if (L > state.len_max) state.len_max = L;
             state.len_sum += L;
             ++state.reads_scanned;
+            if (!state.lsd_cnt.empty())
+                state.lbs.update(seq, (L < LSD_L_MAX) ? L : LSD_L_MAX);
+            worker_ox_accumulate(state, seq, L);
         }
     }
 }
@@ -168,6 +265,9 @@ inline static void clip_worker_fn(WorkQueue& queue, WorkerState& state,
             if (L > state.len_max) state.len_max = L;
             state.len_sum += L;
             ++state.reads_scanned;
+            if (!state.lsd_cnt.empty())
+                state.lbs.update(seq, (L < LSD_L_MAX) ? L : LSD_L_MAX);
+            worker_ox_accumulate(state, seq, L);
         }
     }
 }
