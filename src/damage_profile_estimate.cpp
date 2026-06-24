@@ -110,8 +110,9 @@ static DamageProfile estimate_damage_impl(
     const std::vector<std::string>* clip_stubs5 = nullptr,
     const std::vector<std::string>* clip_stubs3 = nullptr)
 {
-    SamplePassState local;
-    SamplePassState& s = out_state ? *out_state : local;
+    std::unique_ptr<SamplePassState> local_owner;
+    if (!out_state) local_owner = std::make_unique<SamplePassState>();
+    SamplePassState& s = out_state ? *out_state : *local_owner;
     static const std::vector<std::string> kEmptyStubs;
     run_sample_pass(reader, forced_lib, max_reads, adapter_scan_reads,
                     clip_stubs5 ? *clip_stubs5 : kEmptyStubs,
@@ -162,8 +163,8 @@ static DamageProfile estimate_damage_impl(
     profile.mask_threshold = mask_threshold;
     profile.bg_5_tc        = deam_profile.fit_baseline_5prime;
     profile.bg_3_channel   = deam_profile.fit_baseline_3prime;
-    profile.mixture_d_damaged = deam_profile.mixture_d_ancient;
-    profile.mixture_pi_damaged = deam_profile.mixture_pi_ancient;
+    profile.mixture_d_damaged = deam_profile.mixture_d_damaged;
+    profile.mixture_pi_damaged = deam_profile.mixture_pi_damaged;
     profile.mixture_d_population_highgc = deam_profile.mixture_d_population_highgc;
     profile.mixture_n_components = deam_profile.mixture_n_components;
     profile.mixture_converged = deam_profile.mixture_converged;

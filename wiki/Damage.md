@@ -219,7 +219,7 @@ The `--json` output also includes a `damage_types` array with one entry per chan
 ## Ancient fraction estimation (JSON only)
 
 `fqdup profile --json` includes an `ancient_fraction` block when bulk d_max > 0.01.
-It decomposes reads into a damaged (ancient) and undamaged (modern) class using
+It decomposes reads into a damaged and non-damaged class using
 a soft-EM approach rather than a hard LLR threshold.
 
 ### Method
@@ -229,7 +229,7 @@ rates. Instead of hard-classifying reads at LLR > 0, each read contributes to
 the fraction accumulators with a **posterior weight**:
 
 ```
-P(ancient | read) = sigmoid(LLR + log(π / (1 − π)))
+P(damaged | read) = sigmoid(LLR + log(π / (1 − π)))
 ```
 
 where π is a prior estimate derived from the ratio of bulk d_max to the
@@ -238,7 +238,7 @@ terminal positions for both 5′ and 3′ accumulators.
 
 The result is that at **high endogenous fractions** (high PPV), soft-EM and
 hard-call estimates agree closely. At **low endogenous fractions** where the
-hard-call ancient pool is dominated by false positives, soft-EM yields a
+hard-call damaged pool is dominated by false positives, soft-EM yields a
 lower, more accurate π and d_max.
 
 ### JSON fields
@@ -264,7 +264,7 @@ lower, more accurate π and d_max.
 
 | Field | Description |
 |-------|-------------|
-| `fraction` | Soft-EM π (posterior-weighted ancient fraction) |
+| `fraction` | Soft-EM π (posterior-weighted damaged fraction) |
 | `n_reads` | Hard-call read count (LLR > 0) |
 | `d_max_5prime` | Soft-EM d_max at 5′ terminus |
 | `d_max_5prime_fit` | WLS+IRLS exponential fit d_max on per-position rates |

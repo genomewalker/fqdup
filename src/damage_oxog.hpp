@@ -250,7 +250,7 @@ inline static float lsd_llr_from_sig(
 
 // Reconstruct LsdLlrBinAccum for n_bins bins from per-(bin,sig) counts.
 // Positions 0..4 are exact; positions 5..14 are approximated from merged_lbs
-// aggregate counts scaled by the per-bin ancient fraction.
+// aggregate counts scaled by the per-bin damaged fraction.
 // Shadow counter output: sh_n/sh_old/sh_new/sh_flip filled when cls.d_anc_contract >= 0.
 inline static std::vector<LsdLlrBinAccum> reconstruct_lsd_llr_accum(
     const std::vector<int32_t>& merged_cnt,  // [n_bins × N_LSD_SIG5]
@@ -325,7 +325,7 @@ inline static std::vector<LsdLlrBinAccum> reconstruct_lsd_llr_accum(
                 }
             }
         }
-        // Positions 5..14: approximate from aggregate lbs × bulk ancient fraction.
+        // Positions 5..14: approximate from aggregate lbs × bulk damaged fraction.
         const int64_t n_total = acc.n_damaged + acc.n_undamaged;
         const int bsz = static_cast<int>(merged_lbs.profiles.size());
         if (n_total > 0 && b < bsz) {
