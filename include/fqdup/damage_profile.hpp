@@ -77,6 +77,9 @@ struct DamageProfile {
     // Validated reference-free ancient fraction (libtaph SampleDamageProfile::pi, SOLUTION §6.3).
     // Shadow-mode step 2: carried for the contract-vs-mixture divergence shadow; not yet a verdict source.
     double pi_point    = -1.0;
+    double pi_lo       = -1.0;
+    double pi_hi       = -1.0;
+    taph::DamageConfidence pi_state = taph::DamageConfidence::UNDETERMINED;
     bool   pi_detected = false;
     bool   enabled        = false;
     bool   ss_mode        = false;  // true = single-stranded library (C→T at both ends)

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -133,23 +134,33 @@ int split_main(int argc, char** argv) {
 
         DamageSplitModel split_model = DamageSplitModel::build(lsd_data, profile);
 
-        // Posterior-weighted threshold: posterior ≥ 0.5  ↔  llr ≥ -log_prior_odds.
-        // Shifts the LLR cut by log(π/(1-π)) so low-π libraries aren't flooded
-        // with false-positive ancient reads that barely cross LLR=0.
+        // Posterior-weighted threshold from the VALIDATED reference-free pi (libtaph SplitPolicy):
+        // posterior ≥ 0.5 ↔ llr ≥ −log(pi/(1−pi)), so the base cut shifts by the prior log-odds and
+        // low-pi libraries aren't flooded with reads that barely cross llr=0. The pi here is the gated
+        // estimate (recovery-aware for diluted samples, ss-correct), NOT the old d_max/d_anc proxy.
+        // State gates behaviour: ABSTAIN/BELOW_FLOOR (blanks, no identifiable damaged stratum) ⇒ no
+        // damaged output — route every read to undamaged rather than manufacture a stratum from noise.
+        taph::DamageEstimate pi_est;
+        pi_est.point = profile.pi_point;
+        pi_est.lo    = profile.pi_lo;
+        pi_est.hi    = profile.pi_hi;
+        pi_est.state = profile.pi_state;
+        const taph::SplitPolicy pol = taph::split_policy(pi_est);
+
         float effective_threshold = split_threshold;
-        if (profile.d_max_5prime > 0.01f) {
-            LsdClassifyParams cls = make_lsd_classify_params(profile);
-            if (cls.d_anc > 0.01) {
-                double pi = std::clamp(
-                    static_cast<double>(profile.d_max_5prime) / cls.d_anc,
-                    1e-6, 1.0 - 1e-6);
-                double log_prior_odds = std::log(pi / (1.0 - pi));
-                effective_threshold = static_cast<float>(split_threshold - log_prior_odds);
-                char b[80];
-                std::snprintf(b, sizeof(b), "%.4f  (pi=%.4f  log_prior_odds=%.4f)",
-                              effective_threshold, pi, log_prior_odds);
-                log_info("Posterior-adjusted split threshold: " + std::string(b));
-            }
+        if (pol.splittable) {
+            effective_threshold = static_cast<float>(split_threshold - pol.log_prior_odds);
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                "%.4f  (pi=%.4f [%.4f,%.4f]  log_prior_odds=%.4f)",
+                effective_threshold, pol.pi, pol.pi_lo, pol.pi_hi, pol.log_prior_odds);
+            log_info("pi-calibrated split threshold: " + std::string(b));
+            log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
+                     "(reference-free per-read AUC ~0.59).");
+        } else {
+            // No identifiable damaged stratum: send everything to undamaged.
+            effective_threshold = std::numeric_limits<float>::infinity();
+            log_info("Damage pi not identifiable (no damaged stratum): routing all reads to undamaged.");
         }
 
         // --- Streaming classification pass ---
