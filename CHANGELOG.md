@@ -9,7 +9,7 @@ First tagged release since v2.0.2. Includes all v2.0.3 and v2.0.4 development
 
 - **`fqdup split`**: splits a deduplication output into damaged and undamaged
   FASTQ streams using the `DamageSplitModel` posterior. Reads are routed to
-  `--out-damaged` / `--out-undamaged` based on their per-read ancient-fraction
+  `--out-damaged` / `--out-undamaged` based on their per-read damaged-fraction
   LLR score. Handles both DS and SS libraries; zero-damage edge case fixed.
 
 ### Performance
@@ -44,9 +44,9 @@ First tagged release since v2.0.2. Includes all v2.0.3 and v2.0.4 development
   fits on the per-position hard-call rate arrays. Fraction cards in the HTML
   report display these alongside `n_reads` for each class.
 
-- **Posterior-weighted (soft-EM) ancient-fraction estimation**: π and d₅/d₃
+- **Posterior-weighted (soft-EM) damaged-fraction estimation**: π and d₅/d₃
   are now estimated via sigmoid-weighted accumulation rather than hard LLR > 0
-  thresholding. A per-read posterior `P(ancient | LLR, π_prior)` weights
+  thresholding. A per-read posterior `P(damaged | LLR, π_prior)` weights
   contributions to the T/(T+C) and A/(A+G) soft accumulators over
   `N_SOFT_POS` terminal positions. The π prior is derived from the ratio of
   bulk d_max to the per-fraction LSD d_max. This eliminates PPV collapse at
@@ -126,7 +126,7 @@ First tagged release since v2.0.2. Includes all v2.0.3 and v2.0.4 development
 ### New features
 
 - **`--out-damaged` / `--out-undamaged`**: route each deduplicated read to a
-  separate FASTQ based on its per-read LLR ancient/modern score. Useful for
+  separate FASTQ based on its per-read LLR damaged/non-damaged score. Useful for
   contamination estimation, variant calling on damaged reads only, and library
   comparisons. `-o` is optional when both split outputs are given.
 

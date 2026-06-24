@@ -456,10 +456,10 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
             }
             lb.per_pos_3prime[p] = v3;
         }
-        lb.mixture_d_damaged    = pr.mixture_d_ancient;
+        lb.mixture_d_damaged    = pr.mixture_d_damaged;
         lb.mixture_d_population_highgc = pr.mixture_d_population_highgc;
         lb.mixture_d_population = pr.mixture_d_population;
-        lb.mixture_pi_damaged   = pr.mixture_pi_ancient;
+        lb.mixture_pi_damaged   = pr.mixture_pi_damaged;
         lb.mixture_n_components = pr.mixture_n_components;
         lb.mixture_converged    = pr.mixture_converged;
         lb.mixture_identifiable = pr.mixture_identifiable;
@@ -615,15 +615,15 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         }
     }
 
-    // ---- Joint length × GC 2-component mixture (shared d_ancient) ----------
+    // ---- Joint length × GC 2-component mixture (shared d_damaged) ----------
     {
         auto jr = taph::fit_length_gc_joint_mixture(master);
-        out.d_joint_ancient    = jr.d_ancient;
-        out.pi_joint_ancient   = jr.pi_ancient;
+        out.d_joint_damaged    = jr.d_damaged;
+        out.pi_joint_damaged   = jr.pi_damaged;
         out.d_joint_population = jr.d_population;
         out.joint_converged    = jr.converged;
         out.joint_separated    = jr.separated;
-        out.cell_w_ancient     = std::move(jr.cell_w_ancient);
+        out.cell_w_damaged     = std::move(jr.cell_w_damaged);
     }
 
     log_info("Pass 0: deamination damage estimation — length stratified (" +

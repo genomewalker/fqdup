@@ -256,7 +256,7 @@ private:
     // Higher score = more terminal deamination signal = more likely to be authentic ancient DNA.
     // Used to select the most-damaged read as cluster representative, maximising the
     // damage signal in the output.
-    // Per-read LLR ancient/modern classifier. Delegates to split_model_ which
+    // Per-read LLR damaged/non-damaged classifier. Delegates to split_model_ which
     // holds precomputed LOD tables (empirical per-bin or bulk exponential fallback).
 
     static uint8_t compute_damage_score(const std::string& seq,
