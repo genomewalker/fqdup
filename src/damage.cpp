@@ -33,6 +33,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -423,7 +424,10 @@ int damage_main(int argc, char** argv) {
     }
 
     // ---- merge all per-thread results ----------------------------------
-    taph::SampleDamageProfile dp;
+    // SampleDamageProfile is ~900KB; heap-allocate to keep damage_main's frame
+    // below the 8MB stack limit when finalize_sample_profile descends into bulk fitting.
+    auto dp_owner = std::make_unique<taph::SampleDamageProfile>();
+    taph::SampleDamageProfile& dp = *dp_owner;
     dp.forced_library_type = forced_lib;
     int64_t reads_scanned = 0, reads_skipped = 0;
     int     len_min = INT_MAX, len_max = 0;
@@ -535,8 +539,8 @@ int damage_main(int argc, char** argv) {
     bulk_dp.bg_5_tc              = dp.fit_baseline_5prime;
     bulk_dp.bg_3_channel         = dp.fit_baseline_3prime;
     bulk_dp.ss_mode              = is_ss;
-    bulk_dp.mixture_d_damaged    = dp.mixture_d_ancient;
-    bulk_dp.mixture_pi_damaged   = dp.mixture_pi_ancient;
+    bulk_dp.mixture_d_damaged    = dp.mixture_d_damaged;
+    bulk_dp.mixture_pi_damaged   = dp.mixture_pi_damaged;
     bulk_dp.mixture_d_population_highgc = dp.mixture_d_population_highgc;
     bulk_dp.mixture_n_components = dp.mixture_n_components;
     bulk_dp.mixture_converged    = dp.mixture_converged;
@@ -546,9 +550,9 @@ int damage_main(int argc, char** argv) {
     bulk_dp.pi_point             = dp.pi.point;  // SOLUTION §6.3 validated pi (shadow step 2)
     bulk_dp.pi_detected          = (dp.pi.state == taph::DamageConfidence::DETECTED);
 
-    // Fuse per-read ancient/modern classification into the oxoG pass whenever
+    // Fuse per-read damaged/non-damaged classification into the oxoG pass whenever
     // damage is detectable. When --length-bins is also enabled, compute multi-bin
-    // LSD edges; otherwise a single global bin accumulates the ancient fraction.
+    // LSD edges; otherwise a single global bin accumulates the damaged fraction.
     const bool fuse_lsd = run_oxog && !paired_mode && dp.d_max_5prime > 0.01f;
     std::vector<int>   lsd_fuse_edges;
     LsdClassifyParams  lsd_cls_params{};
@@ -850,8 +854,8 @@ int damage_main(int argc, char** argv) {
                 std::cout << "  S_oxog=" << std::showpos << std::fixed << std::setprecision(4)
                           << S_oxog << std::noshowpos
                           << "  SE=" << std::setprecision(4) << SE_oxog
-                          << (is_ss ? "  [SS: ancient-weighted T/(T+G) enrichment]"
-                                    : "  [DS: dual-orient ancient-weighted T/(T+G) enrichment]")
+                          << (is_ss ? "  [SS: damaged-weighted T/(T+G) enrichment]"
+                                    : "  [DS: dual-orient damaged-weighted T/(T+G) enrichment]")
                           << "\n";
             }
             std::cout << "\n";
@@ -1325,8 +1329,8 @@ int damage_main(int argc, char** argv) {
         h << "  ,\"anc_d3\": "        << (frac_too_low_for_identity ? "null" : jv(dp.damaged_fraction_d3)) << "\n";
         h << "  ,\"anc_pi\": "        << jv(dp.damaged_fraction_pi)     << "\n";
         h << "  ,\"anc_n\": "         << dp.damaged_fraction_n          << "\n";
-        h << "  ,\"mod_d5\": "        << jv(dp.modern_fraction_d5)      << "\n";
-        h << "  ,\"mod_d3\": "        << jv(dp.modern_fraction_d3)      << "\n";
+        h << "  ,\"mod_d5\": "        << jv(dp.nondamaged_fraction_d5)      << "\n";
+        h << "  ,\"mod_d3\": "        << jv(dp.nondamaged_fraction_d3)      << "\n";
         // Per-position rates for fraction damage curves
         h << "  ,\"anc_rate5\": [";
         for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.damaged_fraction_rate5[p]); }
@@ -1343,17 +1347,17 @@ int damage_main(int argc, char** argv) {
         h << "  ,\"anc_d3_fit\": "   << jv(dp.damaged_fraction_d3_fit)  << "\n";
         h << "  ,\"anc_lam3\": "     << jv(dp.damaged_fraction_lambda3) << "\n";
         h << "  ,\"mod_rate5\": [";
-        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.modern_fraction_rate5[p]); }
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.nondamaged_fraction_rate5[p]); }
         h << "]\n";
         h << "  ,\"mod_rate3\": [";
-        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.modern_fraction_rate3[p]); }
+        for (int p = 0; p < 15; ++p) { if (p) h << ","; h << jv(dp.nondamaged_fraction_rate3[p]); }
         h << "]\n";
-        h << "  ,\"mod_d5_fit\": "   << jv(dp.modern_fraction_d5_fit)   << "\n";
-        h << "  ,\"mod_lam5\": "     << jv(dp.modern_fraction_lambda5)  << "\n";
-        h << "  ,\"mod_d3_fit\": "   << jv(dp.modern_fraction_d3_fit)   << "\n";
-        h << "  ,\"mod_lam3\": "     << jv(dp.modern_fraction_lambda3)  << "\n";
-        h << "  ,\"mod_leakage_5\": " << jb(dp.modern_fraction_leakage_5prime) << "\n";
-        h << "  ,\"mod_leakage_3\": " << jb(dp.modern_fraction_leakage_3prime) << "\n";
+        h << "  ,\"mod_d5_fit\": "   << jv(dp.nondamaged_fraction_d5_fit)   << "\n";
+        h << "  ,\"mod_lam5\": "     << jv(dp.nondamaged_fraction_lambda5)  << "\n";
+        h << "  ,\"mod_d3_fit\": "   << jv(dp.nondamaged_fraction_d3_fit)   << "\n";
+        h << "  ,\"mod_lam3\": "     << jv(dp.nondamaged_fraction_lambda3)  << "\n";
+        h << "  ,\"mod_leakage_5\": " << jb(dp.nondamaged_fraction_leakage_5prime) << "\n";
+        h << "  ,\"mod_leakage_3\": " << jb(dp.nondamaged_fraction_leakage_3prime) << "\n";
         // OLS amplitude (curve parameter) vs reported d(1) (summary statistic).
         // When pos0_art5/3, d*_fit = d(1) = d_ols*exp(-lam); recover d_ols for rendering.
         {
@@ -1364,8 +1368,8 @@ int damage_main(int argc, char** argv) {
             bool a3 = dp.position_0_artifact_3prime;
             h << "  ,\"anc_d5_ols\": " << jv(ols_amp(dp.damaged_fraction_d5_fit, dp.damaged_fraction_lambda5, a5)) << "\n";
             h << "  ,\"anc_d3_ols\": " << jv(ols_amp(dp.damaged_fraction_d3_fit, dp.damaged_fraction_lambda3, a3)) << "\n";
-            h << "  ,\"mod_d5_ols\": " << jv(ols_amp(dp.modern_fraction_d5_fit,  dp.modern_fraction_lambda5,  a5)) << "\n";
-            h << "  ,\"mod_d3_ols\": " << jv(ols_amp(dp.modern_fraction_d3_fit,  dp.modern_fraction_lambda3,  a3)) << "\n";
+            h << "  ,\"mod_d5_ols\": " << jv(ols_amp(dp.nondamaged_fraction_d5_fit,  dp.nondamaged_fraction_lambda5,  a5)) << "\n";
+            h << "  ,\"mod_d3_ols\": " << jv(ols_amp(dp.nondamaged_fraction_d3_fit,  dp.nondamaged_fraction_lambda3,  a3)) << "\n";
         }
         h << "  ,\"pres_score\": "    << jv(dp.preservation_score)    << "\n";
         h << "  ,\"pres_label\": \""  << pres_h.label                 << "\"\n";
