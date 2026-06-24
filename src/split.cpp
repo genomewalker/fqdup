@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <algorithm>
 #include <limits>
+#include <vector>
 #include <memory>
 #include <string>
 #include <thread>
@@ -147,20 +149,53 @@ int split_main(int argc, char** argv) {
         pi_est.state = profile.pi_state;
         const taph::SplitPolicy pol = taph::split_policy(pi_est);
 
+        // Split strategy is AUTO-SELECTED by the estimator's own regime (pi_state):
+        //   DETECTED      -> posterior-threshold: cut = base - log(pi/(1-pi)). Reads are individually
+        //                    confident, so the realized damaged fraction tracks pi naturally.
+        //   LOW_ABUNDANCE -> yield-locked: the recovery regime where pi is small and the per-read signal
+        //                    is weak, so a posterior cut mathematically collapses to ~0 (no read clears
+        //                    the high prior-driven threshold). Instead pick the cut at the pi-quantile of
+        //                    the LLR distribution -> route the top pi*N best-ranked reads as the damaged
+        //                    enrichment set. Costs one extra histogram pass over the input.
+        //   ABSTAIN/BELOW_FLOOR -> no identifiable stratum: route everything undamaged.
         float effective_threshold = split_threshold;
-        if (pol.splittable) {
+        if (!pol.splittable) {
+            effective_threshold = std::numeric_limits<float>::infinity();
+            log_info("Damage pi not identifiable (no damaged stratum): routing all reads to undamaged.");
+        } else if (pol.state == taph::DamageConfidence::LOW_ABUNDANCE) {
+            // Yield-locked: histogram pass to find the LLR cut whose upper tail mass ≈ pi.
+            constexpr int    NB = 20001;
+            constexpr double LO = -100.0, HI = 100.0;
+            std::vector<uint64_t> hist(NB, 0);
+            uint64_t n_scan = 0;
+            { auto hr = make_fastq_reader(in_path); FastqRecord hrec;
+              while (hr->read(hrec)) {
+                  float s = split_model.score(hrec.seq);
+                  int bi = static_cast<int>((s - LO) / (HI - LO) * (NB - 1));
+                  bi = std::clamp(bi, 0, NB - 1);
+                  ++hist[bi]; ++n_scan;
+              } }
+            const uint64_t target = static_cast<uint64_t>(pol.pi * static_cast<double>(n_scan));
+            uint64_t cum = 0; int tb = NB - 1;
+            for (; tb > 0; --tb) { cum += hist[tb]; if (cum >= target) break; }
+            effective_threshold = static_cast<float>(LO + (HI - LO) * tb / (NB - 1));
+            char b[176];
+            std::snprintf(b, sizeof(b),
+                "%.4f  (yield-locked: top pi=%.4f [%.4f,%.4f] of %llu reads ~= %llu damaged)",
+                effective_threshold, pol.pi, pol.pi_lo, pol.pi_hi,
+                (unsigned long long)n_scan, (unsigned long long)target);
+            log_info("LOW_ABUNDANCE auto-detected -> yield-locked split threshold: " + std::string(b));
+            log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
+                     "(reference-free per-read AUC ~0.59).");
+        } else {
             effective_threshold = static_cast<float>(split_threshold - pol.log_prior_odds);
             char b[160];
             std::snprintf(b, sizeof(b),
                 "%.4f  (pi=%.4f [%.4f,%.4f]  log_prior_odds=%.4f)",
                 effective_threshold, pol.pi, pol.pi_lo, pol.pi_hi, pol.log_prior_odds);
-            log_info("pi-calibrated split threshold: " + std::string(b));
+            log_info("DETECTED -> posterior-threshold split: " + std::string(b));
             log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
                      "(reference-free per-read AUC ~0.59).");
-        } else {
-            // No identifiable damaged stratum: send everything to undamaged.
-            effective_threshold = std::numeric_limits<float>::infinity();
-            log_info("Damage pi not identifiable (no damaged stratum): routing all reads to undamaged.");
         }
 
         // --- Streaming classification pass ---
