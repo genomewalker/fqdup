@@ -1002,10 +1002,19 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
         // log-odds (built from per_pos_3prime) and is 0 wherever the bin has no 3' damage, so adding it
         // for ds is harmless when absent and recovers the joint-end signal single-end scoring drops.
         // Validated: composition-matched synthetic AUC +0.015-0.03 (5'-only -> 5'+3') at FLB-KapK damage.
+        // Library-aware 3' transition (must match the per_pos_3prime build): ds 3' = G->A (damaged=A,
+        // ref=G); ss 3' = C->T (damaged=T, ref=C). lod3_T is the DAMAGED-base lod, lod3_C the REF-base
+        // lod, regardless of transition. The previous code scored A/G unconditionally, which mismatched
+        // the C->T-trained ss lod3 (scoring the wrong bases). ss synthetic AUC gain doubles when correct.
         for (int i = 1; i <= lim5 && i < L; ++i) {
             char c = seq[L - 1 - i];
-            if      (c == 'A') s += bin->lod3_T[i];
-            else if (c == 'G') s += bin->lod3_C[i];
+            if (bin->ss_mode) {              // ss: 3' C->T
+                if      (c == 'T') s += bin->lod3_T[i];
+                else if (c == 'C') s += bin->lod3_C[i];
+            } else {                         // ds: 3' G->A
+                if      (c == 'A') s += bin->lod3_T[i];
+                else if (c == 'G') s += bin->lod3_C[i];
+            }
         }
         return s;
     }
@@ -1037,8 +1046,11 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
             pd = std::max(0.0001, std::min(0.9999, pd));
             pu = std::max(0.0001, std::min(0.9999, pu));
             char c = seq[L - 1 - i];
-            if      (c == 'A') s += static_cast<float>(std::log(pd / pu));
-            else if (c == 'G') s += static_cast<float>(std::log((1 - pd) / (1 - pu)));
+            // Library-aware 3' transition: ss 3' = C->T (damaged=T, ref=C), ds 3' = G->A (damaged=A, ref=G).
+            const char dam = fallback.ss_mode ? 'T' : 'A';
+            const char ref = fallback.ss_mode ? 'C' : 'G';
+            if      (c == dam) s += static_cast<float>(std::log(pd / pu));
+            else if (c == ref) s += static_cast<float>(std::log((1 - pd) / (1 - pu)));
         }
     }
     return s;
