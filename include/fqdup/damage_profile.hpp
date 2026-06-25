@@ -347,6 +347,10 @@ struct DamageEstimate {
     // Passed as prebuilt_hist to estimate_damage_by_length() to skip its
     // own histogram sub-pass (saves one full file read).
     std::vector<uint64_t> lsd_hist;
+    // Total records READ in the scan (incl. length-filtered short reads). Equals max_reads
+    // when the cap bound the scan -> more reads exist; < max_reads means EOF was reached.
+    // Used to decide full-depth escalation without being fooled by short-read filtering.
+    int64_t reads_seen = 0;
 };
 
 DamageEstimate estimate_damage_with_qc(const std::string& path,

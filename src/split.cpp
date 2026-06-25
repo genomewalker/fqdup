@@ -122,16 +122,14 @@ int split_main(int argc, char** argv) {
             const bool resolved = (st == taph::DamageConfidence::DETECTED ||
                                    st == taph::DamageConfidence::LOW_ABUNDANCE);
             const float sig = std::max(est.profile.d_max_5prime, est.profile.d_max_3prime);
-            // lsd_hist counts reads that passed the length filter, so it lands below the raw cap even
-            // when the cap was hit; use a fraction of the cap as "the cap bound the scan (more reads
-            // exist)" rather than ==, which never fires once any read is length-filtered.
-            int64_t n_scanned = 0;
-            for (uint64_t h : est.lsd_hist) n_scanned += static_cast<int64_t>(h);
-            if (!resolved && sig > 0.02f && n_scanned >= opts.max_reads * 4 / 5) {
+            // Escalate only if the cap actually bound the scan (reads_seen == cap => more reads exist).
+            // reads_seen counts records READ, not length-passed reads, so heavy short-read filtering
+            // (e.g. the most-degraded samples) can't fool it into skipping a warranted rescan.
+            if (!resolved && sig > 0.02f && est.reads_seen >= opts.max_reads) {
                 char m[160];
                 std::snprintf(m, sizeof(m),
                     "Pass 0 inconclusive at %lld reads with d_max=%.3f present; rescanning at full depth.",
-                    (long long)n_scanned, sig);
+                    (long long)est.reads_seen, sig);
                 log_info(m);
                 auto t0b = std::chrono::steady_clock::now();
                 DamageEstimateOptions full_opts = opts;
