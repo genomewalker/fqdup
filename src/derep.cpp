@@ -3146,7 +3146,8 @@ int derep_main(int argc, char** argv) {
                 want_split &&
                 split_model_mode != SplitModelMode::Bulk &&
                 (split_model_mode == SplitModelMode::Empirical ||
-                 est.profile.d_max_5prime > 0.01);
+                 // max(d5,d3): 3'-only DS damage was gated out of the empirical model (see split.cpp).
+                 std::max(est.profile.d_max_5prime, est.profile.d_max_3prime) > 0.01);
             if (run_empirical) {
                 const std::vector<uint64_t>* hist_ptr =
                     est.lsd_hist.empty() ? nullptr : &est.lsd_hist;

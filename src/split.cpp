@@ -119,7 +119,9 @@ int split_main(int argc, char** argv) {
         const bool run_empirical =
             split_model_mode != SplitModelMode::Bulk &&
             (split_model_mode == SplitModelMode::Empirical ||
-             est.profile.d_max_5prime > 0.01);
+             // max(d5,d3): a 3'-only DS signal (5' ->G-overcall artifact-dead, e.g. FLB57md) was
+             // gated out of the empirical model by the 5'-only test and fell to the bulk fallback.
+             std::max(est.profile.d_max_5prime, est.profile.d_max_3prime) > 0.01);
 
         if (run_empirical) {
             auto t1 = std::chrono::steady_clock::now();
