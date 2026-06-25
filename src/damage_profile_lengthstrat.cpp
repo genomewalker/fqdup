@@ -942,25 +942,38 @@ DamageSplitModel DamageSplitModel::build(const LengthStratifiedDamageProfile& ls
         bin.hi      = lb.length_hi;
         bin.ss_mode = lb.ss_mode;
 
+        // CpG amplitude ratio: scale the per-position 5' C->T damage EXCESS (not the baseline) by
+        // d_max_5_cpg / d_max_5_bulk when both are well-estimated; else r_cpg=1 (CpG lod == bulk lod).
+        double r_cpg = 1.0;
+        if (std::isfinite(lb.d_max_5_cpg_damaged) && std::isfinite(lb.d_max_5_damaged)
+                && lb.d_max_5_damaged > 1e-4f)
+            r_cpg = std::clamp(static_cast<double>(lb.d_max_5_cpg_damaged) / lb.d_max_5_damaged, 0.0, 5.0);
         for (int i = 0; i < LengthBinDamageProfile::N_POS; ++i) {
             double pb = lb.per_pos_5prime_ct[i];
             double pd = lb.per_pos_5prime_ct_damaged[i];
-            if (pb < 0.0 || pd < 0.0) { bin.lod5_T[i] = bin.lod5_C[i] = 0.0f; continue; }
+            if (pb < 0.0 || pd < 0.0) {
+                bin.lod5_T[i] = bin.lod5_C[i] = bin.lod5_T_cpg[i] = bin.lod5_C_cpg[i] = 0.0f; continue;
+            }
             double pu = std::max(0.0001, std::min(0.9999, (pb - pi_d * pd) / pi_u));
             pd = std::max(0.0001, std::min(0.9999, pd));
             bin.lod5_T[i] = static_cast<float>(std::log(pd / pu));
             bin.lod5_C[i] = static_cast<float>(std::log((1.0 - pd) / (1.0 - pu)));
+            // CpG-elevated: scale the excess (pd-pu) by r_cpg, keep the baseline pu.
+            double pd_cpg = std::max(0.0001, std::min(0.9999, pu + (pd - pu) * r_cpg));
+            bin.lod5_T_cpg[i] = static_cast<float>(std::log(pd_cpg / pu));
+            bin.lod5_C_cpg[i] = static_cast<float>(std::log((1.0 - pd_cpg) / (1.0 - pu)));
         }
-        if (lb.ss_mode) {
-            for (int i = 0; i < LengthBinDamageProfile::N_POS; ++i) {
-                double pb = lb.per_pos_3prime[i];
-                double pd = lb.per_pos_3prime_damaged[i];
-                if (pb < 0.0 || pd < 0.0) { bin.lod3_T[i] = bin.lod3_C[i] = 0.0f; continue; }
-                double pu = std::max(0.0001, std::min(0.9999, (pb - pi_d * pd) / pi_u));
-                pd = std::max(0.0001, std::min(0.9999, pd));
-                bin.lod3_T[i] = static_cast<float>(std::log(pd / pu));
-                bin.lod3_C[i] = static_cast<float>(std::log((1.0 - pd) / (1.0 - pu)));
-            }
+        // Build the 3' G->A lod for BOTH ds and ss (was ss-only). per_pos_3prime holds the 3' G->A
+        // damage (A-fraction) for ds and the 3' deamination for ss; the lod stays 0 where there is no
+        // 3' signal, so the score()'s now-ungated 3' term is harmless when absent. Recovers the joint end.
+        for (int i = 0; i < LengthBinDamageProfile::N_POS; ++i) {
+            double pb = lb.per_pos_3prime[i];
+            double pd = lb.per_pos_3prime_damaged[i];
+            if (pb < 0.0 || pd < 0.0) { bin.lod3_T[i] = bin.lod3_C[i] = 0.0f; continue; }
+            double pu = std::max(0.0001, std::min(0.9999, (pb - pi_d * pd) / pi_u));
+            pd = std::max(0.0001, std::min(0.9999, pd));
+            bin.lod3_T[i] = static_cast<float>(std::log(pd / pu));
+            bin.lod3_C[i] = static_cast<float>(std::log((1.0 - pd) / (1.0 - pu)));
         }
         m.bins.push_back(std::move(bin));
     }
@@ -980,15 +993,19 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
         const int lim5 = std::min(n_pos, LengthBinDamageProfile::N_POS - 1);
         for (int i = 1; i <= lim5 && i < L; ++i) {
             char c = seq[i];
-            if      (c == 'T') s += bin->lod5_T[i];
-            else if (c == 'C') s += bin->lod5_C[i];
+            // CpG context (next base G): methyl-C deaminates faster -> use the CpG-elevated lod.
+            const bool cpg = (i + 1 < L && seq[i + 1] == 'G');
+            if      (c == 'T') s += cpg ? bin->lod5_T_cpg[i] : bin->lod5_T[i];
+            else if (c == 'C') s += cpg ? bin->lod5_C_cpg[i] : bin->lod5_C[i];
         }
-        if (bin->ss_mode) {
-            for (int i = 1; i <= lim5 && i < L; ++i) {
-                char c = seq[L - 1 - i];
-                if      (c == 'A') s += bin->lod3_T[i];
-                else if (c == 'G') s += bin->lod3_C[i];
-            }
+        // 3' G->A joint-ends LLR for BOTH ds and ss (was ss-only). The lod3 table encodes the 3' G->A
+        // log-odds (built from per_pos_3prime) and is 0 wherever the bin has no 3' damage, so adding it
+        // for ds is harmless when absent and recovers the joint-end signal single-end scoring drops.
+        // Validated: composition-matched synthetic AUC +0.015-0.03 (5'-only -> 5'+3') at FLB-KapK damage.
+        for (int i = 1; i <= lim5 && i < L; ++i) {
+            char c = seq[L - 1 - i];
+            if      (c == 'A') s += bin->lod3_T[i];
+            else if (c == 'G') s += bin->lod3_C[i];
         }
         return s;
     }
@@ -996,10 +1013,11 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
     // Bulk exponential fallback
     // No damage signal → all reads score below threshold → undamaged
     if (!fallback.enabled) return -1.0f;
-    // d_max_5prime=0 → pd==pu at every 5' position → LLR=0 for all reads → uninformative.
-    // For DS only 5' matters; for SS both ends must be zero before we give up.
-    if (fallback.d_max_5prime <= 0.0 &&
-            (!fallback.ss_mode || fallback.d_max_3prime <= 0.0))
+    // Bail only when NEITHER end carries signal. The 3' G->A live end is scored for BOTH ds and ss:
+    // when the 5' is ->G-overcall artifact-dead (d_max_5prime~0, e.g. FLB57md) the damage lives entirely
+    // on the 3' end, so 5'-only ds scoring is blind to it. A d_max_5prime=0 5' loop contributes log(1)=0
+    // per position, so keeping it is harmless; the 3' term supplies the discrimination.
+    if (fallback.d_max_5prime <= 0.0 && fallback.d_max_3prime <= 0.0)
         return -1.0f;
     for (int i = 1; i <= n_pos && i < L; ++i) {
         double pd = fallback.bg_5_tc + fallback.d_max_5prime *
@@ -1011,7 +1029,7 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
         if      (c == 'T') s += static_cast<float>(std::log(pd / pu));
         else if (c == 'C') s += static_cast<float>(std::log((1 - pd) / (1 - pu)));
     }
-    if (fallback.ss_mode) {
+    if (fallback.d_max_3prime > 0.0) {
         for (int i = 1; i <= n_pos && i < L; ++i) {
             double pd = fallback.bg_3_channel + fallback.d_max_3prime *
                         std::exp(-fallback.lambda_3prime * i);
