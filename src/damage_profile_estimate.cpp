@@ -39,64 +39,168 @@ struct SamplePassState {
     std::array<uint64_t, LSD_HIST_BINS> lsd_hist{};
 };
 
+// Per-record accumulation, shared by the serial and parallel paths. Touches only the count state
+// (commutative), so summing thread-local states via merge_sample_profiles reproduces the serial
+// result bit-for-bit. record_pos / max_reads gating is the caller's job. `buf` is a scratch reused
+// across calls to avoid per-record allocation under clipping.
+static inline void accumulate_record(SamplePassState& s, const std::string& seq,
+                                     const std::vector<std::string>& clip_stubs5,
+                                     const std::vector<std::string>& clip_stubs3,
+                                     int64_t adapter_scan_reads, std::string& buf)
+{
+    const std::string* seq_p = &seq;
+    if (!clip_stubs5.empty() || !clip_stubs3.empty()) {
+        buf = seq;
+        if (!clip_stubs5.empty() && (int)buf.size() >= 6) {
+            for (const auto& stub : clip_stubs5)
+                if (buf.compare(0, 6, stub) == 0) { buf.erase(0, 6); break; }
+        }
+        if (!clip_stubs3.empty()) {
+            bool trimmed;
+            do {
+                trimmed = false;
+                int L = static_cast<int>(buf.size());
+                if (L < 12) break;
+                for (const auto& stub : clip_stubs3) {
+                    if (buf.compare(L - 6, 6, stub) == 0) {
+                        buf.erase(L - 6, 6);
+                        trimmed = true;
+                        break;
+                    }
+                }
+            } while (trimmed);
+        }
+        seq_p = &buf;
+    }
+
+    int L = static_cast<int>(seq_p->size());
+    if (L < 30) {
+        if (L > 0) s.short_reads++;
+        return;
+    }
+    s.len_sum += L;
+    ++s.lsd_hist[lsd_hist_bin(L)];
+    taph::FrameSelector::update_sample_profile(s.deam_profile, *seq_p);
+    s.reads_scanned++;
+
+    if (adapter_scan_reads == 0 || s.adapter_reads_scanned < adapter_scan_reads) {
+        if (L >= 12) {
+            int code = taph::encode_hex_at(*seq_p, L - 6);
+            if (code >= 0) { ++s.hex3_terminal[code]; ++s.hex3_count; }
+        }
+        ++s.adapter_reads_scanned;
+    }
+}
+
+static void merge_pass_state(SamplePassState& dst, SamplePassState& src)
+{
+    taph::FrameSelector::merge_sample_profiles(dst.deam_profile, src.deam_profile);
+    dst.reads_scanned         += src.reads_scanned;
+    dst.short_reads           += src.short_reads;
+    dst.len_sum               += src.len_sum;
+    dst.adapter_reads_scanned += src.adapter_reads_scanned;
+    dst.hex3_count            += src.hex3_count;
+    for (size_t i = 0; i < dst.hex3_terminal.size(); ++i) dst.hex3_terminal[i] += src.hex3_terminal[i];
+    for (size_t i = 0; i < dst.lsd_hist.size();      ++i) dst.lsd_hist[i]      += src.lsd_hist[i];
+}
+
 static void run_sample_pass(FastqReaderBase& reader,
                             taph::SampleDamageProfile::LibraryType forced_lib,
                             int64_t max_reads,
                             int64_t adapter_scan_reads,
                             const std::vector<std::string>& clip_stubs5,
                             const std::vector<std::string>& clip_stubs3,
-                            SamplePassState& s)
+                            SamplePassState& s,
+                            size_t threads = 1)
 {
     s.deam_profile.forced_library_type = forced_lib;
+
+    if (threads <= 1) {
+        FastqRecord rec;
+        std::string buf;
+        while (reader.read(rec)) {
+            s.record_pos++;
+            if (max_reads > 0 && s.record_pos > max_reads) break;
+            accumulate_record(s, rec.seq, clip_stubs5, clip_stubs3, adapter_scan_reads, buf);
+        }
+        return;
+    }
+
+    // Parallel: one reader thread (serial gzip decode) feeds batches to N workers, each accumulating
+    // into a thread-local state; merged afterwards. update_sample_profile sums commutative counts, so
+    // the merged estimate is identical to the serial one. Mirrors the LSD-scan producer/consumer.
+    const int n = static_cast<int>(threads);
+    constexpr int BATCH = 4096;
+    struct Queue {
+        std::mutex mtx;
+        std::condition_variable cv_fill, cv_drain;
+        std::vector<std::vector<std::string>> q;
+        bool done = false;
+        int cap;
+        explicit Queue(int c) : cap(c) {}
+    } queue(n * 2);
+
+    std::vector<SamplePassState> wstate(n);
+    for (auto& w : wstate) w.deam_profile.forced_library_type = forced_lib;
+    // Split the adapter-scan budget across workers so the aggregate stays ~adapter_scan_reads
+    // (0 = scan every read, as in the serial path).
+    const int64_t per_worker_adapter =
+        adapter_scan_reads > 0 ? (adapter_scan_reads + n - 1) / n : 0;
+
+    std::vector<std::thread> workers;
+    workers.reserve(n);
+    for (int t = 0; t < n; ++t) {
+        workers.emplace_back([&, t] {
+            std::vector<std::string> batch;
+            std::string buf;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(queue.mtx);
+                    queue.cv_fill.wait(lk, [&] { return !queue.q.empty() || queue.done; });
+                    if (queue.q.empty()) break;
+                    batch = std::move(queue.q.back());
+                    queue.q.pop_back();
+                    queue.cv_drain.notify_one();
+                }
+                for (auto& seq : batch)
+                    accumulate_record(wstate[t], seq, clip_stubs5, clip_stubs3,
+                                      per_worker_adapter, buf);
+            }
+        });
+    }
+
+    int64_t total = 0;
     FastqRecord rec;
-    std::string buf;
+    std::vector<std::string> batch;
+    batch.reserve(BATCH);
     while (reader.read(rec)) {
-        s.record_pos++;
-        if (max_reads > 0 && s.record_pos > max_reads) break;
-
-        const std::string* seq_p = &rec.seq;
-        if (!clip_stubs5.empty() || !clip_stubs3.empty()) {
-            buf = rec.seq;
-            if (!clip_stubs5.empty() && (int)buf.size() >= 6) {
-                for (const auto& stub : clip_stubs5)
-                    if (buf.compare(0, 6, stub) == 0) { buf.erase(0, 6); break; }
-            }
-            if (!clip_stubs3.empty()) {
-                bool trimmed;
-                do {
-                    trimmed = false;
-                    int L = static_cast<int>(buf.size());
-                    if (L < 12) break;
-                    for (const auto& stub : clip_stubs3) {
-                        if (buf.compare(L - 6, 6, stub) == 0) {
-                            buf.erase(L - 6, 6);
-                            trimmed = true;
-                            break;
-                        }
-                    }
-                } while (trimmed);
-            }
-            seq_p = &buf;
-        }
-
-        int L = static_cast<int>(seq_p->size());
-        if (L < 30) {
-            if (L > 0) s.short_reads++;
-            continue;
-        }
-        s.len_sum += L;
-        ++s.lsd_hist[lsd_hist_bin(L)];
-        taph::FrameSelector::update_sample_profile(s.deam_profile, *seq_p);
-        s.reads_scanned++;
-
-        if (adapter_scan_reads == 0 || s.adapter_reads_scanned < adapter_scan_reads) {
-            if (L >= 12) {
-                int code = taph::encode_hex_at(*seq_p, L - 6);
-                if (code >= 0) { ++s.hex3_terminal[code]; ++s.hex3_count; }
-            }
-            ++s.adapter_reads_scanned;
+        total++;
+        if (max_reads > 0 && total > max_reads) break;  // matches serial: cap-th+1 record dropped
+        batch.push_back(std::move(rec.seq));
+        if (static_cast<int>(batch.size()) == BATCH) {
+            std::unique_lock<std::mutex> lk(queue.mtx);
+            queue.cv_drain.wait(lk, [&] { return static_cast<int>(queue.q.size()) < queue.cap; });
+            queue.q.push_back(std::move(batch));
+            queue.cv_fill.notify_one();
+            batch.clear();
+            batch.reserve(BATCH);
         }
     }
+    if (!batch.empty()) {
+        std::unique_lock<std::mutex> lk(queue.mtx);
+        queue.cv_drain.wait(lk, [&] { return static_cast<int>(queue.q.size()) < queue.cap; });
+        queue.q.push_back(std::move(batch));
+        queue.cv_fill.notify_one();
+    }
+    {
+        std::unique_lock<std::mutex> lk(queue.mtx);
+        queue.done = true;
+        queue.cv_fill.notify_all();
+    }
+    for (auto& w : workers) w.join();
+
+    s.record_pos = total;
+    for (auto& w : wstate) merge_pass_state(s, w);
 }
 
 static DamageProfile estimate_damage_impl(
@@ -108,7 +212,8 @@ static DamageProfile estimate_damage_impl(
     SamplePassState* out_state = nullptr,
     int64_t adapter_scan_reads = 0,
     const std::vector<std::string>* clip_stubs5 = nullptr,
-    const std::vector<std::string>* clip_stubs3 = nullptr)
+    const std::vector<std::string>* clip_stubs3 = nullptr,
+    size_t threads = 1)
 {
     std::unique_ptr<SamplePassState> local_owner;
     if (!out_state) local_owner = std::make_unique<SamplePassState>();
@@ -117,7 +222,7 @@ static DamageProfile estimate_damage_impl(
     run_sample_pass(reader, forced_lib, max_reads, adapter_scan_reads,
                     clip_stubs5 ? *clip_stubs5 : kEmptyStubs,
                     clip_stubs3 ? *clip_stubs3 : kEmptyStubs,
-                    s);
+                    s, threads);
 
     int      typical_len   = 0;
     int64_t& reads_scanned = s.reads_scanned;
@@ -273,7 +378,8 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
                                            opts.forced_lib,
                                            opts.max_reads,
                                            &state,
-                                           opts.qc_enabled ? opts.adapter_scan_reads : 0);
+                                           opts.qc_enabled ? opts.adapter_scan_reads : 0,
+                                           nullptr, nullptr, opts.threads);
     }
     out.lsd_hist.assign(state.lsd_hist.begin(), state.lsd_hist.end());
 
@@ -331,7 +437,8 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
                                            &clipped,
                                            opts.adapter_scan_reads,
                                            &out.qc.adapter.stubs5,
-                                           &out.qc.adapter.stubs3);
+                                           &out.qc.adapter.stubs3,
+                                           opts.threads);
         out.qc.profile_clipped = true;
         // Recompute top enriched hexamers from the post-clip dp.
         out.qc.adapter.top_enriched =
