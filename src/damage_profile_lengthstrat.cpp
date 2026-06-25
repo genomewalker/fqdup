@@ -722,6 +722,8 @@ LengthStratifiedDamageProfile estimate_damage_split_model(
     }
 
     // ---- Stripped per-bin accumulator ----
+    // No CpG fields: the CpG/bulk amplitude ratio (r_cpg) is taken from the first LSD pass
+    // (per_pos_5prime_ct_cpg_damaged). This pass only refines the bulk damaged-class profile.
     struct SplitBinAccum {
         int64_t n_dam = 0, n_und = 0;
         // all reads (bulk T/(T+C)) and damaged-class only
@@ -775,7 +777,9 @@ LengthStratifiedDamageProfile estimate_damage_split_model(
                     if (b < 0 || b >= n_bins) continue;
                     auto& acc = wacc[t][b];
 
-                    // classify: additive LLR, no transcendentals
+                    // classify: additive LLR, no transcendentals.
+                    // ds classifies on 5' only; the 3' G->A enrichment is then measured against
+                    // this class. Classifying on 3' as well would make the 3' lod self-referential.
                     double llr = 0.0;
                     int np5 = std::min(CLASS_POS, L);
                     for (int p = 0; p < np5; ++p) {
@@ -991,7 +995,10 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
             if (L >= b.lo && L <= b.hi) { bin = &b; break; }
 
         const int lim5 = std::min(n_pos, LengthBinDamageProfile::N_POS - 1);
-        for (int i = 1; i <= lim5 && i < L; ++i) {
+        // i=0 is the 5' terminus — the MOST discriminative position (max C->T amplitude). The classifier
+        // (coeff5, built from p=0 with exp(-lam*p) peaking at p=0) already weights it; score() masked it
+        // out by starting at i=1, discarding the single strongest feature. Score from the terminus.
+        for (int i = 0; i <= lim5 && i < L; ++i) {
             char c = seq[i];
             // CpG context (next base G): methyl-C deaminates faster -> use the CpG-elevated lod.
             const bool cpg = (i + 1 < L && seq[i + 1] == 'G');
@@ -1006,7 +1013,7 @@ float DamageSplitModel::score(const std::string& seq, int n_pos) const
         // ref=G); ss 3' = C->T (damaged=T, ref=C). lod3_T is the DAMAGED-base lod, lod3_C the REF-base
         // lod, regardless of transition. The previous code scored A/G unconditionally, which mismatched
         // the C->T-trained ss lod3 (scoring the wrong bases). ss synthetic AUC gain doubles when correct.
-        for (int i = 1; i <= lim5 && i < L; ++i) {
+        for (int i = 0; i <= lim5 && i < L; ++i) {   // i=0 = 3' terminus (max G->A), see 5' note above
             char c = seq[L - 1 - i];
             if (bin->ss_mode) {              // ss: 3' C->T
                 if      (c == 'T') s += bin->lod3_T[i];
