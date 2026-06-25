@@ -385,6 +385,11 @@ struct DamageSplitModel {
         std::array<float, LengthBinDamageProfile::N_POS> lod5_C{};
         std::array<float, LengthBinDamageProfile::N_POS> lod3_T{};
         std::array<float, LengthBinDamageProfile::N_POS> lod3_C{};
+        // CpG-context 5' C->T lod (used when the next base is G): methyl-C deaminates faster, so the
+        // damage excess is scaled by the bin's CpG/bulk amplitude ratio. Falls back to the bulk lod5
+        // when the CpG amplitude is ill-estimated. Recovers the CpG channel single-rate scoring misses.
+        std::array<float, LengthBinDamageProfile::N_POS> lod5_T_cpg{};
+        std::array<float, LengthBinDamageProfile::N_POS> lod5_C_cpg{};
     };
 
     std::vector<Bin> bins;
