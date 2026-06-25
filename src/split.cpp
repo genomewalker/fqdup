@@ -101,6 +101,7 @@ int split_main(int argc, char** argv) {
         opts.forced_lib         = forced_library_type;
         opts.qc_enabled         = false;
         opts.max_reads          = damage_deam_max_reads;
+        opts.threads            = std::max(1u, threads);
 
         auto t0 = std::chrono::steady_clock::now();
         DamageEstimate est = estimate_damage_with_qc(in_path, opts);
@@ -108,6 +109,38 @@ int split_main(int argc, char** argv) {
         {
             char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t0s);
             log_info("Phase timer: damage estimation = " + std::string(b));
+        }
+
+        // Adaptive Pass-0 escalation. Identifiability of a low-abundance damaged stratum scales with
+        // the number of reads scanned, not with d_max: at the sample cap a real LOW_ABUNDANCE stratum
+        // (small pi, small d_max) can sit below the floor and the estimator abstains for lack of power.
+        // If the capped scan leaves a present terminal signal unresolved, rescan at full depth so the
+        // estimator can separate a real stratum from noise instead of dropping it (deep-coverage
+        // libraries are exactly where the cap bites). Resolved or genuinely-flat samples skip this.
+        if (opts.max_reads > 0) {
+            const auto st = est.profile.pi_state;
+            const bool resolved = (st == taph::DamageConfidence::DETECTED ||
+                                   st == taph::DamageConfidence::LOW_ABUNDANCE);
+            const float sig = std::max(est.profile.d_max_5prime, est.profile.d_max_3prime);
+            // lsd_hist counts reads that passed the length filter, so it lands below the raw cap even
+            // when the cap was hit; use a fraction of the cap as "the cap bound the scan (more reads
+            // exist)" rather than ==, which never fires once any read is length-filtered.
+            int64_t n_scanned = 0;
+            for (uint64_t h : est.lsd_hist) n_scanned += static_cast<int64_t>(h);
+            if (!resolved && sig > 0.02f && n_scanned >= opts.max_reads * 4 / 5) {
+                char m[160];
+                std::snprintf(m, sizeof(m),
+                    "Pass 0 inconclusive at %lld reads with d_max=%.3f present; rescanning at full depth.",
+                    (long long)n_scanned, sig);
+                log_info(m);
+                auto t0b = std::chrono::steady_clock::now();
+                DamageEstimateOptions full_opts = opts;
+                full_opts.max_reads = 0;
+                est = estimate_damage_with_qc(in_path, full_opts);
+                char b[64]; std::snprintf(b, sizeof(b), "%.1f s",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0b).count());
+                log_info("Phase timer: full-depth rescan = " + std::string(b));
+            }
         }
 
         DamageProfile profile = est.profile;
