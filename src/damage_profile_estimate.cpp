@@ -382,6 +382,7 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
                                            nullptr, nullptr, opts.threads);
     }
     out.lsd_hist.assign(state.lsd_hist.begin(), state.lsd_hist.end());
+    out.reads_seen = state.record_pos;
 
     // Bug 3: small-input warning. deamination fit needs ~100k reads to converge to
     // d_max>0; below that the fit silently returns 0 and downstream code
