@@ -670,7 +670,7 @@ LengthStratifiedDamageProfile estimate_damage_split_model(
         for (auto c : hist) reads_scanned += static_cast<int64_t>(c);
     } else {
         hist.assign(LSD_HIST_BINS, 0);
-        auto reader = make_fastq_reader(path);
+        auto reader = make_fastq_reader(path, static_cast<size_t>(std::max(1, n_workers)));  // parallel inflate
         FastqRecord rec;
         while (reader->read(rec)) {
             int L = static_cast<int>(rec.seq.size());
@@ -849,7 +849,7 @@ LengthStratifiedDamageProfile estimate_damage_split_model(
     }
 
     {
-        auto reader = make_fastq_reader(path);
+        auto reader = make_fastq_reader(path, static_cast<size_t>(std::max(1, n_workers)));  // parallel inflate
         FastqRecord rec;
         std::vector<std::string> batch;
         batch.reserve(BATCH);
