@@ -372,7 +372,7 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
 
     SamplePassState state;
     {
-        auto reader = make_fastq_reader(path);
+        auto reader = make_fastq_reader(path, opts.threads);  // forward -p to the rapidgzip reader (parallel inflate)
         out.profile = estimate_damage_impl(*reader, path,
                                            opts.mask_threshold,
                                            opts.forced_lib,
@@ -430,7 +430,7 @@ DamageEstimate estimate_damage_with_qc(const std::string& path,
         (out.qc.adapter.adapter_clipped || out.qc.adapter.adapter3_clipped))
     {
         SamplePassState clipped;
-        auto reader2 = make_fastq_reader(path);
+        auto reader2 = make_fastq_reader(path, opts.threads);  // forward -p to the rapidgzip reader (parallel inflate)
         out.profile = estimate_damage_impl(*reader2, path,
                                            opts.mask_threshold,
                                            opts.forced_lib,
