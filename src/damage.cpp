@@ -10,6 +10,7 @@
 
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/damage_profile.hpp"
+#include "fqdup/damage_model_io.hpp"
 #include "damage_html_assets.hpp"
 
 #include "taph/frame_selector_decl.hpp"
@@ -108,6 +109,8 @@ int damage_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    std::string damage_json_out;   // scalar damage model for `split --damage-json`
+    std::string model_bin_out;     // full split model for `split --model-bin`
     int         json_level        = 2;  // 1=summary, 2=standard, 3=full
     std::string count_table_path;
     std::string html_path;
@@ -153,6 +156,10 @@ int damage_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--damage-json-out" && i + 1 < argc) {
+            damage_json_out = argv[++i];
+        } else if (arg == "--model-bin-out" && i + 1 < argc) {
+            model_bin_out = argv[++i];
         } else if (arg == "--json-level" && i + 1 < argc) {
             std::string lvl(argv[++i]);
             if (lvl == "summary")       json_level = 1;
@@ -549,6 +556,10 @@ int damage_main(int argc, char** argv) {
     bulk_dp.d_noncpg_5prime      = dp.dmax_ct5_noncpg_like;
     bulk_dp.pi_point             = dp.pi.point;  // SOLUTION §6.3 validated pi (shadow step 2)
     bulk_dp.pi_detected          = (dp.pi.state == taph::DamageConfidence::DETECTED);
+    bulk_dp.pi_lo                = dp.pi.lo;     // carried so a serialized model drives split's SplitPolicy
+    bulk_dp.pi_hi                = dp.pi.hi;
+    bulk_dp.pi_state             = dp.pi.state;
+    bulk_dp.mode_3prime          = is_ss ? Damage3PrimeMode::ss_ct : Damage3PrimeMode::ds_ga;
 
     // Fuse per-read damaged/non-damaged classification into the oxoG pass whenever
     // damage is detectable. When --length-bins is also enabled, compute multi-bin
@@ -992,6 +1003,30 @@ int damage_main(int argc, char** argv) {
         }
         if (total_len_reads > 0)
             short_read_frac = static_cast<double>(short_reads) / total_len_reads;
+    }
+
+    // ---- optional damage-model export (for `fqdup split` reuse) --------
+    // Keeps split in sync with profile: split loads these instead of re-deriving.
+    if (!damage_json_out.empty() || !model_bin_out.empty()) {
+        if (paired_mode) {
+            std::cerr << "Warning: --damage-json-out/--model-bin-out require single-end (-i merged); "
+                         "skipping in paired mode.\n";
+        } else {
+            const std::string in_digest = fqdup_model_io::compute_input_digest(in_path);
+            if (!damage_json_out.empty()) {
+                fqdup_model_io::write_damage_model_json(bulk_dp, damage_json_out, reads_scanned, in_digest);
+                std::cout << "Damage model (JSON): " << damage_json_out << "\n";
+            }
+            if (!model_bin_out.empty()) {
+                // Build the scorer the SAME way `split` does, so the binary IS what split would compute.
+                LengthStratifiedDamageProfile sm_lsd = estimate_damage_split_model(
+                    in_path, bulk_dp, merged_lsd_hist.empty() ? nullptr : &merged_lsd_hist);
+                DamageSplitModel sm = DamageSplitModel::build(sm_lsd, bulk_dp);
+                fqdup_model_io::write_split_model_bin(sm, model_bin_out, reads_scanned, in_digest);
+                std::cout << "Split model (binary): " << model_bin_out
+                          << " (" << sm.bins.size() << " bins)\n";
+            }
+        }
     }
 
     // ---- optional JSON -------------------------------------------------

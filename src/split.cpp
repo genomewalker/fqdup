@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "fqdup/damage_profile.hpp"
+#include "fqdup/damage_model_io.hpp"
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
 #include "fqdup/version.hpp"
@@ -36,12 +37,19 @@ static void usage(const char* prog) {
         "                         empirical: always run length-stratified LSD scan\n"
         "  --split-threshold F  LLR threshold for damaged call (default: 0.0)\n"
         "  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000)\n"
+        "  --model-bin FILE     Reuse full split model from `fqdup profile --model-bin-out`\n"
+        "                         (zero estimation: no Pass-0, no LSD scan). Digest-validated.\n"
+        "  --damage-json FILE   Reuse scalar model from `fqdup profile --damage-json-out`\n"
+        "                         (one LSD pass to build bins). Digest-validated.\n"
+        "  --allow-model-mismatch  Permit a model whose input digest differs (off by default)\n"
         "  -t N                 Threads (default: all available, capped at 16 for I/O)\n"
         "  -h, --help           Show this help\n";
 }
 
 int split_main(int argc, char** argv) {
     std::string in_path, out_damaged_path, out_undamaged_path;
+    std::string model_bin_path, damage_json_path;
+    bool allow_model_mismatch = false;
     float split_threshold = 0.0f;
     int64_t damage_deam_max_reads = 5'000'000;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
@@ -56,6 +64,9 @@ int split_main(int argc, char** argv) {
         else if (a == "--out-undamaged" && i+1 < argc)          { out_undamaged_path = argv[++i]; }
         else if (a == "--split-threshold" && i+1 < argc)        { split_threshold = std::stof(argv[++i]); }
         else if (a == "--damage-deam-sample" && i+1 < argc)     { damage_deam_max_reads = std::stoll(argv[++i]); }
+        else if (a == "--model-bin" && i+1 < argc)              { model_bin_path = argv[++i]; }
+        else if (a == "--damage-json" && i+1 < argc)            { damage_json_path = argv[++i]; }
+        else if (a == "--allow-model-mismatch")                 { allow_model_mismatch = true; }
         else if ((a == "-t" || a == "--threads") && i+1 < argc) { threads = static_cast<unsigned>(std::stoi(argv[++i])); }
         else if (a == "--library-type" && i+1 < argc) {
             std::string m = argv[++i];
@@ -96,78 +107,110 @@ int split_main(int argc, char** argv) {
         log_info("Damage scan: first " + std::to_string(damage_deam_max_reads) + " reads");
 
     try {
-        // --- Pass 0: damage profile estimation ---
-        DamageEstimateOptions opts;
-        opts.forced_lib         = forced_library_type;
-        opts.qc_enabled         = false;
-        opts.max_reads          = damage_deam_max_reads;
-        opts.threads            = std::max(1u, threads);
+        DamageSplitModel split_model;
+        DamageProfile    profile;
+        bool             have_full_model = false;   // Tier 0: scorer fully loaded, skip LSD build
+        std::vector<uint64_t> prebuilt_hist;        // Tier 2 only: reuse Pass-0 histogram
 
-        auto t0 = std::chrono::steady_clock::now();
-        DamageEstimate est = estimate_damage_with_qc(in_path, opts);
-        double t0s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        {
-            char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t0s);
-            log_info("Phase timer: damage estimation = " + std::string(b));
-        }
+        // Digest guard: a reused model must come from the same read-set as the input.
+        auto guard_digest = [&](const std::string& model_digest, const char* flag) -> bool {
+            if (model_digest.empty() || allow_model_mismatch) return true;
+            const std::string in_digest = fqdup_model_io::compute_input_digest(in_path);
+            if (in_digest == model_digest) return true;
+            std::cerr << "Error: " << flag << " was built on a different read-set (model digest "
+                      << model_digest << " != input " << in_digest << ").\n"
+                      << "       Refusing to score one dataset with another's model; "
+                         "pass --allow-model-mismatch to override.\n";
+            return false;
+        };
 
-        // Adaptive Pass-0 escalation. Identifiability of a low-abundance damaged stratum scales with
-        // the number of reads scanned, not with d_max: at the sample cap a real LOW_ABUNDANCE stratum
-        // (small pi, small d_max) can sit below the floor and the estimator abstains for lack of power.
-        // If the capped scan leaves a present terminal signal unresolved, rescan at full depth so the
-        // estimator can separate a real stratum from noise instead of dropping it (deep-coverage
-        // libraries are exactly where the cap bites). Resolved or genuinely-flat samples skip this.
-        if (opts.max_reads > 0) {
-            const auto st = est.profile.pi_state;
-            const bool resolved = (st == taph::DamageConfidence::DETECTED ||
-                                   st == taph::DamageConfidence::LOW_ABUNDANCE);
-            const float sig = std::max(est.profile.d_max_5prime, est.profile.d_max_3prime);
-            // Escalate only if the cap actually bound the scan (reads_seen == cap => more reads exist).
-            // reads_seen counts records READ, not length-passed reads, so heavy short-read filtering
-            // (e.g. the most-degraded samples) can't fool it into skipping a warranted rescan.
-            if (!resolved && sig > 0.02f && est.reads_seen >= opts.max_reads) {
-                char m[160];
-                std::snprintf(m, sizeof(m),
-                    "Pass 0 inconclusive at %lld reads with d_max=%.3f present; rescanning at full depth.",
-                    (long long)est.reads_seen, sig);
-                log_info(m);
-                auto t0b = std::chrono::steady_clock::now();
-                DamageEstimateOptions full_opts = opts;
-                full_opts.max_reads = 0;
-                est = estimate_damage_with_qc(in_path, full_opts);
-                char b[64]; std::snprintf(b, sizeof(b), "%.1f s",
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0b).count());
-                log_info("Phase timer: full-depth rescan = " + std::string(b));
+        if (!model_bin_path.empty()) {
+            // --- Tier 0: reuse the FULL split model (zero estimation) ---
+            int64_t model_n = -1; std::string model_digest;
+            if (!fqdup_model_io::read_split_model_bin(model_bin_path, split_model, model_n, model_digest)) {
+                std::cerr << "Error: bad/incompatible --model-bin " << model_bin_path << "\n";
+                return 1;
             }
-        }
-
-        DamageProfile profile = est.profile;
-        log_info("Split model: " +
-            std::string(profile.d_max_5prime > 0.01 ? "empirical candidate" : "bulk exponential"));
-
-        // --- Optional LSD scan for empirical per-length-bin model ---
-        LengthStratifiedDamageProfile lsd_data;
-        const bool run_empirical =
-            split_model_mode != SplitModelMode::Bulk &&
-            (split_model_mode == SplitModelMode::Empirical ||
-             // max(d5,d3): a 3'-only DS signal (5' ->G-overcall artifact-dead, e.g. FLB57md) was
-             // gated out of the empirical model by the 5'-only test and fell to the bulk fallback.
-             std::max(est.profile.d_max_5prime, est.profile.d_max_3prime) > 0.01);
-
-        if (run_empirical) {
-            auto t1 = std::chrono::steady_clock::now();
-            const std::vector<uint64_t>* hist_ptr =
-                est.lsd_hist.empty() ? nullptr : &est.lsd_hist;
-            lsd_data = estimate_damage_split_model(in_path, est.profile, hist_ptr);
-            double t1s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-            char b[64]; std::snprintf(b, sizeof(b), "%.1f s", t1s);
-            log_info("Phase timer: length-stratified LLR model = " +
-                std::string(b) + " (" + std::to_string(lsd_data.bins.size()) + " bins)");
+            if (!guard_digest(model_digest, "--model-bin")) return 1;
+            profile = split_model.fallback;
+            have_full_model = true;
+            char b[176]; std::snprintf(b, sizeof(b),
+                "Reusing full split model from %s (%zu bins, pi=%.3f pi_state=%d) "
+                "— no Pass-0, no LSD scan.",
+                model_bin_path.c_str(), split_model.bins.size(),
+                profile.pi_point, (int)profile.pi_state);
+            log_info(std::string(b));
+        } else if (!damage_json_path.empty()) {
+            // --- Tier 1: scalar model from JSON; one LSD pass builds the bins ---
+            int64_t model_n = -1; std::string model_digest;
+            if (!fqdup_model_io::load_damage_model_json(damage_json_path, profile, model_n, model_digest)) {
+                std::cerr << "Error: cannot read --damage-json " << damage_json_path << "\n";
+                return 1;
+            }
+            if (!guard_digest(model_digest, "--damage-json")) return 1;
+            log_info("Loaded scalar damage model from " + damage_json_path +
+                     " (skips Pass-0; building bins via one LSD pass).");
         } else {
-            log_info("Split model: bulk exponential (--split-model bulk or no damage detected)");
+            // --- Tier 2: self-estimate (Pass-0 + adaptive escalation) ---
+            DamageEstimateOptions opts;
+            opts.forced_lib         = forced_library_type;
+            opts.qc_enabled         = false;
+            opts.max_reads          = damage_deam_max_reads;
+            opts.threads            = std::max(1u, threads);
+
+            auto t0 = std::chrono::steady_clock::now();
+            DamageEstimate est = estimate_damage_with_qc(in_path, opts);
+            {
+                char b[64]; std::snprintf(b, sizeof(b), "%.1f s",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                log_info("Phase timer: damage estimation = " + std::string(b));
+            }
+
+            // Adaptive Pass-0 escalation: rescan full depth when a capped scan leaves a present
+            // terminal signal unresolved (deep-coverage libraries are where the cap bites).
+            if (opts.max_reads > 0) {
+                const auto st = est.profile.pi_state;
+                const bool resolved = (st == taph::DamageConfidence::DETECTED ||
+                                       st == taph::DamageConfidence::LOW_ABUNDANCE);
+                const float sig = std::max(est.profile.d_max_5prime, est.profile.d_max_3prime);
+                if (!resolved && sig > 0.02f && est.reads_seen >= opts.max_reads) {
+                    char m[160];
+                    std::snprintf(m, sizeof(m),
+                        "Pass 0 inconclusive at %lld reads with d_max=%.3f present; rescanning at full depth.",
+                        (long long)est.reads_seen, sig);
+                    log_info(m);
+                    DamageEstimateOptions full_opts = opts;
+                    full_opts.max_reads = 0;
+                    est = estimate_damage_with_qc(in_path, full_opts);
+                }
+            }
+            profile = est.profile;
+            prebuilt_hist = std::move(est.lsd_hist);
         }
 
-        DamageSplitModel split_model = DamageSplitModel::build(lsd_data, profile);
+        // --- Tier 1 & 2: build the empirical per-length-bin scorer from one LSD pass ---
+        if (!have_full_model) {
+            log_info("Split model: " +
+                std::string(profile.d_max_5prime > 0.01 ? "empirical candidate" : "bulk exponential"));
+            LengthStratifiedDamageProfile lsd_data;
+            const bool run_empirical =
+                split_model_mode != SplitModelMode::Bulk &&
+                (split_model_mode == SplitModelMode::Empirical ||
+                 std::max(profile.d_max_5prime, profile.d_max_3prime) > 0.01);
+            if (run_empirical) {
+                auto t1 = std::chrono::steady_clock::now();
+                const std::vector<uint64_t>* hist_ptr =
+                    prebuilt_hist.empty() ? nullptr : &prebuilt_hist;
+                lsd_data = estimate_damage_split_model(in_path, profile, hist_ptr);
+                char b[64]; std::snprintf(b, sizeof(b), "%.1f s",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count());
+                log_info("Phase timer: length-stratified LLR model = " +
+                    std::string(b) + " (" + std::to_string(lsd_data.bins.size()) + " bins)");
+            } else {
+                log_info("Split model: bulk exponential (--split-model bulk or no damage detected)");
+            }
+            split_model = DamageSplitModel::build(lsd_data, profile);
+        }
 
         // Posterior-weighted threshold from the VALIDATED reference-free pi (libtaph SplitPolicy):
         // posterior ≥ 0.5 ↔ llr ≥ −log(pi/(1−pi)), so the base cut shifts by the prior log-odds and
