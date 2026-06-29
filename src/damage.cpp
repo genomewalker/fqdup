@@ -248,19 +248,59 @@ int damage_main(int argc, char** argv) {
         reader_se = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
         int64_t n = 0;
+        // Serial read into the buffer (rapidgzip decode is I/O-bound, ~8% of the
+        // window); only count qualifying reads (L>=LSD_L_MIN) toward the cap so
+        // se_scan_buf holds exactly the first pre_scan_reads qualifying reads in
+        // file order (consumed later for LSD edges + re-fed into the full pass).
         while (reader_se->read(rec) && (pre_scan_reads == 0 || n < pre_scan_reads)) {
-            int L = static_cast<int>(rec.seq.size());
-            if (L >= LSD_L_MIN) {
-                taph::FrameSelector::update_sample_profile(scan_state.profile, rec.seq);
-                if (L >= 12) {
-                    int code = taph::encode_hex_at(rec.seq, L - 6);
-                    if (code >= 0) { ++hex3_terminal[code]; ++n_hex3; }
-                }
-                ++n;
-            }
+            if (static_cast<int>(rec.seq.size()) >= LSD_L_MIN) ++n;
             se_scan_buf.push_back(std::move(rec));
         }
         // reader_se stays open — remaining records consumed in full pass below.
+
+        // Parallel accumulation over the buffered reads. update_sample_profile is
+        // ~82% of this window. The pre-scan profile is consumed ONLY by
+        // detect_adapter_stubs, which reads only integer-exact count fields
+        // (hexamer_count_{5,3,interior}prime[], n_hexamers_*), and hex3_terminal[]
+        // is uint32 counts. Both merge associatively and bit-exactly regardless of
+        // read partition — every qualifying buffer entry is one of the first N
+        // qualifying reads, so a contiguous range split processes the same set.
+        {
+            const int nt = std::max(1, n_threads);
+            const size_t nbuf = se_scan_buf.size();
+            std::vector<std::unique_ptr<WorkerState>> pstate(nt);
+            std::vector<std::array<uint32_t, 4096>> phex(nt);
+            std::vector<uint64_t> pn_hex3(nt, 0);
+            for (int t = 0; t < nt; ++t) { pstate[t] = std::make_unique<WorkerState>(); phex[t].fill(0); }
+            std::vector<std::thread> ws;
+            ws.reserve(nt);
+            for (int t = 0; t < nt; ++t) {
+                const size_t lo = nbuf * static_cast<size_t>(t) / nt;
+                const size_t hi = nbuf * static_cast<size_t>(t + 1) / nt;
+                ws.emplace_back([&, t, lo, hi]() {
+                    WorkerState& st = *pstate[t];
+                    auto& hx = phex[t];
+                    uint64_t nh = 0;
+                    for (size_t i = lo; i < hi; ++i) {
+                        const std::string& seq = se_scan_buf[i].seq;
+                        const int L = static_cast<int>(seq.size());
+                        if (L >= LSD_L_MIN) {
+                            taph::FrameSelector::update_sample_profile(st.profile, seq);
+                            const int code = taph::encode_hex_at(seq, L - 6);
+                            if (code >= 0) { ++hx[code]; ++nh; }
+                        }
+                    }
+                    pn_hex3[t] = nh;
+                });
+            }
+            for (auto& w : ws) w.join();
+            // Merge in thread-index (file) order. Integer counts → bit-exact.
+            for (int t = 0; t < nt; ++t) {
+                taph::FrameSelector::merge_sample_profiles(scan_state.profile, pstate[t]->profile);
+                for (int i = 0; i < 4096; ++i) hex3_terminal[i] += phex[t][i];
+                n_hex3 += pn_hex3[t];
+            }
+        }
         stubs = taph::detect_adapter_stubs(scan_state.profile, hex3_terminal.data(), n_hex3);
     } else {
         // Paired pre-scan: 5' hexamer from R1[0..5], 3' terminal hexamer from
