@@ -496,7 +496,7 @@ int damage_main(int argc, char** argv) {
         } // end per-file loop
     }
 
-    taph::FrameSelector::finalize_sample_profile(dp);
+    taph::FrameSelector::finalize_sample_profile(dp, n_threads);
 
     // Recompute F/G/H z-scores excluding reads whose first (5') or last (3')
     // hexamer matches a detected adapter stub — single-pass prefix-conditioned
