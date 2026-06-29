@@ -409,7 +409,7 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
         master.configure(edges);
         for (auto& w : worker_stats) master.merge(w);
     }
-    master.finalize_all();
+    master.finalize_all(n_threads);   // FIX A: parallelize the independent per-length-bin fits
 
     // ---- extract LengthBinDamageProfile ----------------------------------
     out.bins.reserve(n_bins);
