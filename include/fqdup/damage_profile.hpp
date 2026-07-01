@@ -21,10 +21,26 @@ static constexpr float kOxChannelZDetect = 3.0f;
 #include "taph/length_bin_damage_profile.hpp"
 #include "taph/length_stratified_profile.hpp"
 #include "taph/sample_damage_profile.hpp"
+#include "taph/lsd_accumulator.hpp"
 
-inline constexpr int LSD_L_MIN             = 30;
-inline constexpr int LSD_L_MAX             = 500;
-inline constexpr int LSD_HIST_BINS         = 128;
+// LSD accumulation/classification (LsdLlrBinAccum, LsdClassifyParams,
+// lsd_llr_score, lsd_classify_read, lsd_accumulate, lsd_accumulate_soft,
+// compute_lsd_edges, LengthBinOptions, LSD_L_MIN/MAX/HIST_BINS) now live in
+// libtaph (taph/lsd_accumulator.hpp) so DART shares the identical per-read
+// math instead of reimplementing it. Aliased unqualified here so existing
+// fqdup call sites need no changes.
+using taph::LsdLlrBinAccum;
+using taph::LsdClassifyParams;
+using taph::LengthBinOptions;
+using taph::lsd_llr_score;
+using taph::lsd_classify_read;
+using taph::lsd_accumulate;
+using taph::lsd_accumulate_soft;
+using taph::compute_lsd_edges;
+using taph::LSD_L_MIN;
+using taph::LSD_L_MAX;
+using taph::LSD_HIST_BINS;
+
 inline constexpr int LSD_MIN_READS_PER_BIN = 100;
 
 inline int lsd_hist_bin(int L) {
@@ -193,102 +209,31 @@ struct DamageProfile {
     }
 };
 
-struct LengthBinOptions {
-    enum class Mode { DISABLED, AUTO, QUANTILE, EXPLICIT };
-
-    Mode mode = Mode::DISABLED;
-    int quantile_bins = 1;
-    std::vector<int> explicit_edges;
-
-    bool enabled() const { return mode != Mode::DISABLED; }
-};
-
 // Use canonical definitions from libtaph (taph/length_bin_damage_profile.hpp).
 using LengthBinDamageProfile       = taph::LengthBinDamageProfile;
 using LengthStratifiedDamageProfile = taph::LengthStratifiedDamageProfile;
 
-// Per-bin ancient-subset accumulator used when fusing the LSD pass into the
-// oxoG second pass (Fix E).  Field layout is identical to the local
-// LlrBinAccum struct inside estimate_damage_by_length so that prebuilt data
-// can be injected without copying.
-struct LsdLlrBinAccum {
-    int64_t n_damaged   = 0;
-    int64_t n_undamaged = 0;
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> h_3_anc{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> n_3_anc{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_cpg{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_cpg{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_noncpg{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_anc_noncpg{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_g{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_anc{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod_g{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tg_5_mod{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_mod{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> tc_5_mod{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> h_3_mod{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> n_3_mod{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> a_5_anc_all{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> c_5_anc_all{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> g_5_anc_all{};
-    std::array<int64_t, LengthBinDamageProfile::N_POS> t_5_anc_all{};
-    // Soft-EM posterior-weighted accumulators for ancient-fraction d_max.
-    // Soft-EM posterior-weighted C→T counts at N_SOFT_POS terminal positions.
-    // Using multiple positions lets d_anc estimation avoid adapter-artifact
-    // contamination at pos 0 by picking the peak over non-masked positions.
-    static constexpr int N_SOFT_POS = 4;
-    double sw_t5_anc[N_SOFT_POS]  = {};
-    double sw_tc5_anc[N_SOFT_POS] = {};
-    double sw_h3_anc[N_SOFT_POS]  = {};
-    double sw_n3_anc[N_SOFT_POS]  = {};
-    double sw_sum = 0.0;
-};
-
-// Parameters for per-read ancient/modern classification (LLR scorer).
-struct LsdClassifyParams {
-    double d_anc        = 0.0;
-    double lam_5        = 0.3;
-    double lam_3        = 0.3;
-    double bg_5         = 0.5;
-    double bg_3         = 0.5;
-    bool   is_ss           = false;
-    bool   skip_pos0_5prime = false;  // skip pos 0 in 5' LLR (hexamer artifact)
-    double cpg_scale    = 1.0;
-    double noncpg_scale = 1.0;
-    // Step-2 shadow (SOLUTION §6.7): contract per-read amplitude (D_MAX_CONSERVED) + UNDETERMINED gate.
-    // When d_anc_contract >= 0 the oxoG pass computes the contract class alongside the current one and
-    // logs divergence; it never drives a verdict. contract_gated_off = library is not pi-DETECTED.
-    double d_anc_contract     = -1.0;
-    bool   contract_gated_off = false;
-};
-
-// Build classify params from a finalized bulk DamageProfile.
-LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk);
-
-// Return raw LLR score for one read (positive = ancient-consistent).
-double lsd_llr_score(const std::string& seq, const LsdClassifyParams& p);
-
-// Classify one read as ancient (true) or modern (false) using the LLR.
-bool lsd_classify_read(const std::string& seq, const LsdClassifyParams& p);
-
-// Accumulate terminal stats for one read into an LsdLlrBinAccum.
-// ancient=true: accumulate damage-channel + composition + oxoG counts.
-// ancient=false: accumulate only oxoG marker (T/G) for the modern subset.
-void lsd_accumulate(const std::string& seq, LsdLlrBinAccum& acc,
-                    bool ancient, bool is_ss);
-
-// Soft-EM accumulation: add posterior-weighted pos-0 counts to sw_* fields.
-// w = P(ancient | read, π), computed as sigmoid(llr + log_prior_odds).
-void lsd_accumulate_soft(const std::string& seq, LsdLlrBinAccum& acc,
-                         double w, bool is_ss);
-
-// Compute bin edges from a log-length histogram + options (same logic as the
-// edge-picking block inside estimate_damage_by_length, extracted so damage.cpp
-// can call it before the oxoG pass to pre-configure worker LSD state).
-std::vector<int> compute_lsd_edges(const std::vector<uint64_t>& hist,
-                                   const LengthBinOptions& options);
+// Build classify params from a finalized bulk DamageProfile. Thin wrapper:
+// extracts the scalar fields taph::make_lsd_classify_params needs into the
+// tool-independent taph::BulkDamageForClassify view, so DART (or any other
+// consumer) can call the shared libtaph function directly with its own
+// equivalent bulk-fit type instead of needing fqdup's DamageProfile.
+inline LsdClassifyParams make_lsd_classify_params(const DamageProfile& bulk) {
+    taph::BulkDamageForClassify b;
+    b.mixture_converged = bulk.mixture_converged;
+    b.mixture_d_damaged  = bulk.mixture_d_damaged;
+    b.d_max_5prime       = bulk.d_max_5prime;
+    b.d_max_3prime       = bulk.d_max_3prime;
+    b.lambda_5prime      = bulk.lambda_5prime;
+    b.lambda_3prime      = bulk.lambda_3prime;
+    b.bg_5_tc            = bulk.bg_5_tc;
+    b.bg_3_channel       = bulk.bg_3_channel;
+    b.ss_mode            = bulk.ss_mode;
+    b.d_cpg_5prime       = bulk.d_cpg_5prime;
+    b.d_noncpg_5prime    = bulk.d_noncpg_5prime;
+    b.pi_detected        = bulk.pi_detected;
+    return taph::make_lsd_classify_params(b);
+}
 
 // Prebuilt LSD data produced by a fused oxoG+LSD pass.  Pass via the
 // prebuilt parameter of estimate_damage_by_length to skip the FASTQ reader.
