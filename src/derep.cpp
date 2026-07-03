@@ -580,6 +580,11 @@ private:
         // brute-force scan in B1 — slower per child but bounded by bucket size.
         ska::flat_hash_map<int, std::vector<uint32_t>> short_parents;
 
+        // Forward per-part hashes, computed here once per indexed id and reused in
+        // B1 where the same id is scanned as a child (identical arena bytes+layout),
+        // instead of re-extracting + re-hashing its 4 forward parts per child.
+        std::vector<uint64_t> part_hash(4 * static_cast<size_t>(N));
+
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
@@ -610,6 +615,8 @@ private:
             uint64_t h[4];
             for (int p = 0; p < 4; ++p)
                 h[p] = XXH3_64bits(parts[p], nbs[p]);
+            for (int p = 0; p < 4; ++p)
+                part_hash[4 * static_cast<size_t>(id) + p] = h[p];
             auto t1 = clk::now();
 
             auto& entries = build_map[lay.ilen];
@@ -841,20 +848,15 @@ private:
             uint8_t* crc_parts = crc_full  + nf;
 
             const uint8_t* psrc_c = arena_.data(cid);
-            int starts[4] = {lay.k5,
-                             lay.k5 + lay.s0,
-                             lay.k5 + lay.s0 + lay.s1,
-                             lay.k5 + lay.s0 + lay.s1 + lay.s2};
             int sizes[4]  = {lay.s0, lay.s1, lay.s2, lay.s3};
             int nbs[4]    = {lay.nb0, lay.nb1, lay.nb2, lay.nb3};
-            uint8_t* ci_p[4] = {ci_parts,
-                                ci_parts + lay.nb0,
-                                ci_parts + lay.nb0 + lay.nb1,
-                                ci_parts + lay.nb0 + lay.nb1 + lay.nb2};
-            for (int p = 0; p < 4; ++p)
-                extract_packed_part(psrc_c, starts[p], sizes[p], ci_p[p]);
+            // Forward part-hashes were already computed when this id was indexed as
+            // a parent (same arena bytes + layout), so reuse them instead of
+            // re-extracting + re-hashing 4 parts per child. RC parts/hashes below
+            // are built fresh (RC is not hashed at index time).
             uint64_t h[4], rh[4];
-            for (int p = 0; p < 4; ++p) h[p] = XXH3_64bits(ci_p[p], nbs[p]);
+            for (int p = 0; p < 4; ++p)
+                h[p] = part_hash[4 * static_cast<size_t>(cid) + p];
 
             extract_packed_part(psrc_c, lay.k5, lay.ilen, ci_full);
 
