@@ -409,33 +409,38 @@ struct FlatPairIndex {
 
     // Open-addressing directory over `keys`, indexed by key (keys are already
     // splitmix64-mixed by pair_key, so the low bits are uniform — no re-hash).
-    // slots[h] holds ki+1 into keys/offsets; 0 = empty. Built once after the CSR
-    // is filled, read-only during parallel B1. Replaces the per-probe
-    // std::lower_bound whose log2(N) dependent-load chain was the 32% cache-miss
-    // midpoint probe; the found idx and the ids[] emission order are identical,
-    // so dedup output is byte-for-byte unchanged.
-    std::vector<uint32_t> slots;
+    // Each slot stores the key INLINE alongside idx_plus1 (ki+1 into
+    // keys/offsets; 0 = empty). Built once after the CSR is filled, read-only
+    // during parallel B1. Inlining the key means a probe reads a single cache
+    // line — the previous slots[h]→keys[s-1] pair was TWO dependent cold loads
+    // (the 34% child-query cost). The found idx and ids[] emission order are
+    // identical, so dedup output is byte-for-byte unchanged.
+    struct Slot {
+        uint64_t key;         // valid only when idx_plus1 != 0
+        uint32_t idx_plus1;   // 0 = empty; real idx 0 maps to idx_plus1 == 1
+    };
+    std::vector<Slot> dir;
     uint64_t slot_mask = 0;
 
     void build_directory() {
         size_t cap = 8;
         while (cap < keys.size() * 2) cap <<= 1;
         slot_mask = cap - 1;
-        slots.assign(cap, 0);
+        dir.assign(cap, Slot{0, 0});
         for (size_t ki = 0; ki < keys.size(); ++ki) {
             size_t h = keys[ki] & slot_mask;
-            while (slots[h]) h = (h + 1) & slot_mask;
-            slots[h] = static_cast<uint32_t>(ki + 1);
+            while (dir[h].idx_plus1) h = (h + 1) & slot_mask;
+            dir[h] = Slot{keys[ki], static_cast<uint32_t>(ki + 1)};
         }
     }
 
     template <typename F>
     void query(uint64_t key, F&& fn) const {
         for (size_t h = key & slot_mask;; h = (h + 1) & slot_mask) {
-            uint32_t s = slots[h];
-            if (!s) return;
-            if (keys[s - 1] == key) {
-                uint32_t idx = s - 1;
+            const Slot& sl = dir[h];
+            if (!sl.idx_plus1) return;
+            if (sl.key == key) {
+                uint32_t idx = sl.idx_plus1 - 1;
                 for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
                     fn(ids[i]);
                 return;
