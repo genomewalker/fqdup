@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -33,7 +32,6 @@
 #include <zlib.h>
 
 #include "taph/frame_selector_decl.hpp"
-#include "taph/packed_ops.hpp"
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -710,26 +708,6 @@ private:
             return interior_slab.data() + interior_off[id];
         };
 
-        // Per-id interior GC (C+G) count, gating the cold interior gather in the
-        // candidate-check loops below. Each single-base substitution changes GC by
-        // at most 1, so |GC(parent)-GC(child)| <= Hamming(parent,child); if |dGC|>2
-        // then Hamming>2 and the pair cannot be a H<=2 parent/child edge -> its
-        // gather + packed_find_mismatch is skipped (a necessary condition; false
-        // negatives are impossible, so output is byte-identical). GC is
-        // reverse-complement-invariant, so one child GC gates both orientations.
-        // Read directly from the arena at [k5, k5+ilen): identical layout to the
-        // extracted interior (extract_packed_part is a bit-shifted copy), so this
-        // matches the slab GC exactly while also covering short-brute ids
-        // (ilen in [kBruteforceMinLen, kMinInteriorLen)) that have no slab entry.
-        std::vector<uint8_t> gc_of(N, 0);
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            const auto& lay = get_layout(arena_.length(id));
-            if (lay.ilen < kBruteforceMinLen) continue;
-            gc_of[id] = static_cast<uint8_t>(
-                taph::gc_count_packed(arena_.data(id), lay.k5, lay.ilen));
-        }
-
         unsigned n_threads = errcor_.threads;
         if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
 
@@ -811,7 +789,6 @@ private:
                         compute_interior_rc(ci_full_s, lay.ilen, crc_full_s);
 
                         ls.short_brute_evaluated++;
-                        const int gc_c = static_cast<int>(gc_of[cid]);
                         constexpr uint32_t kPrefetchAhead = 8;
                         for (size_t pvi = 0; pvi < parents_vec.size(); ++pvi) {
                             uint32_t pid = parents_vec[pvi];
@@ -821,8 +798,6 @@ private:
                             if (pid == cid) continue;
                             if (id_count[pid] < id_count[cid]) continue;
                             if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-                            // GC prefilter: |dGC|>2 => Hamming>2 => not an edge (both orientations).
-                            if (std::abs(static_cast<int>(gc_of[pid]) - gc_c) > 2) continue;
                             extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf_s);
 
                             MismatchInfo mm = packed_find_mismatch(
@@ -959,7 +934,6 @@ private:
             // gather below scatters into the 3.6GB slab and is the dominant LLC
             // miss (57% of B1). Prefetch-neutral: cannot change results.
             constexpr uint32_t kPrefetchAhead = 8;
-            const int gc_c = static_cast<int>(gc_of[cid]);
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
                 if (ci + kPrefetchAhead < n_cands)
                     __builtin_prefetch(interior_ptr(cand_buf[ci + kPrefetchAhead]), 0, 0);
@@ -977,11 +951,6 @@ private:
                 // (both halves of the pair share the same mismatch → sig/parent = 100%).
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-                // GC prefilter: |dGC|>2 => Hamming>2 in both orientations
-                // (GC is RC-invariant) => cannot be a H<=2 edge; skip the cold
-                // gather + packed_find_mismatch. Necessary condition, so the
-                // set of surviving matches is unchanged (byte-identical output).
-                if (std::abs(static_cast<int>(gc_of[pid]) - gc_c) > 2) continue;
 
                 // Parent's full interior: read from the per-id slab (extracted
                 // once). pid has length == L here (checked above), so its slab
