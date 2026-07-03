@@ -1651,8 +1651,13 @@ private:
                             if (arena_.length(cid) != Lp) continue;
                             uint64_t cc = acc_count[cid];
                             if (cc == 0) continue;
-                            if (cp > 0 && static_cast<double>(cc) /
-                                static_cast<double>(cp) > errcor_.b3_count_ratio)
+                            // Require parent >= b3_count_ratio x child abundance
+                            // (a real sequence dominates its deaminated sibling).
+                            // The bucket is sorted count-descending so cp >= cc;
+                            // the old cc/cp test could never exceed 1, so the gate
+                            // never fired and no ratio filter was applied.
+                            if (static_cast<double>(cp) <
+                                static_cast<double>(cc) * errcor_.b3_count_ratio)
                                 continue;
                             ++stats.b3_candidates;
                             ci_buf.resize(static_cast<size_t>(nbp));
