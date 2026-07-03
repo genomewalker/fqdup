@@ -661,6 +661,7 @@ private:
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
                 }
+                pi.build_directory();  // O(1) key lookup, replaces per-probe lower_bound
             }
         }
         build_map.clear();  // free memory before allocating ChildMismatch vector
