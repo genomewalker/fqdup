@@ -732,6 +732,16 @@ private:
                     if (is_error_[cid]) continue;
                     if (!arena_.is_eligible(cid)) continue;
 
+                    // Timing here is diagnostic only (decode_hash_child_ms/query_ms/check_ms
+                    // feed a log summary, never an algorithmic decision -- confirmed by reading
+                    // every consumer of B1LocalStats). clk::now() was being called 4x per read
+                    // on the full-scale hot path (profiled: ~60%+ of this worker's CPU time was
+                    // in __vdso_clock_gettime, not the actual comparison logic). Sample 1-in-64
+                    // and extrapolate (x kTimingStride) to keep the aggregate estimate roughly
+                    // unbiased while cutting timestamp-call overhead ~64x.
+                    constexpr uint32_t kTimingStride = 64;
+                    const bool do_time = (cid % kTimingStride) == 0;
+
                     int L = arena_.length(cid);
                     const auto& lay = get_layout(L);
                     if (lay.ilen < kMinInteriorLen) {
@@ -791,7 +801,7 @@ private:
                     auto shard_it = shards.find(lay.ilen);
                     if (shard_it == shards.end()) continue;
 
-                    auto t0 = clk::now();
+                    auto t0 = do_time ? clk::now() : clk::time_point{};
             // Scratch layout (per child):
             //   [0 .. nbytes)               : ci_parts  (4-part canonical, nb0+nb1+nb2+nb3 bytes)
             //   [nbytes .. nbytes+nf)       : ci_full   (full canonical interior)
@@ -839,14 +849,29 @@ private:
             for (int p = 0; p < 4; ++p)
                 extract_packed_part(crc_full, rc_starts[p], sizes[p], crc_p[p]);
             for (int p = 0; p < 4; ++p) rh[p] = XXH3_64bits(crc_p[p], nbs[p]);
-            auto t1 = clk::now();
-            ls.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (do_time) {
+                auto t1 = clk::now();
+                ls.decode_hash_child_ms +=
+                    std::chrono::duration<double, std::milli>(t1 - t0).count() * kTimingStride;
+            }
 
             ls.children_scanned++;
 
             // Collect unique parent candidates — query both canonical and RC hash keys.
             // With bucket_cap=0 (default), the storage grows; with bucket_cap>0 it is
             // pre-sized and any overflow is counted (paired with bucket_overflow_drops).
+            //
+            // Tried and reverted: dedup-on-insert (linear scan before append), reasoning
+            // that avg candidates/child measured at 1.23 on a real 5M-read run meant
+            // std::sort+std::unique's overhead should dominate actual work. Measured
+            // result was the opposite: 98.3s -> 112.7s wall clock, cache-miss rate
+            // 10.17% -> 11.41%, LLC misses +29% (perf stat, same dataset, byte-identical
+            // correctness both ways). Likely cause: introsort's small-N fast path
+            // (insertion sort below its threshold) is already a fast, cache-friendly
+            // single sequential pass; the interleaved linear-scan-per-insert during the
+            // 12 hash lookups appears to hurt cache behavior more than the sort/unique
+            // pass it replaced. Kept as sort+unique -- a small average candidate count
+            // does not by itself justify removing a well-optimized generic algorithm.
             uint32_t n_cands = 0;
             const bool unbounded = (errcor_.bucket_cap == 0);
             auto collect = [&](uint32_t pid) {
@@ -859,14 +884,17 @@ private:
             };
             uint32_t* cand_buf = cand_storage.data();
 
-            auto tq0 = clk::now();
+            auto tq0 = do_time ? clk::now() : clk::time_point{};
             auto& sh = shard_it->second;
             for (int t = 0; t < 6; ++t) {
                 sh.pi[t].query(pair_key(h[kPairA[t]],  h[kPairB[t]],  t, lay.ilen), collect);
                 sh.pi[t].query(pair_key(rh[kPairA[t]], rh[kPairB[t]], t, lay.ilen), collect);
             }
-            auto tq1 = clk::now();
-            ls.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+            if (do_time) {
+                auto tq1 = clk::now();
+                ls.query_ms +=
+                    std::chrono::duration<double, std::milli>(tq1 - tq0).count() * kTimingStride;
+            }
 
             // Refresh: collect() may have reallocated cand_storage in unbounded mode.
             cand_buf = cand_storage.data();
@@ -875,7 +903,7 @@ private:
                 std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
             ls.total_candidates += n_cands;
 
-            auto tc0 = clk::now();
+            auto tc0 = do_time ? clk::now() : clk::time_point{};
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
                 uint32_t pid = cand_buf[ci];
                 if (is_error_[pid]) continue;
@@ -971,7 +999,10 @@ private:
                     if (admit_h2(mm2, true)) { /* admitted */ }
                 }
             }
-            ls.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+            if (do_time) {
+                ls.check_ms +=
+                    std::chrono::duration<double, std::milli>(clk::now() - tc0).count() * kTimingStride;
+            }
                 }  // end for cid in chunk
             }  // end while chunk dispatcher
         };  // end b1_worker
@@ -2745,7 +2776,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited)\n"
         << "  --errcor-snp-cutoff INT      Low-coverage cutoff (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    Low-coverage SNP multiplier (default: 1.75)\n"
-        << "  -t, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
+        << "  -p, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
         << "  --errcor-empirical           Empirical posterior-odds rule (default; absorb iff S>0)\n"
         << "  --errcor-legacy-veto         Legacy SNP-veto rule\n"
         << "  --protect-transversions      Protect A↔T / C↔G (Channels H/G) from H=1/H=2 absorption\n"
@@ -2933,7 +2964,7 @@ int derep_main(int argc, char** argv) {
             errcor.b3_max_hamming = v;
         } else if (arg == "--b3-count-ratio" && i + 1 < argc) {
             errcor.b3_count_ratio = std::stod(argv[++i]);
-        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+        } else if ((arg == "-p" || arg == "--threads") && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
             if (v < 0) { std::cerr << "Error: " << arg << " must be >= 0 (0 = auto), got " << v << "\n"; return 1; }
             errcor.threads = static_cast<unsigned>(v);
@@ -3117,6 +3148,12 @@ int derep_main(int argc, char** argv) {
                                                         : DamageClipPolicy::Off;
             opts.skip_deam_fit      = false;
             opts.max_reads          = damage_deam_max_reads;
+            // Forward the derep thread count to the taph deamination+QC pass;
+            // it defaulted to 1 (single-threaded), making Pass 0 ~2x slower than
+            // the standalone `profile -p N` path doing identical work. Match
+            // derep's 0->hardware_concurrency convention (see lines 688-689).
+            opts.threads            = errcor.threads ? errcor.threads
+                                                     : std::max(1u, std::thread::hardware_concurrency());
             if (damage_deam_max_reads > 0)
                 log_info("Damage deamination fit: sampling first " +
                          std::to_string(damage_deam_max_reads) +
