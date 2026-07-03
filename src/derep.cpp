@@ -679,11 +679,33 @@ private:
         log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
         // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
-        // Pre-warm layout_cache before workers start so it becomes read-only.
+        // Pre-warm layout_cache before workers start so it becomes read-only, and
+        // build a per-id interior slab: extract each eligible long-interior id's
+        // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
+        // deref) instead of re-extracting it per child. That re-extraction was the
+        // 38% __memmove_evex in the perf profile. Output-preserving: at the B1 use
+        // site the parent's length == the child's length (checked there), so the
+        // id's own layout used here is the exact layout used at the comparison.
+        std::vector<uint64_t> interior_off(static_cast<size_t>(N) + 1, 0);
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
-            (void)get_layout(arena_.length(id));
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen >= kMinInteriorLen)
+                interior_off[id + 1] = static_cast<uint64_t>((lay.ilen + 3) / 4);
         }
+        for (uint32_t id = 0; id < N; ++id)
+            interior_off[id + 1] += interior_off[id];
+        std::vector<uint8_t> interior_slab(interior_off[N]);
+        for (uint32_t id = 0; id < N; ++id) {
+            if (!arena_.is_eligible(id)) continue;
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen < kMinInteriorLen) continue;
+            extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
+                                interior_slab.data() + interior_off[id]);
+        }
+        auto interior_ptr = [&](uint32_t id) -> const uint8_t* {
+            return interior_slab.data() + interior_off[id];
+        };
 
         unsigned n_threads = errcor_.threads;
         if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -807,16 +829,15 @@ private:
             //   [nbytes .. nbytes+nf)       : ci_full   (full canonical interior)
             //   [nbytes+nf .. nbytes+2nf)   : crc_full  (RC of ci_full)
             //   [nbytes+2nf .. 2*nbytes+2nf): crc_parts (4-part RC, nb0+nb1+nb2+nb3 bytes)
-            //   [2*nbytes+2nf .. 2*nbytes+3nf): pi_buf  (parent, per candidate)
+            // (parent interior is read from the per-id slab, not scratch.)
             int nf = (lay.ilen + 3) / 4;
-            size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 3 * nf);
+            size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 2 * nf);
             if (scratch.size() < total_scratch)
                 scratch.resize(total_scratch);
             uint8_t* ci_parts  = scratch.data();
             uint8_t* ci_full   = ci_parts  + lay.nbytes;
             uint8_t* crc_full  = ci_full   + nf;
             uint8_t* crc_parts = crc_full  + nf;
-            uint8_t* pi_buf    = crc_parts + lay.nbytes;
 
             const uint8_t* psrc_c = arena_.data(cid);
             int starts[4] = {lay.k5,
@@ -920,8 +941,10 @@ private:
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
 
-                // Extract parent's full interior for comparison.
-                extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
+                // Parent's full interior: read from the per-id slab (extracted
+                // once). pid has length == L here (checked above), so its slab
+                // layout equals lay -> byte-identical to a live extract.
+                const uint8_t* pi_buf = interior_ptr(pid);
 
                 // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, errcor_.protect_transversions);
