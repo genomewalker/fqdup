@@ -789,7 +789,11 @@ private:
                         compute_interior_rc(ci_full_s, lay.ilen, crc_full_s);
 
                         ls.short_brute_evaluated++;
-                        for (uint32_t pid : parents_vec) {
+                        constexpr uint32_t kPrefetchAhead = 8;
+                        for (size_t pvi = 0; pvi < parents_vec.size(); ++pvi) {
+                            uint32_t pid = parents_vec[pvi];
+                            if (pvi + kPrefetchAhead < parents_vec.size())
+                                __builtin_prefetch(arena_.data(parents_vec[pvi + kPrefetchAhead]), 0, 0);
                             if (is_error_[pid]) continue;
                             if (pid == cid) continue;
                             if (id_count[pid] < id_count[cid]) continue;
@@ -926,7 +930,13 @@ private:
             ls.total_candidates += n_cands;
 
             auto tc0 = do_time ? clk::now() : clk::time_point{};
+            // Prefetch a candidate's interior K iterations ahead: the pi_buf
+            // gather below scatters into the 3.6GB slab and is the dominant LLC
+            // miss (57% of B1). Prefetch-neutral: cannot change results.
+            constexpr uint32_t kPrefetchAhead = 8;
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
+                if (ci + kPrefetchAhead < n_cands)
+                    __builtin_prefetch(interior_ptr(cand_buf[ci + kPrefetchAhead]), 0, 0);
                 uint32_t pid = cand_buf[ci];
                 if (is_error_[pid]) continue;
                 if (!arena_.is_eligible(pid)) continue;
