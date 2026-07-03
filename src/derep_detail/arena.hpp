@@ -407,13 +407,40 @@ struct FlatPairIndex {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
 
+    // Open-addressing directory over `keys`, indexed by key (keys are already
+    // splitmix64-mixed by pair_key, so the low bits are uniform — no re-hash).
+    // slots[h] holds ki+1 into keys/offsets; 0 = empty. Built once after the CSR
+    // is filled, read-only during parallel B1. Replaces the per-probe
+    // std::lower_bound whose log2(N) dependent-load chain was the 32% cache-miss
+    // midpoint probe; the found idx and the ids[] emission order are identical,
+    // so dedup output is byte-for-byte unchanged.
+    std::vector<uint32_t> slots;
+    uint64_t slot_mask = 0;
+
+    void build_directory() {
+        size_t cap = 8;
+        while (cap < keys.size() * 2) cap <<= 1;
+        slot_mask = cap - 1;
+        slots.assign(cap, 0);
+        for (size_t ki = 0; ki < keys.size(); ++ki) {
+            size_t h = keys[ki] & slot_mask;
+            while (slots[h]) h = (h + 1) & slot_mask;
+            slots[h] = static_cast<uint32_t>(ki + 1);
+        }
+    }
+
     template <typename F>
     void query(uint64_t key, F&& fn) const {
-        auto it = std::lower_bound(keys.begin(), keys.end(), key);
-        if (it == keys.end() || *it != key) return;
-        size_t idx = static_cast<size_t>(it - keys.begin());
-        for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
-            fn(ids[i]);
+        for (size_t h = key & slot_mask;; h = (h + 1) & slot_mask) {
+            uint32_t s = slots[h];
+            if (!s) return;
+            if (keys[s - 1] == key) {
+                uint32_t idx = s - 1;
+                for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
+                    fn(ids[i]);
+                return;
+            }
+        }
     }
 };
 
