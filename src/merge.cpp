@@ -31,7 +31,9 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <unordered_map>
 
 #ifdef __AVX2__
@@ -59,14 +61,18 @@ struct MergeRecord {
     FastqRecord unmerged2; // trimmed R2 when is_merged=false and !is_orphan
     bool is_merged = false;
     bool is_orphan = false; // one mate discarded; surviving mate is in merged
+    bool orphan_r1 = false; // when is_orphan: true=survivor was R1 (molecule 5'), false=R2 (RC 3')
 };
 
 struct MergeBatch {
     uint64_t id = 0;
     std::vector<MergeRecord> records;
-    int64_t n_merged   = 0;
-    int64_t n_unmerged = 0;
-    int64_t n_orphan   = 0;
+    int64_t n_merged     = 0;
+    int64_t n_unmerged   = 0;
+    int64_t n_orphan     = 0;
+    int64_t n_orphan_r1  = 0; // survivor = R1 (molecule 5', C->T frame)
+    int64_t n_orphan_r2  = 0; // survivor = R2 (RC molecule 3'; ds biological, ss dA-tail)
+    int64_t n_dropped    = 0; // both mates failed QC after clipping
 };
 
 // ============================================================================
@@ -399,6 +405,27 @@ static void trim_adapter_5p(FastqRecord& rec, const std::string& adapter, int mi
     rec.qual = rec.qual.substr(alen);
 }
 
+// Trim a learned 5' construct (variable-length ss linker) from the read 5'.
+// Anchors on the first 12 bp (<=1 mm), then confirms the FULL construct matches within
+// max_mm_rate before removing exactly its length. Unlike trim_adapter_5p (12 bp cap), this
+// removes the whole var-length linker so no 8 bp tail survives on the biological insert (I1).
+static void trim_construct_5p(FastqRecord& rec, const std::string& construct,
+                              float max_mm_rate, int min_len) {
+    int clen = (int)construct.size();
+    if (clen < 12 || (int)rec.seq.size() < clen) return;
+    int anchor_mm = 0;
+    for (int k = 0; k < 12; ++k)
+        anchor_mm += (rec.seq[k] != construct[k]) ? 1 : 0;
+    if (anchor_mm > 1) return;
+    int mm = 0;
+    for (int k = 0; k < clen; ++k)
+        mm += (rec.seq[k] != construct[k]) ? 1 : 0;
+    if ((float)mm > max_mm_rate * clen) return;
+    if ((int)rec.seq.size() - clen < min_len) { rec.seq.clear(); rec.qual.clear(); return; }
+    rec.seq  = rec.seq.substr(clen);
+    rec.qual = rec.qual.substr(clen);
+}
+
 static void trim_adapter(FastqRecord& rec, const std::string& adapter, int min_len) {
     if (adapter.empty() || (int)rec.seq.size() < min_len) return;
     int L    = (int)rec.seq.size();
@@ -509,6 +536,8 @@ struct MergeOpts {
     float max_n_rate    = 1.0f; // 1=disabled; max fraction of N bases
     std::string adapter1;
     std::string adapter2;
+    std::string adapter_5p_linker;              // library 5' construct clipped from unmerged reads
+    std::string forced_library_type;            // "ss"/"ds" declared override; ""=auto-detect
     std::vector<std::string> extra_adapters1;   // additional R1 adapters to try (from --adapter-fasta)
     std::string damage_out;     // path for paired damage profile JSON; empty=disabled
     std::string subst_out;      // path for overlap substitution matrix TSV; empty=disabled
@@ -524,17 +553,31 @@ struct DetectedParams {
     std::string adapter1;      // 24bp P7_RC suffix found on R1 past overlap
     std::string adapter2;      // 24bp P5_RC suffix found on RC(R2) past overlap
     bool   is_ss           = false;
+    bool   type_from_panel = false;  // is_ss set by construct-panel stem vote (overrides geometry)
+    float  type_confidence = 0.f;    // |prefix_agree_rate - 0.5| * 2, in [0,1]
     bool   is_udg          = false;
     bool   is_half_udg     = false;
     bool   poly_g_detected = false;  // NextSeq/NovaSeq dark cycle signal
     int    skip_terminal   = 0;
     float  damage_5p       = 0.f;
     float  damage_3p       = 0.f;
+    std::string adapter_5p_linker;   // library-specific fixed 5' construct (adapter-dimer prefix)
 };
 
 // Forward declaration (defined below)
 static int find_adapter_in(const std::string& seq, const std::string& adapter,
                            int min_pos, int max_mm, int alen_req);
+
+static const std::array<int,256>& make_base_idx() {
+    static std::array<int,256> t;
+    t.fill(-1);
+    t[(uint8_t)'A'] = t[(uint8_t)'a'] = 0;
+    t[(uint8_t)'C'] = t[(uint8_t)'c'] = 1;
+    t[(uint8_t)'G'] = t[(uint8_t)'g'] = 2;
+    t[(uint8_t)'T'] = t[(uint8_t)'t'] = 3;
+    return t;
+}
+static const std::array<int,256>& BASE_IDX = make_base_idx();
 
 static DetectedParams detect_merge_params(
         std::vector<ReadPair>& scan_buf,
@@ -546,6 +589,15 @@ static DetectedParams detect_merge_params(
     int64_t prefix_agree = 0, prefix_total = 0;
     // Adapter suffix k-mer frequency
     std::unordered_map<std::string, int> a1_freq, a2_freq;
+    // R1 5' 12-mer frequency: a fixed library construct (adapter-dimer prefix) spikes here;
+    // real inserts spread thin (<1%). Used to detect a 5' linker to clip from unmerged reads.
+    std::unordered_map<std::string, int> r1_5p_freq;
+    int64_t n_5p = 0;
+    // ss/ds construct-panel stem vote (Ellesmere supp §4.3.2): the SCR splint core GGAAGAGCGTCG
+    // reads through R1 3' with NO upstream AGATC in ss libraries, but sits behind the TruSeq stem
+    // (AGATCGGAAGAGCGTCG) in ds. Presence/absence of the AGATC prefix is a positive ss/ds signal.
+    static const std::string SS_SPLINT_CORE = "GGAAGAGCGTCG";
+    int64_t ss_stem = 0, ds_stem = 0;
 
     alignas(32) uint8_t pa[MAX_READ_LEN / 4 + 4] = {};
     alignas(32) uint8_t pb[MAX_READ_LEN / 4 + 4] = {};
@@ -621,6 +673,12 @@ static DetectedParams detect_merge_params(
         // adapter2 in RC(R2) at position r2s - 12 (just before the insert)
         if (r2s >= 12)
             a2_freq[rc2_seq.substr(r2s - 12, 12)]++;
+        if (L1 >= 12) { r1_5p_freq[pr.r1.seq.substr(0, 12)]++; ++n_5p; }
+        int sp = find_adapter_in(pr.r1.seq, SS_SPLINT_CORE, 0, 1, 12);
+        if (sp >= 0) {
+            if (sp >= 5 && pr.r1.seq.compare(sp - 5, 5, "AGATC") == 0) ++ds_stem;
+            else ++ss_stem;
+        }
     }
 
     DetectedParams d;
@@ -629,6 +687,21 @@ static DetectedParams detect_merge_params(
     // ---- library geometry ----
     float prefix_agree_rate = (float)prefix_agree / (float)prefix_total;
     d.is_ss = (prefix_agree_rate < 0.3f);
+    d.type_confidence = std::min(1.f, std::fabs(prefix_agree_rate - 0.5f) * 2.f);
+    // Construct-panel stem vote overrides geometry when it carries strong positive sequence
+    // evidence: the geometry check alone miscalls SCR-splint ss libraries as ds (memory: Med11,
+    // FLB01mAss4 both called ds conf~0.95 despite being ss). The splint stem is decisive.
+    int64_t stem_tot = ss_stem + ds_stem;
+    if (stem_tot >= 100) {
+        float ss_frac = (float)ss_stem / (float)stem_tot;
+        if (ss_frac >= 0.6f) {
+            d.is_ss = true;  d.type_from_panel = true;
+            d.type_confidence = std::max(d.type_confidence, ss_frac);
+        } else if (ss_frac <= 0.4f) {
+            d.is_ss = false; d.type_from_panel = true;
+            d.type_confidence = std::max(d.type_confidence, 1.f - ss_frac);
+        }
+    }
 
     // ---- damage rates ----
     auto rate = [&](int i) -> float {
@@ -686,6 +759,66 @@ static DetectedParams detect_merge_params(
     // adapter1 = RC(adapter2)
     d.adapter1 = revcomp(d.adapter2);  // revcomp from fastq_common.hpp
 
+    // ---- 5' library linker (adapter-dimer prefix) ----
+    // A single 12-mer dominating R1 5' ends (>=5% of reads) that is NOT the read-through
+    // adapter is a fixed library construct fused to insert-less dimers (observed:
+    // CGCAATGCTCAT...GGACTCAA + P7). Register it so unmerged reads get it clipped and the
+    // residual zero-insert body falls below min-length. Real inserts spread <1% per 12-mer.
+    if (n_5p > 0) {
+        std::string top = best_kmer(r1_5p_freq);
+        auto is_known = [&](const std::string& s) {
+            return s.compare(0, 8, TRUSEQ_R1, 0, 8) == 0
+                || s.compare(0, 8, TRUSEQ_RC2, 0, 8) == 0
+                || (!d.adapter1.empty() && s.compare(0, 8, d.adapter1, 0, 8) == 0)
+                || (!d.adapter2.empty() && s.compare(0, 8, d.adapter2, 0, 8) == 0);
+        };
+        if (!top.empty() && (float)r1_5p_freq[top] / (float)n_5p >= 0.05f && !is_known(top)) {
+            // Greedy-extend the 12-mer seed to the full var-length construct. Second pass over
+            // reads whose 5' matches the seed: build a per-position majority consensus. In dimers
+            // the construct is linker+read-through adapter, so the consensus reads linker then
+            // adapter — the linker length is where the universal adapter begins (protocol constant,
+            // not a calibration). Fallback: interior-purity boundary (self-calibrated, no magic).
+            static const int LKMAX = 45;
+            int64_t cnt[LKMAX][4] = {};
+            for (auto& pr : scan_buf) {
+                const std::string& s = pr.r1.seq;
+                if ((int)s.size() < 12) continue;
+                int amm = 0;
+                for (int k = 0; k < 12; ++k) amm += (s[k] != top[k]) ? 1 : 0;
+                if (amm > 1) continue;
+                int n = std::min((int)s.size(), LKMAX);
+                for (int j = 0; j < n; ++j) {
+                    int b = BASE_IDX[(uint8_t)s[j]];
+                    if (b >= 0) ++cnt[j][b];
+                }
+            }
+            std::string cons(LKMAX, 'N');
+            float maj[LKMAX] = {};
+            for (int j = 0; j < LKMAX; ++j) {
+                int64_t tot = cnt[j][0]+cnt[j][1]+cnt[j][2]+cnt[j][3];
+                if (tot == 0) { maj[j] = 0.f; continue; }
+                int bb = 0; for (int b = 1; b < 4; ++b) if (cnt[j][b] > cnt[j][bb]) bb = b;
+                cons[j] = "ACGT"[bb];
+                maj[j]  = (float)cnt[j][bb] / (float)tot;
+            }
+            int linker_len = 12;
+            int adp = find_adapter_in(cons, TRUSEQ_R1, 12, 2, 12);
+            if (adp >= 12) {
+                linker_len = adp;
+            } else {
+                float m_seed = 0.f; for (int j = 0; j < 12; ++j) m_seed += maj[j]; m_seed /= 12.f;
+                float m_int = 0.f; int ni = 0;
+                for (int j = 30; j < LKMAX; ++j) if (maj[j] > 0.f) { m_int += maj[j]; ++ni; }
+                m_int = ni ? m_int / ni : 0.30f;
+                float thresh = 0.5f * (m_seed + m_int);
+                int j = 12;
+                while (j < LKMAX && maj[j] >= thresh) ++j;
+                linker_len = j;
+            }
+            d.adapter_5p_linker = cons.substr(0, linker_len);
+        }
+    }
+
     return d;
 }
 
@@ -703,17 +836,6 @@ static int find_adapter_in(const std::string& seq, const std::string& adapter,
     }
     return -1;
 }
-
-static const std::array<int,256>& make_base_idx() {
-    static std::array<int,256> t;
-    t.fill(-1);
-    t[(uint8_t)'A'] = t[(uint8_t)'a'] = 0;
-    t[(uint8_t)'C'] = t[(uint8_t)'c'] = 1;
-    t[(uint8_t)'G'] = t[(uint8_t)'g'] = 2;
-    t[(uint8_t)'T'] = t[(uint8_t)'t'] = 3;
-    return t;
-}
-static const std::array<int,256>& BASE_IDX = make_base_idx();
 
 static void accum_overlap_subst(OverlapSubstCounts& cnt,
                                 const std::string& r1_seq,
@@ -751,6 +873,58 @@ static bool passes_qc(const FastqRecord& rec, const MergeOpts& opts) {
     return true;
 }
 
+// Full adapter/artifact clip for an unmerged read (no overlap geometry to lean on).
+// Order matters: the whole-read read-through scan runs first so an all-adapter dimer
+// (adapter at pos 0) collapses to empty, and a linker+adapter dimer collapses to just
+// the linker, which the 5' clips then strip below min-length.
+//   adapter_3p = read-through adapter in this read's orientation (R1:adapter1, R2:adapter2)
+//   adapter_5p = adapter-complement bleedthrough at 5'      (R1:adapter2, R2:adapter1)
+//   linker5p   = detected library 5' construct (may be empty)
+// Diagnostic (behind FQDUP_CLIP_DEBUG): per-mate attribution of which clip step took a
+// read below min_length. Step legend printed at exit. Zero cost when dbg==nullptr.
+//   0 wholeread-cut@detected-adapter  1 wholeread-cut@universal  2 linker-5p
+//   3 adapter5p-5p  4 adapter3p-5p  5 universal-5p  6 polyG-3p  7 already-short (pre-clip)
+static std::atomic<int64_t> g_clip_death[2][8];
+static const bool g_clip_dbg = std::getenv("FQDUP_CLIP_DEBUG") != nullptr;
+struct ClipDebug { int mate; int min_len; bool dead=false; };
+static inline void clip_track(ClipDebug* d, int step, size_t before, size_t after) {
+    if (!d || d->dead) return;
+    if ((int)before >= d->min_len && (int)after < d->min_len) {
+        g_clip_death[d->mate][step].fetch_add(1, std::memory_order_relaxed);
+        d->dead = true;
+    }
+}
+
+static void clip_unmerged(FastqRecord& rec, const std::string& adapter_3p,
+                          const std::string& adapter_5p, const std::string& linker5p,
+                          int poly_g_run, int min_len, ClipDebug* dbg = nullptr) {
+    // Universal Illumina read-through prefix — present at the insert boundary of EVERY
+    // read-through/adapter-dimer regardless of what auto-detection picked for adapter1/2
+    // (a library can carry TruSeq read-through while detection locks onto a Nextera stub).
+    // Protocol constant, not a calibration.
+    static const std::string UNIVERSAL_3P = "AGATCGGAAGAG";
+    // Whole-read scan: cut at the earliest read-through hit (detected adapter OR universal).
+    // A pure adapter dimer hits at pos 0 -> empty; linker+adapter hits right after the
+    // linker -> only the linker survives, which the 5' clips then strip below min-length.
+    if (dbg && (int)rec.seq.size() < min_len) {   // already short before any clip
+        g_clip_death[dbg->mate][7].fetch_add(1, std::memory_order_relaxed); dbg->dead = true;
+    }
+    int cut = -1, cut_src = -1;
+    int pd = adapter_3p.empty() ? -1 : find_adapter_in(rec.seq, adapter_3p,   0, 2, 12);
+    int pu =                          find_adapter_in(rec.seq, UNIVERSAL_3P, 0, 2, 12);
+    if (pd >= 0)                    { cut = pd; cut_src = 0; }
+    if (pu >= 0 && (cut < 0 || pu < cut)) { cut = pu; cut_src = 1; }
+    size_t sz0 = rec.seq.size();
+    if (cut >= 0) { rec.seq.resize(cut); rec.qual.resize(cut); }
+    clip_track(dbg, cut_src < 0 ? 1 : cut_src, sz0, rec.seq.size());
+    size_t s;
+    s = rec.seq.size(); if (!linker5p.empty())   trim_construct_5p(rec, linker5p, 0.1f, min_len); clip_track(dbg, 2, s, rec.seq.size());
+    s = rec.seq.size(); if (!adapter_5p.empty()) trim_adapter_5p(rec, adapter_5p, min_len);       clip_track(dbg, 3, s, rec.seq.size());
+    s = rec.seq.size(); if (!adapter_3p.empty()) trim_adapter_5p(rec, adapter_3p, min_len);       clip_track(dbg, 4, s, rec.seq.size());  // dimer: read-through at 5'
+    s = rec.seq.size(); trim_adapter_5p(rec, UNIVERSAL_3P, min_len);                              clip_track(dbg, 5, s, rec.seq.size());  // dimer: universal at 5'
+    s = rec.seq.size(); if (poly_g_run > 0)      trim_polybase(rec, 'G', poly_g_run, min_len);    clip_track(dbg, 6, s, rec.seq.size());
+}
+
 static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                          const MergeOpts& opts,
                          taph::SampleDamageProfile* prof_out,
@@ -760,6 +934,31 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
     OverlapSubstCounts local_subst;
     const bool do_profile = (prof_out != nullptr);
     const bool do_subst   = (subst_out != nullptr);
+
+    // Emit an unmerged pair with full adapter/linker/poly-G clipping and QC.
+    // Zero-insert dimers collapse below min-length and are dropped; one survivor → orphan.
+    auto emit_unmerged = [&](FastqRecord& u1, FastqRecord& u2, MergeBatch& out) {
+        ClipDebug d1{0, opts.min_length}, d2{1, opts.min_length};
+        clip_unmerged(u1, opts.adapter1, opts.adapter2, opts.adapter_5p_linker,
+                      opts.poly_g_min_run, opts.min_length, g_clip_dbg ? &d1 : nullptr);
+        clip_unmerged(u2, opts.adapter2, opts.adapter1, opts.adapter_5p_linker,
+                      opts.poly_g_min_run, opts.min_length, g_clip_dbg ? &d2 : nullptr);
+        bool ok1 = passes_qc(u1, opts);
+        bool ok2 = passes_qc(u2, opts);
+        MergeRecord mr;
+        mr.is_merged = false;
+        if (ok1 && ok2) {
+            mr.merged = std::move(u1); mr.unmerged2 = std::move(u2); ++out.n_unmerged;
+        } else if (ok1 || ok2) {
+            mr.is_orphan = true; mr.orphan_r1 = ok1;
+            mr.merged = ok1 ? std::move(u1) : std::move(u2); ++out.n_orphan;
+            if (ok1) ++out.n_orphan_r1; else ++out.n_orphan_r2;
+        } else {
+            ++out.n_dropped;
+            return;  // both fail QC → drop
+        }
+        out.records.push_back(std::move(mr));
+    };
 
     PairBatch batch;
     while (in_q.pop(batch)) {
@@ -786,13 +985,8 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 
             if (L1 < opts.min_ov || L2 < opts.min_ov ||
                 L1 > MAX_READ_LEN  || L2 > MAX_READ_LEN) {
-                // Too short or too long: emit unmerged
-                MergeRecord mr;
-                mr.merged    = r1;
-                mr.unmerged2 = r2;
-                mr.is_merged = false;
-                out.records.push_back(std::move(mr));
-                ++out.n_unmerged;
+                // Too short or too long to overlap: clip adapters and emit as unmerged
+                emit_unmerged(r1, r2, out);
                 continue;
             }
 
@@ -962,37 +1156,17 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
                     if (passes_qc(mr.merged, opts)) {
                         ++out.n_merged;
+                        out.records.push_back(std::move(mr));
                     } else {
-                        mr.is_merged = false;
-                        mr.merged    = r1;
-                        mr.unmerged2 = r2;
-                        ++out.n_unmerged;
+                        emit_unmerged(r1, r2, out);
                     }
-                    out.records.push_back(std::move(mr));
                     continue;
                 }
             }
 
             if (best_ov < opts.min_ov) {
-                // No overlap found: trim adapters, apply QC, handle orphans
-                FastqRecord t1 = r1, t2 = r2;
-                if (!opts.adapter1.empty()) trim_adapter(t1, opts.adapter1, opts.min_length);
-                if (!opts.adapter2.empty()) trim_adapter(t2, opts.adapter2, opts.min_length);
-                bool ok1 = passes_qc(t1, opts);
-                bool ok2 = passes_qc(t2, opts);
-                MergeRecord mr;
-                mr.is_merged = false;
-                if (ok1 && ok2) {
-                    mr.merged    = std::move(t1);
-                    mr.unmerged2 = std::move(t2);
-                    ++out.n_unmerged;
-                } else if (ok1 || ok2) {
-                    mr.is_orphan = true;
-                    mr.merged    = ok1 ? std::move(t1) : std::move(t2);
-                    ++out.n_orphan;
-                }
-                // both fail → drop (emit nothing; push empty record skipped by writer)
-                if (ok1 || ok2) out.records.push_back(std::move(mr));
+                // No overlap found: clip adapters/linker/poly-G, QC, handle orphans/dimers
+                emit_unmerged(r1, r2, out);
                 continue;
             }
 
@@ -1005,20 +1179,21 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             // Trim adapter artifacts from merged output:
             // 5': adapter complement (CTCTTCCGATCT) from library-prep bleedthrough
             // 3': adapter sequence surviving in Phase-2 suffix or mismerges
+            // ss library 5' linker precedes the insert on the merged 5' too — clip the full
+            // learned construct before the adapter trims, else its tail corrupts the insert 5'.
+            if (!opts.adapter_5p_linker.empty())
+                trim_construct_5p(mr.merged, opts.adapter_5p_linker, 0.1f, opts.min_length);
             if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
             if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
 
             if (!passes_qc(mr.merged, opts)) {
-                mr.is_merged = false;
-                mr.merged    = r1;
-                mr.unmerged2 = r2;
-                ++out.n_unmerged;
+                emit_unmerged(r1, r2, out);
             } else {
                 if (do_subst)
                     accum_overlap_subst(local_subst, r1.seq, rc2_seq, r2_offset, best_ov, 0);
                 ++out.n_merged;
+                out.records.push_back(std::move(mr));
             }
-            out.records.push_back(std::move(mr));
         }
 
         out_q.push(std::move(out));
@@ -1115,6 +1290,7 @@ static bool load_adapter_fasta(const std::string& path,
 int merge_main(int argc, char** argv) {
     std::vector<std::string> r1_paths, r2_paths;
     std::string out_path, r1_out_path, r2_out_path, orphan_out_path;
+    std::string orphan_r1_out_path, orphan_r2_out_path;
     std::string adapter_fasta;
     MergeOpts opts;
     int n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
@@ -1127,6 +1303,9 @@ int merge_main(int argc, char** argv) {
         else if (a == "--r1-out"           && i+1 < argc) r1_out_path      = argv[++i];
         else if (a == "--r2-out"           && i+1 < argc) r2_out_path      = argv[++i];
         else if (a == "--orphan-out"       && i+1 < argc) orphan_out_path  = argv[++i];
+        else if (a == "--orphanr1-out"     && i+1 < argc) orphan_r1_out_path = argv[++i];
+        else if (a == "--orphanr2-out"     && i+1 < argc) orphan_r2_out_path = argv[++i];
+        else if (a == "--library-type"     && i+1 < argc) opts.forced_library_type = argv[++i];
         else if (a == "--damage-out"       && i+1 < argc) opts.damage_out  = argv[++i];
         else if (a == "--subst-out"        && i+1 < argc) opts.subst_out   = argv[++i];
         else if (a == "--subst-binary"     && i+1 < argc) opts.subst_binary = argv[++i];
@@ -1191,6 +1370,7 @@ int merge_main(int argc, char** argv) {
     if (!user_override) {
         opts.adapter1 = det.adapter1;
         opts.adapter2 = det.adapter2;
+        opts.adapter_5p_linker = det.adapter_5p_linker;
         opts.skip_terminal = det.skip_terminal;
         if (opts.poly_g_min_run == 0 && det.poly_g_detected)
             opts.poly_g_min_run = 10;
@@ -1200,14 +1380,27 @@ int merge_main(int argc, char** argv) {
         opts.adapter2 = revcomp(opts.adapter1);
     }
 
-    std::string lib_type = det.is_ss ? "ss" : "ds";
+    // Resolve library type: an authoritative --library-type declaration always wins over
+    // geometry auto-detection (memory: a named-"ss" library was proven ds by geometry+BIC).
+    bool is_ss = det.is_ss;
+    std::string lib_type_source = det.type_from_panel ? "panel" : "detected";
+    float lib_type_conf = det.type_confidence;
+    if (opts.forced_library_type == "ss")      { is_ss = true;  lib_type_source = "declared"; lib_type_conf = 1.f; }
+    else if (opts.forced_library_type == "ds") { is_ss = false; lib_type_source = "declared"; lib_type_conf = 1.f; }
+    // ds libraries carry no extra 5' linker; a linker learned on a ds library would risk
+    // clipping a real biological 5', so gate the linker on ss (I1 / design §2.2).
+    if (!is_ss) opts.adapter_5p_linker.clear();
+
+    std::string lib_type = is_ss ? "ss" : "ds";
     std::string udg_type = det.is_udg ? "UDG" : (det.is_half_udg ? "half-UDG" : "untreated");
     std::cerr << "fqdup merge: " << n_threads << " threads (workers=" << wrk_threads << ")\n"
-              << "  library=" << lib_type << " damage=" << udg_type
+              << "  library=" << lib_type << " (" << lib_type_source
+              << " conf=" << lib_type_conf << ") damage=" << udg_type
               << " skip-terminal=" << opts.skip_terminal << "\n"
               << "  damage_5p=" << det.damage_5p << " damage_3p=" << det.damage_3p << "\n"
               << "  adapter1=" << (opts.adapter1.empty() ? "(none)" : opts.adapter1) << "\n"
               << "  adapter2=" << (opts.adapter2.empty() ? "(none)" : opts.adapter2) << "\n"
+              << "  5p-linker=" << (opts.adapter_5p_linker.empty() ? "(none)" : opts.adapter_5p_linker) << "\n"
               << "  min-overlap=" << opts.min_ov
               << " max-mm-rate=" << opts.max_mm_rate
               << " min-length=" << opts.min_length;
@@ -1238,31 +1431,52 @@ int merge_main(int argc, char** argv) {
         bool c = orphan_out_path.size() >= 3 && orphan_out_path.compare(orphan_out_path.size()-3,3,".gz")==0;
         orphan_writer = std::make_unique<FastqWriter>(orphan_out_path, c, wrt_threads);
     }
+    // Mate-preserved orphan streams. When given, orphan-R1 (molecule 5', C->T frame) and
+    // orphan-R2 (RC molecule 3'; ds biological, ss dA-tail) are routed separately so the
+    // estimator never conflates the two channels. Fallback: combined --orphan-out.
+    std::unique_ptr<FastqWriter> orphan_r1_writer, orphan_r2_writer;
+    if (!orphan_r1_out_path.empty()) {
+        bool c = orphan_r1_out_path.size() >= 3 && orphan_r1_out_path.compare(orphan_r1_out_path.size()-3,3,".gz")==0;
+        orphan_r1_writer = std::make_unique<FastqWriter>(orphan_r1_out_path, c, wrt_threads);
+    }
+    if (!orphan_r2_out_path.empty()) {
+        bool c = orphan_r2_out_path.size() >= 3 && orphan_r2_out_path.compare(orphan_r2_out_path.size()-3,3,".gz")==0;
+        orphan_r2_writer = std::make_unique<FastqWriter>(orphan_r2_out_path, c, wrt_threads);
+    }
 
     PairQueue    pair_q(2 * wrk_threads);
     MergeOutQueue out_q;
 
-    int64_t n_pairs    = 0;
-    int64_t n_merged   = 0;
-    int64_t n_unmerged = 0;
-    int64_t n_orphan   = 0;
+    int64_t n_pairs      = 0;
+    int64_t n_merged     = 0;
+    int64_t n_unmerged   = 0;
+    int64_t n_orphan     = 0;
+    int64_t n_orphan_r1  = 0;
+    int64_t n_orphan_r2  = 0;
+    int64_t n_dropped    = 0;
 
     // Writer thread
     std::thread writer_thr([&] {
         uint64_t expected = 0;
         MergeBatch batch;
         while (out_q.pop_ordered(expected, batch)) {
-            n_merged   += batch.n_merged;
-            n_unmerged += batch.n_unmerged;
-            n_orphan   += batch.n_orphan;
+            n_merged    += batch.n_merged;
+            n_unmerged  += batch.n_unmerged;
+            n_orphan    += batch.n_orphan;
+            n_orphan_r1 += batch.n_orphan_r1;
+            n_orphan_r2 += batch.n_orphan_r2;
+            n_dropped   += batch.n_dropped;
             for (auto& mr : batch.records) {
                 ++n_pairs;
                 if (mr.is_merged) {
                     if (!mr.merged.seq.empty())
                         merged_writer.write(mr.merged);
                 } else if (mr.is_orphan) {
-                    if (orphan_writer && !mr.merged.seq.empty())
-                        orphan_writer->write(mr.merged);
+                    // Prefer the mate-specific stream; fall back to the combined orphan stream.
+                    FastqWriter* ow = mr.orphan_r1 ? orphan_r1_writer.get() : orphan_r2_writer.get();
+                    if (!ow) ow = orphan_writer.get();
+                    if (ow && !mr.merged.seq.empty())
+                        ow->write(mr.merged);
                 } else {
                     if (r1_writer && !mr.merged.seq.empty())
                         r1_writer->write(mr.merged);
@@ -1386,7 +1600,7 @@ int merge_main(int argc, char** argv) {
         if (!bf) {
             std::cerr << "Error: cannot write binary subst: " << opts.subst_binary << "\n";
         } else {
-            static const uint8_t MAGIC[8] = {'B','S','U','B','S','T',0x02,0x00};
+            static const uint8_t MAGIC[8] = {'B','S','U','B','S','T',0x03,0x00};
             fwrite(MAGIC, 1, 8, bf);
             fwrite(&subst_ptr->n_pairs, 8, 1, bf);
             fwrite(&subst_ptr->n_bases, 8, 1, bf);
@@ -1395,6 +1609,29 @@ int merge_main(int argc, char** argv) {
             fwrite(subst_ptr->fwd, sizeof(subst_ptr->fwd), 1, bf);
             fwrite(subst_ptr->rev, sizeof(subst_ptr->rev), 1, bf);
             fwrite(subst_ptr->all, sizeof(subst_ptr->all), 1, bf);
+            // v3 library trailer: sits between `all` and the v2 len-bin block. Carries the
+            // library-type contract + merge counts so `fqdup damage` can splice a "library"
+            // block into the profile JSON (no sidecar, no separate pass). Read by V3 readers;
+            // V1/V2 readers stop after `all` and never see it.
+            {
+                uint8_t  ss8  = is_ss ? 1 : 0;
+                uint8_t  src8 = (lib_type_source == "declared") ? 1 : 0;
+                uint8_t  bal8 = ((n_orphan_r1 + n_orphan_r2 == n_orphan) &&
+                                 (n_merged + n_unmerged + n_orphan_r1 + n_orphan_r2 + n_dropped
+                                  == n_pairs + n_dropped)) ? 1 : 0;
+                float    conf = lib_type_conf;
+                int64_t  pairs_in = n_merged + n_unmerged + n_orphan_r1 + n_orphan_r2 + n_dropped;
+                fwrite(&ss8, 1, 1, bf); fwrite(&src8, 1, 1, bf); fwrite(&conf, 4, 1, bf);
+                auto wstr = [&](const std::string& s) {
+                    uint16_t n = (uint16_t)std::min(s.size(), (size_t)65535);
+                    fwrite(&n, 2, 1, bf); if (n) fwrite(s.data(), 1, n, bf);
+                };
+                wstr(opts.adapter_5p_linker); wstr(opts.adapter1); wstr(opts.adapter2);
+                int64_t cnts[6] = { pairs_in, n_merged, n_unmerged,
+                                    n_orphan_r1, n_orphan_r2, n_dropped };
+                fwrite(cnts, 8, 6, bf);
+                fwrite(&bal8, 1, 1, bf);
+            }
             // v2 extension: per-length-bin data
             int32_t n_len_bins = LenBins::N;
             fwrite(&n_len_bins, 4, 1, bf);
@@ -1410,10 +1647,28 @@ int merge_main(int argc, char** argv) {
     }
 
     double pct = n_pairs > 0 ? 100.0 * n_merged / n_pairs : 0.0;
+    int64_t pairs_in = n_merged + n_unmerged + n_orphan_r1 + n_orphan_r2 + n_dropped;
+    bool balanced = (n_orphan_r1 + n_orphan_r2 == n_orphan) && (pairs_in == n_pairs + n_dropped);
     std::cerr << "Pairs processed:  " << n_pairs    << "\n"
               << "Merged:           " << n_merged   << " (" << pct << "%)\n"
               << "Unmerged:         " << n_unmerged << "\n"
-              << "Orphan:           " << n_orphan   << "\n";
+              << "Orphan:           " << n_orphan   << " (R1=" << n_orphan_r1
+              << " R2=" << n_orphan_r2 << ")\n"
+              << "Dropped:          " << n_dropped  << "\n"
+              << "Balance:          " << (balanced ? "OK" : "MISMATCH")
+              << " (pairs_in=" << pairs_in << ")\n";
+
+    if (g_clip_dbg) {
+        static const char* STEP[8] = {
+            "wholeread@detected-adapter", "wholeread@universal", "linker-5p",
+            "adapter5p-5p", "adapter3p-5p", "universal-5p", "polyG-3p", "already-short"};
+        std::cerr << "Clip-death attribution (reads taken below min_length):\n";
+        for (int m = 0; m < 2; ++m)
+            for (int s = 0; s < 8; ++s) {
+                int64_t v = g_clip_death[m][s].load();
+                if (v) std::cerr << "  " << (m ? "R2" : "R1") << "  " << STEP[s] << " = " << v << "\n";
+            }
+    }
 
     return 0;
 }

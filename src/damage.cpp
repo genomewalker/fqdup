@@ -119,11 +119,18 @@ int damage_main(int argc, char** argv) {
     // bsubst arrays shared between early pseudo-count injection and late JSON output
     static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
     static const uint8_t BMAGIC_V2[8] = {'B','S','U','B','S','T',0x02,0x00};
+    static const uint8_t BMAGIC_V3[8] = {'B','S','U','B','S','T',0x03,0x00};
     // alias for the check below
     const uint8_t* BMAGIC = BMAGIC_V1; (void)BMAGIC;
     int64_t bsubst_fwd[30][4][4] = {}, bsubst_rev[30][4][4] = {}, bsubst_all[4][4] = {};
     int64_t bsubst_n_pairs = 0, bsubst_n_bases = 0;
     bool    bsubst_loaded  = false;
+    // Library trailer from the .bsubst v3 (fqdup merge). Populated from the first v3 file.
+    bool        lib_meta_loaded = false;
+    bool        lib_is_ss = false, lib_declared = false, lib_balanced = false;
+    float       lib_conf = 0.f;
+    std::string lib_linker, lib_adapter1, lib_adapter2;
+    int64_t     lib_cnts[6] = {};   // pairs_in, merged, unmerged, orphan_r1, orphan_r2, dropped
     LengthBinOptions lb_opts = []{ bool ok; return parse_length_bins("auto", ok); }();
     int64_t     adapter_scan_reads = 1'000'000;  // 0 = scan entire file
     taph::SampleDamageProfile::LibraryType forced_lib =
@@ -508,13 +515,32 @@ int damage_main(int argc, char** argv) {
             std::cerr << "Warning: cannot open --subst-in: " << subst_in_path << "\n";
         } else {
             bool ok = fread(magic, 1, 8, bf) == 8
-                   && (memcmp(magic, BMAGIC_V1, 8) == 0 || memcmp(magic, BMAGIC_V2, 8) == 0)
+                   && (memcmp(magic, BMAGIC_V1, 8) == 0 || memcmp(magic, BMAGIC_V2, 8) == 0
+                       || memcmp(magic, BMAGIC_V3, 8) == 0)
                    && fread(&tmp_pairs, 8, 1, bf) == 1
                    && fread(&tmp_bases, 8, 1, bf) == 1
                    && fread(&npos,      4, 1, bf) == 1 && npos == 30
                    && fread(tmp_fwd,  sizeof(tmp_fwd),  1, bf) == 1
                    && fread(tmp_rev,  sizeof(tmp_rev),  1, bf) == 1
                    && fread(tmp_all,  sizeof(tmp_all),  1, bf) == 1;
+            // v3 library trailer (sits right after `all`; first v3 file wins).
+            if (ok && memcmp(magic, BMAGIC_V3, 8) == 0 && !lib_meta_loaded) {
+                uint8_t ss8 = 0, src8 = 0, bal8 = 0;
+                float conf = 0.f;
+                auto rstr = [&](std::string& s) -> bool {
+                    uint16_t n = 0;
+                    if (fread(&n, 2, 1, bf) != 1) return false;
+                    s.resize(n);
+                    return n == 0 || fread(&s[0], 1, n, bf) == (size_t)n;
+                };
+                bool tok = fread(&ss8,1,1,bf)==1 && fread(&src8,1,1,bf)==1 && fread(&conf,4,1,bf)==1
+                        && rstr(lib_linker) && rstr(lib_adapter1) && rstr(lib_adapter2)
+                        && fread(lib_cnts, 8, 6, bf) == 6 && fread(&bal8,1,1,bf)==1;
+                if (tok) {
+                    lib_is_ss = ss8; lib_declared = src8; lib_balanced = bal8;
+                    lib_conf = conf; lib_meta_loaded = true;
+                }
+            }
             fclose(bf);
             if (!ok) {
                 std::cerr << "Warning: corrupt or wrong-version .bsubst: " << subst_in_path << "\n";
@@ -1201,6 +1227,33 @@ int damage_main(int argc, char** argv) {
                 pji.paired_tg_pos.push_back(sum_p > 0 ? (double)bsubst_fwd[p][3][2] / sum_p : 0.0);
                 pji.paired_ca_pos.push_back(sum_p > 0 ? (double)bsubst_fwd[p][1][0] / sum_p : 0.0);
             }
+        }
+
+        if (lib_meta_loaded) {
+            // Biological termini contract (design I1): ds carries damage on BOTH termini
+            // (5' C->T, 3' G->A); ss carries it only on the 5' — the 3' is a dA-tail prep
+            // artifact, QC-only, not a deamination estimand.
+            const char* bt5 = "true";
+            const char* bt3 = lib_is_ss ? "false" : "true";
+            auto esc = [](const std::string& s) { return s.empty() ? std::string("null")
+                                                      : "\"" + s + "\""; };
+            std::ostringstream lj;
+            lj << "  \"library\": {\n"
+               << "    \"type\": \"" << (lib_is_ss ? "ss" : "ds") << "\",\n"
+               << "    \"type_source\": \"" << (lib_declared ? "declared" : "detected") << "\",\n"
+               << "    \"type_confidence\": " << std::fixed << std::setprecision(4) << lib_conf << ",\n"
+               << "    \"biological_termini\": {\"five_prime\": " << bt5
+               << ", \"three_prime\": " << bt3 << "},\n"
+               << "    \"linker\": " << esc(lib_linker) << ",\n"
+               << "    \"adapter1\": " << esc(lib_adapter1) << ",\n"
+               << "    \"adapter2\": " << esc(lib_adapter2) << ",\n"
+               << "    \"merge_counts\": {\"pairs_in\": " << lib_cnts[0]
+               << ", \"merged\": " << lib_cnts[1] << ", \"unmerged\": " << lib_cnts[2]
+               << ", \"orphan_r1\": " << lib_cnts[3] << ", \"orphan_r2\": " << lib_cnts[4]
+               << ", \"dropped\": " << lib_cnts[5] << "},\n"
+               << "    \"balanced\": " << (lib_balanced ? "true" : "false") << "\n"
+               << "  }";
+            pji.library_json = lj.str();
         }
 
         taph::profile_to_json(dp, j, pji);
