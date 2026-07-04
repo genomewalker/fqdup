@@ -539,6 +539,7 @@ struct MergeOpts {
     std::string adapter_5p_linker;              // library 5' construct clipped from unmerged reads
     std::string forced_library_type;            // "ss"/"ds" declared override; ""=auto-detect
     std::vector<std::string> extra_adapters1;   // additional R1 adapters to try (from --adapter-fasta)
+    bool  use_internal_panel = false;           // --internal-panel: aDNA construct read-through table
     std::string damage_out;     // path for paired damage profile JSON; empty=disabled
     std::string subst_out;      // path for overlap substitution matrix TSV; empty=disabled
     std::string subst_binary;   // path for binary .bsubst format; empty=disabled
@@ -1238,7 +1239,8 @@ static void usage() {
         "Adapter trimming (for unmerged pairs):\n"
         "  --adapter1 SEQ     R1 adapter sequence (Illumina P7 RC)\n"
         "  --adapter2 SEQ     R2 adapter sequence (Illumina P7)\n"
-        "  --adapter-fasta F  FASTA with adapter pairs (odd=R1, even=R2); multiple pairs supported\n\n"
+        "  --adapter-fasta F  FASTA with adapter pairs (odd=R1, even=R2); multiple pairs supported\n"
+        "  --internal-panel   Also trim built-in aDNA construct read-throughs (ss/ds type-aware)\n\n"
         "Performance:\n"
         "  -p N               Threads (default: all cores)\n"
         "  -h, --help         Show this help\n\n"
@@ -1316,6 +1318,7 @@ int merge_main(int argc, char** argv) {
         else if (a == "--adapter1"         && i+1 < argc) opts.adapter1       = argv[++i];
         else if (a == "--adapter2"         && i+1 < argc) opts.adapter2       = argv[++i];
         else if (a == "--adapter-fasta"    && i+1 < argc) adapter_fasta       = argv[++i];
+        else if (a == "--internal-panel")                 opts.use_internal_panel = true;
         else if (a == "--clip-r1-5p"       && i+1 < argc) opts.clip_5p         = std::stoi(argv[++i]);
         else if (a == "--poly-g")                         opts.poly_g_min_run = 10;
         else if (a == "--poly-g-min-run"   && i+1 < argc) opts.poly_g_min_run = std::stoi(argv[++i]);
@@ -1374,6 +1377,19 @@ int merge_main(int argc, char** argv) {
         opts.skip_terminal = det.skip_terminal;
         if (opts.poly_g_min_run == 0 && det.poly_g_detected)
             opts.poly_g_min_run = 10;
+        // Internal aDNA construct panel (protocol constants; Ellesmere supp §4.3.2 / Kapp 2021 /
+        // Illumina TruSeq): extra R1-side read-through constructs tried in phase-0-extra. Replicates
+        // the published fastp --adapter_fasta panel. Gated OFF by default (--internal-panel);
+        // validated 3'-terminus-neutral before enabling.
+        if (opts.use_internal_panel && opts.extra_adapters1.empty()) {
+            opts.extra_adapters1 = {
+                "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC",   // Illumina universal read-through
+                "ATCTCGTATGCCGTCTTCTGCTTG",             // P7 index read-through
+                "GTGTAGATCTCGGTGGTCGCCGTATCATT",        // P5 read-2 segment
+            };
+            opts.extra_adapters1.push_back(det.is_ss ? "GGAAGAGCGTCGTGTAGGGAAAGAGTGT"
+                                                     : "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT");
+        }
     } else if (opts.adapter1.empty() && !opts.adapter2.empty()) {
         opts.adapter1 = revcomp(opts.adapter2);
     } else if (opts.adapter2.empty() && !opts.adapter1.empty()) {
