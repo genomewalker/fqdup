@@ -675,10 +675,19 @@ static DetectedParams detect_merge_params(
         if (r2s >= 12)
             a2_freq[rc2_seq.substr(r2s - 12, 12)]++;
         if (L1 >= 12) { r1_5p_freq[pr.r1.seq.substr(0, 12)]++; ++n_5p; }
+        // ss/ds vote: the splint core reads through R1 3'. In ds it sits behind the TruSeq stem
+        // (AGATC upstream), in ss it does not. Score ONLY reads where the stem is in-frame and
+        // decisive: undeterminable (core within 5bp of read start) and ambiguous (2 mismatches to
+        // AGATC, near the random-sequence expectation) reads cast no vote — an absent/degraded stem
+        // is not positive ss evidence. Symmetric tolerance on both arms avoids a ds->ss bias that
+        // would drop the ds 3' G->A terminus (fable review, HIGH).
         int sp = find_adapter_in(pr.r1.seq, SS_SPLINT_CORE, 0, 1, 12);
-        if (sp >= 0) {
-            if (sp >= 5 && pr.r1.seq.compare(sp - 5, 5, "AGATC") == 0) ++ds_stem;
-            else ++ss_stem;
+        if (sp >= 5) {
+            static const char STEM[5] = {'A','G','A','T','C'};
+            int d0 = 0;
+            for (int k = 0; k < 5; ++k) d0 += (pr.r1.seq[sp - 5 + k] != STEM[k]);
+            if      (d0 <= 1) ++ds_stem;   // TruSeq stem present -> ds
+            else if (d0 >= 3) ++ss_stem;   // clearly no stem -> ss
         }
     }
 
