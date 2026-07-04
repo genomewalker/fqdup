@@ -930,13 +930,18 @@ private:
             ls.total_candidates += n_cands;
 
             auto tc0 = do_time ? clk::now() : clk::time_point{};
-            // Prefetch a candidate's interior K iterations ahead: the pi_buf
-            // gather below scatters into the 3.6GB slab and is the dominant LLC
-            // miss (57% of B1). Prefetch-neutral: cannot change results.
-            constexpr uint32_t kPrefetchAhead = 8;
+            // Two-pass software-pipelined gather to deepen memory-level
+            // parallelism. Each pi_buf gather below scatters into the 3.6GB
+            // slab and is the dominant LLC miss (57% of B1). Pass A applies the
+            // cheap guards and issues a prefetch for EVERY surviving parent's
+            // interior, so all ~21 cold misses go outstanding together (vs one
+            // K-ahead before, which also wasted slots on guard-failing pids).
+            // Pass B runs the compares once the lines are in flight. Output-
+            // neutral: survivors are compacted into cand_buf in candidate order
+            // (n_surv <= ci, no clobber of unread entries) and the compare body
+            // is unchanged, so the recorded edges are byte-identical.
+            uint32_t n_surv = 0;
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
-                if (ci + kPrefetchAhead < n_cands)
-                    __builtin_prefetch(interior_ptr(cand_buf[ci + kPrefetchAhead]), 0, 0);
                 uint32_t pid = cand_buf[ci];
                 if (is_error_[pid]) continue;
                 if (!arena_.is_eligible(pid)) continue;
@@ -951,10 +956,14 @@ private:
                 // (both halves of the pair share the same mismatch → sig/parent = 100%).
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-
+                __builtin_prefetch(interior_ptr(pid), 0, 0);
+                cand_buf[n_surv++] = pid;
+            }
+            for (uint32_t si = 0; si < n_surv; ++si) {
+                uint32_t pid = cand_buf[si];
                 // Parent's full interior: read from the per-id slab (extracted
-                // once). pid has length == L here (checked above), so its slab
-                // layout equals lay -> byte-identical to a live extract.
+                // once). pid has length == L here (checked in Pass A), so its
+                // slab layout equals lay -> byte-identical to a live extract.
                 const uint8_t* pi_buf = interior_ptr(pid);
 
                 // Try direct comparison (H=1 — same canonical orientation)
