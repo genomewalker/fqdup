@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -195,61 +196,55 @@ public:
     }
 
 private:
-    XXH128_hash_t compute_hash(const std::string& seq, bool& is_forward) const {
+    // Thread-safe canonical hash: all scratch is passed in, so worker threads
+    // may call it concurrently during parallel Pass-1. Byte-identical to the
+    // former member body (same LUTs, same masking, same canonical tiebreak).
+    static XXH128_hash_t compute_hash_impl(const std::string& seq,
+                                           const DamageProfile& profile,
+                                           bool use_revcomp, bool& is_forward,
+                                           std::vector<char>& s1, std::vector<char>& s2) {
         int L = static_cast<int>(seq.size());
-        if (profile_.enabled) {
-            if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
-            if (scratch2_.size() < seq.size()) scratch2_.resize(seq.size());
-            apply_damage_mask_inplace(seq, profile_, scratch1_.data());
-            XXH128_hash_t h1 = XXH3_128bits(scratch1_.data(), L);
-            if (!use_revcomp_) { is_forward = true; return h1; }
-            // Build RC into scratch2_
+        if (profile.enabled) {
+            if (s1.size() < seq.size()) s1.resize(seq.size());
+            if (s2.size() < seq.size()) s2.resize(seq.size());
+            apply_damage_mask_inplace(seq, profile, s1.data());
+            XXH128_hash_t h1 = XXH3_128bits(s1.data(), L);
+            if (!use_revcomp) { is_forward = true; return h1; }
+            for (int i = 0; i < L; ++i)
+                s2[i] = static_cast<char>(
+                    lut::kCompCase[static_cast<unsigned char>(seq[L - 1 - i])]);
             for (int i = 0; i < L; ++i) {
-                unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-                switch (c) {
-                    case 'A': case 'a': scratch2_[i] = (c == 'A') ? 'T' : 't'; break;
-                    case 'C': case 'c': scratch2_[i] = (c == 'C') ? 'G' : 'g'; break;
-                    case 'G': case 'g': scratch2_[i] = (c == 'G') ? 'C' : 'c'; break;
-                    case 'T': case 't': scratch2_[i] = (c == 'T') ? 'A' : 'a'; break;
-                    default:            scratch2_[i] = 'N'; break;
-                }
-            }
-            // Apply damage mask to RC
-            for (int i = 0; i < L; ++i) {
-                char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2_[i])));
-                bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[i];
-                bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[L - 1 - i];
-                if (profile_.ss_mode) {
-                    if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
-                    else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                char cu = static_cast<char>(lut::kUpper[static_cast<unsigned char>(s2[i])]);
+                bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && profile.mask_pos[i];
+                bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && profile.mask_pos[L - 1 - i];
+                if (profile.ss_mode) {
+                    if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) s2[i] = '\x01';
+                    else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) s2[i] = '\x02';
                 } else {
-                    if (in_5zone && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
-                    else if (in_3zone && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                    if (in_5zone && (cu == 'C' || cu == 'T')) s2[i] = '\x01';
+                    else if (in_3zone && (cu == 'G' || cu == 'A')) s2[i] = '\x02';
                 }
             }
-            XXH128_hash_t h2 = XXH3_128bits(scratch2_.data(), L);
+            XXH128_hash_t h2 = XXH3_128bits(s2.data(), L);
             is_forward = (h1.high64 < h2.high64 ||
                           (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
             return is_forward ? h1 : h2;
         }
-        // No damage masking
         XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
-        if (!use_revcomp_) { is_forward = true; return h1; }
-        if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
-        for (int i = 0; i < L; ++i) {
-            unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-            switch (c) {
-                case 'A': case 'a': scratch1_[i] = (c == 'A') ? 'T' : 't'; break;
-                case 'C': case 'c': scratch1_[i] = (c == 'C') ? 'G' : 'g'; break;
-                case 'G': case 'g': scratch1_[i] = (c == 'G') ? 'C' : 'c'; break;
-                case 'T': case 't': scratch1_[i] = (c == 'T') ? 'A' : 'a'; break;
-                default:            scratch1_[i] = 'N'; break;
-            }
-        }
-        XXH128_hash_t h2 = XXH3_128bits(scratch1_.data(), L);
+        if (!use_revcomp) { is_forward = true; return h1; }
+        if (s1.size() < seq.size()) s1.resize(seq.size());
+        for (int i = 0; i < L; ++i)
+            s1[i] = static_cast<char>(
+                lut::kCompCase[static_cast<unsigned char>(seq[L - 1 - i])]);
+        XXH128_hash_t h2 = XXH3_128bits(s1.data(), L);
         is_forward = (h1.high64 < h2.high64 ||
                       (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
         return is_forward ? h1 : h2;
+    }
+
+    XXH128_hash_t compute_hash(const std::string& seq, bool& is_forward) const {
+        return compute_hash_impl(seq, profile_, use_revcomp_, is_forward,
+                                 scratch1_, scratch2_);
     }
 
     // Count terminal damage markers: T at masked 5' positions + A at masked 3' positions.
@@ -265,8 +260,8 @@ private:
         int L = static_cast<int>(seq.size());
         for (int p = 0; p < DamageProfile::MASK_POSITIONS && p < L; ++p) {
             if (!prof.mask_pos[p]) continue;
-            if (std::toupper(static_cast<unsigned char>(seq[p]))       == 'T') ++score;
-            if (std::toupper(static_cast<unsigned char>(seq[L-1-p]))   == 'A') ++score;
+            if (lut::kUpper[static_cast<unsigned char>(seq[p])]     == 'T') ++score;
+            if (lut::kUpper[static_cast<unsigned char>(seq[L-1-p])] == 'A') ++score;
         }
         return static_cast<uint8_t>(std::min(score, 255));
     }
@@ -328,6 +323,22 @@ private:
             // the regrow path.
         }
 
+        // Parallel Pass-1 offloads the pure per-read work (canonical hash, RC
+        // build, damage score) to a worker pool; a single committer replays the
+        // exact serial insert in record order -> byte-identical index_/arena_.
+        // Disabled when a derep_pairs prior is loaded (that path needs raw seq
+        // in the committer) or when only one thread is available.
+        unsigned n_threads = errcor_.threads;
+        if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
+        bool want_par = n_threads > 1 && prior_counts_.empty();
+        if (const char* e = std::getenv("FQDUP_PASS1_SERIAL"))
+            if (e[0] == '1') want_par = false;
+
+        if (want_par) pass1_parallel(in_path, n_threads);
+        else          pass1_serial(in_path);
+    }
+
+    void pass1_serial(const std::string& in_path) {
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
@@ -359,16 +370,9 @@ private:
                         int L = static_cast<int>(rec.seq.size());
                         if (rc_buf_.size()  < static_cast<size_t>(L)) rc_buf_.resize(L);
                         if (rc_qbuf_.size() < static_cast<size_t>(L)) rc_qbuf_.resize(L);
-                        for (int i = 0; i < L; ++i) {
-                            unsigned char c = static_cast<unsigned char>(rec.seq[L - 1 - i]);
-                            switch (c) {
-                                case 'A': case 'a': rc_buf_[i] = 'T'; break;
-                                case 'C': case 'c': rc_buf_[i] = 'G'; break;
-                                case 'G': case 'g': rc_buf_[i] = 'C'; break;
-                                case 'T': case 't': rc_buf_[i] = 'A'; break;
-                                default:            rc_buf_[i] = 'N'; break;
-                            }
-                        }
+                        for (int i = 0; i < L; ++i)
+                            rc_buf_[i] = static_cast<char>(
+                                lut::kCompUpper[static_cast<unsigned char>(rec.seq[L - 1 - i])]);
                         it->second.seq_id = arena_.append_chars(rc_buf_.data(), L);
                         if (!rec.qual.empty()) {
                             for (int i = 0; i < L; ++i) rc_qbuf_[i] = rec.qual[L - 1 - i];
@@ -409,6 +413,111 @@ private:
 
         std::cerr << "\r";
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
+    }
+
+    // Byte-identical parallel variant of pass1_serial (see want_par guard).
+    void pass1_parallel(const std::string& in_path, unsigned n_threads) {
+        const size_t CHUNK = size_t{1} << 22;   // 4M records per chunk
+
+        std::vector<char>          seqbuf, qualbuf, canon, canonq;
+        std::vector<uint64_t>      off;          // n+1 prefix offsets (shared: seq==qual len)
+        std::vector<uint16_t>      len;          // n
+        std::vector<uint8_t>       hasq;         // n
+        std::vector<XXH128_hash_t> hh;           // n
+        std::vector<uint8_t>       fwd, dsc;     // n
+
+        auto reader = make_fastq_reader(in_path);
+        FastqRecord rec;
+        uint64_t record_idx = 0;
+
+        auto worker = [&](size_t lo, size_t hi) {
+            std::vector<char> s1, s2;            // thread-local hash scratch
+            for (size_t i = lo; i < hi; ++i) {
+                int L = len[i];
+                const char* sp = seqbuf.data() + off[i];
+                std::string seq(sp, static_cast<size_t>(L));
+                bool f = true;
+                hh[i]  = compute_hash_impl(seq, profile_, use_revcomp_, f, s1, s2);
+                fwd[i] = f ? 1 : 0;
+                if (profile_.enabled) dsc[i] = compute_damage_score(seq, profile_);
+                char* cs = canon.data() + off[i];
+                if (f) std::memcpy(cs, sp, L);
+                else   for (int k = 0; k < L; ++k)
+                           cs[k] = static_cast<char>(
+                               lut::kCompUpper[static_cast<unsigned char>(sp[L - 1 - k])]);
+                if (hasq[i]) {
+                    const char* qp = qualbuf.data() + off[i];
+                    char* cq = canonq.data() + off[i];
+                    if (f) std::memcpy(cq, qp, L);
+                    else   for (int k = 0; k < L; ++k) cq[k] = qp[L - 1 - k];
+                }
+            }
+        };
+
+        while (true) {
+            seqbuf.clear(); qualbuf.clear(); off.clear(); len.clear(); hasq.clear();
+            off.push_back(0);
+            size_t n = 0;
+            while (n < CHUNK && reader->read(rec)) {
+                uint16_t L = static_cast<uint16_t>(rec.seq.size());
+                seqbuf.insert(seqbuf.end(), rec.seq.begin(), rec.seq.end());
+                bool hq = !rec.qual.empty();
+                if (hq) qualbuf.insert(qualbuf.end(), rec.qual.begin(), rec.qual.end());
+                else    qualbuf.insert(qualbuf.end(), rec.seq.size(), '\0');
+                len.push_back(L);
+                hasq.push_back(hq ? 1 : 0);
+                off.push_back(seqbuf.size());
+                ++n;
+            }
+            if (n == 0) break;
+
+            hh.resize(n); fwd.resize(n); dsc.assign(n, 0);
+            canon.resize(seqbuf.size()); canonq.resize(qualbuf.size());
+
+            unsigned nw = static_cast<unsigned>(std::min<size_t>(n_threads, n));
+            std::vector<std::thread> ts; ts.reserve(nw);
+            size_t per = (n + nw - 1) / nw;
+            for (unsigned t = 0; t < nw; ++t) {
+                size_t lo = static_cast<size_t>(t) * per, hi = std::min(n, lo + per);
+                if (lo >= hi) break;
+                ts.emplace_back(worker, lo, hi);
+            }
+            for (auto& th : ts) th.join();
+
+            for (size_t i = 0; i < n; ++i) {
+                int L = len[i];
+                SequenceFingerprint fp(hh[i], static_cast<size_t>(L));
+                auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
+                if (inserted) {
+                    if (profile_.enabled) it->second.damage_score = dsc[i];
+                    if (errcor_.enabled) {
+                        it->second.seq_id = arena_.append_chars(canon.data() + off[i], L);
+                        if (hasq[i]) qual_arena_.append_chars(canonq.data() + off[i], L);
+                        else         qual_arena_.append_empty();
+                    }
+                } else {
+                    it->second.count++;
+                    if (profile_.enabled && dsc[i] > it->second.damage_score) {
+                        it->second.record_index = record_idx;
+                        it->second.damage_score = dsc[i];
+                    }
+                }
+                if (fwd[i]) it->second.fwd_count++;
+                ++record_idx;
+                ++total_reads_;
+                if ((total_reads_ % 1000000) == 0) {
+                    size_t uniq = index_.size();
+                    double dup_pct = 100.0 * (1.0 - (double)uniq / total_reads_);
+                    std::cerr << "\r[Pass 1] " << total_reads_ << " reads, "
+                              << uniq << " unique, " << std::fixed << std::setprecision(1)
+                              << dup_pct << "% dedup" << std::flush;
+                }
+            }
+        }
+
+        std::cerr << "\r";
+        log_info("Pass 1 complete: " + std::to_string(total_reads_) +
+                 " reads indexed (parallel x" + std::to_string(n_threads) + ")");
     }
 
     // Phase 3: parent-centric mismatch pattern detection.
