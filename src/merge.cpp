@@ -463,6 +463,27 @@ static void trim_polybase(FastqRecord& rec, char base, int min_run, int min_leng
     }
 }
 
+// Data-derived 3' poly-G run-length threshold. A trailing G-run is contamination
+// (NovaSeq/NextSeq two-color dark-cycle run-through) only when longer than the
+// interior G-composition would produce by chance: k = smallest run with
+// P(run) < 1e-3 under interior G fraction f, i.e. k = ceil(log(1e-3)/log(f)).
+// Floored at 4 so a G-rich genome can't push k so high the real tail survives.
+// Safe by construction: on 4-channel/HiSeq data (no run-through) a random G-run
+// reaching length k occurs with prob <1e-3, so trimming is a no-op.
+static int derive_polyg_k(const std::vector<ReadPair>& scan_buf) {
+    int64_t g = 0, n = 0;
+    for (const auto& pr : scan_buf) {
+        for (const std::string* s : {&pr.r1.seq, &pr.r2.seq}) {
+            int L = (int)s->size(), lo = L / 3, hi = 2 * L / 3;  // interior third, unbiased by 3' tail
+            for (int i = lo; i < hi; ++i) { ++n; if ((*s)[i] == 'G') ++g; }
+        }
+    }
+    if (n == 0 || g == 0) return 4;
+    double f = (double)g / (double)n;
+    int k = (int)std::ceil(std::log(1e-3) / std::log(f));
+    return k < 4 ? 4 : k;
+}
+
 static float shannon_entropy(const std::string& seq) {
     if (seq.empty()) return 0.f;
     int cnt[4] = {};
@@ -479,6 +500,91 @@ static float shannon_entropy(const std::string& seq) {
         h -= p * std::log2(p);
     }
     return h;
+}
+
+// Base-composition complexity of seq[lo,hi): Shannon entropy (bits, max 2) and the
+// single-base dominance fraction (max over A/C/G/T). N excluded from the denominator.
+// Both are the raw statistics whose merged-read distribution the unmerged QC gate is
+// derived from (no hardcoded threshold — see detect_merge_params / passes_qc).
+struct SeqComplexity { float entropy; float max_frac; };
+static SeqComplexity seq_complexity(const std::string& seq, int lo, int hi) {
+    int cnt[4] = {}, tot = 0;
+    for (int i = lo; i < hi; ++i) {
+        switch (seq[i]) {
+            case 'A': cnt[0]++; tot++; break;  case 'C': cnt[1]++; tot++; break;
+            case 'G': cnt[2]++; tot++; break;  case 'T': cnt[3]++; tot++; break;
+        }
+    }
+    if (!tot) return {0.f, 1.f};
+    float h = 0.f, mx = 0.f;
+    for (int i = 0; i < 4; ++i) {
+        if (!cnt[i]) continue;
+        float p = (float)cnt[i] / (float)tot;
+        h -= p * std::log2(p);
+        if (p > mx) mx = p;
+    }
+    return {h, mx};
+}
+
+// Structural low-complexity window. A run-through/low-complexity tract is scored on its
+// worst fixed-width window so the statistic is length-invariant: the merged-insert reference
+// and the full-length unmerged mate are compared on the SAME 20bp-window scale, and a
+// "clean prefix + poly-G tail" partial run-through is caught even when whole-read entropy
+// stays moderate. 20bp is a structural analysis width (cf. min_ov), not a data threshold.
+// ceiling: a low-complexity tract shorter than 20bp hides; upgrade: tie W to derived poly-G k.
+static constexpr int     COMPLEXITY_W         = 20;
+static constexpr int64_t COMPLEXITY_REF_FLOOR = 500;  // min merged inserts to enable the gate
+
+// Worst window over seq[lo,hi): MIN Shannon entropy and MAX single-base dominance across all
+// COMPLEXITY_W-wide windows (rolling counts, O(L)). N excluded from each window denominator.
+static SeqComplexity worst_window(const std::string& seq, int lo, int hi, int W = COMPLEXITY_W) {
+    int L = hi - lo;
+    if (L <= W) return seq_complexity(seq, lo, hi);
+    auto idx = [](char c) -> int {
+        switch (c) { case 'A': return 0; case 'C': return 1;
+                     case 'G': return 2; case 'T': return 3; } return -1; };
+    int cnt[4] = {}, valid = 0;
+    for (int i = lo; i < lo + W; ++i) { int b = idx(seq[i]); if (b >= 0) { cnt[b]++; valid++; } }
+    float worst_ent = 2.f, worst_dom = 0.f;
+    auto eval = [&]() {
+        if (!valid) { worst_dom = 1.f; worst_ent = 0.f; return; }
+        int mx = 0; for (int j = 0; j < 4; ++j) if (cnt[j] > mx) mx = cnt[j];
+        float dom = (float)mx / (float)valid;
+        if (dom > worst_dom) worst_dom = dom;
+        float h = 0.f;
+        for (int j = 0; j < 4; ++j) { if (!cnt[j]) continue;
+            float p = (float)cnt[j] / (float)valid; h -= p * std::log2(p); }
+        if (h < worst_ent) worst_ent = h;
+    };
+    eval();
+    for (int i = lo + W; i < hi; ++i) {
+        int bo = idx(seq[i - W]); if (bo >= 0) { cnt[bo]--; valid--; }
+        int bn = idx(seq[i]);     if (bn >= 0) { cnt[bn]++; valid++; }
+        eval();
+    }
+    return {worst_ent, worst_dom};
+}
+
+// Adapter-dimer test for an unmerged mate's 5' end. A zero-insert dimer reads straight
+// into the read-through adapter, but a 1-base indel (e.g. missing leading A) shifts the
+// match so clip_unmerged's exact anchored find_adapter_in misses it and the full adapter
+// survives at high entropy. Slide both the read start and the adapter start over [0,max_off)
+// and accept a 12-mer window with <=2 mismatches: reject when the learned adapter matches
+// within the first few bases. Uses the ALREADY-LEARNED per-mate read-through adapter; empty
+// adapter (undetected) → no dimer gate for that mate.
+static bool is_adapter_dimer_5p(const std::string& seq, const std::string& adapter,
+                                int max_off = 4, int anchor = 12, int max_mm = 2) {
+    int L = (int)seq.size(), A = (int)adapter.size();
+    if (A < anchor || L < anchor) return false;
+    for (int rs = 0; rs < max_off && rs + anchor <= L; ++rs) {
+        for (int as = 0; as < max_off && as + anchor <= A; ++as) {
+            int mm = 0;
+            for (int k = 0; k < anchor && mm <= max_mm; ++k)
+                mm += (seq[rs + k] != adapter[as + k]);
+            if (mm <= max_mm) return true;
+        }
+    }
+    return false;
 }
 
 // Scan from the 3' end of seq for an adapter prefix tail of length t in [1,max_tail].
@@ -534,6 +640,9 @@ struct MergeOpts {
     int   poly_g_min_run = 0;   // 0=disabled; trim 3' poly-G runs >= this length
     float min_entropy   = 0.0f; // 0=disabled; Shannon entropy floor (bits, max=2.0)
     float max_n_rate    = 1.0f; // 1=disabled; max fraction of N bases
+    // Data-derived low-complexity gate for unmerged mates (from merged-mate reference), per mate.
+    float complexity_entropy_lo_r1 = 0.f,  complexity_dom_hi_r1 = 1.0f;
+    float complexity_entropy_lo_r2 = 0.f,  complexity_dom_hi_r2 = 1.0f;
     std::string adapter1;
     std::string adapter2;
     std::string adapter_5p_linker;              // library 5' construct clipped from unmerged reads
@@ -558,11 +667,17 @@ struct DetectedParams {
     float  type_confidence = 0.f;    // |prefix_agree_rate - 0.5| * 2, in [0,1]
     bool   is_udg          = false;
     bool   is_half_udg     = false;
-    bool   poly_g_detected = false;  // NextSeq/NovaSeq dark cycle signal
     int    skip_terminal   = 0;
     float  damage_5p       = 0.f;
     float  damage_3p       = 0.f;
     std::string adapter_5p_linker;   // library-specific fixed 5' construct (adapter-dimer prefix)
+    // Low-complexity QC gate derived from the merged-MATE insert reference (worst-window
+    // entropy/dominance), kept separate per mate because the run-through artifact is R2-heavy.
+    // A mate is junk if its worst-window entropy < entropy_lo OR dominance > dom_hi.
+    // Defaults (0 / 1.0) = gate disabled (the small-sample fallback below the ref floor).
+    float   complexity_entropy_lo_r1 = 0.f,  complexity_dom_hi_r1 = 1.0f;
+    float   complexity_entropy_lo_r2 = 0.f,  complexity_dom_hi_r2 = 1.0f;
+    int64_t complexity_ref_n_r1 = 0,         complexity_ref_n_r2 = 0;
 };
 
 // Forward declaration (defined below)
@@ -600,6 +715,12 @@ static DetectedParams detect_merge_params(
     static const std::string SS_SPLINT_CORE = "GGAAGAGCGTCG";
     int64_t ss_stem = 0, ds_stem = 0;
 
+    // Merged-mate complexity reference: worst-window entropy + base-dominance of each
+    // overlap-verified insert, kept per mate (R1[0:ov], R2[0:ov]). These trusted real
+    // fragments define the distribution the unmerged low-complexity gate is derived from —
+    // no hardcoded entropy/dominance constant. Same worst-window statistic as the gate target.
+    std::vector<float> ref_ent_r1, ref_dom_r1, ref_ent_r2, ref_dom_r2;
+
     alignas(32) uint8_t pa[MAX_READ_LEN / 4 + 4] = {};
     alignas(32) uint8_t pb[MAX_READ_LEN / 4 + 4] = {};
     int mm[MAX_READ_LEN + 1];
@@ -635,6 +756,18 @@ static DetectedParams detect_merge_params(
             if (ov_d0 >= min_ov) { ov = ov_d0; r2s = 0; }
         }
         if (ov < min_ov) continue;
+
+        // Overlap-verified insert → per-mate worst-window complexity reference. Only inserts
+        // at least one window wide contribute, so short-fragment sampling noise never widens
+        // the reference tails. R2's insert sits at its 5' too (R2=[insert_RC][adapter2]).
+        if (ov >= COMPLEXITY_W) {
+            auto w1 = worst_window(pr.r1.seq, 0, ov);
+            ref_ent_r1.push_back(w1.entropy); ref_dom_r1.push_back(w1.max_frac);
+            if (ov <= L2) {
+                auto w2 = worst_window(pr.r2.seq, 0, ov);
+                ref_ent_r2.push_back(w2.entropy); ref_dom_r2.push_back(w2.max_frac);
+            }
+        }
 
         // ---- ds geometry check: R1[0:4] vs insert portion of RC(R2) ----
         {
@@ -692,6 +825,27 @@ static DetectedParams detect_merge_params(
     }
 
     DetectedParams d;
+
+    // ---- derive the unmerged low-complexity gate from the merged-mate reference ----
+    // Gate an unmerged mate when its worst window is MORE extreme than the merged mates'
+    // own worst-window tails: entropy below their 1st percentile OR base-dominance above
+    // their 99th percentile. The 1%/99% choice keeps the gate off the body of the real
+    // distribution (≤1% of genuine biased windows sit past each tail) while poly-G
+    // (entropy≈0, dominance≈1) falls far outside it. Below COMPLEXITY_REF_FLOOR trusted
+    // inserts the gate stays disabled (defaults 0 / 1.0) — only clip + min-length + dimer QC
+    // apply — so a tiny/blank library cannot derive a degenerate gate.
+    auto quantile = [](std::vector<float>& v, double q) {
+        std::sort(v.begin(), v.end());
+        return v[(size_t)std::llround(q * (double)(v.size() - 1))];
+    };
+    auto derive = [&](std::vector<float>& ent, std::vector<float>& dom,
+                      float& ent_lo, float& dom_hi, int64_t& n) {
+        n = (int64_t)ent.size();
+        if (n >= COMPLEXITY_REF_FLOOR) { ent_lo = quantile(ent, 0.01); dom_hi = quantile(dom, 0.99); }
+    };
+    derive(ref_ent_r1, ref_dom_r1, d.complexity_entropy_lo_r1, d.complexity_dom_hi_r1, d.complexity_ref_n_r1);
+    derive(ref_ent_r2, ref_dom_r2, d.complexity_entropy_lo_r2, d.complexity_dom_hi_r2, d.complexity_ref_n_r2);
+
     if (prefix_total == 0) return d;
 
     // ---- library geometry ----
@@ -754,15 +908,6 @@ static DetectedParams detect_merge_params(
     } else {
         d.skip_terminal = 4;       // only 3' above interior (rare) → still trim terminus
     }
-
-    // ---- poly-G tail detection (NextSeq/NovaSeq dark cycle: last 10 positions)----
-    int64_t tail_g = 0, tail_n = 0;
-    for (auto& pr : scan_buf) {
-        int L1 = (int)pr.r1.seq.size();
-        for (int i = std::max(0, L1 - 10); i < L1; ++i)
-            { ++tail_n; if (pr.r1.seq[i] == 'G') ++tail_g; }
-    }
-    d.poly_g_detected = tail_n > 1000 && (float)tail_g / tail_n > 0.40f;
 
     // ---- adapter sequences ----
     // adapter2 = what appears in RC(R2) at insert boundary = RC(TruSeq_P7) = CTCTTCCGATCT
@@ -887,13 +1032,21 @@ static void accum_overlap_subst(OverlapSubstCounts& cnt,
     }
 }
 
-static bool passes_qc(const FastqRecord& rec, const MergeOpts& opts) {
+static bool passes_qc(const FastqRecord& rec, const MergeOpts& opts,
+                      float complexity_entropy_lo, float complexity_dom_hi) {
     if ((int)rec.seq.size() < opts.min_length) return false;
     if (opts.max_n_rate < 1.0f) {
         int ns = (int)std::count(rec.seq.begin(), rec.seq.end(), 'N');
         if ((float)ns / (float)rec.seq.size() > opts.max_n_rate) return false;
     }
     if (opts.min_entropy > 0.f && shannon_entropy(rec.seq) < opts.min_entropy) return false;
+    // Data-derived low-complexity gate (merged-mate reference). One-sided: reject only the
+    // low-entropy / high-dominance extreme (poly-G run-through, low-complexity tracts).
+    if (complexity_entropy_lo > 0.f || complexity_dom_hi < 1.0f) {
+        auto w = worst_window(rec.seq, 0, (int)rec.seq.size());
+        if (w.entropy < complexity_entropy_lo) return false;
+        if (w.max_frac > complexity_dom_hi)   return false;
+    }
     return true;
 }
 
@@ -967,8 +1120,12 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                       opts.poly_g_min_run, opts.min_length, g_clip_dbg ? &d1 : nullptr);
         clip_unmerged(u2, opts.adapter2, opts.adapter1, opts.adapter_5p_linker,
                       opts.poly_g_min_run, opts.min_length, g_clip_dbg ? &d2 : nullptr);
-        bool ok1 = passes_qc(u1, opts);
-        bool ok2 = passes_qc(u2, opts);
+        // Per-mate QC: low-complexity gate against that mate's merged reference, plus a
+        // 5' adapter-dimer reject (learned read-through adapter shifted match clip missed).
+        bool ok1 = passes_qc(u1, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)
+                   && !is_adapter_dimer_5p(u1.seq, opts.adapter1);
+        bool ok2 = passes_qc(u2, opts, opts.complexity_entropy_lo_r2, opts.complexity_dom_hi_r2)
+                   && !is_adapter_dimer_5p(u2.seq, opts.adapter2);
         MergeRecord mr;
         mr.is_merged = false;
         if (ok1 && ok2) {
@@ -994,10 +1151,9 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             FastqRecord& r1 = pr.r1;
             FastqRecord& r2 = pr.r2;
 
-            if (opts.poly_g_min_run > 0) {
-                trim_polybase(r1, 'G', opts.poly_g_min_run, opts.min_length);
-                trim_polybase(r2, 'G', opts.poly_g_min_run, opts.min_length);
-            }
+            // Poly-G run-through is trimmed only off the unmerged mate outputs
+            // (in clip_unmerged); merged reads are left as-is — the insert-only
+            // consensus already excludes the 3' adapter/run-through region.
 
             if (opts.clip_5p > 0 && (int)r1.seq.size() > opts.clip_5p) {
                 r1.seq  = r1.seq.substr(opts.clip_5p);
@@ -1178,7 +1334,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                                      + rc2_qual.substr(best_ov);
                     if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
                     if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
-                    if (passes_qc(mr.merged, opts)) {
+                    if (passes_qc(mr.merged, opts, 0.f, 1.0f)) {  // merged = reference, no complexity gate
                         ++out.n_merged;
                         out.records.push_back(std::move(mr));
                     } else {
@@ -1210,7 +1366,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
             if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
 
-            if (!passes_qc(mr.merged, opts)) {
+            if (!passes_qc(mr.merged, opts, 0.f, 1.0f)) {  // merged = reference, no complexity gate
                 emit_unmerged(r1, r2, out);
             } else {
                 if (do_subst)
@@ -1398,8 +1554,6 @@ int merge_main(int argc, char** argv) {
         opts.adapter2 = det.adapter2;
         opts.adapter_5p_linker = det.adapter_5p_linker;
         opts.skip_terminal = det.skip_terminal;
-        if (opts.poly_g_min_run == 0 && det.poly_g_detected)
-            opts.poly_g_min_run = 10;
         // Internal aDNA construct panel (protocol constants; Ellesmere supp §4.3.2 / Kapp 2021 /
         // Illumina TruSeq): extra R1-side read-through constructs tried in phase-0-extra. Replicates
         // the published fastp --adapter_fasta panel. Gated OFF by default (--internal-panel);
@@ -1418,6 +1572,21 @@ int merge_main(int argc, char** argv) {
     } else if (opts.adapter2.empty() && !opts.adapter1.empty()) {
         opts.adapter2 = revcomp(opts.adapter1);
     }
+
+    // Canonical QC (on by default, independent of adapter override): clean 3'
+    // poly-G run-through off the unmerged mate outputs (merged reads are already
+    // clean via overlap-clip). Data-derived run-length; a no-op on data without a
+    // real G-run. CLI --poly-g[-min-run] overrides (leaves poly_g_min_run != 0).
+    if (opts.poly_g_min_run == 0)
+        opts.poly_g_min_run = derive_polyg_k(scan_buf);
+
+    // Canonical QC: data-derived low-complexity gate on unmerged mates, learned per mate from
+    // the merged-mate worst-window reference (no literal). Disabled (0/1.0) when the reference
+    // is below floor. Independent of adapter override — always applied to the unmerged stream.
+    opts.complexity_entropy_lo_r1 = det.complexity_entropy_lo_r1;
+    opts.complexity_dom_hi_r1     = det.complexity_dom_hi_r1;
+    opts.complexity_entropy_lo_r2 = det.complexity_entropy_lo_r2;
+    opts.complexity_dom_hi_r2     = det.complexity_dom_hi_r2;
 
     // Resolve library type: an authoritative --library-type declaration always wins over
     // geometry auto-detection (memory: a named-"ss" library was proven ds by geometry+BIC).
@@ -1449,6 +1618,10 @@ int merge_main(int argc, char** argv) {
         std::cerr << " poly-g=" << opts.poly_g_min_run;
     if (opts.min_entropy > 0.f)
         std::cerr << " min-entropy=" << opts.min_entropy;
+    std::cerr << "\n  complexity-gate R1[n=" << det.complexity_ref_n_r1
+              << " ent>=" << opts.complexity_entropy_lo_r1 << " dom<=" << opts.complexity_dom_hi_r1
+              << "] R2[n=" << det.complexity_ref_n_r2
+              << " ent>=" << opts.complexity_entropy_lo_r2 << " dom<=" << opts.complexity_dom_hi_r2 << "]";
     if (opts.max_n_rate < 1.0f)
         std::cerr << " max-n-rate=" << opts.max_n_rate;
     std::cerr << "\n";

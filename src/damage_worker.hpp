@@ -234,8 +234,9 @@ inline static void paired_worker_fn(PairedWorkQueue& queue, WorkerState& state) 
     while (queue.pop(batch)) {
         const size_t n = std::min(batch.r1.size(), batch.r2.size());
         for (size_t k = 0; k < n; ++k) {
-            const std::string& s1 = batch.r1[k];
-            const std::string& s2 = batch.r2[k];
+            // Input is trusted clean (fqdup merge strips 3' poly-G run-through upstream).
+            std::string_view s1(batch.r1[k]);
+            std::string_view s2(batch.r2[k]);
             int L1 = static_cast<int>(s1.size());
             int L2 = static_cast<int>(s2.size());
             if (L1 < LSD_L_MIN || L2 < LSD_L_MIN) { ++state.reads_skipped; continue; }
@@ -250,6 +251,43 @@ inline static void paired_worker_fn(PairedWorkQueue& queue, WorkerState& state) 
             if (L1 > state.len_max) state.len_max = L1;
             state.len_sum += L1;
             ++state.reads_scanned;
+            // Pool into the length-stratified estimator's top stratum so the primary
+            // damage estimate reflects ALL reads (matches the all-reads global-metaDMG anchor).
+            if (!state.lsd_cnt.empty()) {
+                state.lbs.update_paired(s1, s2);
+                // Feed the unified per-read LSD scorer: 5' terminus from R1, 3' terminus
+                // from complement(R2[0..4]) (R2 reads the bottom strand from the molecule
+                // 3' inward, so top_strand_3'[i] = complement(R2[i])). Same sig5 encoding
+                // as the SE path so paired fragments enter merged_cnt / reconstruct_lsd_llr_accum
+                // identically — the primary pi reflects merged + R1 + R2 under one scorer.
+                uint32_t sig5f = 0;
+                {
+                    const char c0 = s1[0] & ~0x20u;
+                    const int v0 = (c0=='A')?1:(c0=='G')?2:(c0=='T')?3:(c0=='C')?4:0;
+                    sig5f = static_cast<uint32_t>(v0);
+                    uint32_t fb2 = 5;
+                    const int k1 = (L1 < 5) ? L1 : 5;
+                    for (int i = 1; i < k1; ++i) {
+                        const char ci = s1[i] & ~0x20u;
+                        const int vi = (ci=='T')?1:(ci=='C')?2:0;
+                        sig5f += static_cast<uint32_t>(vi) * fb2;
+                        fb2 *= 3;
+                    }
+                }
+                uint32_t sig5r_4 = 0, q5 = 1;
+                const int k5 = (L2 < 5) ? L2 : 5;
+                for (int i = 0; i < k5; ++i) {
+                    char b = s2[i] & ~0x20u;                    // complement R2[i] -> top 3'[i]
+                    const char top = (b=='A')?'T':(b=='T')?'A':(b=='C')?'G':(b=='G')?'C':'N';
+                    const int rv4 = (top=='A')?1:(top=='G')?2:(top=='T')?3:(top=='C')?4:0;
+                    sig5r_4 += rv4 * q5; q5 *= 5;
+                }
+                const uint32_t lsd_sig = sig5f * N_LSD_SIG5_3R + sig5r_4;
+                int cb = 0;
+                const int Lcap = (L1 < LSD_L_MAX) ? L1 : LSD_L_MAX;
+                for (int e : state.lsd_prov_edges) { if (Lcap >= e) ++cb; else break; }
+                ++state.lsd_cnt[cb * N_LSD_SIG5 + lsd_sig];
+            }
         }
     }
 }
