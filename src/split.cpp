@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <algorithm>
 #include <limits>
@@ -293,9 +295,22 @@ int split_main(int argc, char** argv) {
         FastqRecord rec;
         uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0;
 
+        // Validation hook (env-gated, zero-cost when unset): dump per-read
+        // header<TAB>split_model_llr<TAB>shared_lsd_llr so a synthetic run
+        // (truth in header) yields a real per-read ROC/AUC for BOTH scorers.
+        std::unique_ptr<std::ofstream> score_dump;
+        LsdClassifyParams dump_params;
+        if (const char* sp = std::getenv("FQDUP_SPLIT_SCORES")) {
+            score_dump = std::make_unique<std::ofstream>(sp);
+            dump_params = make_lsd_classify_params(profile);
+        }
+
         while (reader->read(rec)) {
             ++n_total;
             float llr = split_model.score(rec.seq);
+            if (score_dump)
+                (*score_dump) << rec.header << '\t' << llr << '\t'
+                              << taph::lsd_llr_score(rec.seq, dump_params) << '\n';
             if (llr >= effective_threshold) {
                 ++n_damaged;
                 if (writer_dam) writer_dam->write(rec);

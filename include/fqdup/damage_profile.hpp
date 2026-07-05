@@ -344,6 +344,18 @@ struct DamageSplitModel {
     std::vector<Bin> bins;
     DamageProfile    fallback;
 
+    // UNIFIED SCORER (integration): score() delegates to the shared closed-form
+    // taph::lsd_llr_score — the SAME per-read math `fqdup profile` uses via
+    // lsd_llr_from_sig. The per-bin empirical `bins` LOD tables are retained only
+    // for BIN model (de)serialization compat; they no longer drive scoring. This
+    // makes split≡profile "one mechanism" (user hard constraint) and, on synthetic
+    // validation, is neutral for ss (ΔAUC≈−0.001) and +0.04 AUC for ds vs the old
+    // empirical-bootstrap tables (which underweight the 3′ G→A because their 3′ LOD
+    // is trained on a 5′-only-labeled subset). cls_ is derived lazily from fallback
+    // so every construction path (build + read_split_model_bin) is covered.
+    mutable taph::LsdClassifyParams cls_{};
+    mutable bool cls_ready_ = false;
+
     bool valid() const { return !bins.empty(); }
 
     // Build from a finalized LengthStratifiedDamageProfile (must have n_damaged
@@ -352,6 +364,10 @@ struct DamageSplitModel {
                                   const DamageProfile& bulk);
 
     // Score one read. Returns LLR > 0 for damaged, < 0 for undamaged.
-    // Uses per-bin empirical tables when valid(), else bulk exponential fallback.
+    // UNIFIED: delegates to the shared taph::lsd_llr_score (== profile's math).
     float score(const std::string& seq, int n_pos = 14) const;
+
+    // Legacy per-bin empirical-LOD scorer (pre-unification). Retained for A/B
+    // comparison and BIN-model diagnostics; not used by split/profile routing.
+    float score_empirical_legacy(const std::string& seq, int n_pos = 14) const;
 };

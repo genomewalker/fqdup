@@ -204,6 +204,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh)
                      $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_polyg.sh)
+    add_test(NAME merge_polyg
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_polyg.sh
+                     $<TARGET_FILE:fqdup>)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_complexity.sh)
+    add_test(NAME merge_complexity
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_complexity.sh
+                     $<TARGET_FILE:fqdup>)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh)
     add_test(NAME io_failures
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh

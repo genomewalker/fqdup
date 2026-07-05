@@ -455,6 +455,9 @@ int profile_main(int argc, char** argv) {
         // In combined mode the unmerged R1/R2 stream is kept separate (states_pe);
         // in PE-only mode it stays in `states` so legacy top-level output is unchanged.
         std::vector<WorkerState>& pe_states = combined_mode ? states_pe : states;
+        // Input is trusted clean: 3' poly-G run-through is stripped upstream by
+        // `fqdup merge` (canonical QC on the unmerged mate outputs). Profile does no
+        // poly-G trimming of its own.
         for (int t = 0; t < n_threads; ++t)
             workers.emplace_back(paired_worker_fn, std::ref(queue), std::ref(pe_states[t]));
         try {
@@ -733,9 +736,20 @@ int profile_main(int argc, char** argv) {
             lsd_master.forced_library_type = forced_lib;
             lsd_master.configure(lsd_fuse_edges);
             for (auto& s : states) lsd_master.merge(s.lbs);
+            // Pool unmerged R1/R2 (top stratum) into the primary estimate. states_pe is
+            // empty outside combined mode, so this is a no-op for merged-only / PE-only runs.
+            for (auto& s : states_pe) lsd_master.merge(s.lbs);
 
             std::vector<int32_t> merged_cnt(n_lsd_bins * N_LSD_SIG5, 0);
             for (auto& s : states) {
+                for (int i = 0; i < n_lsd_bins * N_LSD_SIG5; ++i)
+                    merged_cnt[i] += s.lsd_cnt[i];
+            }
+            // Pool the unmerged (long-fragment) per-read sig5 histogram so the primary
+            // LSD pi is scored over merged + R1 + R2 by the one unified scorer. No-op
+            // outside combined mode (states_pe empty).
+            for (auto& s : states_pe) {
+                if (s.lsd_cnt.empty()) continue;
                 for (int i = 0; i < n_lsd_bins * N_LSD_SIG5; ++i)
                     merged_cnt[i] += s.lsd_cnt[i];
             }

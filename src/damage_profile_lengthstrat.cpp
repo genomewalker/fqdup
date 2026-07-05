@@ -399,7 +399,8 @@ LengthStratifiedDamageProfile estimate_damage_by_length(
     }
 
     // ---- merge + finalize ------------------------------------------------
-    taph::LengthBinStats master;
+    auto master_holder = std::make_unique<taph::LengthBinStats>();  // ~3.75MB (4x SampleDamageProfile); heap, not stack, to avoid 8MB stack overflow
+    taph::LengthBinStats& master = *master_holder;
     master.forced_library_type = forced_lib;
     if (prebuilt != nullptr) {
         // Prebuilt stats were accumulated in damage.cpp workers; take them as-is.
@@ -985,6 +986,17 @@ DamageSplitModel DamageSplitModel::build(const LengthStratifiedDamageProfile& ls
 }
 
 float DamageSplitModel::score(const std::string& seq, int n_pos) const
+{
+    // UNIFIED per-read scorer: delegate to the shared closed-form LLR that
+    // `fqdup profile` uses (taph::lsd_llr_score ≡ lsd_llr_from_sig math), so
+    // split and profile select damaged/undamaged reads with ONE mechanism.
+    // cls_ is derived once from the (always-populated) fallback bulk fit; the
+    // per-library d_anc/λ/bg + ss|ds channel + CpG scale all come from data.
+    if (!cls_ready_) { cls_ = make_lsd_classify_params(fallback); cls_ready_ = true; }
+    return static_cast<float>(taph::lsd_llr_score(seq, cls_));
+}
+
+float DamageSplitModel::score_empirical_legacy(const std::string& seq, int n_pos) const
 {
     const int L = static_cast<int>(seq.size());
     float s = 0.0f;
