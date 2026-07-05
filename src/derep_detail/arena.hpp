@@ -406,6 +406,13 @@ struct FlatPairIndex {
     std::vector<uint64_t> keys;
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
+    // Parallel to ids: id_off[i] = interior_off[ids[i]], the byte offset of
+    // that parent's interior in the Phase-3 interior_slab, precomputed at build
+    // time. query() emits it alongside the id so the candidate loop forms the
+    // slab address without a random interior_off[pid] gather — that gather was
+    // 48% of candidate-check DRAM misses (the un-prefetched hop-1 load feeding
+    // the slab prefetch). Read sequentially here → hardware-prefetched.
+    std::vector<uint32_t> id_off;
 
     // Open-addressing directory over `keys`, indexed by key (keys are already
     // splitmix64-mixed by pair_key, so the low bits are uniform — no re-hash).
@@ -442,7 +449,7 @@ struct FlatPairIndex {
             if (sl.key == key) {
                 uint32_t idx = sl.idx_plus1 - 1;
                 for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
-                    fn(ids[i]);
+                    fn(ids[i], id_off[i]);
                 return;
             }
         }
