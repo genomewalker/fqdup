@@ -744,11 +744,21 @@ private:
                      std::to_string(kBruteforceMinLen) + "," +
                      std::to_string(kMinInteriorLen - 1) + "]");
 
-        // Build CSR per shard per tag
+        // Streaming Phase-3: instead of building every length-shard up front and
+        // holding them all resident (the ~33GB FlatPairIndex peak), the B1 driver
+        // below builds ONE ilen's shard just-in-time, runs that ilen's children
+        // against it, then frees it before the next ilen. Candidate edges are
+        // strictly intra-ilen (B1 requires parent.len==child.len), and the output
+        // is invariant to the order in which edges are collected (proven: identical
+        // md5 across thread counts / work-stealing orders), so per-ilen streaming
+        // is byte-for-byte identical to the all-resident build. `build_map` is kept
+        // live and consumed one ilen at a time. Peak collapses to floor +
+        // largest-single-shard.
         ska::flat_hash_map<int, LenShard> shards;
-        shards.reserve(build_map.size());
-        for (auto& [ilen, tag_entries] : build_map) {
+        std::array<uint64_t, 8> bhist{};
+        auto build_shard = [&](int ilen) -> LenShard& {
             auto& sh = shards[ilen];
+            auto& tag_entries = build_map[ilen];
             for (int t = 0; t < 6; ++t) {
                 auto& ev = tag_entries[t];
                 std::sort(ev.begin(), ev.end(),
@@ -769,24 +779,15 @@ private:
                         i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
-                }
-                pi.build_directory();  // O(1) key lookup, replaces per-probe lower_bound
-            }
-        }
-        build_map.clear();  // free memory before allocating ChildMismatch vector
-
-        // Bucket histogram
-        std::array<uint64_t, 8> bhist{};
-        for (const auto& [ilen, sh] : shards)
-            for (const auto& pi : sh.pi)
-                for (size_t ki = 0; ki < pi.keys.size(); ++ki) {
-                    uint32_t blen = pi.offsets[ki + 1] - pi.offsets[ki];
+                    uint32_t blen = pi.offsets.back() - pi.offsets[pi.offsets.size() - 2];
                     unsigned b = blen == 0 ? 0 : 31 - __builtin_clz(blen);
                     bhist[std::min(b, 7u)]++;
                 }
-        std::string hstr;
-        for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
-        log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
+                pi.build_directory();  // O(1) key lookup, replaces per-probe lower_bound
+            }
+            build_map.erase(ilen);  // free this ilen's build entries once shard is built
+            return sh;
+        };
 
         // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
         // Pre-warm layout_cache before workers start so it becomes read-only, and
@@ -817,6 +818,40 @@ private:
             return interior_slab.data() + interior_off[id];
         };
 
+        // Group children by interior length so each shard's children are a
+        // contiguous window in `order`; the driver builds/frees one ilen's shard
+        // around its window. Only ids with a real interior (>= kBruteforceMinLen)
+        // ever generate edges; tinier ids are skipped by the worker. Output is
+        // order-invariant, so grouping by (ilen,id) instead of id is byte-identical.
+        std::vector<uint32_t> order;
+        struct IlenSeg { int ilen; uint32_t lo, hi; };
+        std::vector<IlenSeg> ilen_segs;
+        {
+            std::vector<std::pair<int, uint32_t>> tmp;
+            tmp.reserve(N);
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                int il = get_layout(arena_.length(id)).ilen;
+                tmp.emplace_back(il, id);  // include tiny ids too: the worker visits
+            }                              // and counts them exactly as the [0,N) scan did
+            std::sort(tmp.begin(), tmp.end(),
+                      [](const std::pair<int, uint32_t>& a,
+                         const std::pair<int, uint32_t>& b) {
+                          return a.first != b.first ? a.first < b.first
+                                                    : a.second < b.second;
+                      });
+            order.reserve(tmp.size());
+            for (size_t i = 0; i < tmp.size();) {
+                int il = tmp[i].first;
+                uint32_t lo = static_cast<uint32_t>(order.size());
+                while (i < tmp.size() && tmp[i].first == il) {
+                    order.push_back(tmp[i].second);
+                    ++i;
+                }
+                ilen_segs.push_back({il, lo, static_cast<uint32_t>(order.size())});
+            }
+        }
+
         unsigned n_threads = errcor_.threads;
         if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
 
@@ -837,7 +872,9 @@ private:
         std::vector<B1LocalStats>              per_thread_stats(n_threads);
 
         constexpr uint32_t kChunkSize = 256;
-        const uint32_t n_chunks = (N + kChunkSize - 1) / kChunkSize;
+        // Per-ilen dispatch window into `order`; the driver sets [seg_lo,seg_hi)
+        // and seg_chunks and resets next_chunk before launching each ilen's workers.
+        uint32_t seg_lo = 0, seg_hi = 0, seg_chunks = 0;
         std::atomic<uint32_t> next_chunk{0};
 
         auto b1_worker = [&](unsigned tid) {
@@ -856,11 +893,12 @@ private:
 
             while (true) {
                 uint32_t chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                if (chunk >= n_chunks) break;
-                uint32_t cid_lo = chunk * kChunkSize;
-                uint32_t cid_hi = std::min(cid_lo + kChunkSize, N);
+                if (chunk >= seg_chunks) break;
+                uint32_t pos_lo = seg_lo + chunk * kChunkSize;
+                uint32_t pos_hi = std::min(pos_lo + kChunkSize, seg_hi);
 
-                for (uint32_t cid = cid_lo; cid < cid_hi; ++cid) {
+                for (uint32_t pos = pos_lo; pos < pos_hi; ++pos) {
+                    uint32_t cid = order[pos];
                     if (is_error_[cid]) continue;
                     if (!arena_.is_eligible(cid)) continue;
 
@@ -1159,15 +1197,32 @@ private:
             }  // end while chunk dispatcher
         };  // end b1_worker
 
-        if (n_threads == 1) {
-            b1_worker(0);
-        } else {
-            std::vector<std::thread> ts;
-            ts.reserve(n_threads - 1);
-            for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(b1_worker, t);
-            b1_worker(0);
-            for (auto& th : ts) th.join();
+        // Streaming driver: process one ilen at a time. Build that ilen's shard
+        // (long-interior ilens only; short-brute ilens use the global short_parents
+        // index), dispatch B1 over its contiguous child window in `order`, then
+        // free the shard before the next ilen. FlatPairIndex residency collapses
+        // from sum-of-all-shards to the single largest shard. Edges are intra-ilen
+        // and output is order-invariant, so this is byte-identical to the old
+        // all-shards-resident pass.
+        for (const auto& seg : ilen_segs) {
+            seg_lo = seg.lo;
+            seg_hi = seg.hi;
+            seg_chunks = (seg_hi - seg_lo + kChunkSize - 1) / kChunkSize;
+            const bool has_shard = seg.ilen >= kMinInteriorLen;
+            if (has_shard) build_shard(seg.ilen);
+            next_chunk.store(0, std::memory_order_relaxed);
+            if (n_threads == 1) {
+                b1_worker(0);
+            } else {
+                std::vector<std::thread> ts;
+                ts.reserve(n_threads - 1);
+                for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(b1_worker, t);
+                b1_worker(0);
+                for (auto& th : ts) th.join();
+            }
+            if (has_shard) shards.erase(seg.ilen);
         }
+        build_map.clear();  // all long ilens already erased in build_shard; no-op safety
 
         // Merge per-thread state. B2 sorts mismatches deterministically, but
         // we concat in tid order so the same -j N gives byte-identical output.
