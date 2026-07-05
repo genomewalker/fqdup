@@ -415,8 +415,15 @@ struct FlatPairIndex {
     // line — the previous slots[h]→keys[s-1] pair was TWO dependent cold loads
     // (the 34% child-query cost). The found idx and ids[] emission order are
     // identical, so dedup output is byte-for-byte unchanged.
+    // Slot stores a 32-bit fingerprint (key>>32) instead of the full 64-bit key:
+    // 8B/slot vs the 16B a {u64,u32} pays after alignment padding, halving `dir`.
+    // The low bits of `key` drive the bucket; the high 32 bits are an independent
+    // fingerprint. A fp match is only a candidate — query() verifies keys[idx]==key
+    // (one load into the resident keys[]) before emitting, so fingerprint collisions
+    // cost an extra probe, never an extra candidate. Output is byte-for-byte
+    // unchanged. keys[] is already resident, so verification adds no new structure.
     struct Slot {
-        uint64_t key;         // valid only when idx_plus1 != 0
+        uint32_t fp;          // key >> 32; valid only when idx_plus1 != 0
         uint32_t idx_plus1;   // 0 = empty; real idx 0 maps to idx_plus1 == 1
     };
     std::vector<Slot> dir;
@@ -430,20 +437,24 @@ struct FlatPairIndex {
         for (size_t ki = 0; ki < keys.size(); ++ki) {
             size_t h = keys[ki] & slot_mask;
             while (dir[h].idx_plus1) h = (h + 1) & slot_mask;
-            dir[h] = Slot{keys[ki], static_cast<uint32_t>(ki + 1)};
+            dir[h] = Slot{static_cast<uint32_t>(keys[ki] >> 32),
+                          static_cast<uint32_t>(ki + 1)};
         }
     }
 
     template <typename F>
     void query(uint64_t key, F&& fn) const {
+        const uint32_t fp = static_cast<uint32_t>(key >> 32);
         for (size_t h = key & slot_mask;; h = (h + 1) & slot_mask) {
             const Slot& sl = dir[h];
             if (!sl.idx_plus1) return;
-            if (sl.key == key) {
+            if (sl.fp == fp) {
                 uint32_t idx = sl.idx_plus1 - 1;
-                for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
-                    fn(ids[i]);
-                return;
+                if (keys[idx] == key) {
+                    for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
+                        fn(ids[i]);
+                    return;
+                }
             }
         }
     }
