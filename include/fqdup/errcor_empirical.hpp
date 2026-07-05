@@ -331,42 +331,7 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
     // signatures is more likely seeing independent real variation.
     // log_pi_ratio_occ[o] = log( (recurring + α) / (unique + α) )
     // Positive ⇒ favor PCR ⇒ higher absorption at this occupancy.
-    std::unordered_map<uint32_t, std::vector<const EdgeCandidate*>> by_parent;
-    by_parent.reserve(edges.size());
-    for (const auto& e : edges) by_parent[e.parent_id].push_back(&e);
-
-    std::array<uint64_t, kNumOccBins> n_recurring{}, n_unique{};
-    for (auto& kv : by_parent) {
-        auto& es = kv.second;
-        // Skip single-child families: with only one edge under a parent,
-        // recurrence is undefined — every signature is trivially "unique"
-        // by construction, which would inject a -log(2) ≈ -0.69 nat
-        // anti-PCR bias into log_pi_ratio_occ for every singleton family.
-        // Without this guard the prior collapses to "favor real" on small
-        // inputs (errcor / pipeline-P8 tests) where most parents have one
-        // child, and absorption stalls at zero.
-        if (es.size() < 2) continue;
-        std::unordered_map<uint64_t, uint32_t> sig_count;
-        sig_count.reserve(es.size() * 2);
-        for (const auto* ep : es) {
-            for (int i = 0; i < ep->n_mm; ++i) {
-                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
-                               static_cast<uint64_t>(ep->mm[i].alt_2b);
-                ++sig_count[sig];
-            }
-        }
-        for (const auto* ep : es) {
-            bool recurring = false;
-            for (int i = 0; i < ep->n_mm; ++i) {
-                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
-                               static_cast<uint64_t>(ep->mm[i].alt_2b);
-                if (sig_count[sig] >= 2) { recurring = true; break; }
-            }
-            int o = occ_bin(ep->bundle_occ);
-            if (recurring) ++n_recurring[o];
-            else           ++n_unique[o];
-        }
-    }
+    //
     // The within-parent recurrence test is a poor PCR signal: PCR errors
     // randomise position across copies, so a 30x parent with 30 H=1 children
     // typically has all-singleton signatures (sig_count=1 each) — which the
@@ -381,7 +346,6 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
     // log(10) ≈ 2.30 nats — modest enough that strongly-recurring real
     // signatures (large p_real_bin) still flip the decision to "protect".
     constexpr double kLogPiPriorPCR = 3.00;
-    (void)n_recurring; (void)n_unique;
     log_pi_ratio_global = kLogPiPriorPCR;
     for (int o = 0; o < kNumOccBins; ++o) log_pi_ratio_occ[o] = kLogPiPriorPCR;
 
