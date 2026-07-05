@@ -86,6 +86,18 @@ FetchContent_MakeAvailable(librapidarchive)
 # all channels, GC bins. Library target: `taph`.
 # To pin against a local checkout during development, set FETCHCONTENT_SOURCE_DIR_LIBTAPH.
 set(FQDUP_MARCH "native" CACHE STRING "Value passed to -march= (override for CI/portability)")
+# Build-provenance guard: a blank FETCHCONTENT_SOURCE_DIR_LIBTAPH silently pulls GitHub main,
+# which once linked a stale libtaph and produced wrong damage numbers with no visible signal.
+# Require an explicit local pin. CI that genuinely wants the remote fetch sets
+# -DFQDUP_ALLOW_REMOTE_LIBTAPH=ON to opt back in.
+option(FQDUP_ALLOW_REMOTE_LIBTAPH "Allow FetchContent to clone libtaph from GitHub instead of a local pin" OFF)
+if(NOT FQDUP_ALLOW_REMOTE_LIBTAPH AND NOT FETCHCONTENT_SOURCE_DIR_LIBTAPH)
+    message(FATAL_ERROR
+        "FETCHCONTENT_SOURCE_DIR_LIBTAPH is unset/empty. Refusing to fetch libtaph from GitHub "
+        "(that path once linked a stale clone silently). Pin a local checkout with "
+        "-DFETCHCONTENT_SOURCE_DIR_LIBTAPH=/path/to/libtaph, or set -DFQDUP_ALLOW_REMOTE_LIBTAPH=ON "
+        "to intentionally fetch the remote (CI only).")
+endif()
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
