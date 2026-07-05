@@ -196,11 +196,28 @@ struct ErrCorEmpiricalModel {
 
     bool fitted = false;
 
+    // Cross-bundle accumulator (WIN 1): bundles_per_bin_[b] = the set of
+    // distinct bundle_keys observed in bin b. fit_accumulate() streams edges
+    // into it so the full edge vector never has to be materialized;
+    // fit_finalize() consumes it. Sized kNumBins on first use.
+    std::vector<std::unordered_set<uint64_t>> bundles_per_bin_;
+
     // Build from collected edges. `total_distinct_bundles` is the number of
     // distinct bundle_keys observed across all edges (used as the recurrence
     // denominator).
     void fit(const std::vector<EdgeCandidate>& edges,
              uint64_t total_distinct_bundles);
+
+    // WIN 1 streaming fit. accumulate_edge() folds one edge's mismatches into
+    // `acc` (kNumBins sets); it is const and takes a caller-owned accumulator
+    // so parallel workers can each fill a private accumulator and then merge —
+    // set-union is order-independent, so the finalized tables are bit-identical
+    // to the single-pass fit().
+    void accumulate_edge(std::vector<std::unordered_set<uint64_t>>& acc,
+                         const EdgeCandidate& e) const;
+    void fit_accumulate(const EdgeCandidate& e);
+    void fit_merge(const std::vector<std::unordered_set<uint64_t>>& other);
+    void fit_finalize(uint64_t total_distinct_bundles);
 
     // Posterior log-odds score for an edge.
     //   S = log P(obs|PCR) − log P(obs|real) + log π_pcr − log π_real
@@ -280,28 +297,52 @@ inline double ErrCorEmpiricalModel::score(const EdgeCandidate& e) const {
 //   "recurring" (seen in ≥2 distinct bundles globally) vs "singleton".
 //   log_pi_ratio_occ[o] = log( (n_singleton[o]+α) / (n_recurring[o]+α) )
 // Singleton-dominated occupancies favor PCR; recurring-dominated favor real.
+// ── Per-bin P(real | bin) from cross-bundle recurrence ─────────────────────
+// For each bin b, count the number of DISTINCT bundles in which a mismatch
+// falling in that bin was observed. A signature that recurs across many
+// independent bundles is evidence of a systematic real pattern (damage,
+// sequencing bias, biological variant); a signature confined to few bundles is
+// more consistent with random PCR error.
+//   p_real_bin[b] = (n_bundles_b + α) / (total_distinct_bundles + α + β)
+// Always in (0, 1) because n_bundles_b ≤ total_distinct_bundles.
+inline void ErrCorEmpiricalModel::accumulate_edge(
+        std::vector<std::unordered_set<uint64_t>>& acc,
+        const EdgeCandidate& e) const {
+    for (int i = 0; i < e.n_mm; ++i) {
+        const auto& m = e.mm[i];
+        int s = subst_class(m.parent_2b, m.alt_2b);
+        if (s < 0) continue;
+        int t = term_dist_bin(m.pos, e.child_len);
+        int o = occ_bin(e.bundle_occ);
+        int d = m.damage_chan ? 1 : 0;
+        acc[bin_index(s, t, o, d)].insert(e.bundle_key);
+    }
+}
+
+inline void ErrCorEmpiricalModel::fit_accumulate(const EdgeCandidate& e) {
+    if (bundles_per_bin_.size() != static_cast<size_t>(kNumBins))
+        bundles_per_bin_.assign(kNumBins, {});
+    accumulate_edge(bundles_per_bin_, e);
+}
+
+inline void ErrCorEmpiricalModel::fit_merge(
+        const std::vector<std::unordered_set<uint64_t>>& other) {
+    if (bundles_per_bin_.size() != static_cast<size_t>(kNumBins))
+        bundles_per_bin_.assign(kNumBins, {});
+    const int n = std::min<int>(kNumBins, static_cast<int>(other.size()));
+    for (int b = 0; b < n; ++b)
+        bundles_per_bin_[b].insert(other[b].begin(), other[b].end());
+}
+
 inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
                                       uint64_t total_distinct_bundles) {
-    // ── Per-bin P(real | bin) from cross-bundle recurrence ─────────────────
-    // For each bin b, count the number of DISTINCT bundles in which a
-    // mismatch falling in that bin was observed. A signature that recurs
-    // across many independent bundles is evidence of a systematic real
-    // pattern (damage, sequencing bias, biological variant); a signature
-    // confined to few bundles is more consistent with random PCR error.
-    //   p_real_bin[b] = (n_bundles_b + α) / (total_distinct_bundles + α + β)
-    // Always in (0, 1) because n_bundles_b ≤ total_distinct_bundles.
-    std::vector<std::unordered_set<uint64_t>> bundles_per_bin(kNumBins);
-    for (const auto& e : edges) {
-        for (int i = 0; i < e.n_mm; ++i) {
-            const auto& m = e.mm[i];
-            int s = subst_class(m.parent_2b, m.alt_2b);
-            if (s < 0) continue;
-            int t = term_dist_bin(m.pos, e.child_len);
-            int o = occ_bin(e.bundle_occ);
-            int d = m.damage_chan ? 1 : 0;
-            bundles_per_bin[bin_index(s, t, o, d)].insert(e.bundle_key);
-        }
-    }
+    bundles_per_bin_.assign(kNumBins, {});
+    for (const auto& e : edges) accumulate_edge(bundles_per_bin_, e);
+    fit_finalize(total_distinct_bundles);
+}
+
+inline void ErrCorEmpiricalModel::fit_finalize(uint64_t total_distinct_bundles) {
+    auto& bundles_per_bin = bundles_per_bin_;
     // Adaptive shrinkage: scale β with total_distinct_bundles so the Beta
     // prior dominates on small inputs. With β fixed at 9999, a single
     // observation in a 1-bundle dataset would push p_real_bin toward
@@ -331,42 +372,7 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
     // signatures is more likely seeing independent real variation.
     // log_pi_ratio_occ[o] = log( (recurring + α) / (unique + α) )
     // Positive ⇒ favor PCR ⇒ higher absorption at this occupancy.
-    std::unordered_map<uint32_t, std::vector<const EdgeCandidate*>> by_parent;
-    by_parent.reserve(edges.size());
-    for (const auto& e : edges) by_parent[e.parent_id].push_back(&e);
-
-    std::array<uint64_t, kNumOccBins> n_recurring{}, n_unique{};
-    for (auto& kv : by_parent) {
-        auto& es = kv.second;
-        // Skip single-child families: with only one edge under a parent,
-        // recurrence is undefined — every signature is trivially "unique"
-        // by construction, which would inject a -log(2) ≈ -0.69 nat
-        // anti-PCR bias into log_pi_ratio_occ for every singleton family.
-        // Without this guard the prior collapses to "favor real" on small
-        // inputs (errcor / pipeline-P8 tests) where most parents have one
-        // child, and absorption stalls at zero.
-        if (es.size() < 2) continue;
-        std::unordered_map<uint64_t, uint32_t> sig_count;
-        sig_count.reserve(es.size() * 2);
-        for (const auto* ep : es) {
-            for (int i = 0; i < ep->n_mm; ++i) {
-                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
-                               static_cast<uint64_t>(ep->mm[i].alt_2b);
-                ++sig_count[sig];
-            }
-        }
-        for (const auto* ep : es) {
-            bool recurring = false;
-            for (int i = 0; i < ep->n_mm; ++i) {
-                uint64_t sig = (static_cast<uint64_t>(ep->mm[i].pos) << 4) |
-                               static_cast<uint64_t>(ep->mm[i].alt_2b);
-                if (sig_count[sig] >= 2) { recurring = true; break; }
-            }
-            int o = occ_bin(ep->bundle_occ);
-            if (recurring) ++n_recurring[o];
-            else           ++n_unique[o];
-        }
-    }
+    //
     // The within-parent recurrence test is a poor PCR signal: PCR errors
     // randomise position across copies, so a 30x parent with 30 H=1 children
     // typically has all-singleton signatures (sig_count=1 each) — which the
@@ -381,7 +387,6 @@ inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
     // log(10) ≈ 2.30 nats — modest enough that strongly-recurring real
     // signatures (large p_real_bin) still flip the decision to "protect".
     constexpr double kLogPiPriorPCR = 3.00;
-    (void)n_recurring; (void)n_unique;
     log_pi_ratio_global = kLogPiPriorPCR;
     for (int o = 0; o < kNumOccBins; ++o) log_pi_ratio_occ[o] = kLogPiPriorPCR;
 

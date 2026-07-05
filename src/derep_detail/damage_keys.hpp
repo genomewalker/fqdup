@@ -4,6 +4,7 @@
 
 #include "fqdup/damage_profile.hpp"
 
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -13,6 +14,37 @@
 
 namespace fqdup::derep_detail {
 
+// Byte LUTs replacing per-base std::toupper / switch in the Pass-1 hot loop.
+// Program runs in the "C" locale (no setlocale), so std::toupper == ASCII
+// uppercase; these tables are byte-identical to the scalar code they replace.
+namespace lut {
+constexpr std::array<unsigned char, 256> make_upper() {
+    std::array<unsigned char, 256> t{};
+    for (int i = 0; i < 256; ++i) t[i] = static_cast<unsigned char>(i);
+    for (int c = 'a'; c <= 'z'; ++c) t[c] = static_cast<unsigned char>(c - 'a' + 'A');
+    return t;
+}
+// Case-preserving complement (A<->T, C<->G, incl. lowercase); non-ACGT -> 'N'.
+constexpr std::array<unsigned char, 256> make_comp_case() {
+    std::array<unsigned char, 256> t{};
+    for (int i = 0; i < 256; ++i) t[i] = 'N';
+    t['A'] = 'T'; t['a'] = 't'; t['C'] = 'G'; t['c'] = 'g';
+    t['G'] = 'C'; t['g'] = 'c'; t['T'] = 'A'; t['t'] = 'a';
+    return t;
+}
+// Uppercasing complement (a/A -> T, etc.); non-ACGT -> 'N'.
+constexpr std::array<unsigned char, 256> make_comp_upper() {
+    std::array<unsigned char, 256> t{};
+    for (int i = 0; i < 256; ++i) t[i] = 'N';
+    t['A'] = 'T'; t['a'] = 'T'; t['C'] = 'G'; t['c'] = 'G';
+    t['G'] = 'C'; t['g'] = 'C'; t['T'] = 'A'; t['t'] = 'A';
+    return t;
+}
+inline constexpr auto kUpper     = make_upper();
+inline constexpr auto kCompCase  = make_comp_case();
+inline constexpr auto kCompUpper = make_comp_upper();
+}  // namespace lut
+
 // Replace damage-prone terminal bases with neutral bytes before hashing.
 // scratch must point to a buffer of at least seq.size() bytes.
 inline void apply_damage_mask_inplace(const std::string& seq,
@@ -21,8 +53,7 @@ inline void apply_damage_mask_inplace(const std::string& seq,
     int L = static_cast<int>(seq.size());
     std::memcpy(scratch, seq.data(), L);
     for (int i = 0; i < L; ++i) {
-        char cu = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(scratch[i])));
+        char cu = static_cast<char>(lut::kUpper[static_cast<unsigned char>(scratch[i])]);
         bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
         bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
         if (prof.ss_mode) {
@@ -61,18 +92,10 @@ inline XXH128_hash_t damage_canonical_hash(const std::string& seq,
     XXH128_hash_t h1 = XXH3_128bits(scratch1, L);
     if (!use_revcomp) return h1;
 
+    for (int i = 0; i < L; ++i)
+        scratch2[i] = static_cast<char>(lut::kCompCase[static_cast<unsigned char>(seq[L - 1 - i])]);
     for (int i = 0; i < L; ++i) {
-        unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-        switch (c) {
-            case 'A': case 'a': scratch2[i] = (c == 'A') ? 'T' : 't'; break;
-            case 'C': case 'c': scratch2[i] = (c == 'C') ? 'G' : 'g'; break;
-            case 'G': case 'g': scratch2[i] = (c == 'G') ? 'C' : 'c'; break;
-            case 'T': case 't': scratch2[i] = (c == 'T') ? 'A' : 'a'; break;
-            default:            scratch2[i] = 'N'; break;
-        }
-    }
-    for (int i = 0; i < L; ++i) {
-        char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2[i])));
+        char cu = static_cast<char>(lut::kUpper[static_cast<unsigned char>(scratch2[i])]);
         bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && prof.mask_pos[i];
         bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && prof.mask_pos[L - 1 - i];
         if (prof.ss_mode) {
