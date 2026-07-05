@@ -1198,21 +1198,27 @@ private:
 
         fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
         if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
-            // Parallel index-fill: all_edges[j] preserves mismatches[] order for
-            // B2's sequential read; distinct_bundles built as per-thread sets then
-            // unioned (order-independent — fit() consumes a set + its size only).
+            // WIN 1: stream edges into the empirical model instead of
+            // materializing the full all_edges vector (~43GB at full scale).
+            // Each thread folds its slice of mismatches[] into a private per-bin
+            // accumulator; the set-union merge is order-independent, so the
+            // fitted model is bit-identical to the old build-then-fit path.
+            // build_edge() is a pure function of one ChildMismatch, so B2
+            // recomputes each edge inline where it needs it.
             unsigned n_edge_threads = errcor_.threads;
             if (n_edge_threads == 0)
                 n_edge_threads = std::max(1u, std::thread::hardware_concurrency());
             const size_t NE = mismatches.size();
-            std::vector<fqdup::errcor_emp::EdgeCandidate> all_edges(NE);
             std::vector<std::unordered_set<uint64_t>> local_bundles(n_edge_threads);
+            std::vector<std::vector<std::unordered_set<uint64_t>>> local_bins(n_edge_threads);
             auto edge_worker = [&](unsigned t) {
                 const size_t lo = NE * t / n_edge_threads;
                 const size_t hi = NE * (t + 1) / n_edge_threads;
                 auto& lb = local_bundles[t];
+                auto& bins = local_bins[t];
+                bins.assign(fqdup::errcor_emp::kNumBins, {});
                 for (size_t j = lo; j < hi; ++j) {
-                    all_edges[j] = build_edge(mismatches[j]);
+                    emp_model.accumulate_edge(bins, build_edge(mismatches[j]));
                     lb.insert(bundle_key_of[mismatches[j].parent_id]);
                 }
             };
@@ -1229,10 +1235,12 @@ private:
             std::unordered_set<uint64_t> distinct_bundles;
             for (auto& lb : local_bundles)
                 distinct_bundles.insert(lb.begin(), lb.end());
-            emp_model.fit(all_edges, distinct_bundles.size());
+            for (auto& bins : local_bins)
+                emp_model.fit_merge(bins);
+            emp_model.fit_finalize(distinct_bundles.size());
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%.4g", emp_model.p_real_global);
-            log_info("Phase 3 empirical model: " + std::to_string(all_edges.size()) +
+            log_info("Phase 3 empirical model: " + std::to_string(NE) +
                      " edges, " + std::to_string(distinct_bundles.size()) +
                      " distinct bundles, p_real_global=" + buf);
             std::snprintf(buf, sizeof(buf), "%.3f", emp_model.log_pi_ratio_global);
