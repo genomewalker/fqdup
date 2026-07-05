@@ -807,6 +807,62 @@ int profile_main(int argc, char** argv) {
                     dp.position_0_artifact_3prime,
                     dp);
             }
+
+            // Diagnostic (pending validation, not yet production): reconstruct
+            // a SECOND time using a joint deamination+depurination classifier
+            // (see purine_joint_d5_fit doc comment) and compute the resulting
+            // d5_fit into a scratch profile copy, so the production `dp`
+            // fields above are untouched — this is purely for side-by-side
+            // comparison.
+            if (dp.channel_e_valid) {
+                taph::PurineClassifyParams purine_params;
+                purine_params.p_anc = static_cast<double>(dp.purine_enrichment_5prime);
+                purine_params.bg    = static_cast<double>(dp.purine_rate_interior);
+
+                uint64_t jsh_n=0, jsh_old=0, jsh_new=0, jsh_flip=0;
+                auto merged_llr_joint = reconstruct_lsd_llr_accum(
+                    merged_cnt, n_lsd_bins, lsd_master,
+                    lsd_cls_params, is_ss, lsd_log_prior_odds,
+                    nullptr, nullptr, nullptr, nullptr,
+                    &purine_params);
+                (void)jsh_n; (void)jsh_old; (void)jsh_new; (void)jsh_flip;
+
+                std::vector<taph::AncientFractionBins> af_bins_joint;
+                af_bins_joint.reserve(merged_llr_joint.size());
+                for (const auto& b : merged_llr_joint) {
+                    taph::AncientFractionBins ab{};
+                    ab.n_damaged   = b.n_damaged;
+                    ab.n_undamaged = b.n_undamaged;
+                    ab.sw_sum      = b.sw_sum;
+                    for (int i = 0; i < taph::TAPH_FRAC_N_SOFT_POS; ++i) {
+                        ab.sw_t5_anc[i]  = b.sw_t5_anc[i];
+                        ab.sw_tc5_anc[i] = b.sw_tc5_anc[i];
+                        ab.sw_h3_anc[i]  = b.sw_h3_anc[i];
+                        ab.sw_n3_anc[i]  = b.sw_n3_anc[i];
+                    }
+                    for (int p = 0; p < taph::TAPH_FRAC_N_POS; ++p) {
+                        ab.t_5_anc[p]  = b.t_5_anc[p];
+                        ab.tc_5_anc[p] = b.tc_5_anc[p];
+                        ab.h_3_anc[p]  = b.h_3_anc[p];
+                        ab.n_3_anc[p]  = b.n_3_anc[p];
+                        ab.t_5_mod[p]  = b.t_5_mod[p];
+                        ab.tc_5_mod[p] = b.tc_5_mod[p];
+                        ab.h_3_mod[p]  = b.h_3_mod[p];
+                        ab.n_3_mod[p]  = b.n_3_mod[p];
+                    }
+                    af_bins_joint.push_back(ab);
+                }
+                std::sort(af_bins_joint.begin(), af_bins_joint.end(),
+                          [](const auto& a, const auto& b){ return a.n_damaged < b.n_damaged; });
+                taph::SampleDamageProfile dp_joint_scratch = dp;
+                taph::compute_ancient_fraction(
+                    af_bins_joint.data(), static_cast<int>(af_bins_joint.size()),
+                    lsd_cls_params.bg_5, lsd_cls_params.bg_3,
+                    dp.position_0_artifact_5prime,
+                    dp.position_0_artifact_3prime,
+                    dp_joint_scratch);
+                dp.purine_joint_d5_fit = dp_joint_scratch.damaged_fraction_d5_fit;
+            }
         }
     }
 

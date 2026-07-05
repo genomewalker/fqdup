@@ -205,22 +205,46 @@ inline static void oxog_from_sig_hist(
 }
 
 // ---- LSD single-pass: reconstruct LsdLlrBinAccum from sig5 histograms ---
-// lsd_llr_from_sig: LLR for a read encoded as 5' ternary (T=1,C=2,other=0)
-// and 3' quinary (A=1,G=2,T=3,C=4,other=0). Uses the same decay model as
-// lsd_llr_score but without per-read CpG context (scale fixed at 1.0).
+// lsd_llr_from_sig: LLR for a read encoded as 5' position-0-quinary+pos1-4-
+// ternary and 3' quinary (A=1,G=2,T=3,C=4,other=0). Uses the same decay model
+// as lsd_llr_score but without per-read CpG context (scale fixed at 1.0).
 // ceiling: cpg_scale/noncpg_scale not applied — needs seq[p+1] which the sig
 //          does not encode; upgrade: extend sig with next-base ternary context.
+//
+// purine: optional joint depurination channel (chemically distinct from
+// deamination — N-glycosidic-bond hydrolysis / abasic-site strand breakage,
+// not cytosine deamination — see PurineClassifyParams). Position-0-only,
+// matching compute_purine_stats (bulk purine_enrichment_5prime is also
+// position-0-only). Pass purine=nullptr to get the deamination-only score
+// (byte-identical to the pre-widening behavior) for equivalence testing.
 inline static float lsd_llr_from_sig(
     uint32_t sig5f,
     uint32_t sig5r_4,
     const LsdClassifyParams& p,
-    bool is_ss)
+    bool is_ss,
+    const taph::PurineClassifyParams* purine = nullptr)
 {
     float llr = 0.0f;
-    // 5' end: advance past skipped position 0, then decode remaining trits
+    // 5' end, position 0: quinary (A=1,G=2,T=3,C=4,other=0) — decode both the
+    // deamination readout (T/C) and, if requested, the purine readout (A/G).
     uint32_t s5 = sig5f;
-    if (p.skip_pos0_5prime) s5 /= 3;
-    for (int i = p.skip_pos0_5prime ? 1 : 0; i < 5; ++i) {
+    const int v0 = static_cast<int>(s5 % 5); s5 /= 5;
+    if (purine != nullptr) {
+        llr += taph::purine_llr_score(
+            (v0 == 1) ? 'A' : (v0 == 2) ? 'G' : (v0 == 3) ? 'T' : (v0 == 4) ? 'C' : 'N',
+            *purine);
+    }
+    if (!p.skip_pos0_5prime) {
+        const float d = static_cast<float>(p.d_anc);
+        if (d >= 1e-4f) {
+            const float bg = static_cast<float>(p.bg_5);
+            const float pd = std::clamp(bg + (1.0f - bg) * d, 1e-6f, 1.0f - 1e-6f);
+            if      (v0 == 3) llr += std::log(pd / bg);        // T
+            else if (v0 == 4) llr += std::log((1.0f - pd) / (1.0f - bg));  // C
+        }
+    }
+    // 5' end, positions 1-4: ternary (T=1,C=2,other=0), unchanged from before.
+    for (int i = 1; i < 5; ++i) {
         const int tv = s5 % 3; s5 /= 3;
         const float d = static_cast<float>(p.d_anc * std::exp(-p.lam_5 * i));
         if (d < 1e-4f) break;
@@ -259,7 +283,8 @@ inline static std::vector<LsdLlrBinAccum> reconstruct_lsd_llr_accum(
     const LsdClassifyParams& cls,
     bool is_ss,
     double lsd_log_prior_odds,
-    uint64_t* sh_n, uint64_t* sh_old, uint64_t* sh_new, uint64_t* sh_flip)
+    uint64_t* sh_n, uint64_t* sh_old, uint64_t* sh_new, uint64_t* sh_flip,
+    const taph::PurineClassifyParams* purine = nullptr)
 {
     std::vector<LsdLlrBinAccum> out(n_bins);
     const bool do_shadow = (sh_n != nullptr) && (cls.d_anc_contract >= 0.0);
@@ -274,7 +299,7 @@ inline static std::vector<LsdLlrBinAccum> reconstruct_lsd_llr_accum(
             if (n == 0) continue;
             const uint32_t sig5f   = static_cast<uint32_t>(sig) / N_LSD_SIG5_3R;
             const uint32_t sig5r_4 = static_cast<uint32_t>(sig) % N_LSD_SIG5_3R;
-            const float llr_val = lsd_llr_from_sig(sig5f, sig5r_4, cls, is_ss);
+            const float llr_val = lsd_llr_from_sig(sig5f, sig5r_4, cls, is_ss, purine);
             const bool  anc     = llr_val > 0.0f;
             const double post   = 1.0 / (1.0 + std::exp(-(static_cast<double>(llr_val) + lsd_log_prior_odds)));
             if (anc) acc.n_damaged   += n; else acc.n_undamaged += n;
@@ -289,11 +314,20 @@ inline static std::vector<LsdLlrBinAccum> reconstruct_lsd_llr_accum(
                 *sh_n += n;
                 if (anc) *sh_old += n;
             }
-            // 5' positions 0..4
+            // 5' position 0: quinary (A=1,G=2,T=3,C=4,other=0) — decode the
+            // T/C deamination readout only here (the A/G purine readout is
+            // consumed separately by lsd_llr_from_sig via the purine param).
+            // 5' positions 1-4: ternary (T=1,C=2,other=0), unchanged.
             uint32_t s5 = sig5f;
             for (int p = 0; p < 5; ++p) {
-                const int fv = s5 % 3; s5 /= 3;
-                const bool is_t = (fv == 1), is_tc = (fv != 0);
+                bool is_t, is_tc;
+                if (p == 0) {
+                    const int v0 = s5 % 5; s5 /= 5;
+                    is_t = (v0 == 3); is_tc = (v0 == 3 || v0 == 4);
+                } else {
+                    const int fv = s5 % 3; s5 /= 3;
+                    is_t = (fv == 1); is_tc = (fv != 0);
+                }
                 if (anc) {
                     acc.t_5_anc[p]  += (int64_t)n * is_t;
                     acc.tc_5_anc[p] += (int64_t)n * is_tc;
