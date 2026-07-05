@@ -1198,14 +1198,37 @@ private:
 
         fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
         if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
-            std::vector<fqdup::errcor_emp::EdgeCandidate> all_edges;
-            all_edges.reserve(mismatches.size());
-            std::unordered_set<uint64_t> distinct_bundles;
-            distinct_bundles.reserve(mismatches.size());
-            for (const auto& cm : mismatches) {
-                all_edges.emplace_back(build_edge(cm));
-                distinct_bundles.insert(bundle_key_of[cm.parent_id]);
+            // Parallel index-fill: all_edges[j] preserves mismatches[] order for
+            // B2's sequential read; distinct_bundles built as per-thread sets then
+            // unioned (order-independent — fit() consumes a set + its size only).
+            unsigned n_edge_threads = errcor_.threads;
+            if (n_edge_threads == 0)
+                n_edge_threads = std::max(1u, std::thread::hardware_concurrency());
+            const size_t NE = mismatches.size();
+            std::vector<fqdup::errcor_emp::EdgeCandidate> all_edges(NE);
+            std::vector<std::unordered_set<uint64_t>> local_bundles(n_edge_threads);
+            auto edge_worker = [&](unsigned t) {
+                const size_t lo = NE * t / n_edge_threads;
+                const size_t hi = NE * (t + 1) / n_edge_threads;
+                auto& lb = local_bundles[t];
+                for (size_t j = lo; j < hi; ++j) {
+                    all_edges[j] = build_edge(mismatches[j]);
+                    lb.insert(bundle_key_of[mismatches[j].parent_id]);
+                }
+            };
+            if (n_edge_threads == 1) {
+                edge_worker(0);
+            } else {
+                std::vector<std::thread> ets;
+                ets.reserve(n_edge_threads - 1);
+                for (unsigned t = 1; t < n_edge_threads; ++t)
+                    ets.emplace_back(edge_worker, t);
+                edge_worker(0);
+                for (auto& th : ets) th.join();
             }
+            std::unordered_set<uint64_t> distinct_bundles;
+            for (auto& lb : local_bundles)
+                distinct_bundles.insert(lb.begin(), lb.end());
             emp_model.fit(all_edges, distinct_bundles.size());
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%.4g", emp_model.p_real_global);
