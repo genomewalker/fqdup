@@ -635,6 +635,36 @@ private:
                      std::to_string(kBruteforceMinLen) + "," +
                      std::to_string(kMinInteriorLen - 1) + "]");
 
+        // Build a per-id interior slab: extract each eligible long-interior id's
+        // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
+        // deref) instead of re-extracting it per child. That re-extraction was the
+        // 38% __memmove_evex in the perf profile. Output-preserving: at the B1 use
+        // site the parent's length == the child's length (checked there), so the
+        // id's own layout used here is the exact layout used at the comparison.
+        // Built BEFORE the CSR shards so each posting caches its parent's interior
+        // offset inline (FlatPairIndex::id_off), removing the per-candidate random
+        // interior_off[pid] gather (48% of candidate-check DRAM misses).
+        std::vector<uint64_t> interior_off(static_cast<size_t>(N) + 1, 0);
+        for (uint32_t id = 0; id < N; ++id) {
+            if (!arena_.is_eligible(id)) continue;
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen >= kMinInteriorLen)
+                interior_off[id + 1] = static_cast<uint64_t>((lay.ilen + 3) / 4);
+        }
+        for (uint32_t id = 0; id < N; ++id)
+            interior_off[id + 1] += interior_off[id];
+        // ceiling: interior_slab must be <4GiB so id_off fits uint32; upgrade: widen id_off to uint64
+        if (interior_off[N] > static_cast<uint64_t>(UINT32_MAX))
+            throw std::runtime_error("Phase 3 interior_slab exceeds 4GiB; widen FlatPairIndex::id_off to uint64");
+        std::vector<uint8_t> interior_slab(interior_off[N]);
+        for (uint32_t id = 0; id < N; ++id) {
+            if (!arena_.is_eligible(id)) continue;
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen < kMinInteriorLen) continue;
+            extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
+                                interior_slab.data() + interior_off[id]);
+        }
+
         // Build CSR per shard per tag
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(build_map.size());
@@ -653,7 +683,9 @@ private:
                     uint32_t cnt = 0;
                     while (i < ev.size() && ev[i].key == k) {
                         if (errcor_.bucket_cap == 0 || cnt < errcor_.bucket_cap) {
-                            pi.ids.push_back(ev[i].id); cnt++;
+                            pi.ids.push_back(ev[i].id);
+                            pi.id_off.push_back(static_cast<uint32_t>(interior_off[ev[i].id]));
+                            cnt++;
                         } else {
                             stats.bucket_overflow_drops++;
                         }
@@ -680,34 +712,8 @@ private:
         log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
 
         // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
-        // Pre-warm layout_cache before workers start so it becomes read-only, and
-        // build a per-id interior slab: extract each eligible long-interior id's
-        // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
-        // deref) instead of re-extracting it per child. That re-extraction was the
-        // 38% __memmove_evex in the perf profile. Output-preserving: at the B1 use
-        // site the parent's length == the child's length (checked there), so the
-        // id's own layout used here is the exact layout used at the comparison.
-        std::vector<uint64_t> interior_off(static_cast<size_t>(N) + 1, 0);
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            const auto& lay = get_layout(arena_.length(id));
-            if (lay.ilen >= kMinInteriorLen)
-                interior_off[id + 1] = static_cast<uint64_t>((lay.ilen + 3) / 4);
-        }
-        for (uint32_t id = 0; id < N; ++id)
-            interior_off[id + 1] += interior_off[id];
-        std::vector<uint8_t> interior_slab(interior_off[N]);
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            const auto& lay = get_layout(arena_.length(id));
-            if (lay.ilen < kMinInteriorLen) continue;
-            extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
-                                interior_slab.data() + interior_off[id]);
-        }
-        auto interior_ptr = [&](uint32_t id) -> const uint8_t* {
-            return interior_slab.data() + interior_off[id];
-        };
-
+        // Pre-warm layout_cache before workers start so it becomes read-only.
+        // The per-id interior slab was built above (before the CSR shards).
         unsigned n_threads = errcor_.threads;
         if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
 
@@ -739,7 +745,7 @@ private:
 
             std::vector<uint8_t>  scratch;
             scratch.reserve(65535);
-            std::vector<uint32_t> cand_storage;
+            std::vector<uint64_t> cand_storage;
             if (errcor_.bucket_cap > 0)
                 cand_storage.resize(12u * errcor_.bucket_cap);
             else
@@ -900,15 +906,22 @@ private:
             // does not by itself justify removing a well-optimized generic algorithm.
             uint32_t n_cands = 0;
             const bool unbounded = (errcor_.bucket_cap == 0);
-            auto collect = [&](uint32_t pid) {
+            // Pack (pid, interior-offset) into one u64: pid in the high 32 bits,
+            // off in the low 32. off = interior_off[pid] is a pure function of pid,
+            // so ascending sort orders by pid exactly as before and std::unique with
+            // default == collapses duplicate pids (identical off) -> byte-identical.
+            // Carrying off here removes the random interior_off[pid] gather in the
+            // candidate loop (was 48% of candidate-check DRAM misses).
+            auto collect = [&](uint32_t pid, uint32_t off) {
+                uint64_t packed = (static_cast<uint64_t>(pid) << 32) | off;
                 if (unbounded) {
                     if (n_cands >= cand_storage.size()) cand_storage.resize(n_cands + 1);
-                    cand_storage[n_cands++] = pid;
+                    cand_storage[n_cands++] = packed;
                 } else if (n_cands < static_cast<uint32_t>(cand_storage.size())) {
-                    cand_storage[n_cands++] = pid;
+                    cand_storage[n_cands++] = packed;
                 }
             };
-            uint32_t* cand_buf = cand_storage.data();
+            uint64_t* cand_buf = cand_storage.data();
 
             auto tq0 = do_time ? clk::now() : clk::time_point{};
             auto& sh = shard_it->second;
@@ -942,7 +955,8 @@ private:
             // is unchanged, so the recorded edges are byte-identical.
             uint32_t n_surv = 0;
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
-                uint32_t pid = cand_buf[ci];
+                uint64_t packed = cand_buf[ci];
+                uint32_t pid = static_cast<uint32_t>(packed >> 32);
                 if (is_error_[pid]) continue;
                 if (!arena_.is_eligible(pid)) continue;
                 if (arena_.length(pid) != static_cast<uint16_t>(L)) continue;
@@ -956,15 +970,16 @@ private:
                 // (both halves of the pair share the same mismatch → sig/parent = 100%).
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-                __builtin_prefetch(interior_ptr(pid), 0, 0);
-                cand_buf[n_surv++] = pid;
+                __builtin_prefetch(interior_slab.data() + static_cast<uint32_t>(packed), 0, 0);
+                cand_buf[n_surv++] = packed;
             }
             for (uint32_t si = 0; si < n_surv; ++si) {
-                uint32_t pid = cand_buf[si];
+                uint64_t packed = cand_buf[si];
+                uint32_t pid = static_cast<uint32_t>(packed >> 32);
                 // Parent's full interior: read from the per-id slab (extracted
                 // once). pid has length == L here (checked in Pass A), so its
                 // slab layout equals lay -> byte-identical to a live extract.
-                const uint8_t* pi_buf = interior_ptr(pid);
+                const uint8_t* pi_buf = interior_slab.data() + static_cast<uint32_t>(packed);
 
                 // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, errcor_.protect_transversions);
