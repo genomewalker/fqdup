@@ -1235,6 +1235,68 @@ private:
             std::unordered_set<uint64_t> distinct_bundles;
             for (auto& lb : local_bundles)
                 distinct_bundles.insert(lb.begin(), lb.end());
+            // ── Phase-3 peak memory accounting (LOG-ONLY; byte-identical) ─────
+            // Emitted at the Phase-3 resident peak: every large B1 structure is
+            // still live (read arena, FlatPairIndex shards, interior slab,
+            // mismatches[]) alongside the just-built distinct-bundle sets and the
+            // per-thread fit accumulators, so accounted bytes reconcile against
+            // the process VmHWM. Reads only container sizes — no algorithm or
+            // output change.
+            {
+                auto vcap = [](const auto& v) -> uint64_t {
+                    return static_cast<uint64_t>(v.capacity()) * sizeof(*v.data());
+                };
+                auto set_bytes = [](const std::unordered_set<uint64_t>& s) -> uint64_t {
+                    // node ≈ 8B key + 8B next-ptr + malloc overhead (~16B); plus
+                    // the bucket pointer array. Approximate, labelled "~".
+                    return static_cast<uint64_t>(s.bucket_count()) * 8ull +
+                           static_cast<uint64_t>(s.size()) * 32ull;
+                };
+                uint64_t arena_b = vcap(arena_.packed) + vcap(arena_.offsets) +
+                                   vcap(arena_.lengths) + vcap(arena_.eligible);
+                uint64_t qual_b  = vcap(qual_arena_.bytes) + vcap(qual_arena_.offsets) +
+                                   vcap(qual_arena_.lengths);
+                uint64_t counts_b = vcap(id_count) + vcap(acc_count) +
+                                    vcap(bundle_key_of) + vcap(rescue_bundle_key_of);
+                uint64_t fpi_b = 0;
+                for (const auto& kv : shards)
+                    for (const auto& pi : kv.second.pi)
+                        fpi_b += vcap(pi.keys) + vcap(pi.offsets) + vcap(pi.ids) +
+                                 vcap(pi.dir);
+                uint64_t mm_b   = vcap(mismatches);
+                uint64_t slab_b = vcap(interior_slab) + vcap(interior_off);
+                uint64_t db_b   = set_bytes(distinct_bundles);
+                uint64_t bins_b = 0;
+                for (const auto& lbset : local_bundles) bins_b += set_bytes(lbset);
+                for (const auto& bins : local_bins)
+                    for (const auto& s : bins) bins_b += set_bytes(s);
+                uint64_t total_b = arena_b + qual_b + counts_b + fpi_b + mm_b +
+                                   slab_b + db_b + bins_b;
+                unsigned long vmhwm_kb = 0;
+                if (FILE* f = std::fopen("/proc/self/status", "r")) {
+                    char line[256];
+                    while (std::fgets(line, sizeof(line), f))
+                        if (std::sscanf(line, "VmHWM: %lu kB", &vmhwm_kb) == 1) break;
+                    std::fclose(f);
+                }
+                auto gb = [](uint64_t b) {
+                    char x[32];
+                    std::snprintf(x, sizeof(x), "%.2f", static_cast<double>(b) / 1073741824.0);
+                    return std::string(x);
+                };
+                auto fld = [&](const char* n, uint64_t b) {
+                    return std::string(n) + "=" + std::to_string(b) + "|" + gb(b) + "GB ";
+                };
+                log_info("Phase 3 mem breakdown: " +
+                         fld("read_arena", arena_b) + fld("qual_arena", qual_b) +
+                         fld("counts(id+acc+bundle_key)", counts_b) +
+                         fld("FlatPairIndex", fpi_b) + fld("mismatches", mm_b) +
+                         fld("interior_slab", slab_b) +
+                         fld("distinct_bundles~", db_b) + fld("fit_accum~", bins_b) +
+                         "| TOTAL_accounted=" + std::to_string(total_b) + "|" + gb(total_b) + "GB" +
+                         "  VmHWM=" + std::to_string(static_cast<uint64_t>(vmhwm_kb) * 1024ull) +
+                         "|" + gb(static_cast<uint64_t>(vmhwm_kb) * 1024ull) + "GB");
+            }
             for (auto& bins : local_bins)
                 emp_model.fit_merge(bins);
             emp_model.fit_finalize(distinct_bundles.size());
