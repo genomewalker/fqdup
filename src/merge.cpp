@@ -726,20 +726,34 @@ static DetectedParams detect_merge_params(
     for (int i = 20; i < 24; ++i) r3 += rate(i);
     d.damage_3p = r3 / 4.f;
 
-    float asym = (d.damage_3p > 0.001f) ? d.damage_5p / d.damage_3p : 10.f;
-    if (d.damage_5p >= 0.02f && asym > 2.5f) {
-        d.is_half_udg   = true;
+    // Library typing against THIS library's own interior mismatch null (positions 8-19: past the
+    // 5' damage decay, before the 3' terminal slots 20-23). No hardcoded damage-rate cut: an end is
+    // "damaged" iff its terminal C→T excess over the interior clears zero at 95% (pooled binomial SE
+    // for the terminal and interior rates). This self-calibrates to each library's own overlap
+    // seq-error + composition floor instead of a panel-tuned 0.02/0.005/0.01/2.5 (fable review #8).
+    auto pooled = [&](int lo, int hi) {
+        int64_t mm = 0, tot = 0;
+        for (int i = lo; i < hi && i < (int)pos_mm.size(); ++i) { mm += pos_mm[i]; tot += pos_total[i]; }
+        double p = tot > 0 ? (double)mm / (double)tot : 0.0;
+        double se = tot > 0 ? std::sqrt(p * (1.0 - p) / (double)tot) : 1.0;
+        return std::pair<double, double>{p, se};
+    };
+    auto [p5, se5]     = pooled(0, 4);    // 5' terminal
+    auto [p3, se3]     = pooled(20, 24);  // 3' terminal (slots 20-23)
+    auto [pint, seint] = pooled(8, 20);   // interior baseline
+    const bool dmg5 = (p5 - pint) - 1.96 * std::sqrt(se5 * se5 + seint * seint) > 0.0;
+    const bool dmg3 = (p3 - pint) - 1.96 * std::sqrt(se3 * se3 + seint * seint) > 0.0;
+    if (dmg5 && !dmg3) {
+        d.is_half_udg   = true;    // 5' above interior, 3' not → half-UDG
         d.skip_terminal = 4;
-    } else if (d.damage_5p >= 0.02f) {
-        d.skip_terminal = 4;       // untreated: both ends damaged
-    } else if (d.damage_5p < 0.005f && d.damage_3p < 0.005f) {
-        d.is_udg = true;           // confidently UDG: very low at both ends
+    } else if (dmg5 && dmg3) {
+        d.skip_terminal = 4;       // both ends above interior → untreated
+    } else if (!dmg5 && !dmg3) {
+        d.is_udg        = true;    // neither end above interior → UDG (or no signal)
         d.skip_terminal = 0;
-    } else if (asym > 2.5f && d.damage_5p >= 0.01f) {
-        d.is_half_udg   = true;    // asymmetric even at low absolute rate → half-UDG
-        d.skip_terminal = 4;
+    } else {
+        d.skip_terminal = 4;       // only 3' above interior (rare) → still trim terminus
     }
-    // else: low absolute damage, symmetric → ambiguous (low f_anc); skip_terminal=0
 
     // ---- poly-G tail detection (NextSeq/NovaSeq dark cycle: last 10 positions)----
     int64_t tail_g = 0, tail_n = 0;

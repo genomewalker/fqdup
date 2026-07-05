@@ -220,8 +220,10 @@ inline static void paired_worker_fn(PairedWorkQueue& queue, WorkerState& state) 
             const bool ok = taph::FrameSelector::update_sample_profile_paired(
                 state.profile, s1, s2);
             if (!ok) { ++state.reads_skipped; continue; }
-            // Length tracking: use R1 as the canonical insert proxy.
-            ++state.lsd_hist[lsd_hist_bin(L1)];
+            // Do NOT feed lsd_hist: R1 read-length != fragment length for the
+            // long inserts that fail to merge, and paired reads do not enter LSD
+            // until they get their own top stratum. Polluting merged_lsd_hist
+            // would shift the merged-channel bin edges (fable review #7).
             if (L1 < state.len_min) state.len_min = L1;
             if (L1 > state.len_max) state.len_max = L1;
             state.len_sum += L1;
