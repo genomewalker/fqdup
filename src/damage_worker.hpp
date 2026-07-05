@@ -13,12 +13,18 @@
 #include <vector>
 
 // LSD sig5 encoding:
-//   5' ternary (T=1,C=2,other=0) — 5 positions = 3^5 = 243 values
+//   5' position 0: quinary (A=1,G=2,T=3,C=4,other=0) — carries both the T/C
+//     deamination readout AND purine/pyrimidine identity, so a joint
+//     deamination+depurination per-read LLR classifier can be reconstructed
+//     from the histogram without a second FASTQ pass. Positions 1-4 stay
+//     ternary (T=1,C=2,other=0) — depurination is a position-0-only signal
+//     (matches compute_purine_stats, which only reads position 0).
+//     5 (pos0 quinary) * 3^4 (pos1-4 ternary) = 405 values.
 //   3' quinary (A=1,G=2,T=3,C=4,other=0) — 5 positions = 5^5 = 3125 values
 // ceiling: CpG context not encoded (needs next-base); upgrade via quinary 5' sig
-static constexpr int N_LSD_SIG5_5P   = 243;   // 3^5 ternary
+static constexpr int N_LSD_SIG5_5P   = 405;   // 5 * 3^4
 static constexpr int N_LSD_SIG5_3R   = 3125;  // 5^5 quinary
-static constexpr int N_LSD_SIG5      = N_LSD_SIG5_5P * N_LSD_SIG5_3R;  // 759375
+static constexpr int N_LSD_SIG5      = N_LSD_SIG5_5P * N_LSD_SIG5_3R;  // 1265625
 // ---- bounded work queue ------------------------------------------------
 struct WorkQueue {
     std::mutex              mtx;
@@ -130,10 +136,26 @@ inline static void worker_ox_accumulate(WorkerState& state, const std::string& s
         cell.t += Tr; cell.g += Gr; cell.cv += Cvr; cell.av += Avr; ++cell.n;
         cell.t2 += (int64_t)Tr*Tr; cell.tm += (int64_t)Tr*M; cell.m2 += (int64_t)M*M;
     }
-    // LSD sig5: joint (5' ternary, 3' quinary) for single-pass reconstruction.
+    // LSD sig5: joint (5' pos0-quinary+pos1-4-ternary, 3' quinary) for
+    // single-pass reconstruction. Computed independently from fsig (which
+    // stays pure ternary for OxoG's own 10-position purposes) because
+    // position 0 here needs the full A/G/T/C readout for the joint
+    // deamination+depurination classifier (see lsd_llr_from_sig).
     if (!state.lsd_cnt.empty()) {
-        // sig5f: first 5 trits of fsig (T=1, C=2, other=0)
-        const uint32_t sig5f = fsig % N_LSD_SIG5_5P;
+        uint32_t sig5f = 0;
+        {
+            const char c0 = seq[0] & ~0x20u;
+            const int v0 = (c0=='A') ? 1 : (c0=='G') ? 2 : (c0=='T') ? 3 : (c0=='C') ? 4 : 0;
+            sig5f = static_cast<uint32_t>(v0);
+            uint32_t fb2 = 5;
+            const int k1 = (L < 5) ? L : 5;
+            for (int i = 1; i < k1; ++i) {
+                const char ci = seq[i] & ~0x20u;
+                const int vi = (ci=='T') ? 1 : (ci=='C') ? 2 : 0;
+                sig5f += static_cast<uint32_t>(vi) * fb2;
+                fb2 *= 3;
+            }
+        }
         // sig5r_4: 3' end with 5-way encoding (A=1, G=2, T=3, C=4, other=0)
         uint32_t sig5r_4 = 0, q5 = 1;
         const int k5 = (L < 5) ? L : 5;
