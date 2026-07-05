@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -195,61 +196,55 @@ public:
     }
 
 private:
-    XXH128_hash_t compute_hash(const std::string& seq, bool& is_forward) const {
+    // Thread-safe canonical hash: all scratch is passed in, so worker threads
+    // may call it concurrently during parallel Pass-1. Byte-identical to the
+    // former member body (same LUTs, same masking, same canonical tiebreak).
+    static XXH128_hash_t compute_hash_impl(const std::string& seq,
+                                           const DamageProfile& profile,
+                                           bool use_revcomp, bool& is_forward,
+                                           std::vector<char>& s1, std::vector<char>& s2) {
         int L = static_cast<int>(seq.size());
-        if (profile_.enabled) {
-            if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
-            if (scratch2_.size() < seq.size()) scratch2_.resize(seq.size());
-            apply_damage_mask_inplace(seq, profile_, scratch1_.data());
-            XXH128_hash_t h1 = XXH3_128bits(scratch1_.data(), L);
-            if (!use_revcomp_) { is_forward = true; return h1; }
-            // Build RC into scratch2_
+        if (profile.enabled) {
+            if (s1.size() < seq.size()) s1.resize(seq.size());
+            if (s2.size() < seq.size()) s2.resize(seq.size());
+            apply_damage_mask_inplace(seq, profile, s1.data());
+            XXH128_hash_t h1 = XXH3_128bits(s1.data(), L);
+            if (!use_revcomp) { is_forward = true; return h1; }
+            for (int i = 0; i < L; ++i)
+                s2[i] = static_cast<char>(
+                    lut::kCompCase[static_cast<unsigned char>(seq[L - 1 - i])]);
             for (int i = 0; i < L; ++i) {
-                unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-                switch (c) {
-                    case 'A': case 'a': scratch2_[i] = (c == 'A') ? 'T' : 't'; break;
-                    case 'C': case 'c': scratch2_[i] = (c == 'C') ? 'G' : 'g'; break;
-                    case 'G': case 'g': scratch2_[i] = (c == 'G') ? 'C' : 'c'; break;
-                    case 'T': case 't': scratch2_[i] = (c == 'T') ? 'A' : 'a'; break;
-                    default:            scratch2_[i] = 'N'; break;
-                }
-            }
-            // Apply damage mask to RC
-            for (int i = 0; i < L; ++i) {
-                char cu = static_cast<char>(std::toupper(static_cast<unsigned char>(scratch2_[i])));
-                bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[i];
-                bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && profile_.mask_pos[L - 1 - i];
-                if (profile_.ss_mode) {
-                    if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
-                    else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                char cu = static_cast<char>(lut::kUpper[static_cast<unsigned char>(s2[i])]);
+                bool in_5zone = (i         < DamageProfile::MASK_POSITIONS) && profile.mask_pos[i];
+                bool in_3zone = (L - 1 - i < DamageProfile::MASK_POSITIONS) && profile.mask_pos[L - 1 - i];
+                if (profile.ss_mode) {
+                    if ((in_5zone || in_3zone) && (cu == 'C' || cu == 'T')) s2[i] = '\x01';
+                    else if ((in_5zone || in_3zone) && (cu == 'G' || cu == 'A')) s2[i] = '\x02';
                 } else {
-                    if (in_5zone && (cu == 'C' || cu == 'T')) scratch2_[i] = '\x01';
-                    else if (in_3zone && (cu == 'G' || cu == 'A')) scratch2_[i] = '\x02';
+                    if (in_5zone && (cu == 'C' || cu == 'T')) s2[i] = '\x01';
+                    else if (in_3zone && (cu == 'G' || cu == 'A')) s2[i] = '\x02';
                 }
             }
-            XXH128_hash_t h2 = XXH3_128bits(scratch2_.data(), L);
+            XXH128_hash_t h2 = XXH3_128bits(s2.data(), L);
             is_forward = (h1.high64 < h2.high64 ||
                           (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
             return is_forward ? h1 : h2;
         }
-        // No damage masking
         XXH128_hash_t h1 = XXH3_128bits(seq.data(), seq.size());
-        if (!use_revcomp_) { is_forward = true; return h1; }
-        if (scratch1_.size() < seq.size()) scratch1_.resize(seq.size());
-        for (int i = 0; i < L; ++i) {
-            unsigned char c = static_cast<unsigned char>(seq[L - 1 - i]);
-            switch (c) {
-                case 'A': case 'a': scratch1_[i] = (c == 'A') ? 'T' : 't'; break;
-                case 'C': case 'c': scratch1_[i] = (c == 'C') ? 'G' : 'g'; break;
-                case 'G': case 'g': scratch1_[i] = (c == 'G') ? 'C' : 'c'; break;
-                case 'T': case 't': scratch1_[i] = (c == 'T') ? 'A' : 'a'; break;
-                default:            scratch1_[i] = 'N'; break;
-            }
-        }
-        XXH128_hash_t h2 = XXH3_128bits(scratch1_.data(), L);
+        if (!use_revcomp) { is_forward = true; return h1; }
+        if (s1.size() < seq.size()) s1.resize(seq.size());
+        for (int i = 0; i < L; ++i)
+            s1[i] = static_cast<char>(
+                lut::kCompCase[static_cast<unsigned char>(seq[L - 1 - i])]);
+        XXH128_hash_t h2 = XXH3_128bits(s1.data(), L);
         is_forward = (h1.high64 < h2.high64 ||
                       (h1.high64 == h2.high64 && h1.low64 <= h2.low64));
         return is_forward ? h1 : h2;
+    }
+
+    XXH128_hash_t compute_hash(const std::string& seq, bool& is_forward) const {
+        return compute_hash_impl(seq, profile_, use_revcomp_, is_forward,
+                                 scratch1_, scratch2_);
     }
 
     // Count terminal damage markers: T at masked 5' positions + A at masked 3' positions.
@@ -265,8 +260,8 @@ private:
         int L = static_cast<int>(seq.size());
         for (int p = 0; p < DamageProfile::MASK_POSITIONS && p < L; ++p) {
             if (!prof.mask_pos[p]) continue;
-            if (std::toupper(static_cast<unsigned char>(seq[p]))       == 'T') ++score;
-            if (std::toupper(static_cast<unsigned char>(seq[L-1-p]))   == 'A') ++score;
+            if (lut::kUpper[static_cast<unsigned char>(seq[p])]     == 'T') ++score;
+            if (lut::kUpper[static_cast<unsigned char>(seq[L-1-p])] == 'A') ++score;
         }
         return static_cast<uint8_t>(std::min(score, 255));
     }
@@ -328,6 +323,22 @@ private:
             // the regrow path.
         }
 
+        // Parallel Pass-1 offloads the pure per-read work (canonical hash, RC
+        // build, damage score) to a worker pool; a single committer replays the
+        // exact serial insert in record order -> byte-identical index_/arena_.
+        // Disabled when a derep_pairs prior is loaded (that path needs raw seq
+        // in the committer) or when only one thread is available.
+        unsigned n_threads = errcor_.threads;
+        if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
+        bool want_par = n_threads > 1 && prior_counts_.empty();
+        if (const char* e = std::getenv("FQDUP_PASS1_SERIAL"))
+            if (e[0] == '1') want_par = false;
+
+        if (want_par) pass1_parallel(in_path, n_threads);
+        else          pass1_serial(in_path);
+    }
+
+    void pass1_serial(const std::string& in_path) {
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
         uint64_t record_idx = 0;
@@ -359,16 +370,9 @@ private:
                         int L = static_cast<int>(rec.seq.size());
                         if (rc_buf_.size()  < static_cast<size_t>(L)) rc_buf_.resize(L);
                         if (rc_qbuf_.size() < static_cast<size_t>(L)) rc_qbuf_.resize(L);
-                        for (int i = 0; i < L; ++i) {
-                            unsigned char c = static_cast<unsigned char>(rec.seq[L - 1 - i]);
-                            switch (c) {
-                                case 'A': case 'a': rc_buf_[i] = 'T'; break;
-                                case 'C': case 'c': rc_buf_[i] = 'G'; break;
-                                case 'G': case 'g': rc_buf_[i] = 'C'; break;
-                                case 'T': case 't': rc_buf_[i] = 'A'; break;
-                                default:            rc_buf_[i] = 'N'; break;
-                            }
-                        }
+                        for (int i = 0; i < L; ++i)
+                            rc_buf_[i] = static_cast<char>(
+                                lut::kCompUpper[static_cast<unsigned char>(rec.seq[L - 1 - i])]);
                         it->second.seq_id = arena_.append_chars(rc_buf_.data(), L);
                         if (!rec.qual.empty()) {
                             for (int i = 0; i < L; ++i) rc_qbuf_[i] = rec.qual[L - 1 - i];
@@ -409,6 +413,111 @@ private:
 
         std::cerr << "\r";
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
+    }
+
+    // Byte-identical parallel variant of pass1_serial (see want_par guard).
+    void pass1_parallel(const std::string& in_path, unsigned n_threads) {
+        const size_t CHUNK = size_t{1} << 22;   // 4M records per chunk
+
+        std::vector<char>          seqbuf, qualbuf, canon, canonq;
+        std::vector<uint64_t>      off;          // n+1 prefix offsets (shared: seq==qual len)
+        std::vector<uint16_t>      len;          // n
+        std::vector<uint8_t>       hasq;         // n
+        std::vector<XXH128_hash_t> hh;           // n
+        std::vector<uint8_t>       fwd, dsc;     // n
+
+        auto reader = make_fastq_reader(in_path);
+        FastqRecord rec;
+        uint64_t record_idx = 0;
+
+        auto worker = [&](size_t lo, size_t hi) {
+            std::vector<char> s1, s2;            // thread-local hash scratch
+            for (size_t i = lo; i < hi; ++i) {
+                int L = len[i];
+                const char* sp = seqbuf.data() + off[i];
+                std::string seq(sp, static_cast<size_t>(L));
+                bool f = true;
+                hh[i]  = compute_hash_impl(seq, profile_, use_revcomp_, f, s1, s2);
+                fwd[i] = f ? 1 : 0;
+                if (profile_.enabled) dsc[i] = compute_damage_score(seq, profile_);
+                char* cs = canon.data() + off[i];
+                if (f) std::memcpy(cs, sp, L);
+                else   for (int k = 0; k < L; ++k)
+                           cs[k] = static_cast<char>(
+                               lut::kCompUpper[static_cast<unsigned char>(sp[L - 1 - k])]);
+                if (hasq[i]) {
+                    const char* qp = qualbuf.data() + off[i];
+                    char* cq = canonq.data() + off[i];
+                    if (f) std::memcpy(cq, qp, L);
+                    else   for (int k = 0; k < L; ++k) cq[k] = qp[L - 1 - k];
+                }
+            }
+        };
+
+        while (true) {
+            seqbuf.clear(); qualbuf.clear(); off.clear(); len.clear(); hasq.clear();
+            off.push_back(0);
+            size_t n = 0;
+            while (n < CHUNK && reader->read(rec)) {
+                uint16_t L = static_cast<uint16_t>(rec.seq.size());
+                seqbuf.insert(seqbuf.end(), rec.seq.begin(), rec.seq.end());
+                bool hq = !rec.qual.empty();
+                if (hq) qualbuf.insert(qualbuf.end(), rec.qual.begin(), rec.qual.end());
+                else    qualbuf.insert(qualbuf.end(), rec.seq.size(), '\0');
+                len.push_back(L);
+                hasq.push_back(hq ? 1 : 0);
+                off.push_back(seqbuf.size());
+                ++n;
+            }
+            if (n == 0) break;
+
+            hh.resize(n); fwd.resize(n); dsc.assign(n, 0);
+            canon.resize(seqbuf.size()); canonq.resize(qualbuf.size());
+
+            unsigned nw = static_cast<unsigned>(std::min<size_t>(n_threads, n));
+            std::vector<std::thread> ts; ts.reserve(nw);
+            size_t per = (n + nw - 1) / nw;
+            for (unsigned t = 0; t < nw; ++t) {
+                size_t lo = static_cast<size_t>(t) * per, hi = std::min(n, lo + per);
+                if (lo >= hi) break;
+                ts.emplace_back(worker, lo, hi);
+            }
+            for (auto& th : ts) th.join();
+
+            for (size_t i = 0; i < n; ++i) {
+                int L = len[i];
+                SequenceFingerprint fp(hh[i], static_cast<size_t>(L));
+                auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
+                if (inserted) {
+                    if (profile_.enabled) it->second.damage_score = dsc[i];
+                    if (errcor_.enabled) {
+                        it->second.seq_id = arena_.append_chars(canon.data() + off[i], L);
+                        if (hasq[i]) qual_arena_.append_chars(canonq.data() + off[i], L);
+                        else         qual_arena_.append_empty();
+                    }
+                } else {
+                    it->second.count++;
+                    if (profile_.enabled && dsc[i] > it->second.damage_score) {
+                        it->second.record_index = record_idx;
+                        it->second.damage_score = dsc[i];
+                    }
+                }
+                if (fwd[i]) it->second.fwd_count++;
+                ++record_idx;
+                ++total_reads_;
+                if ((total_reads_ % 1000000) == 0) {
+                    size_t uniq = index_.size();
+                    double dup_pct = 100.0 * (1.0 - (double)uniq / total_reads_);
+                    std::cerr << "\r[Pass 1] " << total_reads_ << " reads, "
+                              << uniq << " unique, " << std::fixed << std::setprecision(1)
+                              << dup_pct << "% dedup" << std::flush;
+                }
+            }
+        }
+
+        std::cerr << "\r";
+        log_info("Pass 1 complete: " + std::to_string(total_reads_) +
+                 " reads indexed (parallel x" + std::to_string(n_threads) + ")");
     }
 
     // Phase 3: parent-centric mismatch pattern detection.
@@ -635,11 +744,21 @@ private:
                      std::to_string(kBruteforceMinLen) + "," +
                      std::to_string(kMinInteriorLen - 1) + "]");
 
-        // Build CSR per shard per tag
+        // Streaming Phase-3: instead of building every length-shard up front and
+        // holding them all resident (the ~33GB FlatPairIndex peak), the B1 driver
+        // below builds ONE ilen's shard just-in-time, runs that ilen's children
+        // against it, then frees it before the next ilen. Candidate edges are
+        // strictly intra-ilen (B1 requires parent.len==child.len), and the output
+        // is invariant to the order in which edges are collected (proven: identical
+        // md5 across thread counts / work-stealing orders), so per-ilen streaming
+        // is byte-for-byte identical to the all-resident build. `build_map` is kept
+        // live and consumed one ilen at a time. Peak collapses to floor +
+        // largest-single-shard.
         ska::flat_hash_map<int, LenShard> shards;
-        shards.reserve(build_map.size());
-        for (auto& [ilen, tag_entries] : build_map) {
+        std::array<uint64_t, 8> bhist{};
+        auto build_shard = [&](int ilen) -> LenShard& {
             auto& sh = shards[ilen];
+            auto& tag_entries = build_map[ilen];
             for (int t = 0; t < 6; ++t) {
                 auto& ev = tag_entries[t];
                 std::sort(ev.begin(), ev.end(),
@@ -660,29 +779,77 @@ private:
                         i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
-                }
-            }
-        }
-        build_map.clear();  // free memory before allocating ChildMismatch vector
-
-        // Bucket histogram
-        std::array<uint64_t, 8> bhist{};
-        for (const auto& [ilen, sh] : shards)
-            for (const auto& pi : sh.pi)
-                for (size_t ki = 0; ki < pi.keys.size(); ++ki) {
-                    uint32_t blen = pi.offsets[ki + 1] - pi.offsets[ki];
+                    uint32_t blen = pi.offsets.back() - pi.offsets[pi.offsets.size() - 2];
                     unsigned b = blen == 0 ? 0 : 31 - __builtin_clz(blen);
                     bhist[std::min(b, 7u)]++;
                 }
-        std::string hstr;
-        for (int i = 0; i < 8; ++i) hstr += (i ? "," : "") + std::to_string(bhist[i]);
-        log_info("Phase 3 bucket histogram [1,2,3-4,5-8,9-16,17-32,33-64,65+]: " + hstr);
+                pi.build_directory();  // O(1) key lookup, replaces per-probe lower_bound
+            }
+            build_map.erase(ilen);  // free this ilen's build entries once shard is built
+            return sh;
+        };
 
         // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
-        // Pre-warm layout_cache before workers start so it becomes read-only.
+        // Pre-warm layout_cache before workers start so it becomes read-only, and
+        // build a per-id interior slab: extract each eligible long-interior id's
+        // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
+        // deref) instead of re-extracting it per child. That re-extraction was the
+        // 38% __memmove_evex in the perf profile. Output-preserving: at the B1 use
+        // site the parent's length == the child's length (checked there), so the
+        // id's own layout used here is the exact layout used at the comparison.
+        std::vector<uint64_t> interior_off(static_cast<size_t>(N) + 1, 0);
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
-            (void)get_layout(arena_.length(id));
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen >= kMinInteriorLen)
+                interior_off[id + 1] = static_cast<uint64_t>((lay.ilen + 3) / 4);
+        }
+        for (uint32_t id = 0; id < N; ++id)
+            interior_off[id + 1] += interior_off[id];
+        std::vector<uint8_t> interior_slab(interior_off[N]);
+        for (uint32_t id = 0; id < N; ++id) {
+            if (!arena_.is_eligible(id)) continue;
+            const auto& lay = get_layout(arena_.length(id));
+            if (lay.ilen < kMinInteriorLen) continue;
+            extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
+                                interior_slab.data() + interior_off[id]);
+        }
+        auto interior_ptr = [&](uint32_t id) -> const uint8_t* {
+            return interior_slab.data() + interior_off[id];
+        };
+
+        // Group children by interior length so each shard's children are a
+        // contiguous window in `order`; the driver builds/frees one ilen's shard
+        // around its window. Only ids with a real interior (>= kBruteforceMinLen)
+        // ever generate edges; tinier ids are skipped by the worker. Output is
+        // order-invariant, so grouping by (ilen,id) instead of id is byte-identical.
+        std::vector<uint32_t> order;
+        struct IlenSeg { int ilen; uint32_t lo, hi; };
+        std::vector<IlenSeg> ilen_segs;
+        {
+            std::vector<std::pair<int, uint32_t>> tmp;
+            tmp.reserve(N);
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                int il = get_layout(arena_.length(id)).ilen;
+                tmp.emplace_back(il, id);  // include tiny ids too: the worker visits
+            }                              // and counts them exactly as the [0,N) scan did
+            std::sort(tmp.begin(), tmp.end(),
+                      [](const std::pair<int, uint32_t>& a,
+                         const std::pair<int, uint32_t>& b) {
+                          return a.first != b.first ? a.first < b.first
+                                                    : a.second < b.second;
+                      });
+            order.reserve(tmp.size());
+            for (size_t i = 0; i < tmp.size();) {
+                int il = tmp[i].first;
+                uint32_t lo = static_cast<uint32_t>(order.size());
+                while (i < tmp.size() && tmp[i].first == il) {
+                    order.push_back(tmp[i].second);
+                    ++i;
+                }
+                ilen_segs.push_back({il, lo, static_cast<uint32_t>(order.size())});
+            }
         }
 
         unsigned n_threads = errcor_.threads;
@@ -705,7 +872,9 @@ private:
         std::vector<B1LocalStats>              per_thread_stats(n_threads);
 
         constexpr uint32_t kChunkSize = 256;
-        const uint32_t n_chunks = (N + kChunkSize - 1) / kChunkSize;
+        // Per-ilen dispatch window into `order`; the driver sets [seg_lo,seg_hi)
+        // and seg_chunks and resets next_chunk before launching each ilen's workers.
+        uint32_t seg_lo = 0, seg_hi = 0, seg_chunks = 0;
         std::atomic<uint32_t> next_chunk{0};
 
         auto b1_worker = [&](unsigned tid) {
@@ -724,13 +893,24 @@ private:
 
             while (true) {
                 uint32_t chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                if (chunk >= n_chunks) break;
-                uint32_t cid_lo = chunk * kChunkSize;
-                uint32_t cid_hi = std::min(cid_lo + kChunkSize, N);
+                if (chunk >= seg_chunks) break;
+                uint32_t pos_lo = seg_lo + chunk * kChunkSize;
+                uint32_t pos_hi = std::min(pos_lo + kChunkSize, seg_hi);
 
-                for (uint32_t cid = cid_lo; cid < cid_hi; ++cid) {
+                for (uint32_t pos = pos_lo; pos < pos_hi; ++pos) {
+                    uint32_t cid = order[pos];
                     if (is_error_[cid]) continue;
                     if (!arena_.is_eligible(cid)) continue;
+
+                    // Timing here is diagnostic only (decode_hash_child_ms/query_ms/check_ms
+                    // feed a log summary, never an algorithmic decision -- confirmed by reading
+                    // every consumer of B1LocalStats). clk::now() was being called 4x per read
+                    // on the full-scale hot path (profiled: ~60%+ of this worker's CPU time was
+                    // in __vdso_clock_gettime, not the actual comparison logic). Sample 1-in-64
+                    // and extrapolate (x kTimingStride) to keep the aggregate estimate roughly
+                    // unbiased while cutting timestamp-call overhead ~64x.
+                    constexpr uint32_t kTimingStride = 64;
+                    const bool do_time = (cid % kTimingStride) == 0;
 
                     int L = arena_.length(cid);
                     const auto& lay = get_layout(L);
@@ -756,7 +936,11 @@ private:
                         compute_interior_rc(ci_full_s, lay.ilen, crc_full_s);
 
                         ls.short_brute_evaluated++;
-                        for (uint32_t pid : parents_vec) {
+                        constexpr uint32_t kPrefetchAhead = 8;
+                        for (size_t pvi = 0; pvi < parents_vec.size(); ++pvi) {
+                            uint32_t pid = parents_vec[pvi];
+                            if (pvi + kPrefetchAhead < parents_vec.size())
+                                __builtin_prefetch(arena_.data(parents_vec[pvi + kPrefetchAhead]), 0, 0);
                             if (is_error_[pid]) continue;
                             if (pid == cid) continue;
                             if (id_count[pid] < id_count[cid]) continue;
@@ -791,22 +975,21 @@ private:
                     auto shard_it = shards.find(lay.ilen);
                     if (shard_it == shards.end()) continue;
 
-                    auto t0 = clk::now();
+                    auto t0 = do_time ? clk::now() : clk::time_point{};
             // Scratch layout (per child):
             //   [0 .. nbytes)               : ci_parts  (4-part canonical, nb0+nb1+nb2+nb3 bytes)
             //   [nbytes .. nbytes+nf)       : ci_full   (full canonical interior)
             //   [nbytes+nf .. nbytes+2nf)   : crc_full  (RC of ci_full)
             //   [nbytes+2nf .. 2*nbytes+2nf): crc_parts (4-part RC, nb0+nb1+nb2+nb3 bytes)
-            //   [2*nbytes+2nf .. 2*nbytes+3nf): pi_buf  (parent, per candidate)
+            // (parent interior is read from the per-id slab, not scratch.)
             int nf = (lay.ilen + 3) / 4;
-            size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 3 * nf);
+            size_t total_scratch = static_cast<size_t>(2 * lay.nbytes + 2 * nf);
             if (scratch.size() < total_scratch)
                 scratch.resize(total_scratch);
             uint8_t* ci_parts  = scratch.data();
             uint8_t* ci_full   = ci_parts  + lay.nbytes;
             uint8_t* crc_full  = ci_full   + nf;
             uint8_t* crc_parts = crc_full  + nf;
-            uint8_t* pi_buf    = crc_parts + lay.nbytes;
 
             const uint8_t* psrc_c = arena_.data(cid);
             int starts[4] = {lay.k5,
@@ -839,14 +1022,29 @@ private:
             for (int p = 0; p < 4; ++p)
                 extract_packed_part(crc_full, rc_starts[p], sizes[p], crc_p[p]);
             for (int p = 0; p < 4; ++p) rh[p] = XXH3_64bits(crc_p[p], nbs[p]);
-            auto t1 = clk::now();
-            ls.decode_hash_child_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (do_time) {
+                auto t1 = clk::now();
+                ls.decode_hash_child_ms +=
+                    std::chrono::duration<double, std::milli>(t1 - t0).count() * kTimingStride;
+            }
 
             ls.children_scanned++;
 
             // Collect unique parent candidates — query both canonical and RC hash keys.
             // With bucket_cap=0 (default), the storage grows; with bucket_cap>0 it is
             // pre-sized and any overflow is counted (paired with bucket_overflow_drops).
+            //
+            // Tried and reverted: dedup-on-insert (linear scan before append), reasoning
+            // that avg candidates/child measured at 1.23 on a real 5M-read run meant
+            // std::sort+std::unique's overhead should dominate actual work. Measured
+            // result was the opposite: 98.3s -> 112.7s wall clock, cache-miss rate
+            // 10.17% -> 11.41%, LLC misses +29% (perf stat, same dataset, byte-identical
+            // correctness both ways). Likely cause: introsort's small-N fast path
+            // (insertion sort below its threshold) is already a fast, cache-friendly
+            // single sequential pass; the interleaved linear-scan-per-insert during the
+            // 12 hash lookups appears to hurt cache behavior more than the sort/unique
+            // pass it replaced. Kept as sort+unique -- a small average candidate count
+            // does not by itself justify removing a well-optimized generic algorithm.
             uint32_t n_cands = 0;
             const bool unbounded = (errcor_.bucket_cap == 0);
             auto collect = [&](uint32_t pid) {
@@ -859,14 +1057,17 @@ private:
             };
             uint32_t* cand_buf = cand_storage.data();
 
-            auto tq0 = clk::now();
+            auto tq0 = do_time ? clk::now() : clk::time_point{};
             auto& sh = shard_it->second;
             for (int t = 0; t < 6; ++t) {
                 sh.pi[t].query(pair_key(h[kPairA[t]],  h[kPairB[t]],  t, lay.ilen), collect);
                 sh.pi[t].query(pair_key(rh[kPairA[t]], rh[kPairB[t]], t, lay.ilen), collect);
             }
-            auto tq1 = clk::now();
-            ls.query_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+            if (do_time) {
+                auto tq1 = clk::now();
+                ls.query_ms +=
+                    std::chrono::duration<double, std::milli>(tq1 - tq0).count() * kTimingStride;
+            }
 
             // Refresh: collect() may have reallocated cand_storage in unbounded mode.
             cand_buf = cand_storage.data();
@@ -875,7 +1076,18 @@ private:
                 std::unique(cand_buf, cand_buf + n_cands) - cand_buf);
             ls.total_candidates += n_cands;
 
-            auto tc0 = clk::now();
+            auto tc0 = do_time ? clk::now() : clk::time_point{};
+            // Two-pass software-pipelined gather to deepen memory-level
+            // parallelism. Each pi_buf gather below scatters into the 3.6GB
+            // slab and is the dominant LLC miss (57% of B1). Pass A applies the
+            // cheap guards and issues a prefetch for EVERY surviving parent's
+            // interior, so all ~21 cold misses go outstanding together (vs one
+            // K-ahead before, which also wasted slots on guard-failing pids).
+            // Pass B runs the compares once the lines are in flight. Output-
+            // neutral: survivors are compacted into cand_buf in candidate order
+            // (n_surv <= ci, no clobber of unread entries) and the compare body
+            // is unchanged, so the recorded edges are byte-identical.
+            uint32_t n_surv = 0;
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
                 uint32_t pid = cand_buf[ci];
                 if (is_error_[pid]) continue;
@@ -891,9 +1103,15 @@ private:
                 // (both halves of the pair share the same mismatch → sig/parent = 100%).
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-
-                // Extract parent's full interior for comparison.
-                extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf);
+                __builtin_prefetch(interior_ptr(pid), 0, 0);
+                cand_buf[n_surv++] = pid;
+            }
+            for (uint32_t si = 0; si < n_surv; ++si) {
+                uint32_t pid = cand_buf[si];
+                // Parent's full interior: read from the per-id slab (extracted
+                // once). pid has length == L here (checked in Pass A), so its
+                // slab layout equals lay -> byte-identical to a live extract.
+                const uint8_t* pi_buf = interior_ptr(pid);
 
                 // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, errcor_.protect_transversions);
@@ -971,20 +1189,40 @@ private:
                     if (admit_h2(mm2, true)) { /* admitted */ }
                 }
             }
-            ls.check_ms += std::chrono::duration<double, std::milli>(clk::now() - tc0).count();
+            if (do_time) {
+                ls.check_ms +=
+                    std::chrono::duration<double, std::milli>(clk::now() - tc0).count() * kTimingStride;
+            }
                 }  // end for cid in chunk
             }  // end while chunk dispatcher
         };  // end b1_worker
 
-        if (n_threads == 1) {
-            b1_worker(0);
-        } else {
-            std::vector<std::thread> ts;
-            ts.reserve(n_threads - 1);
-            for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(b1_worker, t);
-            b1_worker(0);
-            for (auto& th : ts) th.join();
+        // Streaming driver: process one ilen at a time. Build that ilen's shard
+        // (long-interior ilens only; short-brute ilens use the global short_parents
+        // index), dispatch B1 over its contiguous child window in `order`, then
+        // free the shard before the next ilen. FlatPairIndex residency collapses
+        // from sum-of-all-shards to the single largest shard. Edges are intra-ilen
+        // and output is order-invariant, so this is byte-identical to the old
+        // all-shards-resident pass.
+        for (const auto& seg : ilen_segs) {
+            seg_lo = seg.lo;
+            seg_hi = seg.hi;
+            seg_chunks = (seg_hi - seg_lo + kChunkSize - 1) / kChunkSize;
+            const bool has_shard = seg.ilen >= kMinInteriorLen;
+            if (has_shard) build_shard(seg.ilen);
+            next_chunk.store(0, std::memory_order_relaxed);
+            if (n_threads == 1) {
+                b1_worker(0);
+            } else {
+                std::vector<std::thread> ts;
+                ts.reserve(n_threads - 1);
+                for (unsigned t = 1; t < n_threads; ++t) ts.emplace_back(b1_worker, t);
+                b1_worker(0);
+                for (auto& th : ts) th.join();
+            }
+            if (has_shard) shards.erase(seg.ilen);
         }
+        build_map.clear();  // all long ilens already erased in build_shard; no-op safety
 
         // Merge per-thread state. B2 sorts mismatches deterministically, but
         // we concat in tid order so the same -j N gives byte-identical output.
@@ -1124,18 +1362,111 @@ private:
 
         fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
         if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
-            std::vector<fqdup::errcor_emp::EdgeCandidate> all_edges;
-            all_edges.reserve(mismatches.size());
-            std::unordered_set<uint64_t> distinct_bundles;
-            distinct_bundles.reserve(mismatches.size());
-            for (const auto& cm : mismatches) {
-                all_edges.emplace_back(build_edge(cm));
-                distinct_bundles.insert(bundle_key_of[cm.parent_id]);
+            // WIN 1: stream edges into the empirical model instead of
+            // materializing the full all_edges vector (~43GB at full scale).
+            // Each thread folds its slice of mismatches[] into a private per-bin
+            // accumulator; the set-union merge is order-independent, so the
+            // fitted model is bit-identical to the old build-then-fit path.
+            // build_edge() is a pure function of one ChildMismatch, so B2
+            // recomputes each edge inline where it needs it.
+            unsigned n_edge_threads = errcor_.threads;
+            if (n_edge_threads == 0)
+                n_edge_threads = std::max(1u, std::thread::hardware_concurrency());
+            const size_t NE = mismatches.size();
+            std::vector<std::unordered_set<uint64_t>> local_bundles(n_edge_threads);
+            std::vector<std::vector<std::unordered_set<uint64_t>>> local_bins(n_edge_threads);
+            auto edge_worker = [&](unsigned t) {
+                const size_t lo = NE * t / n_edge_threads;
+                const size_t hi = NE * (t + 1) / n_edge_threads;
+                auto& lb = local_bundles[t];
+                auto& bins = local_bins[t];
+                bins.assign(fqdup::errcor_emp::kNumBins, {});
+                for (size_t j = lo; j < hi; ++j) {
+                    emp_model.accumulate_edge(bins, build_edge(mismatches[j]));
+                    lb.insert(bundle_key_of[mismatches[j].parent_id]);
+                }
+            };
+            if (n_edge_threads == 1) {
+                edge_worker(0);
+            } else {
+                std::vector<std::thread> ets;
+                ets.reserve(n_edge_threads - 1);
+                for (unsigned t = 1; t < n_edge_threads; ++t)
+                    ets.emplace_back(edge_worker, t);
+                edge_worker(0);
+                for (auto& th : ets) th.join();
             }
-            emp_model.fit(all_edges, distinct_bundles.size());
+            std::unordered_set<uint64_t> distinct_bundles;
+            for (auto& lb : local_bundles)
+                distinct_bundles.insert(lb.begin(), lb.end());
+            // ── Phase-3 peak memory accounting (LOG-ONLY; byte-identical) ─────
+            // Emitted at the Phase-3 resident peak: every large B1 structure is
+            // still live (read arena, FlatPairIndex shards, interior slab,
+            // mismatches[]) alongside the just-built distinct-bundle sets and the
+            // per-thread fit accumulators, so accounted bytes reconcile against
+            // the process VmHWM. Reads only container sizes — no algorithm or
+            // output change.
+            {
+                auto vcap = [](const auto& v) -> uint64_t {
+                    return static_cast<uint64_t>(v.capacity()) * sizeof(*v.data());
+                };
+                auto set_bytes = [](const std::unordered_set<uint64_t>& s) -> uint64_t {
+                    // node ≈ 8B key + 8B next-ptr + malloc overhead (~16B); plus
+                    // the bucket pointer array. Approximate, labelled "~".
+                    return static_cast<uint64_t>(s.bucket_count()) * 8ull +
+                           static_cast<uint64_t>(s.size()) * 32ull;
+                };
+                uint64_t arena_b = vcap(arena_.packed) + vcap(arena_.offsets) +
+                                   vcap(arena_.lengths) + vcap(arena_.eligible);
+                uint64_t qual_b  = vcap(qual_arena_.bytes) + vcap(qual_arena_.offsets) +
+                                   vcap(qual_arena_.lengths);
+                uint64_t counts_b = vcap(id_count) + vcap(acc_count) +
+                                    vcap(bundle_key_of) + vcap(rescue_bundle_key_of);
+                uint64_t fpi_b = 0;
+                for (const auto& kv : shards)
+                    for (const auto& pi : kv.second.pi)
+                        fpi_b += vcap(pi.keys) + vcap(pi.offsets) + vcap(pi.ids) +
+                                 vcap(pi.dir);
+                uint64_t mm_b   = vcap(mismatches);
+                uint64_t slab_b = vcap(interior_slab) + vcap(interior_off);
+                uint64_t db_b   = set_bytes(distinct_bundles);
+                uint64_t bins_b = 0;
+                for (const auto& lbset : local_bundles) bins_b += set_bytes(lbset);
+                for (const auto& bins : local_bins)
+                    for (const auto& s : bins) bins_b += set_bytes(s);
+                uint64_t total_b = arena_b + qual_b + counts_b + fpi_b + mm_b +
+                                   slab_b + db_b + bins_b;
+                unsigned long vmhwm_kb = 0;
+                if (FILE* f = std::fopen("/proc/self/status", "r")) {
+                    char line[256];
+                    while (std::fgets(line, sizeof(line), f))
+                        if (std::sscanf(line, "VmHWM: %lu kB", &vmhwm_kb) == 1) break;
+                    std::fclose(f);
+                }
+                auto gb = [](uint64_t b) {
+                    char x[32];
+                    std::snprintf(x, sizeof(x), "%.2f", static_cast<double>(b) / 1073741824.0);
+                    return std::string(x);
+                };
+                auto fld = [&](const char* n, uint64_t b) {
+                    return std::string(n) + "=" + std::to_string(b) + "|" + gb(b) + "GB ";
+                };
+                log_info("Phase 3 mem breakdown: " +
+                         fld("read_arena", arena_b) + fld("qual_arena", qual_b) +
+                         fld("counts(id+acc+bundle_key)", counts_b) +
+                         fld("FlatPairIndex", fpi_b) + fld("mismatches", mm_b) +
+                         fld("interior_slab", slab_b) +
+                         fld("distinct_bundles~", db_b) + fld("fit_accum~", bins_b) +
+                         "| TOTAL_accounted=" + std::to_string(total_b) + "|" + gb(total_b) + "GB" +
+                         "  VmHWM=" + std::to_string(static_cast<uint64_t>(vmhwm_kb) * 1024ull) +
+                         "|" + gb(static_cast<uint64_t>(vmhwm_kb) * 1024ull) + "GB");
+            }
+            for (auto& bins : local_bins)
+                emp_model.fit_merge(bins);
+            emp_model.fit_finalize(distinct_bundles.size());
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%.4g", emp_model.p_real_global);
-            log_info("Phase 3 empirical model: " + std::to_string(all_edges.size()) +
+            log_info("Phase 3 empirical model: " + std::to_string(NE) +
                      " edges, " + std::to_string(distinct_bundles.size()) +
                      " distinct bundles, p_real_global=" + buf);
             std::snprintf(buf, sizeof(buf), "%.3f", emp_model.log_pi_ratio_global);
@@ -1597,8 +1928,13 @@ private:
                             if (arena_.length(cid) != Lp) continue;
                             uint64_t cc = acc_count[cid];
                             if (cc == 0) continue;
-                            if (cp > 0 && static_cast<double>(cc) /
-                                static_cast<double>(cp) > errcor_.b3_count_ratio)
+                            // Require parent >= b3_count_ratio x child abundance
+                            // (a real sequence dominates its deaminated sibling).
+                            // The bucket is sorted count-descending so cp >= cc;
+                            // the old cc/cp test could never exceed 1, so the gate
+                            // never fired and no ratio filter was applied.
+                            if (static_cast<double>(cp) <
+                                static_cast<double>(cc) * errcor_.b3_count_ratio)
                                 continue;
                             ++stats.b3_candidates;
                             ci_buf.resize(static_cast<size_t>(nbp));
@@ -2745,7 +3081,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited)\n"
         << "  --errcor-snp-cutoff INT      Low-coverage cutoff (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    Low-coverage SNP multiplier (default: 1.75)\n"
-        << "  -t, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
+        << "  -p, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
         << "  --errcor-empirical           Empirical posterior-odds rule (default; absorb iff S>0)\n"
         << "  --errcor-legacy-veto         Legacy SNP-veto rule\n"
         << "  --protect-transversions      Protect A↔T / C↔G (Channels H/G) from H=1/H=2 absorption\n"
@@ -2933,7 +3269,7 @@ int derep_main(int argc, char** argv) {
             errcor.b3_max_hamming = v;
         } else if (arg == "--b3-count-ratio" && i + 1 < argc) {
             errcor.b3_count_ratio = std::stod(argv[++i]);
-        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+        } else if ((arg == "-p" || arg == "--threads") && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
             if (v < 0) { std::cerr << "Error: " << arg << " must be >= 0 (0 = auto), got " << v << "\n"; return 1; }
             errcor.threads = static_cast<unsigned>(v);
@@ -3117,6 +3453,12 @@ int derep_main(int argc, char** argv) {
                                                         : DamageClipPolicy::Off;
             opts.skip_deam_fit      = false;
             opts.max_reads          = damage_deam_max_reads;
+            // Forward the derep thread count to the taph deamination+QC pass;
+            // it defaulted to 1 (single-threaded), making Pass 0 ~2x slower than
+            // the standalone `profile -p N` path doing identical work. Match
+            // derep's 0->hardware_concurrency convention (see lines 688-689).
+            opts.threads            = errcor.threads ? errcor.threads
+                                                     : std::max(1u, std::thread::hardware_concurrency());
             if (damage_deam_max_reads > 0)
                 log_info("Damage deamination fit: sampling first " +
                          std::to_string(damage_deam_max_reads) +
