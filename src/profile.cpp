@@ -1399,10 +1399,10 @@ int profile_main(int argc, char** argv) {
             const double excess_merged_5 = dp.d_max_5prime, b_long_5 = du.d_max_5prime;
             const double excess_merged_3 = dp.d_max_3prime, b_long_3 = du.d_max_3prime;
             std::ostringstream sblk;
-            sblk << "  \"streams\": {\n"
+            sblk << "  \"length_contrast\": {\n"
                  << "    \"merged\": "   << stream_obj(dp, reads_scanned)    << ",\n"
                  << "    \"unmerged\": " << stream_obj(du, reads_scanned_pe) << ",\n"
-                 << "    \"length_contrast\": {\"delta_d5\": " << sj(excess_merged_5 - b_long_5)
+                 << "    \"contrast\": {\"delta_d5\": " << sj(excess_merged_5 - b_long_5)
                  << ", \"delta_d3\": " << sj(excess_merged_3 - b_long_3)
                  << ", \"excess_merged_d5\": " << sj(excess_merged_5)
                  << ", \"b_long_d5\": " << sj(b_long_5)
