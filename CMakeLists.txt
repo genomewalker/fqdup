@@ -115,7 +115,7 @@ add_executable(fqdup
     src/split.cpp
     src/trim.cpp
     src/merge.cpp
-    src/damage.cpp
+    src/profile.cpp
     src/damage_profile_estimate.cpp
     src/damage_profile_lsd.cpp
     src/damage_profile_lengthstrat.cpp
