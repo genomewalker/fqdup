@@ -653,9 +653,13 @@ private:
         }
         for (uint32_t id = 0; id < N; ++id)
             interior_off[id + 1] += interior_off[id];
-        // ceiling: interior_slab must be <4GiB so id_off fits uint32; upgrade: widen id_off to uint64
-        if (interior_off[N] > static_cast<uint64_t>(UINT32_MAX))
-            throw std::runtime_error("Phase 3 interior_slab exceeds 4GiB; widen FlatPairIndex::id_off to uint64");
+        // Candidate pack = (pid << kOffBits) | off, so off must fit kOffBits (16GiB slab)
+        // and pid must fit the remaining 64-kOffBits (=30) bits (~1.07B reads). id_off is
+        // uint64; only the packed candidate representation bounds the slab.
+        if (interior_off[N] >= (static_cast<uint64_t>(1) << 34))
+            throw std::runtime_error("Phase 3 interior_slab exceeds 16GiB; raise kOffBits");
+        if (static_cast<uint64_t>(N) >= (static_cast<uint64_t>(1) << 30))
+            throw std::runtime_error("Phase 3: >1.07B reads exceed candidate-pack pid field; raise pid bits");
         std::vector<uint8_t> interior_slab(interior_off[N]);
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
@@ -665,9 +669,38 @@ private:
                                 interior_slab.data() + interior_off[id]);
         }
 
+        // Distinct-4mer complexity of an interior (ASCII ACGT). Repetitive runs
+        // (homopolymer/STR/telomere/minisatellite) collapse to few distinct 4-mers
+        // regardless of length; real DNA keeps most positions distinct. Used to
+        // decide whether an oversized candidate bucket is a technical explosion
+        // (cap it) or genuinely abundant biology (keep every posting).
+        auto interior_low_complexity = [](const uint8_t* seq, int ilen, double frac) -> bool {
+            if (ilen < 8) return false;              // too short to judge → never cap
+            static const auto B = [] {
+                std::array<int8_t, 256> t{}; t.fill(-1);
+                t['A']=0; t['C']=1; t['G']=2; t['T']=3;
+                return t;
+            }();
+            uint64_t seen[4] = {0,0,0,0};
+            uint32_t kmer = 0; int run = 0, valid = 0;
+            for (int p = 0; p < ilen; ++p) {
+                int8_t c = B[seq[p]];
+                if (c < 0) { run = 0; continue; }
+                kmer = ((kmer << 2) | (uint32_t)c) & 0xFFu;  // trailing 4 bases (8 bits)
+                if (++run >= 4) { seen[kmer >> 6] |= (1ull << (kmer & 63)); ++valid; }
+            }
+            if (valid <= 0) return false;
+            int distinct = __builtin_popcountll(seen[0]) + __builtin_popcountll(seen[1])
+                         + __builtin_popcountll(seen[2]) + __builtin_popcountll(seen[3]);
+            return (double)distinct < frac * (double)valid;
+        };
+
         // Build CSR per shard per tag
         ska::flat_hash_map<int, LenShard> shards;
         shards.reserve(build_map.size());
+        // Entropy-cap visibility: how many oversized buckets we saw, capped (low-complexity),
+        // or spared (high-complexity → real abundant biology, left uncapped).
+        int64_t ent_oversized = 0, ent_capped = 0, ent_spared = 0;
         for (auto& [ilen, tag_entries] : build_map) {
             auto& sh = shards[ilen];
             for (int t = 0; t < 6; ++t) {
@@ -680,16 +713,33 @@ private:
                 while (i < ev.size()) {
                     uint64_t k = ev[i].key;
                     pi.keys.push_back(k);
+                    // Bucket extent [i, j): all postings sharing this part-key.
+                    size_t j = i;
+                    while (j < ev.size() && ev[j].key == k) ++j;
+                    // Decide the effective cap for THIS bucket. In entropy-aware mode an
+                    // oversized bucket is capped only when its representative interior is
+                    // low-complexity; complex buckets (real abundant reads) stay uncapped.
+                    uint32_t cap = errcor_.bucket_cap;  // 0 = no cap
+                    if (cap && errcor_.bucket_cap_lowcomplexity_only && (j - i) > cap) {
+                        ++ent_oversized;
+                        const auto& rlay = get_layout(arena_.length(ev[i].id));
+                        if (!interior_low_complexity(arena_.data(ev[i].id) + rlay.k5,
+                                                     rlay.ilen, errcor_.bucket_cap_complexity_frac)) {
+                            cap = 0;  // high-complexity → keep every posting
+                            ++ent_spared;
+                        } else {
+                            ++ent_capped;
+                        }
+                    }
                     uint32_t cnt = 0;
-                    while (i < ev.size() && ev[i].key == k) {
-                        if (errcor_.bucket_cap == 0 || cnt < errcor_.bucket_cap) {
+                    for (; i < j; ++i) {
+                        if (cap == 0 || cnt < cap) {
                             pi.ids.push_back(ev[i].id);
-                            pi.id_off.push_back(static_cast<uint32_t>(interior_off[ev[i].id]));
+                            pi.id_off.push_back(interior_off[ev[i].id]);
                             cnt++;
                         } else {
                             stats.bucket_overflow_drops++;
                         }
-                        i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
                 }
@@ -697,6 +747,12 @@ private:
             }
         }
         build_map.clear();  // free memory before allocating ChildMismatch vector
+
+        if (errcor_.bucket_cap && errcor_.bucket_cap_lowcomplexity_only)
+            log_info("Phase 3 entropy-cap: oversized buckets=" + std::to_string(ent_oversized)
+                     + " capped(low-complexity)=" + std::to_string(ent_capped)
+                     + " spared(high-complexity)=" + std::to_string(ent_spared)
+                     + " postings_dropped=" + std::to_string(stats.bucket_overflow_drops));
 
         // Bucket histogram
         std::array<uint64_t, 8> bhist{};
@@ -905,15 +961,21 @@ private:
             // pass it replaced. Kept as sort+unique -- a small average candidate count
             // does not by itself justify removing a well-optimized generic algorithm.
             uint32_t n_cands = 0;
-            const bool unbounded = (errcor_.bucket_cap == 0);
-            // Pack (pid, interior-offset) into one u64: pid in the high 32 bits,
-            // off in the low 32. off = interior_off[pid] is a pure function of pid,
-            // so ascending sort orders by pid exactly as before and std::unique with
-            // default == collapses duplicate pids (identical off) -> byte-identical.
+            // Entropy-aware mode leaves high-complexity buckets uncapped, so a query can
+            // legitimately return more than 12*bucket_cap postings — grow on demand there.
+            const bool unbounded = (errcor_.bucket_cap == 0) || errcor_.bucket_cap_lowcomplexity_only;
+            // Pack (pid, interior-offset) into one u64: pid in the high 30 bits, off in
+            // the low kOffBits(34). off = interior_off[pid] is a pure function of pid, so
+            // ascending sort orders by pid exactly as before and std::unique collapses
+            // duplicate pids (identical off) -> byte-identical. The 34-bit off field lifts
+            // the interior_slab ceiling from 4GiB to 16GiB (id_off is uint64 upstream), so
+            // >321M-unique libraries no longer overflow. pid gets the remaining 30 bits.
             // Carrying off here removes the random interior_off[pid] gather in the
             // candidate loop (was 48% of candidate-check DRAM misses).
-            auto collect = [&](uint32_t pid, uint32_t off) {
-                uint64_t packed = (static_cast<uint64_t>(pid) << 32) | off;
+            constexpr int      kOffBits = 34;
+            constexpr uint64_t kOffMask = (static_cast<uint64_t>(1) << kOffBits) - 1;
+            auto collect = [&](uint32_t pid, uint64_t off) {
+                uint64_t packed = (static_cast<uint64_t>(pid) << kOffBits) | (off & kOffMask);
                 if (unbounded) {
                     if (n_cands >= cand_storage.size()) cand_storage.resize(n_cands + 1);
                     cand_storage[n_cands++] = packed;
@@ -956,7 +1018,7 @@ private:
             uint32_t n_surv = 0;
             for (uint32_t ci = 0; ci < n_cands; ++ci) {
                 uint64_t packed = cand_buf[ci];
-                uint32_t pid = static_cast<uint32_t>(packed >> 32);
+                uint32_t pid = static_cast<uint32_t>(packed >> kOffBits);
                 if (is_error_[pid]) continue;
                 if (!arena_.is_eligible(pid)) continue;
                 if (arena_.length(pid) != static_cast<uint16_t>(L)) continue;
@@ -970,16 +1032,16 @@ private:
                 // (both halves of the pair share the same mismatch → sig/parent = 100%).
                 if (id_count[pid] < id_count[cid]) continue;
                 if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-                __builtin_prefetch(interior_slab.data() + static_cast<uint32_t>(packed), 0, 0);
+                __builtin_prefetch(interior_slab.data() + (packed & kOffMask), 0, 0);
                 cand_buf[n_surv++] = packed;
             }
             for (uint32_t si = 0; si < n_surv; ++si) {
                 uint64_t packed = cand_buf[si];
-                uint32_t pid = static_cast<uint32_t>(packed >> 32);
+                uint32_t pid = static_cast<uint32_t>(packed >> kOffBits);
                 // Parent's full interior: read from the per-id slab (extracted
                 // once). pid has length == L here (checked in Pass A), so its
                 // slab layout equals lay -> byte-identical to a live extract.
-                const uint8_t* pi_buf = interior_slab.data() + static_cast<uint32_t>(packed);
+                const uint8_t* pi_buf = interior_slab.data() + (packed & kOffMask);
 
                 // Try direct comparison (H=1 — same canonical orientation)
                 MismatchInfo mm = packed_find_mismatch(pi_buf, ci_full, 0, lay.ilen, errcor_.protect_transversions);
@@ -2993,6 +3055,10 @@ int derep_main(int argc, char** argv) {
             if (v < 0) { std::cerr << "Error: --errcor-bucket-cap must be >= 0 (0 = unlimited), got " << v << "\n"; return 1; }
             errcor.bucket_cap = static_cast<uint32_t>(v);
             bucket_cap_explicit = true;
+        } else if (arg == "--errcor-bucket-cap-lowcomplexity") {
+            errcor.bucket_cap_lowcomplexity_only = true;
+        } else if (arg == "--errcor-bucket-cap-complexity-frac" && i + 1 < argc) {
+            errcor.bucket_cap_complexity_frac = std::stod(argv[++i]);
         } else if (arg == "--errcor-snp-cutoff" && i + 1 < argc) {
             long v = std::stol(argv[++i]);
             if (v < 1) { std::cerr << "Error: --errcor-snp-cutoff must be >= 1, got " << v << "\n"; return 1; }

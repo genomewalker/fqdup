@@ -20,6 +20,8 @@
 
 #include <array>
 #include <condition_variable>
+#include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -565,6 +567,22 @@ static SeqComplexity worst_window(const std::string& seq, int lo, int hi, int W 
     return {worst_ent, worst_dom};
 }
 
+// Conservative homopolymer/degenerate test for the pre-merge fast reject. Fixed hard
+// threshold (NOT the learned gate): a read is obvious junk only if its worst window is
+// near-degenerate (a single base ≥90% or entropy <0.4 bits — poly-A/poly-G tracts). This
+// catches only the extreme tail cheaply, before spending overlap-detection work; the
+// data-derived merged-read gate downstream handles the borderline low-complexity cases.
+static constexpr float HOMOPOLYMER_DOM = 0.90f;
+static constexpr float HOMOPOLYMER_ENT = 0.40f;
+static bool is_homopolymer_read(const std::string& seq) {
+    if ((int)seq.size() < COMPLEXITY_W) {
+        auto c = seq_complexity(seq, 0, (int)seq.size());
+        return c.max_frac >= HOMOPOLYMER_DOM || c.entropy < HOMOPOLYMER_ENT;
+    }
+    auto w = worst_window(seq, 0, (int)seq.size());
+    return w.max_frac >= HOMOPOLYMER_DOM || w.entropy < HOMOPOLYMER_ENT;
+}
+
 // Adapter-dimer test for an unmerged mate's 5' end. A zero-insert dimer reads straight
 // into the read-through adapter, but a 1-base indel (e.g. missing leading A) shifts the
 // match so clip_unmerged's exact anchored find_adapter_in misses it and the full adapter
@@ -583,6 +601,134 @@ static bool is_adapter_dimer_5p(const std::string& seq, const std::string& adapt
                 mm += (seq[rs + k] != adapter[as + k]);
             if (mm <= max_mm) return true;
         }
+    }
+    return false;
+}
+
+// Myers (1999) bit-parallel semi-global approximate matcher: minimum edit distance of a
+// pattern (<=64bp -> one machine word) against any substring of a text, in O(text) word
+// ops. Semi-global (free start/end in text) => shift-in 0 (edlib "HW"). This is the
+// mapper-grade primitive (edlib/minimap2 use it); adapter trimmers mostly use heavier
+// edit-distance DP (cutadapt) or k-mers (bbduk). Here it detects adapter-fragment merged
+// reads (dimers / mismerges) that position-anchored 5'/3' checks miss.
+struct BitMatcher {
+    uint64_t Peq[4] = {0, 0, 0, 0};
+    int m = 0;
+    static int b2(char c) { switch (c) { case 'A': return 0; case 'C': return 1;
+                                         case 'G': return 2; case 'T': return 3; } return -1; }
+    void build(const std::string& p) {
+        m = (int)std::min<size_t>(p.size(), 64);
+        Peq[0] = Peq[1] = Peq[2] = Peq[3] = 0;
+        for (int i = 0; i < m; ++i) { int b = b2(p[i]); if (b >= 0) Peq[b] |= (1ULL << i); }
+    }
+    struct Hit { int dist = INT_MAX; int end = -1; };   // min edit distance + text end index
+    Hit search_pos(const char* T, int n) const {
+        Hit h;
+        if (m == 0) return h;
+        uint64_t VP = ~0ULL, VN = 0; int score = m; uint64_t hb = 1ULL << (m - 1);
+        for (int j = 0; j < n; ++j) {
+            int b = b2(T[j]); uint64_t Eq = (b >= 0) ? Peq[b] : 0;
+            uint64_t Xv = Eq | VN;
+            uint64_t Xh = (((Eq & VP) + VP) ^ VP) | Eq;
+            uint64_t Ph = VN | ~(Xh | VP);
+            uint64_t Mh = VP & Xh;
+            if (Ph & hb) score++; else if (Mh & hb) score--;
+            Ph <<= 1; Mh <<= 1;
+            VP = Mh | ~(Xv | Ph); VN = Ph & Xv;
+            if (score < h.dist) { h.dist = score; h.end = j; }
+        }
+        return h;
+    }
+    int search(const char* T, int n) const { return search_pos(T, n).dist; }
+};
+
+// A merged read is an adapter fragment (dimer / adapter-only mismerge) when the WHOLE read
+// aligns as a substring of the learned adapter (either orientation) within a small edit
+// budget. Read-as-pattern (<=64bp) searched in the adapter text — this catches the SHORT
+// (15-24bp) adapter fragments that a full-adapter match can't (read shorter than adapter).
+// Tiered: an exact 11-mer of the read must appear in the adapter reference first (fast
+// reject: real inserts share no adapter 11-mer, so they skip the bit-vector entirely).
+static bool is_adapter_fragment(const std::string& read,
+                                const std::string& adapter1, const std::string& adapter2) {
+    const int L = (int)read.size();
+    if (L < 12 || (int)adapter1.size() < 12) return false;
+    if (adapter1.find(read.substr(0, 11)) == std::string::npos &&
+        adapter2.find(read.substr(0, 11)) == std::string::npos) return false;  // fast reject
+    BitMatcher bm; bm.build(read);
+    const int k = 1 + L / 8;   // ~12% edit budget over the read
+    return bm.search(adapter1.data(), (int)adapter1.size()) <= k ||
+           bm.search(adapter2.data(), (int)adapter2.size()) <= k;
+}
+
+// Verification instrumentation for the Myers adapter-fragment drop (highest-risk path):
+// a false positive eats short damaged inserts and biases damage estimation. These count
+// the drops and their length histogram so a run can confirm the drops are dimer-shaped
+// (peaked at adapter length ~15-24bp), not shaving the real short-fragment tail.
+static std::atomic<int64_t> g_frag_drop{0};
+static std::atomic<int64_t> g_frag_len_hist[64];
+// Audit hook: FQDUP_TECH_DUMP=<path> dumps every dropped-as-technical sequence so a run
+// can confirm the drops are genuine adapter/construct, not real damaged inserts.
+static std::mutex g_tech_dump_mx;
+static std::ofstream* tech_dump_stream() {
+    static std::ofstream* s = [] {
+        const char* p = std::getenv("FQDUP_TECH_DUMP");
+        return p ? new std::ofstream(p) : nullptr;
+    }();
+    return s;
+}
+static inline void note_frag_drop(const std::string& seq) {
+    g_frag_drop.fetch_add(1, std::memory_order_relaxed);
+    g_frag_len_hist[std::min((int)seq.size(), 63)].fetch_add(1, std::memory_order_relaxed);
+    if (auto* s = tech_dump_stream()) {
+        std::lock_guard<std::mutex> lk(g_tech_dump_mx);
+        (*s) << seq << '\n';
+    }
+}
+static std::atomic<int64_t> g_embed_drop{0};
+
+// Third angle (after 5' dimer and 3' read-through): an adapter EMBEDDED mid-read, i.e. a
+// confident adapter-prefix match that (a) is not at the 5', (b) is followed by >=3bp that do
+// NOT continue as adapter, and (c) has real insert before it. That is a mismerge chimera
+// ([insert][adapter fragment][junk]) — never a real molecule — so drop it. If the sequence
+// after the prefix DOES continue as adapter it's a 3' read-through (trim handles it, insert
+// kept), and a 5' match is the dimer path — neither is flagged here.
+static bool is_adapter_embedded(const std::string& read,
+                                const std::string& ad1, const std::string& ad2) {
+    const int L = (int)read.size();
+    auto chk = [&](const std::string& ad) -> bool {
+        if ((int)ad.size() < 18 || L < 24) return false;
+        BitMatcher bm; bm.build(ad.substr(0, 16));         // 16bp adapter prefix probe
+        BitMatcher::Hit h = bm.search_pos(read.data(), L);
+        if (h.dist > 2) return false;                      // no confident adapter-prefix hit
+        int start = h.end - 15;                            // prefix start in read
+        if (start < 6) return false;                       // 5' region -> dimer path, not here
+        int after = L - 1 - h.end;
+        if (after < 3) return false;                       // at/near 3' end -> read-through (trim)
+        int chkn = std::min(after, std::min((int)ad.size() - 16, 8));
+        int cont = 0;
+        for (int i = 0; i < chkn; ++i) cont += (read[h.end + 1 + i] == ad[16 + i]);
+        if (chkn >= 4 && cont >= chkn - 1) return false;   // continues as adapter -> read-through
+        return true;                                       // insert + adapter fragment + non-adapter = chimera
+    };
+    return chk(ad1) || chk(ad2);
+}
+
+// Unified merged-read technical-sequence QC across ALL learned constructs (both orientations
+// pre-expanded in `techs`): the read is technical if it is an adapter dimer (5'), an adapter
+// fragment (whole read is adapter), or an embedded-adapter chimera for ANY construct. Cheap
+// checks first; the fragment/embedded paths already fast-reject via an exact adapter k-mer.
+static std::atomic<int64_t> g_reason_dimer{0}, g_reason_frag{0}, g_reason_embed{0};
+// Merged-read technical gate. A MERGED read is [insert][3'adapter]; its 5' is the insert,
+// so it is technical only if the WHOLE read is adapter/construct (a zero-insert dimer that
+// overlap-merged into pure adapter) or an embedded-adapter chimera. Both are full-length
+// significance tests. The 5'-anchor dimer check (is_adapter_dimer_5p) is intentionally NOT
+// used here: it is calibrated for UNMERGED mates that read into adapter at the 5', and on
+// merged reads it false-drops real inserts whose 5' coincidentally resembles the adapter
+// start within 2 mismatches (measured: 98% of its drops were real DNA, <70% adapter identity).
+static bool is_technical_read(const std::string& read, const std::vector<std::string>& techs) {
+    for (size_t ti = 0; ti < techs.size(); ++ti) {
+        const auto& t = techs[ti];
+        if (is_adapter_fragment(read, t, t)) { g_reason_frag.fetch_add(1, std::memory_order_relaxed); return true; }
     }
     return false;
 }
@@ -634,7 +780,12 @@ static void rc_record(const FastqRecord& r2, std::string& seq, std::string& qual
 struct MergeOpts {
     int   min_ov        = 11;
     float max_mm_rate   = 0.08f;
-    int   min_length    = 15;
+    // Drop every output read below 30nt: DART predict cannot use shorter reads
+    // (--min-length 30), so carrying them through sort/derep is wasted work and a
+    // low-complexity candidate-explosion source. Enforced on ALL emit paths via passes_qc
+    // (merged + unmerged mates). Override with --min-length. NOTE: this changes merge
+    // output vs the 15nt WIN1 reference (intentional — new clean-data policy for DART).
+    int   min_length    = 30;
     int   skip_terminal = 0;
     int   clip_5p       = 0;   // 0=disabled; hard-clip N bases from R1 5' end before merge
     int   poly_g_min_run = 0;   // 0=disabled; trim 3' poly-G runs >= this length
@@ -647,7 +798,9 @@ struct MergeOpts {
     std::string adapter2;
     std::string adapter_5p_linker;              // library 5' construct clipped from unmerged reads
     std::string forced_library_type;            // "ss"/"ds" declared override; ""=auto-detect
+    std::string json_out;                       // --json: comprehensive lossless merge-QC report
     std::vector<std::string> extra_adapters1;   // additional R1 adapters to try (from --adapter-fasta)
+    std::vector<std::string> tech_seqs;          // ALL learned technical constructs (multi-adapter QC)
     bool  use_internal_panel = false;           // --internal-panel: aDNA construct read-through table
     std::string damage_out;     // path for paired damage profile JSON; empty=disabled
     std::string subst_out;      // path for overlap substitution matrix TSV; empty=disabled
@@ -660,8 +813,12 @@ struct MergeOpts {
 // ============================================================================
 
 struct DetectedParams {
-    std::string adapter1;      // 24bp P7_RC suffix found on R1 past overlap
-    std::string adapter2;      // 24bp P5_RC suffix found on RC(R2) past overlap
+    std::string adapter1;      // dominant learned construct on R1 past overlap
+    std::string adapter2;      // its revcomp (RC(R2) side)
+    std::vector<std::string> tech_seqs;   // ALL learned technical constructs (P7/P5/splint/index/...)
+    // Per-construct provenance for the QC JSON (parallel to tech_seqs, before revcomp expansion).
+    struct TechInfo { std::string seq; int64_t support = 0; double ic_body = 0.0; };
+    std::vector<TechInfo> tech_info;
     bool   is_ss           = false;
     bool   type_from_panel = false;  // is_ss set by construct-panel stem vote (overrides geometry)
     float  type_confidence = 0.f;    // |prefix_agree_rate - 0.5| * 2, in [0,1]
@@ -705,6 +862,25 @@ static DetectedParams detect_merge_params(
     int64_t prefix_agree = 0, prefix_total = 0;
     // Adapter suffix k-mer frequency
     std::unordered_map<std::string, int> a1_freq, a2_freq;
+    // Full read-through adapter learned by overlap-consensus: r1[p1:] (the region past the
+    // insert boundary) IS adapter1, read straight from the data. Accumulate per-position
+    // ACGT counts across the sample; a column-majority walk to the coverage/agreement cliff
+    // yields the full-length adapter (30+bp) instead of a 12bp seed — making read-through
+    // trimming and adapter-dimer detection shift-robust with no magic anchor. O(MAXADAPT)/pair.
+    static constexpr int MAXADAPT   = 48;
+    static constexpr int ADAPT_MINN = 100;   // min supporting pairs before we trust a learned construct
+    static constexpr int MAX_TECH   = 6;     // max distinct technical constructs learned (P7/P5/splint/index/...)
+    // Min beyond-seed consensus information (bits) to accept a construct as a real fixed
+    // adapter rather than a phantom cluster of real inserts sharing a leading 10-mer.
+    // 0 during calibration (accept all + print); set to the data-derived cut after.
+    static constexpr double MIN_IC_BODY = 0.0;
+    // Multi-construct learning: the region past the insert is technical sequence, read from
+    // the data. Cluster those post-insert regions by their leading 10-mer (different constructs
+    // start differently); each cluster's per-position majority consensus is one full technical
+    // sequence. This is adapter-AGNOSTIC (harvested at the overlap boundary, not via a known
+    // adapter), so it learns EVERY construct present, not just the top-1.
+    struct TechCluster { std::array<std::array<int64_t, 4>, MAXADAPT> cons{}; int64_t n = 0; };
+    std::unordered_map<uint32_t, TechCluster> tech_clusters;
     // R1 5' 12-mer frequency: a fixed library construct (adapter-dimer prefix) spikes here;
     // real inserts spread thin (<1%). Used to detect a 5' linker to clip from unmerged reads.
     std::unordered_map<std::string, int> r1_5p_freq;
@@ -804,6 +980,33 @@ static DetectedParams detect_merge_params(
         // ---- adapter k-mer collection ----
         if (p1 >= min_ov && p1 + 12 <= L1)
             a1_freq[pr.r1.seq.substr(p1, 12)]++;
+        // multi-construct consensus: the region past the overlap boundary `ov` is technical
+        // sequence, whatever the construct (harvested at the ADAPTER-AGNOSTIC overlap boundary,
+        // not via a known adapter). Cluster by its leading 10-mer so different constructs
+        // (P7 / P5 / splint / index) accumulate into separate consensuses.
+        if (ov >= min_ov && ov + 10 <= L1) {
+            uint32_t key = 0; bool ok = true;
+            for (int j = 0; j < 10 && ok; ++j) {
+                switch (pr.r1.seq[ov + j]) {
+                    case 'A': key = (key << 2);          break;
+                    case 'C': key = (key << 2) | 1u;     break;
+                    case 'G': key = (key << 2) | 2u;     break;
+                    case 'T': key = (key << 2) | 3u;     break;
+                    default:  ok = false;                break;
+                }
+            }
+            if (ok) {
+                TechCluster& tc = tech_clusters[key];
+                int amax = std::min(MAXADAPT, L1 - ov);
+                for (int j = 0; j < amax; ++j) {
+                    switch (pr.r1.seq[ov + j]) {
+                        case 'A': tc.cons[j][0]++; break; case 'C': tc.cons[j][1]++; break;
+                        case 'G': tc.cons[j][2]++; break; case 'T': tc.cons[j][3]++; break;
+                    }
+                }
+                tc.n++;
+            }
+        }
         // adapter2 in RC(R2) at position r2s - 12 (just before the insert)
         if (r2s >= 12)
             a2_freq[rc2_seq.substr(r2s - 12, 12)]++;
@@ -921,12 +1124,79 @@ static DetectedParams detect_merge_params(
         for (auto& [k,v] : freq) if (v > best_n) { best_n = v; best = k; }
         return best;
     };
-    // RC(R2) adapter: use detected if high confidence, else TruSeq default
-    std::string a2 = best_kmer(a2_freq);
-    if (a2.empty() || a2_freq[a2] < 100) a2 = TRUSEQ_RC2;
-    d.adapter2 = a2;
-    // adapter1 = RC(adapter2)
-    d.adapter1 = revcomp(d.adapter2);  // revcomp from fastq_common.hpp
+    // Full read-through adapter1 from the R1 post-insert consensus. Walk columns while
+    // coverage stays >= half the peak AND the majority base clears 60% — that is the fixed
+    // adapter body; where either drops we have run into the (random) insert continuation, so
+    // stop. Below ADAPT_MINN supporting pairs the consensus is untrusted → fall back to the
+    // 12bp seed / TruSeq default (a safe adapter, never a degenerate one).
+    // Consensus of one cluster: walk columns while coverage >= half the peak AND the majority
+    // base clears 60% — the fixed construct body; where either drops we've hit the random insert
+    // continuation, so stop.
+    auto consensus_of = [&](const TechCluster& tc) -> std::string {
+        int64_t peak = tc.n; std::string a;
+        for (int j = 0; j < MAXADAPT; ++j) {
+            int64_t tot = 0, mx = 0; int mb = 0;
+            for (int b = 0; b < 4; ++b) { tot += tc.cons[j][b]; if (tc.cons[j][b] > mx) { mx = tc.cons[j][b]; mb = b; } }
+            if (tot == 0 || tot < peak / 2) break;
+            if ((double)mx / (double)tot < 0.60) break;
+            a += "ACGT"[mb];
+        }
+        return a;
+    };
+    // Learn ALL technical constructs: rank clusters by support, consensus the top MAX_TECH with
+    // a real body (>=12bp) and enough support. tech_seqs[0] is the dominant read-through adapter.
+    std::vector<std::pair<int64_t, const TechCluster*>> ranked;
+    ranked.reserve(tech_clusters.size());
+    for (auto& kv : tech_clusters) ranked.push_back({kv.second.n, &kv.second});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const std::pair<int64_t,const TechCluster*>& a,
+                 const std::pair<int64_t,const TechCluster*>& b){ return a.first > b.first; });
+    // Likelihood-ratio construct gate (fixed-adapter hypothesis vs random-DNA null).
+    // Clusters are seeded on a shared leading 10-mer, so the first SEEDLEN columns carry
+    // ~2 bits each by construction — for BOTH a real adapter and a phantom cluster of real
+    // inserts that merely share a 10-mer. The discriminator is the information content of
+    // the consensus BEYOND the seed: a fixed construct stays determined (~1.7 bits/col) for
+    // 20-40 more columns; a phantom decays to background (~0 bits) at once. IC_body is that
+    // beyond-seed information in bits; only constructs carrying real fixed sequence pass.
+    constexpr int SEEDLEN = 10;
+    auto ic_body_of = [&](const TechCluster& tc, int len) -> double {
+        double ic = 0.0;
+        for (int j = SEEDLEN; j < len && j < MAXADAPT; ++j) {
+            int64_t tot = 0;
+            for (int b = 0; b < 4; ++b) tot += tc.cons[j][b];
+            if (tot == 0) continue;
+            double H = 0.0;
+            for (int b = 0; b < 4; ++b) {
+                double p = (double)tc.cons[j][b] / (double)tot;
+                if (p > 0) H -= p * std::log2(p);
+            }
+            ic += (2.0 - H);
+        }
+        return ic;
+    };
+    const bool tech_dbg = std::getenv("FQDUP_TECH_LEARN") != nullptr;
+    for (auto& r : ranked) {
+        if ((int)d.tech_seqs.size() >= MAX_TECH || r.first < ADAPT_MINN) break;
+        std::string a = consensus_of(*r.second);
+        double icb = ic_body_of(*r.second, (int)a.size());
+        if (tech_dbg)
+            std::cerr << "[tech-learn] support=" << r.first << " len=" << a.size()
+                      << " ic_body=" << icb << "  " << a << "\n";
+        if ((int)a.size() >= 12 && icb >= MIN_IC_BODY) {
+            d.tech_seqs.push_back(a);
+            d.tech_info.push_back({a, r.first, icb});
+        }
+    }
+    if (!d.tech_seqs.empty()) {
+        d.adapter1 = d.tech_seqs[0];          // dominant learned construct (30+bp typical)
+        d.adapter2 = revcomp(d.adapter1);
+    } else {
+        std::string a2 = best_kmer(a2_freq);
+        if (a2.empty() || a2_freq[a2] < 100) a2 = TRUSEQ_RC2;
+        d.adapter2 = a2;
+        d.adapter1 = revcomp(d.adapter2);
+        d.tech_seqs.push_back(d.adapter1);    // never leave the list empty (safe fallback)
+    }
 
     // ---- 5' library linker (adapter-dimer prefix) ----
     // A single 12-mer dominating R1 5' ends (>=5% of reads) that is NOT the read-through
@@ -1163,6 +1433,15 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             int L1 = (int)r1.seq.size();
             int L2 = (int)r2.seq.size();
 
+            // Conservative pre-merge homopolymer reject: when BOTH raw mates are
+            // near-degenerate the insert is junk regardless of merge outcome, so drop
+            // it before spending overlap-detection work (speed + smaller output). The
+            // learned merged-read gate downstream handles borderline low-complexity.
+            if (is_homopolymer_read(r1.seq) && is_homopolymer_read(r2.seq)) {
+                ++out.n_dropped;
+                continue;
+            }
+
             if (L1 < opts.min_ov || L2 < opts.min_ov ||
                 L1 > MAX_READ_LEN  || L2 > MAX_READ_LEN) {
                 // Too short or too long to overlap: clip adapters and emit as unmerged
@@ -1334,7 +1613,17 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                                      + rc2_qual.substr(best_ov);
                     if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
                     if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
-                    if (passes_qc(mr.merged, opts, 0.f, 1.0f)) {  // merged = reference, no complexity gate
+                    // Gate merged inserts on the learned insert-complexity tail (r1 side =
+                    // insert orientation, the same worst-window distribution ref_ent_r1 was
+                    // sampled from). Low-complexity inserts (poly-A/STR run-through) are the
+                    // source of the Phase-3 candidate-bucket explosion downstream.
+                    // A 5' adapter on a MERGED read means it's an adapter dimer (real aDNA
+                    // inserts are [insert][3'adapter], never 5'adapter) — the shifted/mismatch
+                    // match the strict 5' trim above misses. These short adapter fragments are
+                    // the dominant Phase-3 bucket-explosion lineage. Drop them.
+                    if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
+                        ++out.n_dropped; note_frag_drop(mr.merged.seq);
+                    } else if (passes_qc(mr.merged, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)) {
                         ++out.n_merged;
                         out.records.push_back(std::move(mr));
                     } else {
@@ -1366,7 +1655,12 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
             if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
 
-            if (!passes_qc(mr.merged, opts, 0.f, 1.0f)) {  // merged = reference, no complexity gate
+            // Adapter dimer on the merged read (5' adapter, shifted/mismatch match the
+            // strict trim missed) → no real insert; drop. Dominant bucket-explosion lineage.
+            if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
+                ++out.n_dropped; note_frag_drop(mr.merged.seq);
+            // Gate merged inserts on the learned insert-complexity tail (see above).
+            } else if (!passes_qc(mr.merged, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)) {
                 emit_unmerged(r1, r2, out);
             } else {
                 if (do_subst)
@@ -1410,7 +1704,8 @@ static void usage() {
         "Overlap:\n"
         "  --min-overlap N    Minimum overlap length (default: 11)\n"
         "  --max-mm-rate F    Max mismatch rate in overlap (default: 0.08)\n"
-        "  --min-length N     Discard merged reads shorter than N bp (default: 15)\n"
+        "  --min-length N     Discard reads shorter than N bp, all emit paths (default: 30)\n"
+        "  --json FILE        Write comprehensive lossless merge-QC report (JSON)\n"
         "  --clip-r1-5p N     Hard-clip N bases from R1 5' end before overlap (removes adapter stubs)\n"
         "  --min-entropy F    Discard low-complexity merged reads; Shannon entropy floor in bits\n"
         "                     (0=disabled; poly-G≈0, random≈2.0; default: 0)\n"
@@ -1494,6 +1789,7 @@ int merge_main(int argc, char** argv) {
         else if (a == "--min-overlap"      && i+1 < argc) opts.min_ov       = std::stoi(argv[++i]);
         else if (a == "--max-mm-rate"      && i+1 < argc) opts.max_mm_rate  = std::stof(argv[++i]);
         else if (a == "--min-length"       && i+1 < argc) opts.min_length   = std::stoi(argv[++i]);
+        else if (a == "--json"             && i+1 < argc) opts.json_out     = argv[++i];
         else if (a == "--adapter1"         && i+1 < argc) opts.adapter1       = argv[++i];
         else if (a == "--adapter2"         && i+1 < argc) opts.adapter2       = argv[++i];
         else if (a == "--adapter-fasta"    && i+1 < argc) adapter_fasta       = argv[++i];
@@ -1554,6 +1850,10 @@ int merge_main(int argc, char** argv) {
         opts.adapter2 = det.adapter2;
         opts.adapter_5p_linker = det.adapter_5p_linker;
         opts.skip_terminal = det.skip_terminal;
+        // All learned technical constructs, in BOTH orientations, for the merged-read QC
+        // (dimer / fragment / embedded checks scan against every construct, not just the top one).
+        opts.tech_seqs = det.tech_seqs;
+        for (const auto& t : det.tech_seqs) opts.tech_seqs.push_back(revcomp(t));
         // Internal aDNA construct panel (protocol constants; Ellesmere supp §4.3.2 / Kapp 2021 /
         // Illumina TruSeq): extra R1-side read-through constructs tried in phase-0-extra. Replicates
         // the published fastp --adapter_fasta panel. Gated OFF by default (--internal-panel);
@@ -1870,6 +2170,26 @@ int merge_main(int argc, char** argv) {
               << "Balance:          " << (balanced ? "OK" : "MISMATCH")
               << " (pairs_in=" << pairs_in << ")\n";
 
+    // Verification: the Myers adapter-fragment drop (highest FP risk). It is CLEAN if the
+    // count is small and the length histogram peaks at adapter length (dimer-shaped ~15-24bp);
+    // it is BIASING damage if it shaves the short real-insert tail. Length histogram of drops:
+    {
+        int64_t fd = g_frag_drop.load();
+        std::cerr << "Adapter-fragment drops (Myers): " << fd;
+        if (fd > 0) {
+            std::cerr << "  len-hist[";
+            for (int L = 12; L < 64; ++L) {
+                int64_t c = g_frag_len_hist[L].load();
+                if (c > 0) std::cerr << L << ":" << c << " ";
+            }
+            std::cerr << "]";
+        }
+        std::cerr << "\n";
+        std::cerr << "Technical-drop reason: dimer=" << g_reason_dimer.load()
+                  << " fragment=" << g_reason_frag.load()
+                  << " embedded=" << g_reason_embed.load() << "\n";
+    }
+
     if (g_clip_dbg) {
         static const char* STEP[8] = {
             "wholeread@detected-adapter", "wholeread@universal", "linker-5p",
@@ -1880,6 +2200,83 @@ int merge_main(int argc, char** argv) {
                 int64_t v = g_clip_death[m][s].load();
                 if (v) std::cerr << "  " << (m ? "R2" : "R1") << "  " << STEP[s] << " = " << v << "\n";
             }
+    }
+
+    // ---- comprehensive lossless merge-QC JSON ----
+    if (!opts.json_out.empty()) {
+        std::ofstream j(opts.json_out);
+        if (!j) {
+            std::cerr << "Error: cannot write --json " << opts.json_out << "\n";
+        } else {
+            j.precision(9);
+            auto js = [](const std::string& s) {
+                std::string o = "\"";
+                for (char c : s) { if (c == '"' || c == '\\') o += '\\'; o += c; }
+                o += '"'; return o;
+            };
+            const char* udg = det.is_udg ? "full" : (det.is_half_udg ? "half" : "none");
+            j << "{\n";
+            j << "  \"tool\": \"fqdup merge\",\n";
+            j << "  \"library\": {\n";
+            j << "    \"type\": \"" << (is_ss ? "ss" : "ds") << "\",\n";
+            j << "    \"type_source\": " << js(lib_type_source) << ",\n";
+            j << "    \"type_confidence\": " << lib_type_conf << ",\n";
+            j << "    \"udg\": \"" << udg << "\",\n";
+            j << "    \"skip_terminal\": " << det.skip_terminal << ",\n";
+            j << "    \"damage_5prime\": " << det.damage_5p << ",\n";
+            j << "    \"damage_3prime\": " << det.damage_3p << "\n";
+            j << "  },\n";
+            j << "  \"adapters\": {\n";
+            j << "    \"adapter1\": " << js(opts.adapter1) << ",\n";
+            j << "    \"adapter2\": " << js(opts.adapter2) << ",\n";
+            j << "    \"linker_5prime\": " << js(opts.adapter_5p_linker) << ",\n";
+            j << "    \"tech_constructs\": [";
+            for (size_t i = 0; i < det.tech_info.size(); ++i) {
+                const auto& t = det.tech_info[i];
+                j << (i ? "," : "") << "\n      {\"seq\": " << js(t.seq)
+                  << ", \"length\": " << t.seq.size()
+                  << ", \"support\": " << t.support
+                  << ", \"ic_body_bits\": " << t.ic_body << "}";
+            }
+            j << (det.tech_info.empty() ? "" : "\n    ") << "]\n";
+            j << "  },\n";
+            j << "  \"complexity_gate\": {\n";
+            j << "    \"r1\": {\"entropy_lo\": " << det.complexity_entropy_lo_r1
+              << ", \"dom_hi\": " << det.complexity_dom_hi_r1
+              << ", \"ref_n\": " << det.complexity_ref_n_r1 << "},\n";
+            j << "    \"r2\": {\"entropy_lo\": " << det.complexity_entropy_lo_r2
+              << ", \"dom_hi\": " << det.complexity_dom_hi_r2
+              << ", \"ref_n\": " << det.complexity_ref_n_r2 << "}\n";
+            j << "  },\n";
+            j << "  \"params\": {\"min_overlap\": " << opts.min_ov
+              << ", \"max_mismatch_rate\": " << opts.max_mm_rate
+              << ", \"min_length\": " << opts.min_length
+              << ", \"poly_g_min_run\": " << opts.poly_g_min_run << "},\n";
+            j << "  \"counts\": {\n";
+            j << "    \"pairs_in\": " << pairs_in << ",\n";
+            j << "    \"merged\": " << n_merged << ",\n";
+            j << "    \"unmerged\": " << n_unmerged << ",\n";
+            j << "    \"orphan_r1\": " << n_orphan_r1 << ",\n";
+            j << "    \"orphan_r2\": " << n_orphan_r2 << ",\n";
+            j << "    \"dropped\": " << n_dropped << ",\n";
+            j << "    \"balanced\": " << (balanced ? "true" : "false") << "\n";
+            j << "  },\n";
+            j << "  \"drops\": {\n";
+            j << "    \"technical_total\": " << g_frag_drop.load() << ",\n";
+            j << "    \"by_reason\": {\"adapter_fragment\": " << g_reason_frag.load()
+              << ", \"adapter_dimer\": " << g_reason_dimer.load()
+              << ", \"adapter_embedded\": " << g_reason_embed.load() << "},\n";
+            j << "    \"length_histogram\": {";
+            bool first = true;
+            for (int L = 12; L < 64; ++L) {
+                int64_t c = g_frag_len_hist[L].load();
+                if (c > 0) { j << (first ? "" : ", ") << "\"" << L << "\": " << c; first = false; }
+            }
+            j << "}\n";
+            j << "  }\n";
+            j << "}\n";
+            std::cerr << "Merge JSON:       " << opts.json_out << "\n";
+        }
     }
 
     return 0;
