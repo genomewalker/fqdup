@@ -652,12 +652,51 @@ static bool is_adapter_fragment(const std::string& read,
                                 const std::string& adapter1, const std::string& adapter2) {
     const int L = (int)read.size();
     if (L < 12 || (int)adapter1.size() < 12) return false;
-    if (adapter1.find(read.substr(0, 11)) == std::string::npos &&
-        adapter2.find(read.substr(0, 11)) == std::string::npos) return false;  // fast reject
+    // Fast reject: real inserts share no exact adapter 11-mer. Probe the read 5', middle and
+    // 3' so a single INTERIOR indel (which frameshifts the sequence past its site) cannot hide
+    // every seed — a merged interior-indel dimer keeps a clean 11-mer on one side of the indel.
+    // A 5'-only probe missed these (the AGATCGGAAGAG G-run indel sits in the first 11bp). This
+    // only decides whether Myers RUNS; the k-budget below still gates the drop, so broadening
+    // the seed cannot false-drop a real insert (which won't align full-length within ~12%).
+    bool seed_hit = false;
+    for (int off : {0, (L - 11) / 2, L - 11}) {
+        const std::string kmer = read.substr(off, 11);
+        if (adapter1.find(kmer) != std::string::npos || adapter2.find(kmer) != std::string::npos) {
+            seed_hit = true; break;
+        }
+    }
+    if (!seed_hit) return false;
     BitMatcher bm; bm.build(read);
     const int k = 1 + L / 8;   // ~12% edit budget over the read
     return bm.search(adapter1.data(), (int)adapter1.size()) <= k ||
            bm.search(adapter2.data(), (int)adapter2.size()) <= k;
+}
+
+// Indel-tolerant 5' adapter-dimer test for an UNMERGED mate. is_adapter_dimer_5p uses a
+// rigid Hamming frame (read-start/adapter-start slide, no indels) and misses zero-insert
+// dimers carrying a single INTERIOR indel in the read-through adapter — the AGATCGGAAGAG
+// G-run is the common site (measured ss unmerged leak ~1.6%: the full adapter survives at
+// high entropy). Fast-reject on an exact adapter-5' seed sitting at the read 5' (real
+// inserts almost never carry it), then confirm with a Myers ±2 semi-global anchor of the
+// adapter 5' segment against the read 5' window: a dimer when the whole segment aligns
+// within edit distance max_ed and ends near its expected read position. Same edit-budget
+// specificity as is_adapter_fragment, so it does not eat real inserts.
+// ceiling: an indel inside the first `seedn` bases breaks the exact seed and escapes;
+// upgrade: a second interior seed. Not observed in the ss leak (indels sit at pos >=6).
+static bool is_adapter_dimer_5p_indel(const std::string& seq, const std::string& adapter,
+                                      int max_off = 4, int seedn = 6, int seg = 20, int max_ed = 2) {
+    const int L = (int)seq.size(), A = (int)adapter.size();
+    if (A < seedn + max_ed || L < seg) return false;
+    size_t sp = seq.find(adapter.substr(0, seedn));
+    if (sp == std::string::npos || (int)sp >= max_off) return false;  // adapter 5' must sit at the read 5'
+    const int plen = std::min(A, seg);
+    BitMatcher bm; bm.build(adapter.substr(0, plen));
+    const int win = std::min(L, plen + max_ed + max_off);
+    BitMatcher::Hit h = bm.search_pos(seq.data(), win);
+    // whole adapter 5' segment aligns within budget, ending near where a 5' dimer would put it
+    return h.dist <= max_ed
+        && h.end >= plen - 1 - max_ed
+        && h.end <= plen - 1 + max_ed + max_off;
 }
 
 // Verification instrumentation for the Myers adapter-fragment drop (highest-risk path):
@@ -684,47 +723,15 @@ static inline void note_frag_drop(const std::string& seq) {
         (*s) << seq << '\n';
     }
 }
-static std::atomic<int64_t> g_embed_drop{0};
-
-// Third angle (after 5' dimer and 3' read-through): an adapter EMBEDDED mid-read, i.e. a
-// confident adapter-prefix match that (a) is not at the 5', (b) is followed by >=3bp that do
-// NOT continue as adapter, and (c) has real insert before it. That is a mismerge chimera
-// ([insert][adapter fragment][junk]) — never a real molecule — so drop it. If the sequence
-// after the prefix DOES continue as adapter it's a 3' read-through (trim handles it, insert
-// kept), and a 5' match is the dimer path — neither is flagged here.
-static bool is_adapter_embedded(const std::string& read,
-                                const std::string& ad1, const std::string& ad2) {
-    const int L = (int)read.size();
-    auto chk = [&](const std::string& ad) -> bool {
-        if ((int)ad.size() < 18 || L < 24) return false;
-        BitMatcher bm; bm.build(ad.substr(0, 16));         // 16bp adapter prefix probe
-        BitMatcher::Hit h = bm.search_pos(read.data(), L);
-        if (h.dist > 2) return false;                      // no confident adapter-prefix hit
-        int start = h.end - 15;                            // prefix start in read
-        if (start < 6) return false;                       // 5' region -> dimer path, not here
-        int after = L - 1 - h.end;
-        if (after < 3) return false;                       // at/near 3' end -> read-through (trim)
-        int chkn = std::min(after, std::min((int)ad.size() - 16, 8));
-        int cont = 0;
-        for (int i = 0; i < chkn; ++i) cont += (read[h.end + 1 + i] == ad[16 + i]);
-        if (chkn >= 4 && cont >= chkn - 1) return false;   // continues as adapter -> read-through
-        return true;                                       // insert + adapter fragment + non-adapter = chimera
-    };
-    return chk(ad1) || chk(ad2);
-}
-
-// Unified merged-read technical-sequence QC across ALL learned constructs (both orientations
-// pre-expanded in `techs`): the read is technical if it is an adapter dimer (5'), an adapter
-// fragment (whole read is adapter), or an embedded-adapter chimera for ANY construct. Cheap
-// checks first; the fragment/embedded paths already fast-reject via an exact adapter k-mer.
-static std::atomic<int64_t> g_reason_dimer{0}, g_reason_frag{0}, g_reason_embed{0};
-// Merged-read technical gate. A MERGED read is [insert][3'adapter]; its 5' is the insert,
-// so it is technical only if the WHOLE read is adapter/construct (a zero-insert dimer that
-// overlap-merged into pure adapter) or an embedded-adapter chimera. Both are full-length
-// significance tests. The 5'-anchor dimer check (is_adapter_dimer_5p) is intentionally NOT
-// used here: it is calibrated for UNMERGED mates that read into adapter at the 5', and on
-// merged reads it false-drops real inserts whose 5' coincidentally resembles the adapter
-// start within 2 mismatches (measured: 98% of its drops were real DNA, <70% adapter identity).
+// Merged-read technical-sequence QC across ALL learned constructs (both orientations
+// pre-expanded in `techs`). A MERGED read is [insert][3'adapter], so its 5' is the insert
+// and it is technical only when the WHOLE read is adapter/construct — a zero-insert dimer
+// that overlap-merged into pure adapter (is_adapter_fragment, indel-tolerant, exact-k-mer
+// fast-reject). The 5'-anchor dimer check (is_adapter_dimer_5p) is intentionally NOT used
+// here: it is calibrated for UNMERGED mates that read into adapter at the 5', and on merged
+// reads it false-drops real inserts whose 5' coincidentally resembles the adapter start
+// (measured: 98% of its drops were real DNA, <70% adapter identity).
+static std::atomic<int64_t> g_reason_frag{0};
 static bool is_technical_read(const std::string& read, const std::vector<std::string>& techs) {
     for (size_t ti = 0; ti < techs.size(); ++ti) {
         const auto& t = techs[ti];
@@ -1393,9 +1400,11 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
         // Per-mate QC: low-complexity gate against that mate's merged reference, plus a
         // 5' adapter-dimer reject (learned read-through adapter shifted match clip missed).
         bool ok1 = passes_qc(u1, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)
-                   && !is_adapter_dimer_5p(u1.seq, opts.adapter1);
+                   && !is_adapter_dimer_5p(u1.seq, opts.adapter1)
+                   && !is_adapter_dimer_5p_indel(u1.seq, opts.adapter1);
         bool ok2 = passes_qc(u2, opts, opts.complexity_entropy_lo_r2, opts.complexity_dom_hi_r2)
-                   && !is_adapter_dimer_5p(u2.seq, opts.adapter2);
+                   && !is_adapter_dimer_5p(u2.seq, opts.adapter2)
+                   && !is_adapter_dimer_5p_indel(u2.seq, opts.adapter2);
         MergeRecord mr;
         mr.is_merged = false;
         if (ok1 && ok2) {
@@ -1613,17 +1622,17 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                                      + rc2_qual.substr(best_ov);
                     if (!opts.adapter2.empty()) trim_adapter_5p(mr.merged, opts.adapter2, opts.min_length);
                     if (!opts.adapter1.empty()) trim_adapter(mr.merged, opts.adapter1, opts.min_length);
-                    // Gate merged inserts on the learned insert-complexity tail (r1 side =
-                    // insert orientation, the same worst-window distribution ref_ent_r1 was
-                    // sampled from). Low-complexity inserts (poly-A/STR run-through) are the
-                    // source of the Phase-3 candidate-bucket explosion downstream.
-                    // A 5' adapter on a MERGED read means it's an adapter dimer (real aDNA
-                    // inserts are [insert][3'adapter], never 5'adapter) — the shifted/mismatch
-                    // match the strict 5' trim above misses. These short adapter fragments are
-                    // the dominant Phase-3 bucket-explosion lineage. Drop them.
+                    // Adapter dimer on a MERGED read (real aDNA inserts are [insert][3'adapter],
+                    // never 5'adapter): the whole read is adapter/construct that overlap-merged
+                    // into pure adapter — the shifted/mismatch match the strict 5' trim missed.
+                    // is_technical_read (Myers, indel-tolerant) drops it. NO low-complexity gate
+                    // on merged reads: the gate is derived FROM the merged inserts it would gate
+                    // (circular — rejects ~1-2% genuine inserts by construction); overlap
+                    // verification IS the complexity check. passes_qc(0.f,1.0f) keeps only the
+                    // absolute floors (min_length / max_n_rate / min_entropy).
                     if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
                         ++out.n_dropped; note_frag_drop(mr.merged.seq);
-                    } else if (passes_qc(mr.merged, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)) {
+                    } else if (passes_qc(mr.merged, opts, 0.f, 1.0f)) {
                         ++out.n_merged;
                         out.records.push_back(std::move(mr));
                     } else {
@@ -1659,8 +1668,8 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             // strict trim missed) → no real insert; drop. Dominant bucket-explosion lineage.
             if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
                 ++out.n_dropped; note_frag_drop(mr.merged.seq);
-            // Gate merged inserts on the learned insert-complexity tail (see above).
-            } else if (!passes_qc(mr.merged, opts, opts.complexity_entropy_lo_r1, opts.complexity_dom_hi_r1)) {
+            // No low-complexity gate on merged reads (circular — see above); absolute floors only.
+            } else if (!passes_qc(mr.merged, opts, 0.f, 1.0f)) {
                 emit_unmerged(r1, r2, out);
             } else {
                 if (do_subst)
@@ -2187,9 +2196,7 @@ int merge_main(int argc, char** argv) {
             std::cerr << "]";
         }
         std::cerr << "\n";
-        std::cerr << "Technical-drop reason: dimer=" << g_reason_dimer.load()
-                  << " fragment=" << g_reason_frag.load()
-                  << " embedded=" << g_reason_embed.load() << "\n";
+        std::cerr << "Technical-drop reason: fragment=" << g_reason_frag.load() << "\n";
     }
 
     if (g_clip_dbg) {
@@ -2265,9 +2272,7 @@ int merge_main(int argc, char** argv) {
             j << "  },\n";
             j << "  \"drops\": {\n";
             j << "    \"technical_total\": " << g_frag_drop.load() << ",\n";
-            j << "    \"by_reason\": {\"adapter_fragment\": " << g_reason_frag.load()
-              << ", \"adapter_dimer\": " << g_reason_dimer.load()
-              << ", \"adapter_embedded\": " << g_reason_embed.load() << "},\n";
+            j << "    \"by_reason\": {\"adapter_fragment\": " << g_reason_frag.load() << "},\n";
             j << "    \"length_histogram\": {";
             bool first = true;
             for (int L = 12; L < 64; ++L) {
