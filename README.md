@@ -14,9 +14,19 @@ damage patterns.
 
 ## How it works
 
-`fqdup` runs four steps in order. An optional diagnostic command, `fqdup profile`,
-can be run beforehand to inspect the damage profile and verify library-type
-detection.
+Paired-end reads are merged into single sequences first, with `fqdup merge` or
+`fastp --merge`. `fqdup` then runs four steps in order. An optional diagnostic
+command, `fqdup profile`, can be run beforehand to inspect the damage profile
+and verify library-type detection.
+
+**Input. `fqdup merge`**: overlap-merge R1 and RC(R2) into one full-length
+ancient DNA molecule. A pre-scan over the first 200k pairs auto-detects
+library type (DS/SS), adapters, and UDG status, then adapter, library-construct,
+and poly-G artifacts are removed before emitting the merged stream (plus
+unmerged pairs and orphans, both optionally adapter-trimmed). Tuned for aDNA
+overlap detection: high mismatch tolerance in the overlap (`--max-mm-rate`
+default 0.08) and Bayesian quality consensus at each overlapping base.
+`fastp --merge` remains a supported alternative merger.
 
 **0. `fqdup profile` (optional diagnostic)**: standalone multi-threaded damage
 profiler. Scans the input reads and reports d_max, lambda, background rate, and
@@ -59,7 +69,8 @@ counterparts (`-e`). The extended sequence is used as the cluster fingerprint.
 Short aDNA fragments that share a merged-read core typically diverge in their
 extensions, reducing false collisions. The representative kept per cluster is the
 entry with the longest merged read. This step is not about R1/R2 paired-end
-sequencing; its input is single-end merged reads from `fastp --merge`.
+sequencing; its input is single-end merged reads from `fqdup merge` or
+`fastp --merge`.
 
 **4. `fqdup derep`**: biological deduplication of the merged-read output.
 Two mechanisms, both on by default:
@@ -198,6 +209,47 @@ bash tests/smoke.sh $(pwd)/build/fqdup
 ---
 
 ## Options
+
+### `fqdup merge`
+
+Overlap-merge R1/R2 pairs into single collapsed reads. Optimized for ancient
+DNA: high damage-tolerance in the overlap, Bayesian quality consensus, and
+incremental-Hamming overlap detection. An upstream alternative to
+`fastp --merge`; see [[Merge]] for the phase-by-phase algorithm.
+
+```
+fqdup merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz [options]
+
+Required:
+  -1 FILE / -2 FILE          R1 / R2 input FASTQ
+  -o FILE                    Output: merged reads
+
+Library:
+  --library-type ds|ss       Override auto-detected library type
+
+Optional output:
+  --r1-out / --r2-out FILE   Unmerged R1 / R2 reads (adapter-trimmed if --adapterN given)
+  --orphan-out FILE          Reads where one mate was discarded by QC filters
+  --damage-out FILE          Strand-resolved paired damage profile JSON
+  --subst-out FILE           Per-position overlap substitution matrix TSV
+
+Overlap:
+  --min-overlap N            Minimum overlap length (default: 11)
+  --max-mm-rate F            Max mismatch rate in overlap (default: 0.08)
+  --min-length N             Discard reads shorter than N bp, all emit paths (default: 30)
+  --clip-r1-5p N             Hard-clip N bases from R1 5' end before overlap
+  --min-entropy F            Discard low-complexity merged reads by Shannon entropy (default: off)
+  --max-n-rate F             Discard merged reads with N fraction above F (default: 1.0=off)
+  --json FILE                Write comprehensive lossless merge-QC report
+
+Adapter trimming (for unmerged pairs):
+  --adapter1 / --adapter2 SEQ  R1 / R2 adapter sequence
+  --adapter-fasta FILE         FASTA with adapter pairs (multiple pairs supported)
+  --no-internal-panel          Disable built-in aDNA construct read-through trimming (default: on)
+```
+
+Library type, adapters, and UDG status are auto-detected from a 200k-read
+pre-scan unless overridden with `--library-type`/`--adapter1`/`--adapter2`.
 
 ### `fqdup profile`
 
@@ -356,7 +408,7 @@ fqdup sort -i INPUT -o OUTPUT --max-memory SIZE [options]
 fqdup derep_pairs -n NON -e EXT -o-non OUT -o-ext OUT [options]
 
 Required:
-  -n FILE      Sorted merged (fastp) FASTQ
+  -n FILE      Sorted merged (fqdup merge / fastp) FASTQ
   -e FILE      Sorted fqdup-extended FASTQ
   -o-non FILE  Output merged FASTQ (representatives)
   -o-ext FILE  Output extended FASTQ (representatives)
@@ -519,6 +571,40 @@ fqdup view FILE.fqcl [options]
   --json                  Emit structured JSON (schema fqdup.view.v1)
   --html PATH             Write self-contained HTML visualisation (top 50 clusters)
 ```
+
+### `fqdup gen`
+
+Synthetic FASTQ generator for testing: emits IID reads at a configurable GC
+content, mixing ancient (damaged) and modern reads at `--f-damaged`. Models
+5'/3' deamination, 8-oxoG G→T transversions, and pos-0 purine enrichment from
+depurination, plus a constant background substitution rate on all reads.
+
+```
+fqdup gen -o OUTPUT [options]
+
+  -o FILE                          Output FASTQ
+  -n, --reads N                    Number of reads (default: 1000000)
+  --seed N                         PRNG seed (default: 1)
+  --read-len N                     Fixed read length (default: 60)
+  --gc FLOAT                       GC content fraction (default: 0.45)
+  --f-damaged FLOAT                Fraction of ancient reads (default: 0.70)
+  --lib-type ds|ss                 Library type (default: ds)
+  --dmg5-max / --dmg5-lambda F     5' C→T amplitude / decay rate (default: 0.18 / 0.35)
+  --dmg3-ga-max / --dmg3-ga-lambda F  3' G→A amplitude / decay rate (default: same as 5')
+  --dmg3-ct-max / --dmg3-ct-lambda F  3' C→T amplitude / decay rate, SS only
+  --oxog FLOAT                     Per-G G→T probability (default: 0.0)
+  --depur FLOAT                    Pos-0 purine enrichment rate in ancient reads (default: 0.0)
+  --bg-ct / --bg-ga FLOAT          Background substitution rate, all reads (default: 0.001)
+  --q-score N                      Constant Phred quality (default: 40)
+```
+
+### `fqdup consensus` — currently disabled
+
+Designed to emit a per-cluster consensus FASTQ from a `.fqcl` cluster
+genealogy (lineage-collapsed Bayesian posterior per parent position, with
+damage-zone handling and per-cluster QC flags). Not runnable in this build:
+`main.cpp` routes `consensus` to a stub that prints "temporarily disabled
+(WIP refactor, task #20)" and exits 2.
 
 ---
 
