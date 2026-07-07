@@ -264,7 +264,8 @@ int split_main(int argc, char** argv) {
                 (unsigned long long)n_scan, (unsigned long long)target);
             log_info("LOW_ABUNDANCE auto-detected -> yield-locked split threshold: " + std::string(b));
             log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
-                     "(reference-free per-read AUC ~0.59).");
+                     "(reference-free per-read separation is weak; measure it per-run "
+                     "with FQDUP_SPLIT_SCORES).");
         } else {
             effective_threshold = static_cast<float>(split_threshold - pol.log_prior_odds);
             char b[160];
@@ -273,7 +274,8 @@ int split_main(int argc, char** argv) {
                 effective_threshold, pol.pi, pol.pi_lo, pol.pi_hi, pol.log_prior_odds);
             log_info("DETECTED -> posterior-threshold split: " + std::string(b));
             log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
-                     "(reference-free per-read AUC ~0.59).");
+                     "(reference-free per-read separation is weak; measure it per-run "
+                     "with FQDUP_SPLIT_SCORES).");
         }
 
         // --- Streaming classification pass ---
