@@ -801,7 +801,7 @@ struct MergeOpts {
     std::string json_out;                       // --json: comprehensive lossless merge-QC report
     std::vector<std::string> extra_adapters1;   // additional R1 adapters to try (from --adapter-fasta)
     std::vector<std::string> tech_seqs;          // ALL learned technical constructs (multi-adapter QC)
-    bool  use_internal_panel = false;           // --internal-panel: aDNA construct read-through table
+    bool  use_internal_panel = true;            // aDNA construct read-through table; default ON, --no-internal-panel disables
     std::string damage_out;     // path for paired damage profile JSON; empty=disabled
     std::string subst_out;      // path for overlap substitution matrix TSV; empty=disabled
     std::string subst_binary;   // path for binary .bsubst format; empty=disabled
@@ -1714,7 +1714,8 @@ static void usage() {
         "  --adapter1 SEQ     R1 adapter sequence (Illumina P7 RC)\n"
         "  --adapter2 SEQ     R2 adapter sequence (Illumina P7)\n"
         "  --adapter-fasta F  FASTA with adapter pairs (odd=R1, even=R2); multiple pairs supported\n"
-        "  --internal-panel   Also trim built-in aDNA construct read-throughs (ss/ds type-aware)\n\n"
+        "  --no-internal-panel  Disable built-in aDNA construct read-through trimming (default: ON;\n"
+        "                       --internal-panel kept as a no-op for back-compat)\n\n"
         "Performance:\n"
         "  -p N               Threads (default: all cores)\n"
         "  -h, --help         Show this help\n\n"
@@ -1793,7 +1794,8 @@ int merge_main(int argc, char** argv) {
         else if (a == "--adapter1"         && i+1 < argc) opts.adapter1       = argv[++i];
         else if (a == "--adapter2"         && i+1 < argc) opts.adapter2       = argv[++i];
         else if (a == "--adapter-fasta"    && i+1 < argc) adapter_fasta       = argv[++i];
-        else if (a == "--internal-panel")                 opts.use_internal_panel = true;
+        else if (a == "--internal-panel")                 opts.use_internal_panel = true;   // no-op back-compat (now default)
+        else if (a == "--no-internal-panel")              opts.use_internal_panel = false;
         else if (a == "--clip-r1-5p"       && i+1 < argc) opts.clip_5p         = std::stoi(argv[++i]);
         else if (a == "--poly-g")                         opts.poly_g_min_run = 10;
         else if (a == "--poly-g-min-run"   && i+1 < argc) opts.poly_g_min_run = std::stoi(argv[++i]);
