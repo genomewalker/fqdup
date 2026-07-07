@@ -85,7 +85,7 @@ FetchContent_MakeAvailable(librapidarchive)
 # finalize}_sample_profile and taph::SampleDamageProfile with d_max_combined,
 # all channels, GC bins. Library target: `taph`.
 # To pin against a local checkout during development, set FETCHCONTENT_SOURCE_DIR_LIBTAPH.
-set(FQDUP_MARCH "native" CACHE STRING "Value passed to -march= (override for CI/portability)")
+set(FQDUP_MARCH "x86-64-v3" CACHE STRING "Value passed to -march= (override for CI/portability)")
 # Build-provenance guard: a blank FETCHCONTENT_SOURCE_DIR_LIBTAPH silently pulls GitHub main,
 # which once linked a stale libtaph and produced wrong damage numbers with no visible signal.
 # Require an explicit local pin. CI that genuinely wants the remote fetch sets
