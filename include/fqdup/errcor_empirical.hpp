@@ -196,11 +196,28 @@ struct ErrCorEmpiricalModel {
 
     bool fitted = false;
 
+    // Cross-bundle accumulator (WIN 1): bundles_per_bin_[b] = the set of
+    // distinct bundle_keys observed in bin b. fit_accumulate() streams edges
+    // into it so the full edge vector never has to be materialized;
+    // fit_finalize() consumes it. Sized kNumBins on first use.
+    std::vector<std::unordered_set<uint64_t>> bundles_per_bin_;
+
     // Build from collected edges. `total_distinct_bundles` is the number of
     // distinct bundle_keys observed across all edges (used as the recurrence
     // denominator).
     void fit(const std::vector<EdgeCandidate>& edges,
              uint64_t total_distinct_bundles);
+
+    // WIN 1 streaming fit. accumulate_edge() folds one edge's mismatches into
+    // `acc` (kNumBins sets); it is const and takes a caller-owned accumulator
+    // so parallel workers can each fill a private accumulator and then merge —
+    // set-union is order-independent, so the finalized tables are bit-identical
+    // to the single-pass fit().
+    void accumulate_edge(std::vector<std::unordered_set<uint64_t>>& acc,
+                         const EdgeCandidate& e) const;
+    void fit_accumulate(const EdgeCandidate& e);
+    void fit_merge(const std::vector<std::unordered_set<uint64_t>>& other);
+    void fit_finalize(uint64_t total_distinct_bundles);
 
     // Posterior log-odds score for an edge.
     //   S = log P(obs|PCR) − log P(obs|real) + log π_pcr − log π_real
@@ -280,28 +297,52 @@ inline double ErrCorEmpiricalModel::score(const EdgeCandidate& e) const {
 //   "recurring" (seen in ≥2 distinct bundles globally) vs "singleton".
 //   log_pi_ratio_occ[o] = log( (n_singleton[o]+α) / (n_recurring[o]+α) )
 // Singleton-dominated occupancies favor PCR; recurring-dominated favor real.
+// ── Per-bin P(real | bin) from cross-bundle recurrence ─────────────────────
+// For each bin b, count the number of DISTINCT bundles in which a mismatch
+// falling in that bin was observed. A signature that recurs across many
+// independent bundles is evidence of a systematic real pattern (damage,
+// sequencing bias, biological variant); a signature confined to few bundles is
+// more consistent with random PCR error.
+//   p_real_bin[b] = (n_bundles_b + α) / (total_distinct_bundles + α + β)
+// Always in (0, 1) because n_bundles_b ≤ total_distinct_bundles.
+inline void ErrCorEmpiricalModel::accumulate_edge(
+        std::vector<std::unordered_set<uint64_t>>& acc,
+        const EdgeCandidate& e) const {
+    for (int i = 0; i < e.n_mm; ++i) {
+        const auto& m = e.mm[i];
+        int s = subst_class(m.parent_2b, m.alt_2b);
+        if (s < 0) continue;
+        int t = term_dist_bin(m.pos, e.child_len);
+        int o = occ_bin(e.bundle_occ);
+        int d = m.damage_chan ? 1 : 0;
+        acc[bin_index(s, t, o, d)].insert(e.bundle_key);
+    }
+}
+
+inline void ErrCorEmpiricalModel::fit_accumulate(const EdgeCandidate& e) {
+    if (bundles_per_bin_.size() != static_cast<size_t>(kNumBins))
+        bundles_per_bin_.assign(kNumBins, {});
+    accumulate_edge(bundles_per_bin_, e);
+}
+
+inline void ErrCorEmpiricalModel::fit_merge(
+        const std::vector<std::unordered_set<uint64_t>>& other) {
+    if (bundles_per_bin_.size() != static_cast<size_t>(kNumBins))
+        bundles_per_bin_.assign(kNumBins, {});
+    const int n = std::min<int>(kNumBins, static_cast<int>(other.size()));
+    for (int b = 0; b < n; ++b)
+        bundles_per_bin_[b].insert(other[b].begin(), other[b].end());
+}
+
 inline void ErrCorEmpiricalModel::fit(const std::vector<EdgeCandidate>& edges,
                                       uint64_t total_distinct_bundles) {
-    // ── Per-bin P(real | bin) from cross-bundle recurrence ─────────────────
-    // For each bin b, count the number of DISTINCT bundles in which a
-    // mismatch falling in that bin was observed. A signature that recurs
-    // across many independent bundles is evidence of a systematic real
-    // pattern (damage, sequencing bias, biological variant); a signature
-    // confined to few bundles is more consistent with random PCR error.
-    //   p_real_bin[b] = (n_bundles_b + α) / (total_distinct_bundles + α + β)
-    // Always in (0, 1) because n_bundles_b ≤ total_distinct_bundles.
-    std::vector<std::unordered_set<uint64_t>> bundles_per_bin(kNumBins);
-    for (const auto& e : edges) {
-        for (int i = 0; i < e.n_mm; ++i) {
-            const auto& m = e.mm[i];
-            int s = subst_class(m.parent_2b, m.alt_2b);
-            if (s < 0) continue;
-            int t = term_dist_bin(m.pos, e.child_len);
-            int o = occ_bin(e.bundle_occ);
-            int d = m.damage_chan ? 1 : 0;
-            bundles_per_bin[bin_index(s, t, o, d)].insert(e.bundle_key);
-        }
-    }
+    bundles_per_bin_.assign(kNumBins, {});
+    for (const auto& e : edges) accumulate_edge(bundles_per_bin_, e);
+    fit_finalize(total_distinct_bundles);
+}
+
+inline void ErrCorEmpiricalModel::fit_finalize(uint64_t total_distinct_bundles) {
+    auto& bundles_per_bin = bundles_per_bin_;
     // Adaptive shrinkage: scale β with total_distinct_bundles so the Beta
     // prior dominates on small inputs. With β fixed at 9999, a single
     // observation in a 1-bundle dataset would push p_real_bin toward
