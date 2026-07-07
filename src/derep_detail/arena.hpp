@@ -29,16 +29,6 @@ struct ErrCorParams {
     uint32_t snp_low_cov_cutoff = 10;
     double   snp_low_cov_factor = 1.75;
     uint32_t bucket_cap         = 0;
-    // Entropy-aware bucket cap: when true, the cap is applied ONLY to buckets whose
-    // representative interior is low-complexity (repetitive/technical). High-complexity
-    // buckets — genuinely abundant real biology — keep every posting. This confines the
-    // candidate-explosion fix to the sequences that cause it (homopolymer/STR/telomere/
-    // minisatellite runs) and preserves absorption for real duplicates. Data-derived,
-    // no per-library tuning. Off → the cap is blanket (all oversized buckets capped).
-    bool     bucket_cap_lowcomplexity_only = false;
-    // Distinct-4mer fraction below which a representative interior is called
-    // low-complexity (distinct_4mers / (ilen-3)). Real DNA ~0.8+; STR/telomere <0.3.
-    double   bucket_cap_complexity_frac    = 0.5;
     double   pcr_phi            = 5.3e-7;
     double   pcr_rate           = 0.0;
     uint32_t max_h2_count       = 2;
@@ -416,13 +406,6 @@ struct FlatPairIndex {
     std::vector<uint64_t> keys;
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
-    // Parallel to ids: id_off[i] = interior_off[ids[i]], the byte offset of
-    // that parent's interior in the Phase-3 interior_slab, precomputed at build
-    // time. query() emits it alongside the id so the candidate loop forms the
-    // slab address without a random interior_off[pid] gather — that gather was
-    // 48% of candidate-check DRAM misses (the un-prefetched hop-1 load feeding
-    // the slab prefetch). Read sequentially here → hardware-prefetched.
-    std::vector<uint64_t> id_off;
 
     // Open-addressing directory over `keys`, indexed by key (keys are already
     // splitmix64-mixed by pair_key, so the low bits are uniform — no re-hash).
@@ -432,8 +415,15 @@ struct FlatPairIndex {
     // line — the previous slots[h]→keys[s-1] pair was TWO dependent cold loads
     // (the 34% child-query cost). The found idx and ids[] emission order are
     // identical, so dedup output is byte-for-byte unchanged.
+    // Slot stores a 32-bit fingerprint (key>>32) instead of the full 64-bit key:
+    // 8B/slot vs the 16B a {u64,u32} pays after alignment padding, halving `dir`.
+    // The low bits of `key` drive the bucket; the high 32 bits are an independent
+    // fingerprint. A fp match is only a candidate — query() verifies keys[idx]==key
+    // (one load into the resident keys[]) before emitting, so fingerprint collisions
+    // cost an extra probe, never an extra candidate. Output is byte-for-byte
+    // unchanged. keys[] is already resident, so verification adds no new structure.
     struct Slot {
-        uint64_t key;         // valid only when idx_plus1 != 0
+        uint32_t fp;          // key >> 32; valid only when idx_plus1 != 0
         uint32_t idx_plus1;   // 0 = empty; real idx 0 maps to idx_plus1 == 1
     };
     std::vector<Slot> dir;
@@ -447,20 +437,24 @@ struct FlatPairIndex {
         for (size_t ki = 0; ki < keys.size(); ++ki) {
             size_t h = keys[ki] & slot_mask;
             while (dir[h].idx_plus1) h = (h + 1) & slot_mask;
-            dir[h] = Slot{keys[ki], static_cast<uint32_t>(ki + 1)};
+            dir[h] = Slot{static_cast<uint32_t>(keys[ki] >> 32),
+                          static_cast<uint32_t>(ki + 1)};
         }
     }
 
     template <typename F>
     void query(uint64_t key, F&& fn) const {
+        const uint32_t fp = static_cast<uint32_t>(key >> 32);
         for (size_t h = key & slot_mask;; h = (h + 1) & slot_mask) {
             const Slot& sl = dir[h];
             if (!sl.idx_plus1) return;
-            if (sl.key == key) {
+            if (sl.fp == fp) {
                 uint32_t idx = sl.idx_plus1 - 1;
-                for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
-                    fn(ids[i], id_off[i]);
-                return;
+                if (keys[idx] == key) {
+                    for (uint32_t i = offsets[idx]; i < offsets[idx + 1]; ++i)
+                        fn(ids[i]);
+                    return;
+                }
             }
         }
     }
