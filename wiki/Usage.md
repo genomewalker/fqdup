@@ -1,5 +1,33 @@
 # Usage
 
+## Command index
+
+**Core pipeline**
+
+| Command | Purpose | Docs |
+|---------|---------|------|
+| `fqdup merge` | Overlap-merge R1/R2 into full-length aDNA molecules | [[Merge]] |
+| `fqdup extend` | Extend merged reads via de Bruijn graph assembly | [[Extend]] |
+| `fqdup sort` | External merge sort by read ID | [[Sort]] |
+| `fqdup derep_pairs` | Structural dedup on merged+extended read pairs | [[Derep-Pairs]] |
+| `fqdup derep` | Damage-aware hashing + PCR error correction | [[Derep]] |
+
+**Utilities**
+
+| Command | Purpose | Docs |
+|---------|---------|------|
+| `fqdup profile` | Standalone damage/library-type diagnostic | [[Damage]] |
+| `fqdup trim` | Remove 5'/3' adapter stub remnants | [[Trim]] |
+| `fqdup split` | Classify reads as damaged/undamaged, no dedup | [[Split]] |
+| `fqdup view` | Inspect `.fqcl` cluster genealogy files | [[View]], [[cluster-format]] |
+
+**Internal / dev**
+
+| Command | Purpose | Docs |
+|---------|---------|------|
+| `fqdup gen` | Synthetic FASTQ generator with configurable damage, for testing | [[Gen]] |
+| `fqdup consensus` | Per-cluster consensus FASTQ from `.fqcl` — currently disabled (WIP refactor) | [[Consensus]] |
+
 ## Prerequisites
 
 ### Upstream steps
@@ -15,6 +43,8 @@ fastp --merge --merged_out merged.fq.gz \
       --in1 R1.fq.gz --in2 R2.fq.gz \
       --disable_adapter_trimming  # (or with adapter trimming, as appropriate)
 ```
+
+`fqdup merge` is the native alternative — see [[Merge]].
 
 **2. fqdup extend**: extend each merged read from both ends using the built-in
 de Bruijn graph assembler. The extended reads serve as deduplication fingerprints;
@@ -268,7 +298,7 @@ Accepts single-end/merged input (`-i`) or raw paired-end reads (`-1`/`-2`).
 | `--length-bins SPEC` | Length-stratified damage: `auto`, `N`, or `e1,e2,...` | off |
 | `--adapter-scan-reads N` | Reads sampled for adapter-stub detection (0=all) | 1000000 |
 
-See [[Profile]] for full output description and typical workflow.
+See [[Damage]] for full output description and typical workflow.
 
 ### `fqdup split`
 

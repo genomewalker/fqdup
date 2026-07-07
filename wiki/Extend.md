@@ -55,8 +55,8 @@ fully-trimmed aDNA workflow, use `--no-damage`.
 
 ### Pass 0: damage estimation
 
-Samples the first N reads (default: 500k, set with `--damage-sample`) to fit an
-exponential decay model of ancient DNA damage:
+Samples the first N reads (default: 1,000,000, set with `--damage-sample`) to
+fit an exponential decay model of ancient DNA damage:
 
 - Measures T/(T+C) at 5' positions 0–14 and A/(A+G) at 3' positions 0–14
 - Background rates come from the middle third of each read
@@ -149,27 +149,36 @@ original sequence/quality are preserved; added bases are appended with quality
 fqdup extend -i INPUT -o OUTPUT [options]
 
 Required:
-  -i FILE                Input merged FASTQ (.gz or plain)
-  -o FILE                Output extended FASTQ
+  -i FILE                     Input merged FASTQ (.gz or plain)
+  -o FILE                     Output extended FASTQ
 
 K-mer graph:
-  -k N                   K-mer size (default: 17, max: 31)
-  --min-count N          Minimum edge support (default: 2)
-  --max-extend N         Maximum bases added per side (default: 100)
-  --threads N            Worker threads (default: all CPU cores)
-  --min-qual N           Exclude bases below this Phred quality (default: 20)
-  --bbhash               Use BBHash MPHF for k-mer lookup instead of binary
-                         search; saves ~6 GB RAM at DS4 scale but is slower
-                         for most datasets (default: off)
+  -k INT                      K-mer size, odd, 5-31 (default: 17)
+  --min-count INT             Minimum edge support (default: 2)
+  --max-extend INT            Maximum bases added per side, 1-255 (default: 100)
+  --min-qual INT              Exclude bases below this Phred quality (default: 20)
+  --threads INT               Worker threads (default: 1)
+  --bbhash                    Use BBHash MPHF for k-mer lookup instead of binary
+                              search; saves ~6 GB RAM at DS4 scale but is slower
+                              for most datasets (default: off)
 
 Damage handling:
-  --library-type TYPE    Library type for damage model: auto|ds|ss (default: auto)
-  --no-damage            Skip damage estimation; no terminal masking
-  --mask-5 N             Manually mask N bp at 5' end (skips Pass 0)
-  --mask-3 N             Manually mask N bp at 3' end (skips Pass 0)
-  --mask-threshold F     Excess damage threshold for masking (default: 0.05)
-  --damage-sample N      Use first N reads for damage estimation (default: 500000; 0=all)
+  --library-type auto|ds|ss   Library type for damage model (default: auto)
+  --no-damage                 Skip damage estimation; no terminal masking
+  --mask-5 N                  Manually mask N bp at 5' end (skips Pass 0; requires --mask-3)
+  --mask-3 N                  Manually mask N bp at 3' end (skips Pass 0; requires --mask-5)
+  --mask-threshold F          Excess damage threshold for masking (default: 0.05)
+  --damage-sample INT         Reads to sample for damage estimation (default: 1000000; 0=all)
+  --no-damage-qc              Disable the adapter-stub/hexamer QC pass
+  --damage-qc-scan-reads INT  Reads sampled for adapter-stub detection (default: 1000000; 0=all)
+  --damage-clip-pass MODE     off|report|refit (default: report). `report` only flags
+                              detected adapter stubs; `refit` re-runs the damage fit
+                              with the stub-contaminated positions excluded.
 ```
+
+`k` must be odd — an even k allows self-reverse-complement (palindromic)
+k-mers that corrupt the canonical fwd/rev edge orientation. `fqdup extend`
+does not read from stdin: the 3-pass algorithm needs to re-read the input file.
 
 ---
 

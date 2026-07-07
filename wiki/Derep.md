@@ -27,11 +27,13 @@ sequences are identical.
 
 `fqdup derep` runs in up to four stages:
 
-**Pass 0: damage estimation** (only with `--collapse-damage`)
+**Pass 0: damage estimation** (runs unless `--damage off`)
 Scans all reads to fit an exponential decay model of terminal deamination
-(same model as [[Damage-Aware-Deduplication]]). Identifies which positions
-exceed the mask threshold. Skipped if `--collapse-damage` is not given (default), or manual
-parameters are supplied.
+(same model as [[Damage-Aware-Deduplication]]) and identifies which positions
+exceed the mask threshold. Runs by default (`--damage report`) for QC/header
+reporting only; the fit result is used to mask Pass 1 hashing only in
+`--damage collapse` mode. A manual `--damage-dmax` override still runs this
+pass (for QC) and then replaces the fitted d_max/lambda before masking.
 
 **Pass 1: index construction**
 Streams all reads and builds a hash index. With damage masking active, masked
@@ -48,7 +50,7 @@ G↔T, and C↔A mismatches are never absorbed (damage-consistent). A↔T and C�
 transversions are eligible by default; use `--protect-transversions` to protect
 them too (recommended for high-oxidative-damage libraries). H=2 absorption
 requires both mismatches to be eligible (non-protected) transversions and the
-child count to be ≤ `--errcor-max-h2-count` (default 2). Enabled by default;
+child count to be ≤ 2 (fixed, not a CLI option). Enabled by default;
 disable with `--no-error-correct`.
 
 **Pass 2: output**
@@ -70,26 +72,39 @@ Required:
 
 Optional:
   -c FILE              Cluster statistics (gzipped TSV)
+  --cluster-format FILE   Write .fqcl genealogy (requires error correction). See [[cluster-format]]
+  --prior-fqcl FILE       Load cluster counts from a derep_pairs --cluster-format
+                          output; seeds Phase 3 count weights for correct
+                          PCR-error scoring
   --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```
 
-### Damage variant collapsing (default: off)
+### Damage variant collapsing (default: `report` — fit + QC, no clustering use)
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--collapse-damage` | Estimate damage from data (Pass 0) | off |
-| `--damage-dmax FLOAT` | d_max for both ends (manual) | - |
+| `--damage MODE` | `off` \| `report` \| `collapse` | `report` |
+| `--collapse-damage` | Deprecated alias for `--damage collapse` | - |
+| `--damage-dmax FLOAT[,FLOAT]` | Manual d_max override, skips the fit for masking (`"5',3'"` or one value for both) | - |
 | `--damage-dmax5 FLOAT` | d_max for 5' end | - |
 | `--damage-dmax3 FLOAT` | d_max for 3' end | - |
 | `--damage-lambda FLOAT` | Decay constant for both ends | - |
-| `--damage-lambda5 FLOAT` | Decay constant for 5' end | - |
-| `--damage-lambda3 FLOAT` | Decay constant for 3' end | - |
+| `--damage-lambda5 FLOAT` | Decay constant for 5' end | 0.5 |
+| `--damage-lambda3 FLOAT` | Decay constant for 3' end | 0.5 |
 | `--damage-bg FLOAT` | Background substitution rate | 0.02 |
 | `--mask-threshold FLOAT` | Mask when excess P(deam) > T | 0.05 |
 | `--library-type auto\|ds\|ss` | Override library-type detection | auto |
+| `--damage-clip-pass off\|report\|refit` | Adapter-clip QC handling | report |
+| `--damage-scan N` | Reads sampled for QC/adapter scan (0 = all) | 1000000 |
+| `--damage-deam-sample N` | Reads sampled for the deamination fit (0 = all) | 5000000 |
+| `--no-damage-qc` | Deprecated alias for `--damage off` | - |
+
+`--damage off` skips Pass 0 entirely. `report` (default) runs the fit and QC
+for header/logging purposes only. `collapse` additionally uses the fitted
+(or manually overridden) d_max/lambda to mask terminal positions in Pass 1.
 
 Run `fqdup profile -i FILE` first to inspect d_max and which positions would
-be masked before committing to `--collapse-damage`. See [[Damage]].
+be masked before committing to `--damage collapse`. See [[Damage]].
 
 ### Damaged/undamaged split
 
@@ -163,15 +178,20 @@ Performance on a 437 M-read SS library (d_max ≈ 0.16, 3 length bins):
 |------|-------------|---------|
 | `--error-correct` | Enable Phase 3 | **default** |
 | `--no-error-correct` | Disable Phase 3 | - |
-| `--errcor-min-parent INT` | Min count to index as parent | 3 |
-| `--errcor-max-h2-count INT` | Max child count eligible for H=2 absorption | 2 |
 | `--errcor-snp-threshold FLOAT` | SNP veto: sig/parent_count threshold | 0.20 |
-| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 2 |
-| `--errcor-bucket-cap INT` | Pair-key bucket size cap | 0 (unlimited) |
+| `--errcor-snp-min-count INT` | SNP veto: min absolute sig_count | 1 |
+| `--errcor-snp-cutoff INT` | Low-coverage cutoff for the SNP-veto multiplier | 10 |
+| `--errcor-snp-factor FLOAT` | Low-coverage SNP-veto multiplier | 1.75 |
+| `--errcor-bucket-cap INT` | Pair-key bucket size cap (0 = unlimited) | 0 |
 | `--protect-transversions` | Protect A↔T / C↔G (Channels H/G) from absorption | off |
+| `--errcor-rescue-indels` | Enable syncmer-indexed indel rescue (ed≤2) | off |
 | `--pcr-cycles INT` | PCR cycles for D_eff log estimate | 0 (auto) |
 | `--pcr-efficiency FLOAT` | Amplification efficiency per cycle | 1.0 |
 | `--pcr-error-rate FLOAT` | Substitutions per base per doubling (log only) | 5.3e-7 |
+
+`fqdup derep --help-advanced` lists further Phase 3 / indel-rescue tuning
+knobs not covered here (`--b1-*`, `--rescue-*`, `--b3-*`, `--errcor-adj-len`,
+`--errcor-empirical` / `--errcor-legacy-veto`).
 
 ---
 
@@ -202,8 +222,8 @@ On sample `a88af16f35`, 5.58 M reads in, 91 bp mean length,
 | Mode | Unique clusters | Wall time |
 |------|----------------|-----------|
 | Standard (exact hash, EC on) | 3,531,821 | ~22 s |
-| `--collapse-damage` only | 3,511,607 | ~31 s |
-| `--collapse-damage --error-correct` | 3,510,151 | ~33 s |
+| `--damage collapse` only | 3,511,607 | ~31 s |
+| `--damage collapse --error-correct` | 3,510,151 | ~33 s |
 
 Across 31 ancient DNA libraries (2.97 B reads total) run in the full paired
 pipeline, `fqdup derep` absorbed a further 8.6% of reads beyond what

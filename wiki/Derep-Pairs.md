@@ -32,10 +32,12 @@ correction. Those are handled by the subsequent `fqdup derep` step.
 **Pass 1: index construction**
 Both sorted files are streamed in lockstep. For each record, the canonical hash
 of the **extended** read is computed: `min(XXH3_128(ext), XXH3_128(revcomp(ext)))`.
-The index stores `{record_offset, count, merged_len}`, ~40 bytes per unique
-cluster. When the same extended hash appears again, the count is incremented;
-if the new merged read is longer than the stored representative, the
-representative is updated.
+The index key is a `SequenceFingerprint` (128-bit hash + extended length, 24
+bytes); the value is an `IndexEntry` (count + longest-merged-length seen +
+representative's record index, 24 bytes) — 48 bytes per unique cluster. When
+the same extended hash appears again, the count is incremented; if the new
+merged read is longer than the stored representative, the representative is
+updated.
 
 **Pass 2: output**
 Both files are re-streamed. For each record, if this is the representative
@@ -55,13 +57,17 @@ Required:
   -o-ext FILE   Output extended FASTQ (representatives)
 
 Optional:
-  -c FILE        Cluster statistics (gzipped TSV)
-  --no-revcomp   Disable reverse-complement collapsing (default: enabled)
+  -c FILE             Cluster statistics (gzipped TSV)
+  --cluster-format F  Write cluster genealogy to .fqcl (use with derep --prior-fqcl). See [[cluster-format]]
+  --no-revcomp        Disable reverse-complement collapsing (default: enabled)
+  --allow-id-mismatch Warn instead of failing on read ID mismatches
+  -t N, --threads N   Decompression/output threads (default: auto)
 ```
 
 Both input files must be sorted by read ID (`fqdup sort`). The two files must
 contain reads in the same order, the same read ID at the same position in
-both files.
+both files, or the run fails with a "Paired FASTQ ID mismatch" error; pass
+`--allow-id-mismatch` to warn and continue instead.
 
 ---
 
@@ -89,9 +95,9 @@ Gzipped TSV, one row per cluster:
 
 ## Memory
 
-The index stores ~40 bytes per unique pair (record offset + count + merged
-length). For a 25 M-pair library with ~5.6 M unique pairs: ~220 MB. Memory
-scales linearly with unique pair count, not total reads.
+The index stores 48 bytes per unique pair (24-byte key + 24-byte value). For a
+25 M-pair library with ~5.6 M unique pairs: ~255 MB. Memory scales linearly
+with unique pair count, not total reads.
 
 ---
 
@@ -105,6 +111,6 @@ length:
 | Input pairs | 25,800,000 |
 | Unique clusters | 5,582,073 |
 | Wall time | ~25 s |
-| Index memory | ~220 MB |
+| Index memory | ~255 MB |
 
 See [[Performance]] for full benchmarks.
