@@ -74,8 +74,9 @@ bash tests/smoke.sh build/fqdup
 # → OK: fqdup smoke test passed
 ```
 
-The smoke test exercises all three subcommands on a synthetic paired dataset
-and checks sorting order, deduplication, and representative selection.
+The smoke test exercises `sort`, `derep_pairs`, and `derep` on a synthetic
+paired dataset and checks sorting order, deduplication, and representative
+selection.
 
 ---
 

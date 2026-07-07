@@ -69,7 +69,7 @@ alone is sufficient.
 
 The upstream steps that produce fqdup's inputs are:
 
-1. **fastp merge**, collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
+1. **fastp merge** (or **`fqdup merge`**, the native alternative), collapse overlapping R1+R2 into a single sequence representing the full ancient DNA molecule
 2. **`fqdup extend`**, extend each merged read outward from both ends using the built-in de Bruijn graph assembler, recovering sequence that may be present in other reads in the library
 
 This produces two files for the same set of molecules:
@@ -106,15 +106,42 @@ them on the original merged sequence.
 
 ## Wiki pages
 
+**Core pipeline**
+
+| Page | Contents |
+|------|----------|
+| [[Merge]] | fqdup merge: overlap-merge R1/R2 into full-length aDNA molecules, auto-detected library type/adapters/UDG |
+| [[Extend]] | fqdup extend: de Bruijn graph extension algorithm, CLI, benchmarks |
+| [[Sort]] | fqdup sort: external merge sort by read ID |
+| [[Derep-Pairs]] | fqdup derep_pairs: structural dedup on merged+extended read pairs |
+| [[Derep]] | fqdup derep: damage-aware hashing and PCR error correction |
+
+**Utilities**
+
+| Page | Contents |
+|------|----------|
+| [[Damage]] | fqdup profile: standalone damage profiler, inspect d_max, library type, mask positions |
+| [[Trim]] | fqdup trim: remove 5'/3' adapter stub remnants |
+| [[Split]] | fqdup split: classify reads as damaged/undamaged, no deduplication |
+| [[View]] | fqdup view: inspect .fqcl cluster genealogy files |
+
+**Internal / dev**
+
+| Page | Contents |
+|------|----------|
+| [[Gen]] | fqdup gen: synthetic FASTQ generator with configurable damage patterns, for testing |
+| [[Consensus]] | fqdup consensus: per-cluster consensus FASTQ from .fqcl — currently disabled (WIP refactor) |
+
+**Reference**
+
 | Page | Contents |
 |------|----------|
 | [[Installation]] | Build from source, dependencies |
 | [[Usage]] | Tutorials and options for all subcommands |
-| [[Extend]] | fqdup extend: de Bruijn graph extension algorithm, CLI, benchmarks |
-| [[Profile]] | fqdup profile: standalone damage profiler, inspect d_max, library type, mask positions |
 | [[Algorithm]] | Internal mechanics of sort, derep_pairs, and derep |
 | [[Damage-Aware-Deduplication]] | The deamination model, empirical masking, and symmetry |
 | [[PCR-Error-Correction]] | Phase 3: 4-way pigeonhole H≤2 Hamming search |
+| [[cluster-format]] | .fqcl binary format: cluster genealogy, edges, reconstruction |
 | [[Performance]] | Benchmarks and memory usage |
 
 ---

@@ -13,18 +13,33 @@ auto-detection is correct, and decide whether `--collapse-damage` is warranted.
 ## Usage
 
 ```bash
-fqdup profile -i FILE [options]
+fqdup profile (-i FILE | -1 R1.fq -2 R2.fq) [options]
 ```
+
+`-i` and `-1`/`-2` can be combined: the merged stream carries both termini and
+the raw pairs add extra 5'/3' depth, finalized as separate accumulators (not
+pooled). At least one input mode is required.
 
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i FILE` | Input FASTQ (.gz or plain) | required |
+| `-i FILE` | Single-end / merged input FASTQ (.gz or plain) | - |
+| `-1 FILE -2 FILE` | Paired-end raw (un-merged) reads; R1 contributes 5' counters, complement-mapped R2 contributes 3' counters | - |
 | `-p N` | Worker threads | all cores |
-| `--library-type auto\|ds\|ss` | Override library-type auto-detection | auto |
+| `--library-type auto\|ds\|ss` | Library type for 3'-end interpretation | auto |
 | `--mask-threshold FLOAT` | Mask positions where excess P(deam) > T | 0.05 |
 | `--tsv FILE` | Write per-position frequency table as TSV | - |
+| `--json FILE` | Write the full damage profile as JSON | - |
+| `--json-level summary\|standard\|full` | JSON output verbosity | standard |
+| `--html FILE` | Write an interactive damage report as self-contained HTML | - |
+| `--count-table-json FILE` | Write Layer-0 stop-channel count tables as JSONL | - |
+| `--length-bins SPEC` | Length-stratified damage: `auto`, `N` (quantile bins), or `e1,e2,...` (explicit edges) | off |
+| `--adapter-scan-reads N` | Reads sampled (single-threaded) for adapter-stub detection | 1000000 (0=all) |
+| `--damage-json-out FILE` | Write the scalar damage model for `fqdup split --damage-json` | - |
+| `--model-bin-out FILE` | Write the full split model (binary) for `fqdup split --model-bin` | - |
+| `--subst-in FILE` | Load an external `.bsubst` count file (repeatable) | - |
+| `--no-oxog` | Disable the 8-oxoG oxidative-damage channel (merged/`-i` input only) | oxoG on |
 
 ---
 
@@ -94,7 +109,7 @@ table.
 ### Human-readable report
 
 ```
-=== fqdup profile ===
+=== fqdup damage ===
 Input:   merged.fq.gz
 Threads: 16
 Reads:   5,582,073 scanned
@@ -102,6 +117,8 @@ Length:  min=30  mean=91.2  max=150
 
 Library: DS (auto-detected)
   BIC  bias=0.0  DS=125432.1  SS=42.0  SS_full=89.3
+  winner=DS  second=SS_full  margin=125342.8
+  post p_ds=1.000  p_ss=0.000  p_bias=0.000  p_winner=1.000
   fit  CT5_amp=0.1928  ΔBIC=125432.1  GA3_amp=0.0403  ΔBIC=1248.7  GA0_amp=0.0201  ΔBIC=22.3  CT3_amp=0.0012  ΔBIC=0.1
   5' terminal shift: +0.0193  (z=18.4)
   3' terminal shift: +0.0040  (z=3.9)
@@ -120,10 +137,16 @@ pos  5'_CT   5'_GA   3'_GA
   ...
 ```
 
+The banner reads `=== fqdup damage ===` regardless of the `profile` subcommand
+name — a leftover from the tool's pre-rename internals, not a typo in your
+invocation.
+
 Fields:
 
 - **Library**, DS or SS, auto-detected or forced. Composition-bias warnings are printed if the read-end base composition makes library-type detection unreliable.
 - **BIC**, BIC scores for the null model (bias), DS, SS, and SS-full (diagnostic). Higher means better fit.
+- **winner / second / margin**, The two best-scoring models by BIC and the gap between them; `[artifact-contaminated: ...]` is appended when the library-artifact checks flag the winner.
+- **post p\_ds / p\_ss / p\_bias / p\_winner**, Posterior model probabilities; `[low confidence]` when `p_winner` is below the classifier's confidence threshold.
 - **fit**, Amplitude and ΔBIC for each of the four biological channels.
 - **terminal shift / z-score**, Observed minus background T/(T+C) or A/(A+G) at the terminal positions; the z-score indicates significance.
 - **d_max / lambda / bg**, Exponential decay parameters for each end, and the combined d_max (the larger of the two, used as the aggregate damage indicator).
