@@ -218,7 +218,7 @@ relative to the parent is at least this fraction of the parent count, the child
 is protected as a potential true SNP. Lower values absorb more aggressively;
 raise to 0.30–0.50 for libraries with genuine heterozygosity or rare variants.
 
-`--errcor-snp-min-count INT` (default 2) — minimum absolute `sig_count`
+`--errcor-snp-min-count INT` (default 1) — minimum absolute `sig_count`
 required for the SNP veto to fire. Raise to 3–5 for libraries where genuine
 rare variants are expected at low absolute count.
 

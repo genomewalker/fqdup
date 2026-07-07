@@ -157,11 +157,12 @@ by `to_node` — O(n_edges) prep, O(depth) per member.
 
 ```
 fqdup derep ... --cluster-format clusters.fqcl
-fqdup view clusters.fqcl                # cluster summary table
-fqdup view clusters.fqcl --cluster 42   # ASCII tree of one cluster
-fqdup view clusters.fqcl --cluster 42 --damage  # per-position damage track
-fqdup export clusters.fqcl bam          # materialise members as BAM
-fqdup export clusters.fqcl fastq        # one rep per cluster (or --consensus)
+fqdup derep_pairs ... --cluster-format clusters.fqcl
+fqdup view clusters.fqcl                   # cluster summary table
+fqdup view clusters.fqcl --cluster 42      # ASCII tree of one cluster
+fqdup view clusters.fqcl --dump-members    # TSV: cluster_id, member_id
+fqdup view clusters.fqcl --member-of in.fq # TSV: read_name, cluster_id
+fqdup view clusters.fqcl --json            # structured JSON (schema fqdup.view.v1)
 ```
 
 ## Versioning
