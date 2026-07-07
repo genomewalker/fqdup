@@ -906,7 +906,7 @@ int profile_main(int argc, char** argv) {
     };
 
     // ---- human-readable report ----------------------------------------
-    std::cout << "=== fqdup damage ===\n";
+    std::cout << "=== fqdup profile ===\n";
     std::cout << "Input:   " << in_path << "\n";
     std::cout << "Threads: " << n_threads << "\n";
     std::cout << "Reads:   " << fmt_count(reads_scanned) << " scanned";
