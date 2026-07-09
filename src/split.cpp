@@ -28,6 +28,7 @@ static void usage(const char* prog) {
         "input once routing each read to --out-damaged / --out-undamaged.\n"
         "\nRequired:\n"
         "  -i FILE              Input FASTQ (raw or .gz); does NOT need to be sorted\n"
+        "  --min-length N       (REQUIRED) Drop reads shorter than N bp before routing\n"
         "\nOutputs (at least one required):\n"
         "  --out-damaged  FILE  Write damaged reads here\n"
         "  --out-undamaged FILE Write undamaged reads here\n"
@@ -52,6 +53,7 @@ int split_main(int argc, char** argv) {
     std::string in_path, out_damaged_path, out_undamaged_path;
     std::string model_bin_path, damage_json_path;
     bool allow_model_mismatch = false;
+    int   min_length = -1;   // REQUIRED read-length floor (unset sentinel)
     float split_threshold = 0.0f;
     int64_t damage_deam_max_reads = 5'000'000;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
@@ -64,6 +66,7 @@ int split_main(int argc, char** argv) {
         if ((a == "-i" || a == "--input") && i+1 < argc)       { in_path = argv[++i]; }
         else if (a == "--out-damaged"  && i+1 < argc)           { out_damaged_path = argv[++i]; }
         else if (a == "--out-undamaged" && i+1 < argc)          { out_undamaged_path = argv[++i]; }
+        else if (a == "--min-length" && i+1 < argc)             { min_length = std::stoi(argv[++i]); }
         else if (a == "--split-threshold" && i+1 < argc)        { split_threshold = std::stof(argv[++i]); }
         else if (a == "--damage-deam-sample" && i+1 < argc)     { damage_deam_max_reads = std::stoll(argv[++i]); }
         else if (a == "--model-bin" && i+1 < argc)              { model_bin_path = argv[++i]; }
@@ -96,6 +99,10 @@ int split_main(int argc, char** argv) {
     if (out_damaged_path.empty() && out_undamaged_path.empty()) {
         std::cerr << "Error: at least one of --out-damaged / --out-undamaged required\n";
         usage(argv[0]);
+        return 1;
+    }
+    if (min_length < 0) {
+        std::cerr << "split: --min-length is required — set the minimum read length explicitly\n";
         return 1;
     }
 
@@ -293,7 +300,7 @@ int split_main(int argc, char** argv) {
         auto t2 = std::chrono::steady_clock::now();
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
-        uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0;
+        uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0, n_dropped = 0;
 
         // Validation hook (env-gated, zero-cost when unset): dump per-read
         // header<TAB>split_model_llr<TAB>shared_lsd_llr so a synthetic run
@@ -307,6 +314,10 @@ int split_main(int argc, char** argv) {
 
         while (reader->read(rec)) {
             ++n_total;
+            if (static_cast<int>(rec.seq.size()) < min_length) {
+                ++n_dropped;   // --min-length: third fate, routed to neither output
+                continue;
+            }
             float llr = split_model.score(rec.seq);
             if (score_dump)
                 (*score_dump) << rec.header << '\t' << llr << '\t'
@@ -328,6 +339,7 @@ int split_main(int argc, char** argv) {
 
         log_info("=== Split complete ===");
         log_info("Total reads: " + std::to_string(n_total));
+        log_info("Dropped (<" + std::to_string(min_length) + " bp): " + std::to_string(n_dropped));
         log_info("Damaged:     " + std::to_string(n_damaged) +
                  " (" + [&]{ char b[16]; std::snprintf(b,sizeof(b),"%.1f%%",
                      n_total ? 100.0*n_damaged/n_total : 0.0); return std::string(b); }() + ")");

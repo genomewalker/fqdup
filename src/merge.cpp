@@ -634,7 +634,7 @@ static void rc_record(const FastqRecord& r2, std::string& seq, std::string& qual
 struct MergeOpts {
     int   min_ov        = 11;
     float max_mm_rate   = 0.08f;
-    int   min_length    = 15;
+    int   min_length    = -1;   // REQUIRED: unset sentinel; user must pass --min-length
     int   skip_terminal = 0;
     int   clip_5p       = 0;   // 0=disabled; hard-clip N bases from R1 5' end before merge
     int   poly_g_min_run = 0;   // 0=disabled; trim 3' poly-G runs >= this length
@@ -1410,7 +1410,7 @@ static void usage() {
         "Overlap:\n"
         "  --min-overlap N    Minimum overlap length (default: 11)\n"
         "  --max-mm-rate F    Max mismatch rate in overlap (default: 0.08)\n"
-        "  --min-length N     Discard merged reads shorter than N bp (default: 15)\n"
+        "  --min-length N     (REQUIRED) Discard merged reads shorter than N bp\n"
         "  --clip-r1-5p N     Hard-clip N bases from R1 5' end before overlap (removes adapter stubs)\n"
         "  --min-entropy F    Discard low-complexity merged reads; Shannon entropy floor in bits\n"
         "                     (0=disabled; poly-G≈0, random≈2.0; default: 0)\n"
@@ -1510,6 +1510,11 @@ int merge_main(int argc, char** argv) {
     if (r1_paths.empty() || r2_paths.empty() || out_path.empty()) {
         std::cerr << "Error: -1, -2, and -o are required\n";
         usage();
+        return 1;
+    }
+
+    if (opts.min_length < 0) {
+        std::cerr << "merge: --min-length is required — set the minimum read length explicitly\n";
         return 1;
     }
 
