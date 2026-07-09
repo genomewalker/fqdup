@@ -122,7 +122,7 @@ run_tadpole "$TMPDIR/p1_non.fq" "$TMPDIR/p1_ext.fq" $EXT_BP
     -n "$TMPDIR/p1_non.sorted.fq" -e "$TMPDIR/p1_ext.sorted.fq" \
     -o-non "$TMPDIR/p1_dp_non.fq" -o-ext "$TMPDIR/p1_dp_ext.fq" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/p1_dp_non.fq" -o "$TMPDIR/p1_final.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p1_dp_non.fq" -o "$TMPDIR/p1_final.fq" \
     --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p1_dp_non.fq" || true)
@@ -190,7 +190,7 @@ run_tadpole "$TMPDIR/p2_non.fq" "$TMPDIR/p2_ext.fq" 15
     -n "$TMPDIR/p2_non.sorted.fq" -e "$TMPDIR/p2_ext.sorted.fq" \
     -o-non "$TMPDIR/p2_dp_non.fq" -o-ext "$TMPDIR/p2_dp_ext.fq" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/p2_dp_non.fq" -o "$TMPDIR/p2_final.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p2_dp_non.fq" -o "$TMPDIR/p2_final.fq" \
     --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p2_dp_non.fq" || true)
@@ -323,11 +323,11 @@ run_tadpole "$TMPDIR/p4_non.fq" "$TMPDIR/p4_ext.fq" 15
     -o-non "$TMPDIR/p4_dp_non.fq" -o-ext "$TMPDIR/p4_dp_ext.fq" 2>/dev/null
 
 # Control: no damage masking
-"$FQDUP" derep -i "$TMPDIR/p4_dp_non.fq" -o "$TMPDIR/p4_nodmg.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p4_dp_non.fq" -o "$TMPDIR/p4_nodmg.fq" \
     --no-error-correct 2>/dev/null
 
 # Treatment: damage-aware masking
-"$FQDUP" derep -i "$TMPDIR/p4_dp_non.fq" -o "$TMPDIR/p4_dmg.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p4_dp_non.fq" -o "$TMPDIR/p4_dmg.fq" \
     --collapse-damage --no-error-correct 2>"$TMPDIR/p4_dmg.log"
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p4_dp_non.fq" || true)
@@ -400,11 +400,11 @@ run_tadpole "$TMPDIR/p5_non.fq" "$TMPDIR/p5_ext.fq" 15
     -o-non "$TMPDIR/p5_dp_non.fq" -o-ext "$TMPDIR/p5_dp_ext.fq" 2>/dev/null
 
 # Baseline: no damage masking
-"$FQDUP" derep -i "$TMPDIR/p5_dp_non.fq" -o "$TMPDIR/p5_base.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p5_dp_non.fq" -o "$TMPDIR/p5_base.fq" \
     --no-error-correct 2>/dev/null
 
 # Treatment: damage masking
-"$FQDUP" derep -i "$TMPDIR/p5_dp_non.fq" -o "$TMPDIR/p5_dmg.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p5_dp_non.fq" -o "$TMPDIR/p5_dmg.fq" \
     --collapse-damage --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p5_dp_non.fq" || true)
@@ -474,7 +474,7 @@ run_tadpole "$TMPDIR/p6_non.fq" "$TMPDIR/p6_ext.fq" 15
     -n "$TMPDIR/p6_non.sorted.fq" -e "$TMPDIR/p6_ext.sorted.fq" \
     -o-non "$TMPDIR/p6_dp_non.fq" -o-ext "$TMPDIR/p6_dp_ext.fq" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/p6_dp_non.fq" -o "$TMPDIR/p6_final.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p6_dp_non.fq" -o "$TMPDIR/p6_final.fq" \
     --collapse-damage --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p6_dp_non.fq" || true)
@@ -536,7 +536,7 @@ run_tadpole "$TMPDIR/p7_non.fq" "$TMPDIR/p7_ext.fq" 15
     -n "$TMPDIR/p7_non.sorted.fq" -e "$TMPDIR/p7_ext.sorted.fq" \
     -o-non "$TMPDIR/p7_dp_non.fq" -o-ext "$TMPDIR/p7_dp_ext.fq" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/p7_dp_non.fq" -o "$TMPDIR/p7_final.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p7_dp_non.fq" -o "$TMPDIR/p7_final.fq" \
     --no-error-correct 2>/dev/null
 
 AFTER_DP=$(grep -c '^@' "$TMPDIR/p7_dp_non.fq" || true)
@@ -606,11 +606,11 @@ echo "  derep runs directly on raw reads; EC absorbs PCR-error singletons into 3
     --no-damage --pcr-rate $PCR_RATE --seed 400 > "$TMPDIR/p8_raw.fq"
 
 # No-EC baseline: PCR errors inflate unique count
-"$FQDUP" derep -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_noec.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_noec.fq" \
     --no-error-correct 2>/dev/null
 
 # With EC (default min_parent=3 works at 30x: true parents have count~29)
-"$FQDUP" derep -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_ec.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p8_raw.fq" -o "$TMPDIR/p8_ec.fq" \
     --error-correct 2>"$TMPDIR/p8_ec.log"
 
 U_NOEC=$(grep -c '^@' "$TMPDIR/p8_noec.fq" || true)
@@ -723,9 +723,9 @@ PYEOF
 
 # Run derep directly on raw reads (EC requires multi-copy input)
 for tag in p9a p9b; do
-    "$FQDUP" derep -i "$TMPDIR/${tag}_raw.fq" -o "$TMPDIR/${tag}_noec.fq" \
+    "$FQDUP" derep --min-length 1 -i "$TMPDIR/${tag}_raw.fq" -o "$TMPDIR/${tag}_noec.fq" \
         --no-error-correct 2>/dev/null
-    "$FQDUP" derep -i "$TMPDIR/${tag}_raw.fq" -o "$TMPDIR/${tag}_ec.fq" \
+    "$FQDUP" derep --min-length 1 -i "$TMPDIR/${tag}_raw.fq" -o "$TMPDIR/${tag}_ec.fq" \
         --error-correct 2>/dev/null
 done
 
@@ -817,7 +817,7 @@ run_tadpole "$TMPDIR/p10_non.fq" "$TMPDIR/p10_ext.fq" 25
     --max-memory 512M -t "$TMPDIR" -p 4 2>/dev/null
 
 # Without extension: derep alone on variable-length copies (expect inflation)
-"$FQDUP" derep -i "$TMPDIR/p10_non.sorted.fq" -o "$TMPDIR/p10_noext.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p10_non.sorted.fq" -o "$TMPDIR/p10_noext.fq" \
     --collapse-damage --no-error-correct 2>/dev/null
 
 # With extension: derep_pairs fingerprint → derep residuals
@@ -825,7 +825,7 @@ run_tadpole "$TMPDIR/p10_non.fq" "$TMPDIR/p10_ext.fq" 25
     -n "$TMPDIR/p10_non.sorted.fq" -e "$TMPDIR/p10_ext.sorted.fq" \
     -o-non "$TMPDIR/p10_dp_non.fq" -o-ext "$TMPDIR/p10_dp_ext.fq" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/p10_dp_non.fq" -o "$TMPDIR/p10_final.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/p10_dp_non.fq" -o "$TMPDIR/p10_final.fq" \
     --collapse-damage --no-error-correct 2>/dev/null
 
 NOEXT=$(grep -c '^@' "$TMPDIR/p10_noext.fq" || true)

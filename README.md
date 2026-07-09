@@ -156,7 +156,8 @@ fqdup derep_pairs \
 # 4. PCR error correction (on by default); damage-aware hashing off by default
 fqdup derep \
   -i merged.deduped.fq.gz \
-  -o merged.final.fq.gz
+  -o merged.final.fq.gz \
+  --min-length 30            # REQUIRED: caller sets the read-length floor
 
 # Optional: also enable damage-aware hashing (only if NOT running DART/mapDamage downstream)
 # fqdup derep -i merged.deduped.fq.gz -o merged.final.fq.gz --collapse-damage
@@ -167,6 +168,7 @@ fqdup derep \
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
 fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz \
+  --min-length 30 \
   --no-error-correct
 ```
 
@@ -218,11 +220,12 @@ incremental-Hamming overlap detection. An upstream alternative to
 `fastp --merge`; see [[Merge]] for the phase-by-phase algorithm.
 
 ```
-fqdup merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz [options]
+fqdup merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz --min-length N [options]
 
 Required:
   -1 FILE / -2 FILE          R1 / R2 input FASTQ
   -o FILE                    Output: merged reads
+  --min-length N             Read-length floor, all emit paths (REQUIRED, >= 1)
 
 Library:
   --library-type ds|ss       Override auto-detected library type
@@ -236,7 +239,7 @@ Optional output:
 Overlap:
   --min-overlap N            Minimum overlap length (default: 11)
   --max-mm-rate F            Max mismatch rate in overlap (default: 0.08)
-  --min-length N             Discard reads shorter than N bp, all emit paths (default: 30)
+  --min-length N             (listed under Required above; REQUIRED, no default)
   --clip-r1-5p N             Hard-clip N bases from R1 5' end before overlap
   --min-entropy F            Discard low-complexity merged reads by Shannon entropy (default: off)
   --max-n-rate F             Discard merged reads with N fraction above F (default: 1.0=off)
@@ -425,11 +428,12 @@ Representative selection: pair with the longest merged read.
 ### `fqdup derep`
 
 ```
-fqdup derep -i INPUT -o OUTPUT [options]
+fqdup derep -i INPUT -o OUTPUT --min-length N [options]
 
 Required:
   -i FILE      Sorted input FASTQ
   -o FILE      Output FASTQ
+  --min-length N   Drop reads shorter than N bp at ingestion (REQUIRED, >= 1)
 
 Optional:
   -c FILE              Cluster statistics (gzipped TSV)
@@ -470,6 +474,7 @@ on damaged reads only, or downstream library comparisons.
 
 ```bash
 fqdup derep -i sorted.fq.gz \
+    --min-length 30 \
     --out-damaged   ancient.fq.gz \
     --out-undamaged modern.fq.gz \
     --damage collapse           # damage fit required for split scoring
@@ -530,10 +535,11 @@ the input once. Input does **not** need to be sorted. Useful for splitting
 already-deduplicated reads or as a fast pre-filter before `fqdup derep`.
 
 ```
-fqdup split -i INPUT [options]
+fqdup split -i INPUT --min-length N [options]
 
 Required:
   -i FILE                 Input FASTQ (raw or .gz); does not need to be sorted
+  --min-length N          Reads shorter than N bp routed to neither output (REQUIRED, >= 1)
 
 Outputs (at least one required):
   --out-damaged  FILE     Write damaged reads here
@@ -665,6 +671,7 @@ fqdup sort -i derep_pairs.fq.gz -o derep_pairs.sorted.fq.gz --max-memory 8G
 fqdup derep \
   -i derep_pairs.sorted.fq.gz \
   -o final.fq.gz \
+  --min-length 30 \
   --cluster-format final.fqcl \
   --prior-fqcl derep_pairs.fqcl
 ```

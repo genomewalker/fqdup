@@ -70,7 +70,7 @@ print(f'{j/n:.4f}' if n else '0.0', n)
 
 read in_lc  in_n  < <(lowcomplex_rate "$TMPDIR/R2.fq.gz")
 
-"$FQDUP" merge -1 "$TMPDIR/R1.fq.gz" -2 "$TMPDIR/R2.fq.gz" \
+"$FQDUP" merge --min-length 15 -1 "$TMPDIR/R1.fq.gz" -2 "$TMPDIR/R2.fq.gz" \
     -o "$TMPDIR/merged.fq.gz" \
     --r1-out "$TMPDIR/unmR1.fq.gz" --r2-out "$TMPDIR/unmR2.fq.gz" \
     --internal-panel --min-length 25 -p 4 2>"$TMPDIR/merge.err" >/dev/null

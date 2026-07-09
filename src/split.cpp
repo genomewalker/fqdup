@@ -101,8 +101,8 @@ int split_main(int argc, char** argv) {
         usage(argv[0]);
         return 1;
     }
-    if (min_length < 0) {
-        std::cerr << "split: --min-length is required — set the minimum read length explicitly\n";
+    if (min_length < 1) {
+        std::cerr << "split: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
         return 1;
     }
 
@@ -255,6 +255,12 @@ int split_main(int argc, char** argv) {
             uint64_t n_scan = 0;
             { auto hr = make_fastq_reader(in_path); FastqRecord hrec;
               while (hr->read(hrec)) {
+                  // P1-#2: the pi-target must be computed over the SAME population
+                  // that the routing pass emits. Reads below --min-length are a
+                  // third fate (dropped, not routed), so exclude them here too;
+                  // otherwise the top-pi LLR cut is calibrated on a superset and
+                  // the emitted damaged fraction drifts off pi.
+                  if (static_cast<int>(hrec.seq.size()) < min_length) continue;
                   float s = split_model.score(hrec.seq);
                   int bi = static_cast<int>((s - LO) / (HI - LO) * (NB - 1));
                   bi = std::clamp(bi, 0, NB - 1);

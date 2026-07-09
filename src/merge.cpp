@@ -1513,8 +1513,8 @@ int merge_main(int argc, char** argv) {
         return 1;
     }
 
-    if (opts.min_length < 0) {
-        std::cerr << "merge: --min-length is required — set the minimum read length explicitly\n";
+    if (opts.min_length < 1) {
+        std::cerr << "merge: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
         return 1;
     }
 
@@ -1540,6 +1540,13 @@ int merge_main(int argc, char** argv) {
     auto r2_rdr = make_chained_fastq_reader(r2_paths, static_cast<size_t>(io_threads));
 
     // ---- Pre-scan: auto-detect library type, adapters, UDG status ----
+    // P1-#2 (decided: no --min-length filter here). --min-length is a MERGED-OUTPUT
+    // length floor; this pre-scan detects library CHEMISTRY (adapters, ds/ss, UDG)
+    // from the raw R1/R2 pairs, which is orthogonal to how long the merged fragment
+    // ends up. Filtering raw input pairs by an output-length floor would neither be
+    // well-defined (a long pair can merge short and vice versa) nor desirable
+    // (chemistry detection wants all pairs). passes_qc (merge.cpp:1037) applies the
+    // floor to every EMITTED record, which is where the floor belongs.
     static constexpr int64_t SCAN_READS = 200'000;
     std::vector<ReadPair> scan_buf;
     scan_buf.reserve(SCAN_READS);
