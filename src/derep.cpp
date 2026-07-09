@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -333,6 +334,11 @@ private:
         uint64_t record_idx = 0;
 
         while (reader->read(rec)) {
+            if (static_cast<int>(rec.seq.size()) < min_length_) {
+                ++n_below_min_length_;
+                ++record_idx;   // keep record_idx aligned with Pass 2 (physical read position)
+                continue;       // --min-length drop: never indexed, never emitted
+            }
             bool is_forward = true;
             XXH128_hash_t h = compute_hash(rec.seq, is_forward);
             SequenceFingerprint fp(h, rec.seq.size());
@@ -409,6 +415,10 @@ private:
 
         std::cerr << "\r";
         log_info("Pass 1 complete: " + std::to_string(total_reads_) + " reads indexed");
+        if (n_below_min_length_ > 0)
+            log_info("--min-length " + std::to_string(min_length_) + ": dropped " +
+                     std::to_string(n_below_min_length_) + " reads shorter than " +
+                     std::to_string(min_length_) + " bp");
     }
 
     // Phase 3: parent-centric mismatch pattern detection.
@@ -529,10 +539,18 @@ private:
         // Below this, splits degenerate (parts of 0-4 bp) and the hash keys
         // become unreliable, risking false absorptions.
         constexpr int kMinInteriorLen = 20;
-        // Below this, even brute-force pairwise comparison is unsafe (random match
-        // probability for a single mismatch at length 7 is non-negligible).
-        constexpr int kBruteforceMinLen = 8;
         uint64_t short_interior_skipped = 0;
+        // Short-read policy (unconditional): reads whose masked interior is shorter
+        // than kMinInteriorLen skip Phase-3 1-mismatch error-correction and pass
+        // through as their own representative. Phase 1 (XXH128 full-seq fingerprint)
+        // already exact-dedups them, so no duplicate survives. Below ilen 20 the
+        // 4-way pigeonhole split degenerates (parts of 0-4 bp -> unreliable keys) and
+        // the only alternative -- an O(bucket^2) same-length brute-force scan -- both
+        // avalanches on the huge short-read buckets AND over-merges distinct short
+        // molecules (the H=1 neighbour graph saturates). The threshold 20 = max of
+        // pigeonhole viability (4 parts x ~5 bp) and chance-neighbour discriminability
+        // (d(l,B) = (B-1).l.(3/4).(1/4)^(l-1) < 1 needs l >= 13-15 at KapK bucket
+        // sizes). Keeping short reads as-is is O(n) and lossless in the safe direction.
 
         struct InteriorLayout {
             int  k5 = 0, ilen = 0;
@@ -575,21 +593,12 @@ private:
         build_map.reserve(64);
         struct LenShard { std::array<FlatPairIndex, 6> pi; };
 
-        // Short-interior fallback: for ilen in [kBruteforceMinLen, kMinInteriorLen),
-        // pigeonhole splits degenerate. Index parents in same-length buckets and
-        // brute-force scan in B1 — slower per child but bounded by bucket size.
-        ska::flat_hash_map<int, std::vector<uint32_t>> short_parents;
-
         uint64_t n_parents = 0;
         for (uint32_t id = 0; id < N; ++id) {
             if (!arena_.is_eligible(id)) continue;
             int L = arena_.length(id);
             const auto& lay = get_layout(L);
-            if (lay.ilen < kMinInteriorLen) {
-                if (lay.ilen >= kBruteforceMinLen)
-                    short_parents[lay.ilen].push_back(id);
-                continue;
-            }
+            if (lay.ilen < kMinInteriorLen) continue;
 
             auto t0 = clk::now();
             if (scratch.size() < static_cast<size_t>(lay.nbytes))
@@ -624,16 +633,6 @@ private:
         stats.parents_indexed = n_parents;
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
                  " sequences (directed monotone ascent, all eligible)");
-
-        uint64_t n_short_parents = 0;
-        for (const auto& [ilen, v] : short_parents) n_short_parents += v.size();
-        stats.short_brute_parents = n_short_parents;
-        if (n_short_parents > 0)
-            log_info("Phase 3: short-interior fallback indexes " +
-                     std::to_string(n_short_parents) + " parents across " +
-                     std::to_string(short_parents.size()) + " length buckets [" +
-                     std::to_string(kBruteforceMinLen) + "," +
-                     std::to_string(kMinInteriorLen - 1) + "]");
 
         // Build a per-id interior slab: extract each eligible long-interior id's
         // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
@@ -774,60 +773,11 @@ private:
                     int L = arena_.length(cid);
                     const auto& lay = get_layout(L);
                     if (lay.ilen < kMinInteriorLen) {
+                        // Unconditional short-read skip: Phase 1 already exact-deduped
+                        // this read; below ilen 20 the pigeonhole index is unreliable,
+                        // so it passes through as its own representative. See the
+                        // policy note at the Phase-A index build.
                         ls.short_interior_skipped++;
-                        if (lay.ilen < kBruteforceMinLen) {
-                            ls.short_too_small_skipped++;
-                            continue;
-                        }
-                        // Brute-force same-length parent scan.
-                        auto sp_it = short_parents.find(lay.ilen);
-                        if (sp_it == short_parents.end()) continue;
-                        const auto& parents_vec = sp_it->second;
-
-                        int nf = (lay.ilen + 3) / 4;
-                        size_t need = static_cast<size_t>(3 * nf);
-                        if (scratch.size() < need) scratch.resize(need);
-                        uint8_t* ci_full_s  = scratch.data();
-                        uint8_t* crc_full_s = ci_full_s  + nf;
-                        uint8_t* pi_buf_s   = crc_full_s + nf;
-
-                        extract_packed_part(arena_.data(cid), lay.k5, lay.ilen, ci_full_s);
-                        compute_interior_rc(ci_full_s, lay.ilen, crc_full_s);
-
-                        ls.short_brute_evaluated++;
-                        constexpr uint32_t kPrefetchAhead = 8;
-                        for (size_t pvi = 0; pvi < parents_vec.size(); ++pvi) {
-                            uint32_t pid = parents_vec[pvi];
-                            if (pvi + kPrefetchAhead < parents_vec.size())
-                                __builtin_prefetch(arena_.data(parents_vec[pvi + kPrefetchAhead]), 0, 0);
-                            if (is_error_[pid]) continue;
-                            if (pid == cid) continue;
-                            if (id_count[pid] < id_count[cid]) continue;
-                            if (id_count[pid] == id_count[cid] && pid >= cid) continue;
-                            extract_packed_part(arena_.data(pid), lay.k5, lay.ilen, pi_buf_s);
-
-                            MismatchInfo mm = packed_find_mismatch(
-                                pi_buf_s, ci_full_s, 0, lay.ilen, errcor_.protect_transversions);
-                            if (mm.found) {
-                                local_mm.push_back({pid, cid, mm.position,
-                                                    mm.base_b, mm.base_a,
-                                                    0, 0, 0, 1, {}});
-                                ls.short_brute_found++;
-                                ls.children_found++;
-                                continue;
-                            }
-                            mm = packed_find_mismatch(
-                                pi_buf_s, crc_full_s, 0, lay.ilen, errcor_.protect_transversions);
-                            if (mm.found) {
-                                uint16_t cpos = static_cast<uint16_t>(lay.ilen - 1 - mm.position);
-                                local_mm.push_back({pid, cid, cpos,
-                                    static_cast<uint8_t>(mm.base_b ^ 0x3u),
-                                    static_cast<uint8_t>(mm.base_a ^ 0x3u),
-                                    0, 0, 0, 1, {}});
-                                ls.short_brute_found++;
-                                ls.children_found++;
-                            }
-                        }
                         continue;
                     }
 
@@ -2365,21 +2315,19 @@ private:
         stats.log();
         // Persist for write_fqcl_ → metadata.
         loss_bucket_overflow_drops_   = stats.bucket_overflow_drops;
-        loss_short_brute_evaluated_   = stats.short_brute_evaluated;
-        loss_short_brute_found_       = stats.short_brute_found;
-        loss_short_too_small_skipped_ = stats.short_too_small_skipped;
-        // Only the truly-unrecoverable (ilen < kBruteforceMinLen) reads remain a "loss".
-        loss_short_interior_skipped_ = stats.short_too_small_skipped;
+        loss_short_brute_evaluated_   = stats.short_brute_evaluated;   // 0: brute-force fallback removed
+        loss_short_brute_found_       = stats.short_brute_found;       // 0
+        loss_short_too_small_skipped_ = stats.short_too_small_skipped; // 0
+        // Short interiors are no longer a loss: they pass through as their own
+        // Phase-1-exact-deduped representatives. This is a kept-count, not a drop.
+        loss_short_interior_skipped_ = short_interior_skipped;
         if (short_interior_skipped > 0) {
             double pct_short = 100.0 * static_cast<double>(short_interior_skipped) /
                                static_cast<double>(N);
             log_info("Phase 3: " + std::to_string(short_interior_skipped) +
                      " reads have interior < " + std::to_string(kMinInteriorLen) +
-                     " bp (" + std::to_string(pct_short).substr(0, 4) + "%); " +
-                     std::to_string(stats.short_brute_evaluated) + " ran brute-force fallback (" +
-                     std::to_string(stats.short_brute_found) + " edges), " +
-                     std::to_string(stats.short_too_small_skipped) +
-                     " unrecoverable (ilen < " + std::to_string(kBruteforceMinLen) + ")");
+                     " bp (" + std::to_string(pct_short).substr(0, 4) + "%); "
+                     "kept as own representatives (Phase-1 exact-deduped, EC skipped)");
             if (pct_short > 10.0)
                 log_warn("Over 10% of reads have interiors too short for the pigeonhole index "
                          "after damage masking. Consider reducing --mask-threshold or "
@@ -2778,6 +2726,12 @@ private:
     std::string out_undamaged_path_;
     float split_threshold_ = 0.0f;
     DamageSplitModel split_model_;
+    // Required read-length floor (--min-length). Reads shorter than this are
+    // dropped at ingestion (Pass 1) and never emitted (Pass 2). Orthogonal to the
+    // ilen<20 EC-skip: this is a user-facing read-length filter, that is a dedup
+    // internal. -1 = unset (guarded in derep_main before the engine is built).
+    int   min_length_ = -1;
+    uint64_t n_below_min_length_ = 0;
 
 public:
     void set_split_paths(std::string damaged, std::string undamaged,
@@ -2789,6 +2743,7 @@ public:
     void set_split_model(DamageSplitModel model) {
         split_model_ = std::move(model);
     }
+    void set_min_length(int n) { min_length_ = n; }
 private:
 
     // Loss counters surfaced into .fqcl metadata (T1.3, T1.2, T3.1).
@@ -2815,6 +2770,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "\nRequired:\n"
         << "  -i FILE              Input sorted FASTQ\n"
         << "  -o FILE              Output deduplicated FASTQ\n"
+        << "  --min-length N       (REQUIRED) Drop reads shorter than N bp at ingestion\n"
         << "\nOutput:\n"
         << "  -c FILE              Cluster statistics (gzipped TSV)\n"
         << "  --out-damaged FILE   Write LLR-classified damaged reads to FILE (.fq.gz)\n"
@@ -2902,6 +2858,7 @@ int derep_main(int argc, char** argv) {
 
     std::string in_path, out_path, cluster_path, fqcl_path, prior_fqcl_path;
     std::string out_damaged_path, out_undamaged_path;
+    int   min_length = -1;   // REQUIRED read-length floor (unset sentinel)
     float split_threshold = 0.0f;
     enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
     bool use_revcomp = true;
@@ -2945,6 +2902,8 @@ int derep_main(int argc, char** argv) {
             in_path = argv[++i];
         } else if (arg == "-o" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--min-length" && i + 1 < argc) {
+            min_length = std::stoi(argv[++i]);
         } else if (arg == "--out-damaged" && i + 1 < argc) {
             out_damaged_path = argv[++i];
         } else if (arg == "--out-undamaged" && i + 1 < argc) {
@@ -3140,6 +3099,10 @@ int derep_main(int argc, char** argv) {
     if (in_path.empty() || out_path.empty()) {
         std::cerr << "Error: Missing required arguments (-i and -o)\n\n";
         print_usage(argv[0]);
+        return 1;
+    }
+    if (min_length < 0) {
+        std::cerr << "derep: --min-length is required — set the minimum read length explicitly\n";
         return 1;
     }
 
@@ -3385,6 +3348,7 @@ int derep_main(int argc, char** argv) {
             engine.set_split_paths(out_damaged_path, out_undamaged_path, effective_split_threshold);
         }
         engine.set_split_model(DamageSplitModel::build(lsd_data, profile));
+        engine.set_min_length(min_length);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
