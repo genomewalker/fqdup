@@ -53,7 +53,7 @@ echo ""
 echo "--- F1: derep main output to /dev/full ---"
 if [[ -w /dev/full ]]; then
     assert_fails "derep -o /dev/full exits non-zero" \
-        "$FQDUP" derep -i "$TMPDIR/sorted.fq" -o /dev/full
+        "$FQDUP" derep --min-length 1 -i "$TMPDIR/sorted.fq" -o /dev/full
 else
     echo "  SKIP: /dev/full not available"
 fi
@@ -65,7 +65,7 @@ echo ""
 echo "--- F2: derep cluster output to /dev/full ---"
 if [[ -w /dev/full ]]; then
     assert_fails "derep -c /dev/full exits non-zero" \
-        "$FQDUP" derep -i "$TMPDIR/sorted.fq" -o "$TMPDIR/ok.fq" -c /dev/full
+        "$FQDUP" derep --min-length 1 -i "$TMPDIR/sorted.fq" -o "$TMPDIR/ok.fq" -c /dev/full
 else
     echo "  SKIP: /dev/full not available"
 fi
@@ -110,7 +110,7 @@ TRUNC=$(( FSIZE * 3 / 4 ))
 dd if="$TMPDIR/full.fq.gz" of="$TMPDIR/trunc.fq.gz" \
     bs=1 count="$TRUNC" 2>/dev/null
 assert_fails "derep truncated gzip exits non-zero" \
-    "$FQDUP" derep -i "$TMPDIR/trunc.fq.gz" -o "$TMPDIR/trunc_out.fq"
+    "$FQDUP" derep --min-length 1 -i "$TMPDIR/trunc.fq.gz" -o "$TMPDIR/trunc_out.fq"
 
 # ---------------------------------------------------------------------------
 # F6: derep with truncated plain input
@@ -124,7 +124,7 @@ TRUNC=$(( FSIZE * 3 / 4 ))
 dd if="$TMPDIR/sorted.fq" of="$TMPDIR/trunc_plain.fq" \
     bs=1 count="$TRUNC" 2>/dev/null
 assert_fails "derep truncated plain FASTQ exits non-zero" \
-    "$FQDUP" derep -i "$TMPDIR/trunc_plain.fq" -o "$TMPDIR/trunc_out2.fq"
+    "$FQDUP" derep --min-length 1 -i "$TMPDIR/trunc_plain.fq" -o "$TMPDIR/trunc_out2.fq"
 
 echo ""
 echo "=== All I/O failure tests passed ==="

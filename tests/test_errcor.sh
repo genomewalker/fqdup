@@ -62,7 +62,7 @@ for i in range(1, 4):
 " > input.fq
 
 "$FQDUP" sort -i input.fq -o sorted.fq --max-memory 1G -t . --fast 2>/dev/null
-"$FQDUP" derep -i sorted.fq -o output.fq --error-correct 2>/dev/null
+"$FQDUP" derep --min-length 1 -i sorted.fq -o output.fq --error-correct 2>/dev/null
 
 # Derive the count=3 two-transversion sequence for case 5 check
 TWO_TRANS3=$(python3 -c "
@@ -108,7 +108,7 @@ echo "OK: H=2 both-transversion count=3 preserved (above max_h2_count)"
 # The same A→T+C→G count=1 child (case 4) must be PRESERVED when the flag is set.
 # ──────────────────────────────────────────────────────────────────────────────
 "$FQDUP" sort -i input.fq -o sorted_prot.fq --max-memory 1G -t . --fast 2>/dev/null
-"$FQDUP" derep \
+"$FQDUP" derep --min-length 1 \
     -i sorted_prot.fq \
     -o output_prot.fq \
     --error-correct \

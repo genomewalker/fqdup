@@ -111,7 +111,7 @@ fi
 # ---- fqdup derep (single-file) ----
 # Run on the derep_pairs non-extended output — all 3 sequences are distinct,
 # so all 3 should pass through unchanged.
-"$FQDUP" derep -i out.non.fq -o non.final.fq
+"$FQDUP" derep --min-length 1 -i out.non.fq -o non.final.fq
 
 if [[ ! -s non.final.fq ]]; then
     echo "FAIL: non.final.fq missing or empty"
@@ -138,14 +138,14 @@ GGGGTTTT
 IIIIIIII
 EOF
 
-"$FQDUP" derep -i rc_test.fq -o rc_merged.fq
+"$FQDUP" derep --min-length 1 -i rc_test.fq -o rc_merged.fq
 rc_merged=$(grep -c '^@' rc_merged.fq || true)
 if [[ "$rc_merged" -ne 1 ]]; then
     echo "FAIL: RC dedup: expected 1 unique read, got $rc_merged"
     exit 1
 fi
 
-"$FQDUP" derep -i rc_test.fq -o rc_unmerged.fq --no-revcomp
+"$FQDUP" derep --min-length 1 -i rc_test.fq -o rc_unmerged.fq --no-revcomp
 rc_unmerged=$(grep -c '^@' rc_unmerged.fq || true)
 if [[ "$rc_unmerged" -ne 2 ]]; then
     echo "FAIL: RC disabled: expected 2 unique reads, got $rc_unmerged"

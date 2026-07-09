@@ -542,8 +542,9 @@ private:
         uint64_t short_interior_skipped = 0;
         // Short-read policy (unconditional): reads whose masked interior is shorter
         // than kMinInteriorLen skip Phase-3 1-mismatch error-correction and pass
-        // through as their own representative. Phase 1 (XXH128 full-seq fingerprint)
-        // already exact-dedups them, so no duplicate survives. Below ilen 20 the
+        // through as their own representative. Phase 1 (XXH128 fingerprint over the
+        // damage-masked sequence when --damage is active, else the raw sequence)
+        // already collapses identical reads, so no duplicate survives. Below ilen 20 the
         // 4-way pigeonhole split degenerates (parts of 0-4 bp -> unreliable keys) and
         // the only alternative -- an O(bucket^2) same-length brute-force scan -- both
         // avalanches on the huge short-read buckets AND over-merges distinct short
@@ -577,6 +578,16 @@ private:
                 lay.ready = true;
             }
             return lay;
+        };
+
+        // Single EC-eligibility predicate (P1-#3): a read may take part in any
+        // Phase-3 error-correction path only if its damage-masked interior is
+        // >= kMinInteriorLen. Below that the pigeonhole split degenerates and the
+        // key is unreliable, so the read stays its own representative. Applied to
+        // the main H=1/H=2 loop (below) AND the adj-len / rescue-indels probes so
+        // no correction path can silently absorb a short-interior read.
+        auto ec_eligible = [&](uint32_t id) -> bool {
+            return get_layout(arena_.length(id)).ilen >= kMinInteriorLen;
         };
 
         Phase3Stats stats;
@@ -1762,7 +1773,7 @@ private:
                 std::vector<uint8_t> dec;
                 std::vector<char>    asc;
                 for (uint32_t id = 0; id < N; ++id) {
-                    if (!arena_.is_eligible(id)) continue;
+                    if (!arena_.is_eligible(id) || !ec_eligible(id)) continue;
                     int L = arena_.length(id);
                     if ((int)dec.size() < L) { dec.resize(L); asc.resize(L); }
                     arena_.decode_range(id, 0, L, dec.data());
@@ -1936,7 +1947,7 @@ private:
             ska::flat_hash_map<uint64_t, std::vector<uint32_t>> bundle_members;
             bundle_members.reserve(N / 4 + 16);
             for (uint32_t id = 0; id < N; ++id) {
-                if (!arena_.is_eligible(id)) continue;
+                if (!arena_.is_eligible(id) || !ec_eligible(id)) continue;
                 if (is_error_[id]) continue;
                 uint32_t occ = static_cast<uint32_t>(child_bundle_occ_of(id));
                 if (occ < 2u) continue;
@@ -2372,7 +2383,10 @@ private:
         cf::WriterMetadata meta;
         meta.tool_version  = FQDUP_VERSION;
         meta.input_fastq   = fqcl_input_fastq_;
-        meta.n_input_reads = total_reads_;
+        // P2-#5: total_reads_ counts only INDEXED (>= --min-length) reads, so it
+        // undercounts the input by the below-min-length drops. Report the true
+        // record count; the floor drops are logged separately at ingestion.
+        meta.n_input_reads = total_reads_ + n_below_min_length_;
         // Bug 1 fix: report the resolved library type from the user flag
         // (or "auto" when truly auto-detected). Previously this read
         // profile_.enabled, which is false whenever deamination fit didn'''t converge (small
@@ -3101,8 +3115,8 @@ int derep_main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
-    if (min_length < 0) {
-        std::cerr << "derep: --min-length is required — set the minimum read length explicitly\n";
+    if (min_length < 1) {
+        std::cerr << "derep: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
         return 1;
     }
 
@@ -3196,6 +3210,19 @@ int derep_main(int argc, char** argv) {
             opts.clip_policy        = damage_qc_enabled ? damage_clip_policy
                                                         : DamageClipPolicy::Off;
             opts.skip_deam_fit      = false;
+            // P1-#2 (decided: calibrate on all input, do NOT apply --min-length here).
+            // This Pass-0 sample estimates the deamination PROFILE SHAPE (terminal
+            // C->T decay, mask positions) that reads the library's chemistry, not a
+            // per-surviving-read decision. Short fragments carry the strongest
+            // damage signal (the whole point of the short-fragment work), so
+            // excluding them would bias the profile toward long, less-damaged reads.
+            // The estimated profile only feeds clustering when the user opts into
+            // --damage (derep default: profile.enabled=false, below). Honoring the
+            // floor inside estimate_damage_with_qc would also need a libtaph API
+            // field (DamageEstimateOptions has none) -> out of Track-1 scope.
+            // ceiling: if a user needs shorts excluded from the fit too, set
+            // --min-length at/above the band; upgrade: add a length floor to
+            // DamageEstimateOptions in libtaph.
             opts.max_reads          = damage_deam_max_reads;
             // Forward the derep thread count to the taph deamination+QC pass;
             // it defaulted to 1 (single-threaded), making Pass 0 ~2x slower than
