@@ -64,7 +64,11 @@ static void print_usage(const char* prog) {
         << "  --html FILE                Write interactive damage report as self-contained HTML\n"
         << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
-        << "                             (default: 1000000; 0 = scan all reads)\n";
+        << "                             (default: 1000000; 0 = scan all reads)\n"
+        << "  --short-fragment           Include 16-29 bp reads in a JOINT length-isotonic damage\n"
+        << "                             re-fit (borrowed interior). Re-estimates the whole length law,\n"
+        << "                             so >=30 bulk delta / tau / preservation reflect ALL lengths\n"
+        << "                             (16+) when set -- NOT purely additive (default: off)\n";
 }
 
 static LengthBinOptions parse_length_bins(const std::string& spec, bool& ok) {
@@ -116,6 +120,7 @@ int profile_main(int argc, char** argv) {
     std::string html_path;
     std::vector<std::string> subst_in_paths;
     bool        run_oxog      = true;
+    bool        short_fragment = false;   // opt-in: estimate damage on 16-29 bp reads (borrowed interior)
     // bsubst arrays shared between early pseudo-count injection and late JSON output
     static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
     static const uint8_t BMAGIC_V2[8] = {'B','S','U','B','S','T',0x02,0x00};
@@ -185,6 +190,8 @@ int profile_main(int argc, char** argv) {
             subst_in_paths.push_back(argv[++i]);
         } else if (arg == "--no-oxog") {
             run_oxog = false;
+        } else if (arg == "--short-fragment") {
+            short_fragment = true;
         } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
             long long v = std::stoll(argv[++i]);
             if (v < 0) {
@@ -226,6 +233,8 @@ int profile_main(int argc, char** argv) {
     // in a separate states_pe and finalized independently (not pooled with merged).
     const bool paired_mode   = have_paired;   // drives the paired ingestion pass
     const bool combined_mode = have_merged && have_paired;
+    // Short-fragment mode floor: 16 bp (opt-in) or 30 (default = legacy >=30-only path, bit-identical).
+    const int short_floor = short_fragment ? 16 : 30;
     if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
         std::cerr << "Error: --mask-threshold must be in (0, 1), got " << mask_threshold << "\n";
         return 1;
@@ -394,6 +403,7 @@ int profile_main(int argc, char** argv) {
                 s.lbs.configure(prov_edges);
                 s.lsd_prov_edges = prov_edges;
                 s.lsd_cnt.assign(n_prov_bins * N_LSD_SIG5, 0);
+                s.profile.short_fragment_floor = short_floor;
             }
         };
         configure_states(states);
@@ -502,6 +512,7 @@ int profile_main(int argc, char** argv) {
     auto dp_owner = std::make_unique<taph::SampleDamageProfile>();
     taph::SampleDamageProfile& dp = *dp_owner;
     dp.forced_library_type = forced_lib;
+    dp.short_fragment_floor = short_floor;   // activate short-group injection in finalize_bulk (opt-in)
     int64_t reads_scanned = 0, reads_skipped = 0;
     int     len_min = INT_MAX, len_max = 0;
     int64_t len_sum = 0;
