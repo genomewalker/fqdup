@@ -104,7 +104,7 @@ struct OutQueue {
 static void clip_worker(ClipQueue& in_q, OutQueue& out_q,
                         const std::vector<std::string>& stubs5,
                         const std::vector<std::string>& stubs3,
-                        int min_length) {
+                        int min_length, int max_length) {
     TrimBatch batch;
     while (in_q.pop(batch)) {
         for (auto& rec : batch.records) {
@@ -135,7 +135,8 @@ static void clip_worker(ClipQueue& in_q, OutQueue& out_q,
                     }
                 } while (trimmed);
             }
-            if ((int)rec.seq.size() < min_length) {
+            if ((int)rec.seq.size() < min_length ||
+                (max_length > 0 && (int)rec.seq.size() > max_length)) {
                 ++batch.n_dropped;
                 rec.seq.clear();  // sentinel: writer skips empty-seq records
             }
@@ -158,6 +159,7 @@ static void usage() {
         "  -p N             Threads (default: all cores)\n"
         "  --scan-reads N   Reads sampled for stub detection (default: 1000000; 0=all)\n"
         "  --min-length N   Discard trimmed reads shorter than N bp (default: 15)\n"
+        "  --max-length N   Discard trimmed reads longer than N bp (default: off)\n"
         "  --stub5 SEQ      Force 5' stub (skip detection)\n"
         "  --stub3 SEQ      Force 3' stub (skip detection)\n"
         "  -h, --help       Show this help\n";
@@ -168,6 +170,7 @@ int trim_main(int argc, char** argv) {
     std::string in_path, out_path;
     int64_t scan_reads = 1'000'000;
     int     min_length = 15;
+    int     max_length = 0;   // 0=disabled (no upper cap)
     int     n_threads  = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     std::string forced_stub5, forced_stub3;
 
@@ -178,6 +181,7 @@ int trim_main(int argc, char** argv) {
         else if ((a == "-p" || a == "--threads") && i+1 < argc) { n_threads = std::stoi(argv[++i]); }
         else if (a == "--scan-reads"             && i+1 < argc) { scan_reads = std::stoll(argv[++i]); }
         else if (a == "--min-length"             && i+1 < argc) { min_length = std::stoi(argv[++i]); }
+        else if (a == "--max-length"             && i+1 < argc) { max_length = std::stoi(argv[++i]); }
         else if (a == "--stub5"                  && i+1 < argc) { forced_stub5 = argv[++i]; }
         else if (a == "--stub3"                  && i+1 < argc) { forced_stub3 = argv[++i]; }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -287,7 +291,7 @@ int trim_main(int argc, char** argv) {
     workers.reserve(clip_threads);
     for (int t = 0; t < clip_threads; ++t)
         workers.emplace_back(clip_worker, std::ref(clip_q), std::ref(out_q),
-                             std::cref(stubs5), std::cref(stubs3), min_length);
+                             std::cref(stubs5), std::cref(stubs3), min_length, max_length);
 
     // Producer (main thread): drain scan_buf first (buffered during detection),
     // then continue reading remaining records from the already-open reader.
