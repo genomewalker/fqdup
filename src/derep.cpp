@@ -339,6 +339,15 @@ private:
 
         if (want_par) pass1_parallel(in_path, n_threads);
         else          pass1_serial(in_path);
+
+        if (n_below_min_length_ > 0)
+            log_info("--min-length " + std::to_string(min_length_) + ": dropped " +
+                     std::to_string(n_below_min_length_) + " reads shorter than " +
+                     std::to_string(min_length_) + " bp");
+        if (n_above_max_length_ > 0)
+            log_info("--max-length " + std::to_string(max_length_) + ": dropped " +
+                     std::to_string(n_above_max_length_) + " reads longer than " +
+                     std::to_string(max_length_) + " bp");
     }
 
     void pass1_serial(const std::string& in_path) {
@@ -350,7 +359,8 @@ private:
             // Length gate: advance the physical index (emit pass re-reads by position)
             // but skip indexing so dropped reads never become a cluster representative.
             const int Lrec = (int)rec.seq.size();
-            if (Lrec < min_length_ || (max_length_ > 0 && Lrec > max_length_)) { record_idx++; continue; }
+            if (Lrec < min_length_) { ++n_below_min_length_; record_idx++; continue; }
+            if (max_length_ > 0 && Lrec > max_length_) { ++n_above_max_length_; record_idx++; continue; }
             bool is_forward = true;
             XXH128_hash_t h = compute_hash(rec.seq, is_forward);
             SequenceFingerprint fp(h, rec.seq.size());
@@ -494,7 +504,9 @@ private:
             for (size_t i = 0; i < n; ++i) {
                 int L = len[i];
                 // Length gate (mirrors pass1_serial): advance physical index, skip indexing.
-                if (L < min_length_ || (max_length_ > 0 && L > max_length_)) { ++record_idx; continue; }
+                // This merge loop runs single-threaded after join() -> counters need no atomic.
+                if (L < min_length_) { ++n_below_min_length_; ++record_idx; continue; }
+                if (max_length_ > 0 && L > max_length_) { ++n_above_max_length_; ++record_idx; continue; }
                 SequenceFingerprint fp(hh[i], static_cast<size_t>(L));
                 auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
                 if (inserted) {
@@ -563,7 +575,9 @@ private:
         cf::WriterMetadata meta;
         meta.tool_version  = FQDUP_VERSION;
         meta.input_fastq   = fqcl_input_fastq_;
-        meta.n_input_reads = total_reads_;
+        // total_reads_ counts only indexed survivors (gates continue before the
+        // increment); add length-filtered drops to report true physical input.
+        meta.n_input_reads = total_reads_ + n_below_min_length_ + n_above_max_length_;
         // Bug 1 fix: report the resolved library type from the user flag
         // (or "auto" when truly auto-detected). Previously this read
         // profile_.enabled, which is false whenever deamination fit didn'''t converge (small
@@ -917,8 +931,10 @@ private:
     std::string out_undamaged_path_;
     float split_threshold_ = 0.0f;
     DamageSplitModel split_model_;
-    int min_length_ = 0;   // 0=disabled (no lower cap); reads shorter dropped before indexing
+    int min_length_ = 0;   // 0=disabled; CLI requires >=1. Reads shorter dropped before indexing.
     int max_length_ = 0;   // 0=disabled (no upper cap); reads longer dropped before indexing
+    uint64_t n_below_min_length_ = 0;  // Pass-1 --min-length drops (never indexed/emitted)
+    uint64_t n_above_max_length_ = 0;  // Pass-1 --max-length drops (never indexed/emitted)
 
 public:
     void set_length_filter(int mn, int mx) { min_length_ = mn; max_length_ = mx; }
@@ -967,8 +983,8 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --out-damaged FILE   Write LLR-classified damaged reads to FILE (.fq.gz)\n"
         << "  --out-undamaged FILE Write LLR-classified undamaged reads to FILE (.fq.gz)\n"
         << "  --split-threshold F  LLR threshold for split (default 0.0)\n"
-        << "  --min-length N       Drop reads shorter than N bp before dedup (default: off)\n"
-        << "  --max-length N       Drop reads longer than N bp before dedup (default: off)\n"
+        << "  --min-length N       REQUIRED. Drop reads shorter than N bp before dedup (N >= 1)\n"
+        << "  --max-length N       Drop reads longer than N bp before dedup (0 = off; must be >= --min-length)\n"
         << "  --split-model MODE   auto (default) | bulk | empirical\n"
         << "                         auto     — empirical per-bin if damage detected, else bulk\n"
         << "                         bulk     — bulk exponential only, no extra file pass\n"
@@ -1295,6 +1311,15 @@ int derep_main(int argc, char** argv) {
     if (in_path.empty() || out_path.empty()) {
         std::cerr << "Error: Missing required arguments (-i and -o)\n\n";
         print_usage(argv[0]);
+        return 1;
+    }
+    if (min_length < 1) {
+        std::cerr << "Error: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
+        return 1;
+    }
+    if (max_length != 0 && max_length < min_length) {
+        std::cerr << "Error: --max-length (" << max_length << ") must be 0 (disabled) or >= --min-length ("
+                  << min_length << ")\n";
         return 1;
     }
 

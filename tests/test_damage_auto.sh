@@ -45,7 +45,7 @@ echo "  True: dmax5=$DMAX5  dmax3=$DMAX3  lambda=$LAMBDA"
 
 "$FQDUP" sort -i "$TMPDIR/est.fq" -o "$TMPDIR/est.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/est.sorted.fq" -o /dev/null \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/est.sorted.fq" -o /dev/null \
     --collapse-damage 2>"$TMPDIR/est.log"
 
 EST5=$(grep "5'-end: d_max=" "$TMPDIR/est.log" | sed 's/.*d_max=\([^ ]*\) .*/\1/')
@@ -84,7 +84,7 @@ echo "  $N_MOL molecules × 2 independently-damaged copies"
 
 "$FQDUP" sort -i "$TMPDIR/dup.fq" -o "$TMPDIR/dup.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/dup.sorted.fq" -o "$TMPDIR/dup.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/dup.sorted.fq" -o "$TMPDIR/dup.out.fq" \
     --collapse-damage 2>"$TMPDIR/dup.log"
 
 UNIQUE_B=$(grep -c '^@' "$TMPDIR/dup.out.fq")
@@ -130,12 +130,12 @@ echo "  $N_MOL_C molecules × 10x coverage, no damage, PCR rate=$PCR_RATE/base"
 "$FQDUP" sort -i "$TMPDIR/pcr.fq" -o "$TMPDIR/pcr.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
 # Without error correction: PCR error reads inflate unique count
-"$FQDUP" derep -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_no_ec.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_no_ec.out.fq" \
     --no-error-correct 2>/dev/null
 UNIQUE_NO_EC=$(grep -c '^@' "$TMPDIR/pcr_no_ec.out.fq")
 
 # With error correction (default min_parent=3 works at 10x: true parents have count~10)
-"$FQDUP" derep -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_ec.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/pcr.sorted.fq" -o "$TMPDIR/pcr_ec.out.fq" \
     --error-correct 2>/dev/null
 UNIQUE_EC=$(grep -c '^@' "$TMPDIR/pcr_ec.out.fq")
 
@@ -204,9 +204,9 @@ echo "  Oxidative: G→T at ox-rate=0.05/G-base  |  PCR: random at rate=0.003/ba
     --no-damage --ox-rate 0.05 --seed 77 > "$TMPDIR/ox.fq"
 "$FQDUP" sort -i "$TMPDIR/ox.fq" -o "$TMPDIR/ox.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
-U_OX_NO_EC=$(  "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_no.fq" \
+U_OX_NO_EC=$(  "$FQDUP" derep --min-length 1 -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_no.fq" \
     --no-error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/ox_no.fq")
-U_OX_EC=$(     "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
+U_OX_EC=$(     "$FQDUP" derep --min-length 1 -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
     --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/ox_ec.fq")
 
 # PCR error dataset (same seed → same base molecules)
@@ -214,9 +214,9 @@ U_OX_EC=$(     "$FQDUP" derep -i "$TMPDIR/ox.sorted.fq" -o "$TMPDIR/ox_ec.fq" \
     --no-damage --pcr-rate 0.003 --seed 77 > "$TMPDIR/pcr_d.fq"
 "$FQDUP" sort -i "$TMPDIR/pcr_d.fq" -o "$TMPDIR/pcr_d.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
-U_PCR_NO_EC=$( "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_no.fq" \
+U_PCR_NO_EC=$( "$FQDUP" derep --min-length 1 -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_no.fq" \
     --no-error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_no.fq")
-U_PCR_EC=$(    "$FQDUP" derep -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_ec.fq" \
+U_PCR_EC=$(    "$FQDUP" derep --min-length 1 -i "$TMPDIR/pcr_d.sorted.fq" -o "$TMPDIR/pcr_d_ec.fq" \
     --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/pcr_d_ec.fq")
 
 echo "  Oxidative  (G→T): no-EC=$U_OX_NO_EC  EC=$U_OX_EC"
@@ -280,7 +280,7 @@ PYEOF
 "$FQDUP" sort -i "$TMPDIR/snp.fq" -o "$TMPDIR/snp.sorted.fq" \
     --max-memory 512M -t "$TMPDIR" 2>/dev/null
 
-"$FQDUP" derep -i "$TMPDIR/snp.sorted.fq" -o "$TMPDIR/snp.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/snp.sorted.fq" -o "$TMPDIR/snp.out.fq" \
     --collapse-damage 2>"$TMPDIR/snp.log"
 
 UNIQUE_E=$(grep -c '^@' "$TMPDIR/snp.out.fq")

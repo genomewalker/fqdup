@@ -75,7 +75,7 @@ SEQ_B="${BASE:0:1}T${BASE:2}"   # C→T at position 1
 printf "@read_001\n%s\n+\n%s\n" "$SEQ_A" "$QUAL" >  "$TMPDIR/t1.fq"
 printf "@read_002\n%s\n+\n%s\n" "$SEQ_B" "$QUAL" >> "$TMPDIR/t1.fq"
 
-"$FQDUP" derep -i "$TMPDIR/t1.fq" -o "$TMPDIR/t1.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/t1.fq" -o "$TMPDIR/t1.out.fq" \
     $DMGFLAGS --no-revcomp 2>/dev/null
 
 check "masked C→T at pos 1 merges into 1 cluster" 1 "$(count_output "$TMPDIR/t1.out.fq")"
@@ -92,7 +92,7 @@ SEQ_C="${BASE:0:5}G${BASE:6}"   # T→G at position 5 (unmasked)
 printf "@read_001\n%s\n+\n%s\n" "$SEQ_A" "$QUAL" >  "$TMPDIR/t2.fq"
 printf "@read_002\n%s\n+\n%s\n" "$SEQ_C" "$QUAL" >> "$TMPDIR/t2.fq"
 
-"$FQDUP" derep -i "$TMPDIR/t2.fq" -o "$TMPDIR/t2.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/t2.fq" -o "$TMPDIR/t2.out.fq" \
     $DMGFLAGS --no-revcomp 2>/dev/null
 
 check "unmasked mutation at pos 5 stays as 2 clusters" 2 "$(count_output "$TMPDIR/t2.out.fq")"
@@ -108,14 +108,14 @@ RC_A=$(revcomp "$SEQ_A")
 printf "@read_001\n%s\n+\n%s\n" "$SEQ_A" "$QUAL" >  "$TMPDIR/t3.fq"
 printf "@read_002\n%s\n+\n%s\n" "$RC_A"  "$QUAL" >> "$TMPDIR/t3.fq"
 
-"$FQDUP" derep -i "$TMPDIR/t3.fq" -o "$TMPDIR/t3.out.fq" 2>/dev/null
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/t3.fq" -o "$TMPDIR/t3.out.fq" 2>/dev/null
 
 check "read and its exact revcomp merge into 1 cluster" 1 "$(count_output "$TMPDIR/t3.out.fq")"
 
 # ---------------------------------------------------------------------------
 # Test 3b: With --no-revcomp the same pair must stay as 2 clusters.
 # ---------------------------------------------------------------------------
-"$FQDUP" derep -i "$TMPDIR/t3.fq" -o "$TMPDIR/t3b.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/t3.fq" -o "$TMPDIR/t3b.out.fq" \
     --no-revcomp 2>/dev/null
 
 check "read and revcomp stay separate with --no-revcomp" 2 "$(count_output "$TMPDIR/t3b.out.fq")"
@@ -146,7 +146,7 @@ RC_B=$(revcomp "$SEQ_B")
 printf "@read_001\n%s\n+\n%s\n" "$SEQ_A" "$QUAL" >  "$TMPDIR/t4.fq"
 printf "@read_002\n%s\n+\n%s\n" "$RC_B"  "$QUAL" >> "$TMPDIR/t4.fq"
 
-"$FQDUP" derep -i "$TMPDIR/t4.fq" -o "$TMPDIR/t4.out.fq" \
+"$FQDUP" derep --min-length 1 -i "$TMPDIR/t4.fq" -o "$TMPDIR/t4.out.fq" \
     $DMGFLAGS 2>/dev/null
 
 check "forward + RC(deaminated) merge (symmetry invariant)" 1 "$(count_output "$TMPDIR/t4.out.fq")"

@@ -65,10 +65,10 @@ echo "--- M3: masking monotonicity (more mask → fewer or equal unique) ---"
 "$FQDUP" sort -i "$TMPDIR/m3.fq" -o "$TMPDIR/m3.sorted.fq" \
     --max-memory 128M -t "$TMPDIR" 2>/dev/null
 
-U_NODMG=$("$FQDUP" derep -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_nodmg.fq" \
+U_NODMG=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_nodmg.fq" \
     --no-error-correct 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m3_nodmg.fq")
-U_DMG=$("$FQDUP" derep -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_dmg.fq" \
+U_DMG=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m3.sorted.fq" -o "$TMPDIR/m3_dmg.fq" \
     --collapse-damage --no-error-correct 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m3_dmg.fq")
 
@@ -91,10 +91,10 @@ echo "--- M4: stricter snp_threshold → ≥ unique reads (less absorption) ---"
 "$FQDUP" sort -i "$TMPDIR/m4.fq" -o "$TMPDIR/m4.sorted.fq" \
     --max-memory 128M -t "$TMPDIR" 2>/dev/null
 
-U_LOOSE=$("$FQDUP" derep -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_loose.fq" \
+U_LOOSE=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_loose.fq" \
     --errcor-snp-threshold 0.05 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m4_loose.fq")
-U_STRICT=$("$FQDUP" derep -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_strict.fq" \
+U_STRICT=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_strict.fq" \
     --errcor-snp-threshold 0.50 2>/dev/null && \
     grep -c '^@' "$TMPDIR/m4_strict.fq")
 
@@ -113,9 +113,9 @@ EOF
 echo ""
 echo "--- M5: EC reduces or holds unique count (no EC ≥ with EC) ---"
 U_NOEC=$(grep -c '^@' "$TMPDIR/m4_strict.fq" || true)
-U_EC=$("$FQDUP" derep -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_ec.fq" \
+U_EC=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_ec.fq" \
     --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/m4_ec.fq")
-U_NOEC2=$("$FQDUP" derep -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_noec.fq" \
+U_NOEC2=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m4.sorted.fq" -o "$TMPDIR/m4_noec.fq" \
     --no-error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/m4_noec.fq")
 
 python3 - <<EOF
@@ -145,7 +145,7 @@ print(f'@ct_child\n{ct_sub}\n+\n{qual}')
 PYEOF
 "$FQDUP" sort -i "$TMPDIR/m6.fq" -o "$TMPDIR/m6.sorted.fq" \
     --max-memory 64M -t "$TMPDIR" 2>/dev/null
-U_EC=$("$FQDUP" derep -i "$TMPDIR/m6.sorted.fq" -o "$TMPDIR/m6_ec.fq" \
+U_EC=$("$FQDUP" derep --min-length 1 -i "$TMPDIR/m6.sorted.fq" -o "$TMPDIR/m6_ec.fq" \
     --error-correct 2>/dev/null && grep -c '^@' "$TMPDIR/m6_ec.fq")
 python3 - <<EOF
 import sys
