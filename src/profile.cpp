@@ -65,13 +65,11 @@ static void print_usage(const char* prog) {
         << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
         << "                             (default: 1000000; 0 = scan all reads)\n"
-        << "  --short-fragment           Include 16-29 bp reads in a JOINT length-isotonic damage\n"
-        << "                             re-fit (borrowed interior). Re-estimates the whole length law,\n"
-        << "                             so >=30 bulk delta / tau / preservation reflect ALL lengths\n"
-        << "                             (16+) when set -- NOT purely additive (default: off)\n"
         << "  --min-length N             Floor for reads entering the estimator. N<30 lowers the\n"
-        << "                             short-fragment floor to max(16,N) (--short-fragment = N 16);\n"
-        << "                             N>=30 keeps the legacy >=30-only path (default: 0 = off)\n"
+        << "                             short-fragment floor to max(16,N), including 16-29 bp reads in a\n"
+        << "                             JOINT length-isotonic re-fit (>=30 bulk delta/tau/preservation\n"
+        << "                             then reflect ALL lengths, NOT purely additive). N>=30 keeps the\n"
+        << "                             legacy >=30-only path (default: 0 = off)\n"
         << "  --max-length N             Drop reads longer than N from the estimator (default: 0 = off)\n";
 }
 
@@ -124,8 +122,7 @@ int profile_main(int argc, char** argv) {
     std::string html_path;
     std::vector<std::string> subst_in_paths;
     bool        run_oxog      = true;
-    bool        short_fragment = false;   // opt-in: estimate damage on 16-29 bp reads (borrowed interior)
-    int         min_length = 0;   // 0=disabled; <30 auto-activates short-fragment down to max(16,min_length)
+    int         min_length = 0;   // 0=disabled; <30 lowers the short-fragment floor to max(16,min_length)
     int         max_length = 0;   // 0=disabled; cap reads entering the estimator
     // bsubst arrays shared between early pseudo-count injection and late JSON output
     static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
@@ -196,8 +193,6 @@ int profile_main(int argc, char** argv) {
             subst_in_paths.push_back(argv[++i]);
         } else if (arg == "--no-oxog") {
             run_oxog = false;
-        } else if (arg == "--short-fragment") {
-            min_length = 16;
         } else if (arg == "--min-length" && i + 1 < argc) {
             min_length = std::stoi(argv[++i]);
         } else if (arg == "--max-length" && i + 1 < argc) {
@@ -243,11 +238,10 @@ int profile_main(int argc, char** argv) {
     // in a separate states_pe and finalized independently (not pooled with merged).
     const bool paired_mode   = have_paired;   // drives the paired ingestion pass
     const bool combined_mode = have_merged && have_paired;
-    // Short-fragment mode floor: derived from --min-length. min_length<30 (incl.
-    // --short-fragment alias = 16) lowers the floor to max(16,min_length); otherwise
-    // 30 (legacy >=30-only path, bit-identical). max_length caps reads above it.
+    // Short-fragment mode floor: derived from --min-length. min_length<30 lowers the
+    // floor to max(16,min_length); otherwise 30 (legacy >=30-only path, bit-identical).
+    // max_length caps reads above it.
     const int short_floor = (min_length > 0 && min_length < 30) ? std::max(16, min_length) : 30;
-    (void)short_fragment;
     if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
         std::cerr << "Error: --mask-threshold must be in (0, 1), got " << mask_threshold << "\n";
         return 1;
