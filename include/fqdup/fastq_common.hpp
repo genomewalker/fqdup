@@ -8,6 +8,7 @@
 // namespace below (internal linkage per TU), avoiding ODR violations.
 
 #include "fqdup/fastq_types.hpp"
+#include "fqdup/fastq_writer.hpp"  // shared FastqWriter (bgzf / isa-l / zlib)
 
 #include <cstdint>
 #include <cstring>
@@ -279,114 +280,7 @@ private:
     uint64_t    record_count_;
 };
 
-// ============================================================================
-// FASTQ Writer — in-process zlib gzip or plain text
-// ============================================================================
-
-class FastqWriter {
-public:
-    FastqWriter(const std::string& path, bool compress, int n_threads = 1)
-        : path_(path), compress_(compress), gzfp_(nullptr)
-#ifdef HAVE_BGZF
-        , bgzfp_(nullptr)
-#endif
-    {
-        if (compress_) {
-#ifdef HAVE_BGZF
-            if (n_threads > 1) {
-                bgzfp_ = bgzf_open(path.c_str(), "w");
-                if (!bgzfp_)
-                    throw std::runtime_error("Cannot open output: " + path);
-                bgzf_mt(bgzfp_, n_threads, 0);
-            } else {
-#endif
-                gzfp_ = gzopen(path.c_str(), "wb6");
-                if (!gzfp_)
-                    throw std::runtime_error("Cannot open output: " + path);
-                gzbuffer(gzfp_, GZBUF_SIZE);
-#ifdef HAVE_BGZF
-            }
-#endif
-        } else {
-            plain_out_.open(path);
-            if (!plain_out_.good())
-                throw std::runtime_error("Cannot open output: " + path);
-        }
-    }
-
-    ~FastqWriter() {
-        try { close(); }
-        catch (const std::exception& e) {
-            std::cerr << "Fatal: " << e.what() << "\n";
-            std::exit(1);
-        }
-        catch (...) {
-            std::cerr << "Fatal: unknown error closing output\n";
-            std::exit(1);
-        }
-    }
-
-    void close() {
-        if (closed_) return;
-        closed_ = true;
-        if (gzfp_) {
-            if (gzclose(gzfp_) != Z_OK)
-                throw std::runtime_error("gzclose failed writing " + path_);
-            gzfp_ = nullptr;
-        }
-#ifdef HAVE_BGZF
-        if (bgzfp_) {
-            if (bgzf_close(bgzfp_) < 0)
-                throw std::runtime_error("bgzf_close failed writing " + path_);
-            bgzfp_ = nullptr;
-        }
-#endif
-        if (plain_out_.is_open()) {
-            plain_out_.flush();
-            plain_out_.close();
-            if (plain_out_.fail())
-                throw std::runtime_error("close failed writing " + path_);
-        }
-    }
-
-    void write(const FastqRecord& rec) {
-#ifdef HAVE_BGZF
-        if (bgzfp_) {
-            auto bw = [&](const void* d, size_t n) {
-                if (bgzf_write(bgzfp_, d, n) < 0)
-                    throw std::runtime_error("bgzf_write failed writing " + path_);
-            };
-            bw(rec.header.data(), rec.header.size()); bw("\n", 1);
-            bw(rec.seq.data(),    rec.seq.size());    bw("\n", 1);
-            bw(rec.plus.data(),   rec.plus.size());   bw("\n", 1);
-            bw(rec.qual.data(),   rec.qual.size());   bw("\n", 1);
-            return;
-        }
-#endif
-        if (compress_) {
-            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                         rec.header.c_str(), rec.seq.c_str(),
-                         rec.plus.c_str(), rec.qual.c_str()) < 0)
-                throw std::runtime_error("gzprintf failed writing FASTQ record");
-        } else {
-            plain_out_ << rec.header << '\n'
-                       << rec.seq    << '\n'
-                       << rec.plus   << '\n'
-                       << rec.qual   << '\n';
-            if (!plain_out_.good())
-                throw std::runtime_error("write failed writing " + path_);
-        }
-    }
-
-private:
-    std::string   path_;
-    bool          compress_;
-    bool          closed_ = false;
-    gzFile        gzfp_;
-#ifdef HAVE_BGZF
-    BGZF*         bgzfp_;
-#endif
-    std::ofstream plain_out_;
-};
+// FastqWriter now lives in fqdup/fastq_writer.hpp (included above) so sort and
+// every other subcommand share one implementation.
 
 }  // anonymous namespace
