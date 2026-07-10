@@ -84,7 +84,10 @@ using namespace fqdup::derep_detail;
 // DerepEngine — single-file two-pass deduplication
 // ============================================================================
 
+class Phase3Runner;  // re-parents phase3_error_correct's body (phase3_runner.hpp)
+
 class DerepEngine {
+    friend class Phase3Runner;
 public:
     DerepEngine(bool use_revcomp, bool write_clusters,
                 const DamageProfile& profile = DamageProfile{},
@@ -532,9 +535,7 @@ private:
     // A child is absorbed unless the mismatch pattern is recurrent (SNP veto):
     //   sig_count_weighted >= snp_min_count AND
     //   sig_count_weighted / parent_count >= snp_threshold.
-    void phase3_error_correct() {
-#include "derep_detail/phase3_error_correct.inc"  // method body split out (byte-identical paste; see baseline af3ac4e1)
-    }
+    void phase3_error_correct();  // out-of-line via Phase3Runner (phase3_runner.hpp)
 
     // Build per-cluster genealogy and emit .fqcl. Must run BEFORE arena_ is freed.
     void write_fqcl_(const std::vector<IndexEntry*>& seq_entry) {
@@ -939,6 +940,11 @@ private:
     uint64_t loss_short_brute_found_       = 0;
     uint64_t loss_short_too_small_skipped_ = 0;
 };
+
+// Phase3Runner needs the complete DerepEngine type; include after the class,
+// then define the thin wrapper. Body remains byte-identical (baseline af3ac4e1).
+#include "derep_detail/phase3_runner.hpp"
+void DerepEngine::phase3_error_correct() { Phase3Runner(*this).run(); }
 
 }  // anonymous namespace
 
