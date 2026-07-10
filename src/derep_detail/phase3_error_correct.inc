@@ -149,6 +149,17 @@
             return lay;
         };
 
+        // Single EC-eligibility predicate: a read may take part in ANY Phase-3
+        // error-correction path only if its damage-masked interior is >=
+        // kMinInteriorLen. Below that the pigeonhole split degenerates and the
+        // key is unreliable, so the read stays its own representative. The main
+        // H=1/H=2 loop guards on lay.ilen inline; this same gate is applied to
+        // the adj-len and rescue-indels bundle builds (which key on is_eligible
+        // alone) so no correction path can silently absorb a short-interior read.
+        auto ec_eligible = [&](uint32_t id) -> bool {
+            return get_layout(static_cast<int>(arena_.length(id))).ilen >= kMinInteriorLen;
+        };
+
         Phase3Stats stats;
         using clk = std::chrono::steady_clock;
 
@@ -1443,6 +1454,7 @@
                 std::vector<char>    asc;
                 for (uint32_t id = 0; id < N; ++id) {
                     if (!arena_.is_eligible(id)) continue;
+                    if (!ec_eligible(id)) continue;   // no short-interior read enters adj-len absorption
                     int L = arena_.length(id);
                     if ((int)dec.size() < L) { dec.resize(L); asc.resize(L); }
                     arena_.decode_range(id, 0, L, dec.data());
@@ -1617,6 +1629,7 @@
             bundle_members.reserve(N / 4 + 16);
             for (uint32_t id = 0; id < N; ++id) {
                 if (!arena_.is_eligible(id)) continue;
+                if (!ec_eligible(id)) continue;   // no short-interior read enters rescue-indel absorption
                 if (is_error_[id]) continue;
                 uint32_t occ = static_cast<uint32_t>(child_bundle_occ_of(id));
                 if (occ < 2u) continue;
