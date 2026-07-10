@@ -20,6 +20,15 @@ meaningless conflict-resolution and can't silently clobber C1 (fable's concern).
   the honest "no lower cap" identity for the gate `Lrec < min_length_`. Keep
   phase3-split's `set_length_filter(mn,mx)` superset; drop integration's `set_min_length`.
 - `--max-length` optional, 0 = disabled (phase3-split only).
+- **Cross-subcommand required-ness (commit 5, executed).** 7816a2a made `--min-length`
+  REQUIRED across THREE subcommands (derep + merge + split), not derep alone; commits
+  2–3 replayed derep only. Replay-ledger audit before the `-s ours` merge caught this —
+  a `-s ours` merge would have silently dropped merge/split's required-flag intent.
+  **User decision: required on all 3** (match derep). merge: default `30` → `-1` sentinel
+  + `min_length < 1` error (recommend 30 kept in help text); split: default `0` → `-1`
+  sentinel + required error, KEEPING phase3-split's richer `--max-length`. Both gained a
+  `max_length == 0 || max_length >= min_length` guard. split's LOW_ABUNDANCE pi-target
+  histogram + routing pass already honor the floor (d86278a P1-#2 pre-satisfied here).
 - **Accounting bug both caught:** integration's `n_input_reads = total_reads_ +
   n_below_min_length_` UNDERCOUNTS once `--max-length` fires. Fix: separate
   `n_above_max_length_` counter; `n_input_reads = indexed + below + above`. Keep both logs.
@@ -33,7 +42,14 @@ Adopt integration's **unconditional short-read EC-skip**, folded INTO the `.inc`
 reverting C1): remove `kBruteforceMinLen` + `short_parents` indexing/logging + the
 brute-force child branch; add the single `ec_eligible(id)` predicate (interior >=
 kMinInteriorLen) and apply it at the two probes integration guards (adjacent-length +
-rescue). Keep `Phase3Runner` + the alias block.
+rescue). Keep `Phase3Runner` + the alias block. **ec_eligible executed (commit 5):**
+the reconcile `.inc`'s adj-len bundle build (`:1445`) and rescue-indel bundle build
+(`:1619`) keyed on `arena_.is_eligible(id)` ALONE — a short-interior (ilen<20) read that
+was count-eligible could be absorbed through either probe. Added one `ec_eligible(id)`
+lambda (`ilen >= kMinInteriorLen`, defined next to `get_layout`) and applied it at both.
+Inert by default (both probes are opt-in `--errcor-adj-len` / `--errcor-rescue-indels`),
+so the C3 default/bucketcap/kappa baselines still match byte-identical (default verified
+e6635f57). Only bites when a probe is ON, where it closes the short-interior absorption.
 
 ## Dead members — VERIFIED schema-facing, so DO NOT delete
 `short_interior_skipped`, `short_brute_evaluated`, `short_brute_found` are serialized in
@@ -94,5 +110,17 @@ has NO derep call (its `--min-length 25` is `fqdup merge`'s own flag) — nothin
    pass through) to wiki/Derep.md; migrated every runnable `fqdup derep` example across
    wiki/{Derep,Usage,Home,Damage,Damage-Aware-Deduplication}.md to carry `--min-length 30`
    (block-aware sweep confirms 0 runnable examples miss it; README already carried it).
-5. `git merge --no-ff -s ours integration` — record ancestry after replay ledger audit.
-6. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.
+5. **merge/split required-min + ec_eligible** (EXECUTED). Replay-ledger audit before the
+   `-s ours` merge found 7816a2a/d86278a touched merge + split too, not derep alone —
+   `-s ours` would have silently dropped that intent. User decision: `--min-length`
+   REQUIRED on all 3. merge.cpp default 30→sentinel -1 + `<1` error + `max>=min` guard +
+   usage text; split.cpp default 0→sentinel -1 + required error + `max>=min` guard + usage
+   (kept `--max-length`). derep `.inc`: added `ec_eligible(id)` lambda, applied at adj-len
+   (`:1445`) + rescue (`:1619`) bundle builds. Build clean; all 4 CLI errors verified
+   firing (merge missing/zero, split missing, split max<min); derep required regression
+   pass. ec_eligible inert by default → C3 default baseline still e6635f57 (verified).
+   Tests already safe (only merge caller test_merge_complexity.sh:88 has --min-length 25;
+   zero split callers). README merge:223/split:539 synopses already show required flag.
+6. `git merge --no-ff -s ours integration` — record ancestry (replay ledger now complete:
+   derep+merge+split intent all replayed; `-s ours` keeps the reconciled tree authoritative).
+7. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.
