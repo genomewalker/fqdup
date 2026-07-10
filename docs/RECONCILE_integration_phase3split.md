@@ -123,4 +123,15 @@ has NO derep call (its `--min-length 25` is `fqdup merge`'s own flag) — nothin
    zero split callers). README merge:223/split:539 synopses already show required flag.
 6. `git merge --no-ff -s ours integration` — record ancestry (replay ledger now complete:
    derep+merge+split intent all replayed; `-s ours` keeps the reconciled tree authoritative).
-7. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.
+7. **main 36d285b entropy-cap port (EXECUTED).** Symmetric replay hazard to (3): `main`'s
+   36d285b (entropy-guarded bucket cap on the streaming engine) modifies the build_shard
+   region that phase3-split moved into the `.inc`, so a plain `-s ours main` at merge time
+   would silently drop it (modify/relocate). Ported natively onto the `.inc` structure:
+   arena.hpp ErrCorParams gained `bucket_cap_lowcomplexity_only`/`bucket_cap_complexity_frac`;
+   `.inc` build_shard gained the `interior_low_complexity` distinct-4mer decode (off the
+   2-bit arena) + per-bucket spare-high-complexity cap decision + ent_* counters + summary
+   log; derep.cpp gained the two `--errcor-bucket-cap-lowcomplexity` /
+   `--errcor-bucket-cap-complexity-frac` flags (usage + parse). Inert by default
+   (`bucket_cap_lowcomplexity_only=false`) → C3 default/bucketcap/kappa baselines still
+   byte-identical (default verified e6635f57). Enables a non-lossy `-s ours main` main-merge.
+8. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.
