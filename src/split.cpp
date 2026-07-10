@@ -28,7 +28,6 @@ static void usage(const char* prog) {
         "input once routing each read to --out-damaged / --out-undamaged.\n"
         "\nRequired:\n"
         "  -i FILE              Input FASTQ (raw or .gz); does NOT need to be sorted\n"
-        "  --min-length N       (REQUIRED) Drop reads shorter than N bp before routing\n"
         "\nOutputs (at least one required):\n"
         "  --out-damaged  FILE  Write damaged reads here\n"
         "  --out-undamaged FILE Write undamaged reads here\n"
@@ -39,6 +38,8 @@ static void usage(const char* prog) {
         "                         bulk: exponential model from Pass 0 estimate\n"
         "                         empirical: always run length-stratified LSD scan\n"
         "  --split-threshold F  LLR threshold for damaged call (default: 0.0)\n"
+        "  --min-length N       (REQUIRED) Drop reads shorter than N bp before classify\n"
+        "  --max-length N       Drop reads longer than N bp before classify (default: off)\n"
         "  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000)\n"
         "  --model-bin FILE     Reuse full split model from `fqdup profile --model-bin-out`\n"
         "                         (zero estimation: no Pass-0, no LSD scan). Digest-validated.\n"
@@ -53,8 +54,9 @@ int split_main(int argc, char** argv) {
     std::string in_path, out_damaged_path, out_undamaged_path;
     std::string model_bin_path, damage_json_path;
     bool allow_model_mismatch = false;
-    int   min_length = -1;   // REQUIRED read-length floor (unset sentinel)
     float split_threshold = 0.0f;
+    int min_length = -1;  // REQUIRED: unset sentinel; user must pass --min-length (>= 1)
+    int max_length = 0;   // 0=disabled (no upper cap); drop reads longer than this before classify
     int64_t damage_deam_max_reads = 5'000'000;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
 
@@ -66,8 +68,9 @@ int split_main(int argc, char** argv) {
         if ((a == "-i" || a == "--input") && i+1 < argc)       { in_path = argv[++i]; }
         else if (a == "--out-damaged"  && i+1 < argc)           { out_damaged_path = argv[++i]; }
         else if (a == "--out-undamaged" && i+1 < argc)          { out_undamaged_path = argv[++i]; }
-        else if (a == "--min-length" && i+1 < argc)             { min_length = std::stoi(argv[++i]); }
         else if (a == "--split-threshold" && i+1 < argc)        { split_threshold = std::stof(argv[++i]); }
+        else if (a == "--min-length" && i+1 < argc)             { min_length = std::stoi(argv[++i]); }
+        else if (a == "--max-length" && i+1 < argc)             { max_length = std::stoi(argv[++i]); }
         else if (a == "--damage-deam-sample" && i+1 < argc)     { damage_deam_max_reads = std::stoll(argv[++i]); }
         else if (a == "--model-bin" && i+1 < argc)              { model_bin_path = argv[++i]; }
         else if (a == "--damage-json" && i+1 < argc)            { damage_json_path = argv[++i]; }
@@ -103,6 +106,10 @@ int split_main(int argc, char** argv) {
     }
     if (min_length < 1) {
         std::cerr << "split: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
+        return 1;
+    }
+    if (max_length != 0 && max_length < min_length) {
+        std::cerr << "split: --max-length must be >= --min-length (or 0 to disable)\n";
         return 1;
     }
 
@@ -255,12 +262,8 @@ int split_main(int argc, char** argv) {
             uint64_t n_scan = 0;
             { auto hr = make_fastq_reader(in_path); FastqRecord hrec;
               while (hr->read(hrec)) {
-                  // P1-#2: the pi-target must be computed over the SAME population
-                  // that the routing pass emits. Reads below --min-length are a
-                  // third fate (dropped, not routed), so exclude them here too;
-                  // otherwise the top-pi LLR cut is calibrated on a superset and
-                  // the emitted damaged fraction drifts off pi.
-                  if (static_cast<int>(hrec.seq.size()) < min_length) continue;
+                  const int hl = (int)hrec.seq.size();
+                  if (hl < min_length || (max_length > 0 && hl > max_length)) continue;
                   float s = split_model.score(hrec.seq);
                   int bi = static_cast<int>((s - LO) / (HI - LO) * (NB - 1));
                   bi = std::clamp(bi, 0, NB - 1);
@@ -277,7 +280,8 @@ int split_main(int argc, char** argv) {
                 (unsigned long long)n_scan, (unsigned long long)target);
             log_info("LOW_ABUNDANCE auto-detected -> yield-locked split threshold: " + std::string(b));
             log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
-                     "(reference-free per-read AUC ~0.59).");
+                     "(reference-free per-read separation is weak; measure it per-run "
+                     "with FQDUP_SPLIT_SCORES).");
         } else {
             effective_threshold = static_cast<float>(split_threshold - pol.log_prior_odds);
             char b[160];
@@ -286,7 +290,8 @@ int split_main(int argc, char** argv) {
                 effective_threshold, pol.pi, pol.pi_lo, pol.pi_hi, pol.log_prior_odds);
             log_info("DETECTED -> posterior-threshold split: " + std::string(b));
             log_info("NOTE: split is pi-calibrated ENRICHMENT, not a pure partition "
-                     "(reference-free per-read AUC ~0.59).");
+                     "(reference-free per-read separation is weak; measure it per-run "
+                     "with FQDUP_SPLIT_SCORES).");
         }
 
         // --- Streaming classification pass ---
@@ -306,7 +311,7 @@ int split_main(int argc, char** argv) {
         auto t2 = std::chrono::steady_clock::now();
         auto reader = make_fastq_reader(in_path);
         FastqRecord rec;
-        uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0, n_dropped = 0;
+        uint64_t n_total = 0, n_damaged = 0, n_undamaged = 0;
 
         // Validation hook (env-gated, zero-cost when unset): dump per-read
         // header<TAB>split_model_llr<TAB>shared_lsd_llr so a synthetic run
@@ -318,12 +323,11 @@ int split_main(int argc, char** argv) {
             dump_params = make_lsd_classify_params(profile);
         }
 
+        uint64_t n_len_filtered = 0;
         while (reader->read(rec)) {
             ++n_total;
-            if (static_cast<int>(rec.seq.size()) < min_length) {
-                ++n_dropped;   // --min-length: third fate, routed to neither output
-                continue;
-            }
+            const int rl = (int)rec.seq.size();
+            if (rl < min_length || (max_length > 0 && rl > max_length)) { ++n_len_filtered; continue; }
             float llr = split_model.score(rec.seq);
             if (score_dump)
                 (*score_dump) << rec.header << '\t' << llr << '\t'
@@ -345,7 +349,8 @@ int split_main(int argc, char** argv) {
 
         log_info("=== Split complete ===");
         log_info("Total reads: " + std::to_string(n_total));
-        log_info("Dropped (<" + std::to_string(min_length) + " bp): " + std::to_string(n_dropped));
+        if (min_length > 0 || max_length > 0)
+            log_info("Length-filtered (dropped): " + std::to_string(n_len_filtered));
         log_info("Damaged:     " + std::to_string(n_damaged) +
                  " (" + [&]{ char b[16]; std::snprintf(b,sizeof(b),"%.1f%%",
                      n_total ? 100.0*n_damaged/n_total : 0.0); return std::string(b); }() + ")");

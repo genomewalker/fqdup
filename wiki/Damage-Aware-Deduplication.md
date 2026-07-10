@@ -133,6 +133,7 @@ skip Pass 0 and supply them directly:
 ```bash
 fqdup derep \
   -i merged.deduped.fq.gz -o merged.final.fq.gz \
+  --min-length 30 \
   --damage-dmax5 0.35 --damage-lambda5 0.40 \
   --damage-dmax3 0.20 --damage-lambda3 0.30 \
   --mask-threshold 0.05
