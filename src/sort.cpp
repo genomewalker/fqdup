@@ -38,6 +38,7 @@
 
 #include "fqdup/fastq_types.hpp"  // FastqRecord, FastqReaderBase, make_fastq_reader
 #include "fqdup/logger.hpp"
+#include "fqdup/fastq_writer.hpp"  // shared FastqWriter (bgzf / isa-l / zlib)
 
 // For memory release to OS
 #ifdef __linux__
@@ -358,205 +359,6 @@ private:
 // are now accessed through SortReaderBridge → make_fastq_reader().
 
 
-class FastqWriter {
-    static constexpr size_t OUT_BUF_SIZE = 4 * 1024 * 1024;  // 4 MB output buffer
-public:
-    FastqWriter(const std::string& path, bool compress, int n_threads = 1) : compress_(compress) {
-        if (compress_) {
-#ifdef HAVE_BGZF
-            if (n_threads > 1) {
-                bgzfp_ = bgzf_open(path.c_str(), "w");
-                if (!bgzfp_) throw std::runtime_error("Cannot open: " + path);
-                bgzf_mt(bgzfp_, n_threads, 0);
-                return;
-            }
-#endif
-#ifdef HAVE_ISAL
-            fp_ = fopen(path.c_str(), "wb");
-            if (!fp_) throw std::runtime_error("Cannot open: " + path);
-            out_buf_.resize(OUT_BUF_SIZE);
-            level_buf_.resize(ISAL_DEF_LVL1_DEFAULT);
-            isal_deflate_init(&stream_);
-            stream_.level          = 1;
-            stream_.level_buf      = level_buf_.data();
-            stream_.level_buf_size = static_cast<uint32_t>(level_buf_.size());
-            stream_.next_out       = out_buf_.data();
-            stream_.avail_out      = static_cast<uint32_t>(out_buf_.size());
-            isal_gzip_header gz_hdr;
-            isal_gzip_header_init(&gz_hdr);
-            isal_write_gzip_header(&stream_, &gz_hdr);
-            flush_isal_buf();
-#else
-            gzfp_ = gzopen(path.c_str(), "wb6");
-            if (!gzfp_) throw std::runtime_error("Cannot open: " + path);
-            gzbuffer(gzfp_, GZBUF_SIZE);
-#endif
-        } else {
-            out_.open(path);
-            if (!out_.good()) throw std::runtime_error("Cannot open: " + path);
-        }
-    }
-
-    ~FastqWriter() {
-        try { close(); }
-        catch (const std::exception& e) {
-            std::cerr << "Fatal: " << e.what() << "\n";
-            std::exit(1);
-        }
-        catch (...) {
-            std::cerr << "Fatal: unknown error closing output\n";
-            std::exit(1);
-        }
-    }
-
-    void close() {
-        if (closed_) return;
-        closed_ = true;
-#ifdef HAVE_BGZF
-        if (bgzfp_) {
-            if (bgzf_close(bgzfp_) < 0)
-                throw std::runtime_error("bgzf_close failed");
-            bgzfp_ = nullptr;
-            return;
-        }
-#endif
-#ifdef HAVE_ISAL
-        if (fp_) {
-            stream_.end_of_stream = 1;
-            stream_.next_in  = nullptr;
-            stream_.avail_in = 0;
-            bool done = false;
-            while (!done) {
-                isal_deflate(&stream_);
-                done = (stream_.avail_out > 0);
-                flush_isal_buf();
-            }
-            if (fclose(fp_) != 0)
-                throw std::runtime_error("fclose failed writing compressed output");
-            fp_ = nullptr;
-            return;
-        }
-#endif
-        if (gzfp_) {
-            if (gzclose(gzfp_) != Z_OK)
-                throw std::runtime_error("gzclose failed");
-            gzfp_ = nullptr;
-        }
-        if (out_.is_open()) {
-            out_.flush();
-            out_.close();
-            if (out_.fail())
-                throw std::runtime_error("close failed writing plain output");
-        }
-    }
-
-    void write(const FastqRecord& rec) {
-#ifdef HAVE_BGZF
-        if (bgzfp_) {
-            auto bw = [&](const void* d, size_t n) {
-                if (bgzf_write(bgzfp_, d, n) < 0)
-                    throw std::runtime_error("bgzf_write failed");
-            };
-            bw(rec.header.data(), rec.header.size()); bw("\n", 1);
-            bw(rec.seq.data(),    rec.seq.size());    bw("\n", 1);
-            bw(rec.plus.data(),   rec.plus.size());   bw("\n", 1);
-            bw(rec.qual.data(),   rec.qual.size());   bw("\n", 1);
-            return;
-        }
-#endif
-#ifdef HAVE_ISAL
-        if (fp_) {
-            isal_write(rec.header.data(), rec.header.size()); isal_write("\n", 1);
-            isal_write(rec.seq.data(),    rec.seq.size());    isal_write("\n", 1);
-            isal_write(rec.plus.data(),   rec.plus.size());   isal_write("\n", 1);
-            isal_write(rec.qual.data(),   rec.qual.size());   isal_write("\n", 1);
-            return;
-        }
-#endif
-        if (compress_) {
-            if (gzprintf(gzfp_, "%s\n%s\n%s\n%s\n",
-                         rec.header.c_str(), rec.seq.c_str(),
-                         rec.plus.c_str(), rec.qual.c_str()) < 0)
-                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
-        } else {
-            out_ << rec.header << '\n' << rec.seq << '\n'
-                 << rec.plus << '\n' << rec.qual << '\n';
-            if (!out_.good()) throw std::runtime_error("write failed writing plain output");
-        }
-    }
-
-    void write(const FastqRecordArena& rec) {
-#ifdef HAVE_BGZF
-        if (bgzfp_) {
-            auto bw = [&](const void* d, size_t n) {
-                if (bgzf_write(bgzfp_, d, n) < 0)
-                    throw std::runtime_error("bgzf_write failed");
-            };
-            bw(rec.header, rec.header_len); bw("\n", 1);
-            bw(rec.seq,    rec.seq_len);    bw("\n", 1);
-            bw(rec.plus,   rec.plus_len);   bw("\n", 1);
-            bw(rec.qual,   rec.qual_len);   bw("\n", 1);
-            return;
-        }
-#endif
-#ifdef HAVE_ISAL
-        if (fp_) {
-            isal_write(rec.header, rec.header_len); isal_write("\n", 1);
-            isal_write(rec.seq,    rec.seq_len);    isal_write("\n", 1);
-            isal_write(rec.plus,   rec.plus_len);   isal_write("\n", 1);
-            isal_write(rec.qual,   rec.qual_len);   isal_write("\n", 1);
-            return;
-        }
-#endif
-        if (compress_) {
-            if (gzprintf(gzfp_, "%.*s\n%.*s\n%.*s\n%.*s\n",
-                         (int)rec.header_len, rec.header,
-                         (int)rec.seq_len, rec.seq,
-                         (int)rec.plus_len, rec.plus,
-                         (int)rec.qual_len, rec.qual) < 0)
-                throw std::runtime_error("gzprintf failed while writing compressed FASTQ record");
-        } else {
-            out_.write(rec.header, rec.header_len) << '\n';
-            out_.write(rec.seq, rec.seq_len) << '\n';
-            out_.write(rec.plus, rec.plus_len) << '\n';
-            out_.write(rec.qual, rec.qual_len) << '\n';
-            if (!out_.good()) throw std::runtime_error("write failed writing plain output");
-        }
-    }
-
-private:
-#ifdef HAVE_ISAL
-    void isal_write(const char* data, size_t len) {
-        stream_.next_in  = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(data));
-        stream_.avail_in = static_cast<uint32_t>(len);
-        while (stream_.avail_in > 0) {
-            if (stream_.avail_out == 0) flush_isal_buf();
-            isal_deflate(&stream_);
-        }
-    }
-
-    void flush_isal_buf() {
-        size_t n = out_buf_.size() - stream_.avail_out;
-        if (n == 0) return;
-        if (fwrite(out_buf_.data(), 1, n, fp_) != n)
-            throw std::runtime_error("fwrite failed writing compressed output");
-        stream_.next_out  = out_buf_.data();
-        stream_.avail_out = static_cast<uint32_t>(out_buf_.size());
-    }
-
-    FILE*             fp_ = nullptr;
-    isal_zstream      stream_{};
-    std::vector<uint8_t> out_buf_;
-    std::vector<uint8_t> level_buf_;
-#endif
-#ifdef HAVE_BGZF
-    BGZF*         bgzfp_ = nullptr;
-#endif
-    bool          compress_;
-    bool          closed_ = false;
-    gzFile        gzfp_ = nullptr;
-    std::ofstream out_;
-};
 
 // Parallel chunk sorter - sorts multiple chunks concurrently
 class ParallelChunkSorter {
@@ -1115,7 +917,9 @@ private:
 
         FastqWriter writer(sorted_file, false);
         for (uint32_t idx : indices) {
-            writer.write(chunk.records[idx]);
+            const auto& _ar = chunk.records[idx];
+            writer.write_fields(_ar.header, _ar.header_len, _ar.seq, _ar.seq_len,
+                                _ar.plus, _ar.plus_len, _ar.qual, _ar.qual_len);
         }
 
         auto end = std::chrono::steady_clock::now();

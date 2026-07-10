@@ -8,6 +8,7 @@
 #endif
 
 #include "fqdup/fastq_common.hpp"
+#include <algorithm>
 #include <memory>
 #include <sys/stat.h>
 #include <stdexcept>
@@ -20,9 +21,19 @@ public:
     explicit FastqReaderRapidgzip(const std::string& path, size_t threads = 0)
         : path_(path), buffer_pos_(0), buffer_used_(0), eof_(false), record_count_(0) {
         buffer_.resize(GZBUF_SIZE);
+        // ceiling: rapidgzip 0.16 parallel decode races on large (>1GB) gz over NFS
+        //   at high thread counts — nondeterministic SIGBUS / spurious mid-stream
+        //   truncation (empirically clean at 4, corrupt at 24). Bound decode
+        //   concurrency independent of compute -p; clamp the 0/"auto" case too,
+        //   since auto = hardware_concurrency (the node's full core count) is the
+        //   worst offender. upgrade: root-cause/patch the rapidgzip race or bump
+        //   the pin, then raise or remove this cap.
+        constexpr size_t kMaxDecodeThreads = 4;
+        const size_t decode_threads =
+            (threads == 0) ? kMaxDecodeThreads : std::min(threads, kMaxDecodeThreads);
         reader_ = std::make_unique<rapidgzip::ParallelGzipReader<>>(
             std::make_unique<rapidgzip::StandardFileReader>(path),
-            threads,    // 0 = auto-detect from hardware_concurrency
+            decode_threads,
             GZBUF_SIZE
         );
         struct stat st{};
