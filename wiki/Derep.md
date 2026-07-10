@@ -69,8 +69,10 @@ fqdup derep -i INPUT -o OUTPUT [options]
 Required:
   -i FILE              Sorted input FASTQ (.gz or plain)
   -o FILE              Output FASTQ
+  --min-length N       Drop reads shorter than N bp at ingestion (REQUIRED, N >= 1)
 
 Optional:
+  --max-length N       Drop reads longer than N bp at ingestion (0 = off; must be >= --min-length)
   -c FILE              Cluster statistics (gzipped TSV)
   --cluster-format FILE   Write .fqcl genealogy (requires error correction). See [[cluster-format]]
   --prior-fqcl FILE       Load cluster counts from a derep_pairs --cluster-format
@@ -113,6 +115,7 @@ files based on its per-read LLR ancient/modern score:
 
 ```bash
 fqdup derep -i sorted.fq.gz -o dedup.fq.gz \
+    --min-length 30 \
     --out-damaged   ancient.fq.gz \
     --out-undamaged modern.fq.gz \
     --damage collapse
@@ -192,6 +195,17 @@ Performance on a 437 M-read SS library (d_max ≈ 0.16, 3 length bins):
 `fqdup derep --help-advanced` lists further Phase 3 / indel-rescue tuning
 knobs not covered here (`--b1-*`, `--rescue-*`, `--b3-*`, `--errcor-adj-len`,
 `--errcor-empirical` / `--errcor-legacy-veto`).
+
+**Short reads skip Phase 3.** A read whose masked interior is shorter than 20 bp
+skips 1-mismatch error correction and passes through as its own representative.
+Phase 1's full-sequence fingerprint already exact-deduplicates these reads, so no
+duplicate survives. Below a 20 bp interior the pigeonhole index degenerates (the
+4-way split leaves parts of 0–4 bp, whose hash keys collide unreliably), and the
+only alternative — an all-pairs same-length scan — both blows up on the large
+short-read buckets and over-merges genuinely distinct short molecules. Keeping
+short reads as-is is linear-time and lossless in the safe direction (it can only
+retain more representatives, never fewer). This is unconditional; there is no flag
+to force error correction below the interior floor.
 
 ---
 

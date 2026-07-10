@@ -436,6 +436,7 @@ Required:
   --min-length N   Drop reads shorter than N bp at ingestion (REQUIRED, >= 1)
 
 Optional:
+  --max-length N       Drop reads longer than N bp at ingestion (0 = off; must be >= --min-length)
   -c FILE              Cluster statistics (gzipped TSV)
   --no-revcomp         Disable reverse-complement collapsing (default: enabled)
 ```

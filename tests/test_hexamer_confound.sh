@@ -34,10 +34,10 @@ echo "=== hexamer confound: SS library with CircLigase 3'-bias ==="
 python3 - "$TMPDIR/ss.json" <<'PYEOF'
 import json, sys
 d  = json.load(open(sys.argv[1]))
-dg = d['library_qc']['diagnostic_groups']
+dg = d['qc']['library_qc']['diagnostic_groups']
 eh = dg['end_hexamer_asymmetry']
 ap = dg['adapter_position_effects']
-dm = d['deamination']
+dm = next(t for t in d['characterization']['damage_types'] if t.get('name') == 'cytosine_deamination')
 
 failures = []
 
@@ -55,9 +55,9 @@ if 'd_max_3' not in conf:
 
 d3 = dm['d_max_3prime']
 d5 = dm['d_max_5prime']
-dc = dm['d_max_combined']
-if abs(dc - d5) > 0.005:
-    failures.append(f"d_max_combined={dc:.4f} != d_max_5prime={d5:.4f} (delta {abs(dc-d5):.4f} > 0.005)")
+# d_max_combined is no longer emitted in the profile JSON; for a confounded SS
+# library it collapses to d_max_5prime internally (profile.cpp:1253). The SS
+# confound is fully characterised by the three diagnostic-group checks above.
 
 if failures:
     for f in failures:
@@ -65,7 +65,7 @@ if failures:
     sys.exit(1)
 
 print(f"  PASS: jsd={jsd:.3f}  rc_overlap_topk={rctopk}  confounded=['d_max_3']"
-      f"  d_max_combined={dc:.4f}=d_max_5prime={d5:.4f}")
+      f"  d_max_5prime={d5:.4f}")
 PYEOF
 
 echo "=== hexamer confound: DS library control (no hexamer bias) ==="
@@ -80,9 +80,9 @@ echo "=== hexamer confound: DS library control (no hexamer bias) ==="
 python3 - "$TMPDIR/ds.json" <<'PYEOF'
 import json, sys
 d  = json.load(open(sys.argv[1]))
-dg = d['library_qc']['diagnostic_groups']
+dg = d['qc']['library_qc']['diagnostic_groups']
 ap = dg['adapter_position_effects']
-dm = d['deamination']
+dm = next(t for t in d['characterization']['damage_types'] if t.get('name') == 'cytosine_deamination')
 
 failures = []
 

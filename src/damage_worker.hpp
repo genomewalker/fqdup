@@ -177,7 +177,14 @@ inline static void worker_fn(WorkQueue& queue, WorkerState& state) {
     while (queue.pop(batch)) {
         for (const std::string& seq : batch) {
             int L = static_cast<int>(seq.size());
-            if (L < LSD_L_MIN) { ++state.reads_skipped; continue; }
+            if (L < LSD_L_MIN) {
+                // Short-fragment mode: route 16-29 bp reads to the terminal-only short path
+                // (update_sample_profile handles the floor + abstain internally). They do NOT
+                // feed lsd_hist / lbs / oxog / len stats, so those stay >=30-exact.
+                if (state.profile.short_fragment_floor < LSD_L_MIN)
+                    taph::FrameSelector::update_sample_profile(state.profile, seq);
+                ++state.reads_skipped; continue;
+            }
             taph::FrameSelector::update_sample_profile(state.profile, seq);
             ++state.lsd_hist[lsd_hist_bin(L)];
             if (L < state.len_min) state.len_min = L;
@@ -320,7 +327,14 @@ inline static void clip_worker_fn(WorkQueue& queue, WorkerState& state,
                 } while (trimmed);
             }
             int L = static_cast<int>(seq.size());
-            if (L < LSD_L_MIN) { ++state.reads_skipped; continue; }
+            if (L < LSD_L_MIN) {
+                // Short-fragment mode: route 16-29 bp reads to the terminal-only short path
+                // (update_sample_profile handles the floor + abstain internally). They do NOT
+                // feed lsd_hist / lbs / oxog / len stats, so those stay >=30-exact.
+                if (state.profile.short_fragment_floor < LSD_L_MIN)
+                    taph::FrameSelector::update_sample_profile(state.profile, seq);
+                ++state.reads_skipped; continue;
+            }
             taph::FrameSelector::update_sample_profile(state.profile, seq);
             ++state.lsd_hist[lsd_hist_bin(L)];
             if (L < state.len_min) state.len_min = L;
