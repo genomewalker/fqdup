@@ -68,7 +68,11 @@ static void print_usage(const char* prog) {
         << "  --short-fragment           Include 16-29 bp reads in a JOINT length-isotonic damage\n"
         << "                             re-fit (borrowed interior). Re-estimates the whole length law,\n"
         << "                             so >=30 bulk delta / tau / preservation reflect ALL lengths\n"
-        << "                             (16+) when set -- NOT purely additive (default: off)\n";
+        << "                             (16+) when set -- NOT purely additive (default: off)\n"
+        << "  --min-length N             Floor for reads entering the estimator. N<30 lowers the\n"
+        << "                             short-fragment floor to max(16,N) (--short-fragment = N 16);\n"
+        << "                             N>=30 keeps the legacy >=30-only path (default: 0 = off)\n"
+        << "  --max-length N             Drop reads longer than N from the estimator (default: 0 = off)\n";
 }
 
 static LengthBinOptions parse_length_bins(const std::string& spec, bool& ok) {
@@ -121,6 +125,8 @@ int profile_main(int argc, char** argv) {
     std::vector<std::string> subst_in_paths;
     bool        run_oxog      = true;
     bool        short_fragment = false;   // opt-in: estimate damage on 16-29 bp reads (borrowed interior)
+    int         min_length = 0;   // 0=disabled; <30 auto-activates short-fragment down to max(16,min_length)
+    int         max_length = 0;   // 0=disabled; cap reads entering the estimator
     // bsubst arrays shared between early pseudo-count injection and late JSON output
     static const uint8_t BMAGIC_V1[8] = {'B','S','U','B','S','T',0x01,0x00};
     static const uint8_t BMAGIC_V2[8] = {'B','S','U','B','S','T',0x02,0x00};
@@ -191,7 +197,11 @@ int profile_main(int argc, char** argv) {
         } else if (arg == "--no-oxog") {
             run_oxog = false;
         } else if (arg == "--short-fragment") {
-            short_fragment = true;
+            min_length = 16;
+        } else if (arg == "--min-length" && i + 1 < argc) {
+            min_length = std::stoi(argv[++i]);
+        } else if (arg == "--max-length" && i + 1 < argc) {
+            max_length = std::stoi(argv[++i]);
         } else if (arg == "--adapter-scan-reads" && i + 1 < argc) {
             long long v = std::stoll(argv[++i]);
             if (v < 0) {
@@ -233,8 +243,11 @@ int profile_main(int argc, char** argv) {
     // in a separate states_pe and finalized independently (not pooled with merged).
     const bool paired_mode   = have_paired;   // drives the paired ingestion pass
     const bool combined_mode = have_merged && have_paired;
-    // Short-fragment mode floor: 16 bp (opt-in) or 30 (default = legacy >=30-only path, bit-identical).
-    const int short_floor = short_fragment ? 16 : 30;
+    // Short-fragment mode floor: derived from --min-length. min_length<30 (incl.
+    // --short-fragment alias = 16) lowers the floor to max(16,min_length); otherwise
+    // 30 (legacy >=30-only path, bit-identical). max_length caps reads above it.
+    const int short_floor = (min_length > 0 && min_length < 30) ? std::max(16, min_length) : 30;
+    (void)short_fragment;
     if (mask_threshold <= 0.0 || mask_threshold >= 1.0) {
         std::cerr << "Error: --mask-threshold must be in (0, 1), got " << mask_threshold << "\n";
         return 1;
@@ -425,6 +438,7 @@ int profile_main(int argc, char** argv) {
             std::vector<std::string> batch;
             batch.reserve(BATCH_SZ);
             auto enqueue = [&](std::string& seq) {
+                if (max_length > 0 && (int)seq.size() > max_length) return;
                 if (!stubs.stubs5.empty() || !stubs.stubs3.empty()) {
                     int L = static_cast<int>(seq.size());
                     if (L >= 6) {

@@ -344,6 +344,10 @@ private:
         uint64_t record_idx = 0;
 
         while (reader->read(rec)) {
+            // Length gate: advance the physical index (emit pass re-reads by position)
+            // but skip indexing so dropped reads never become a cluster representative.
+            const int Lrec = (int)rec.seq.size();
+            if (Lrec < min_length_ || (max_length_ > 0 && Lrec > max_length_)) { record_idx++; continue; }
             bool is_forward = true;
             XXH128_hash_t h = compute_hash(rec.seq, is_forward);
             SequenceFingerprint fp(h, rec.seq.size());
@@ -486,6 +490,8 @@ private:
 
             for (size_t i = 0; i < n; ++i) {
                 int L = len[i];
+                // Length gate (mirrors pass1_serial): advance physical index, skip indexing.
+                if (L < min_length_ || (max_length_ > 0 && L > max_length_)) { ++record_idx; continue; }
                 SequenceFingerprint fp(hh[i], static_cast<size_t>(L));
                 auto [it, inserted] = index_.emplace(fp, IndexEntry(record_idx));
                 if (inserted) {
@@ -2997,8 +3003,11 @@ private:
     std::string out_undamaged_path_;
     float split_threshold_ = 0.0f;
     DamageSplitModel split_model_;
+    int min_length_ = 0;   // 0=disabled (no lower cap); reads shorter dropped before indexing
+    int max_length_ = 0;   // 0=disabled (no upper cap); reads longer dropped before indexing
 
 public:
+    void set_length_filter(int mn, int mx) { min_length_ = mn; max_length_ = mx; }
     void set_split_paths(std::string damaged, std::string undamaged,
                          float threshold = 0.0f) {
         out_damaged_path_   = std::move(damaged);
@@ -3039,6 +3048,8 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --out-damaged FILE   Write LLR-classified damaged reads to FILE (.fq.gz)\n"
         << "  --out-undamaged FILE Write LLR-classified undamaged reads to FILE (.fq.gz)\n"
         << "  --split-threshold F  LLR threshold for split (default 0.0)\n"
+        << "  --min-length N       Drop reads shorter than N bp before dedup (default: off)\n"
+        << "  --max-length N       Drop reads longer than N bp before dedup (default: off)\n"
         << "  --split-model MODE   auto (default) | bulk | empirical\n"
         << "                         auto     — empirical per-bin if damage detected, else bulk\n"
         << "                         bulk     — bulk exponential only, no extra file pass\n"
@@ -3122,6 +3133,8 @@ int derep_main(int argc, char** argv) {
     std::string in_path, out_path, cluster_path, fqcl_path, prior_fqcl_path;
     std::string out_damaged_path, out_undamaged_path;
     float split_threshold = 0.0f;
+    int   min_length = 0;   // 0=disabled (no lower cap)
+    int   max_length = 0;   // 0=disabled (no upper cap)
     enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
     bool use_revcomp = true;
 
@@ -3170,6 +3183,10 @@ int derep_main(int argc, char** argv) {
             out_undamaged_path = argv[++i];
         } else if (arg == "--split-threshold" && i + 1 < argc) {
             split_threshold = std::stof(argv[++i]);
+        } else if (arg == "--min-length" && i + 1 < argc) {
+            min_length = std::stoi(argv[++i]);
+        } else if (arg == "--max-length" && i + 1 < argc) {
+            max_length = std::stoi(argv[++i]);
         } else if (arg == "--split-model" && i + 1 < argc) {
             std::string m(argv[++i]);
             if      (m == "auto")     split_model_mode = SplitModelMode::Auto;
@@ -3604,6 +3621,7 @@ int derep_main(int argc, char** argv) {
             engine.set_split_paths(out_damaged_path, out_undamaged_path, effective_split_threshold);
         }
         engine.set_split_model(DamageSplitModel::build(lsd_data, profile));
+        engine.set_length_filter(min_length, max_length);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {

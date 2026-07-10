@@ -38,6 +38,8 @@ static void usage(const char* prog) {
         "                         bulk: exponential model from Pass 0 estimate\n"
         "                         empirical: always run length-stratified LSD scan\n"
         "  --split-threshold F  LLR threshold for damaged call (default: 0.0)\n"
+        "  --min-length N       Drop reads shorter than N bp before classify (default: off)\n"
+        "  --max-length N       Drop reads longer than N bp before classify (default: off)\n"
         "  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000)\n"
         "  --model-bin FILE     Reuse full split model from `fqdup profile --model-bin-out`\n"
         "                         (zero estimation: no Pass-0, no LSD scan). Digest-validated.\n"
@@ -53,6 +55,8 @@ int split_main(int argc, char** argv) {
     std::string model_bin_path, damage_json_path;
     bool allow_model_mismatch = false;
     float split_threshold = 0.0f;
+    int min_length = 0;   // 0=disabled (no lower cap); drop reads shorter than this before classify
+    int max_length = 0;   // 0=disabled (no upper cap); drop reads longer than this before classify
     int64_t damage_deam_max_reads = 5'000'000;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
 
@@ -65,6 +69,8 @@ int split_main(int argc, char** argv) {
         else if (a == "--out-damaged"  && i+1 < argc)           { out_damaged_path = argv[++i]; }
         else if (a == "--out-undamaged" && i+1 < argc)          { out_undamaged_path = argv[++i]; }
         else if (a == "--split-threshold" && i+1 < argc)        { split_threshold = std::stof(argv[++i]); }
+        else if (a == "--min-length" && i+1 < argc)             { min_length = std::stoi(argv[++i]); }
+        else if (a == "--max-length" && i+1 < argc)             { max_length = std::stoi(argv[++i]); }
         else if (a == "--damage-deam-sample" && i+1 < argc)     { damage_deam_max_reads = std::stoll(argv[++i]); }
         else if (a == "--model-bin" && i+1 < argc)              { model_bin_path = argv[++i]; }
         else if (a == "--damage-json" && i+1 < argc)            { damage_json_path = argv[++i]; }
@@ -248,6 +254,8 @@ int split_main(int argc, char** argv) {
             uint64_t n_scan = 0;
             { auto hr = make_fastq_reader(in_path); FastqRecord hrec;
               while (hr->read(hrec)) {
+                  const int hl = (int)hrec.seq.size();
+                  if (hl < min_length || (max_length > 0 && hl > max_length)) continue;
                   float s = split_model.score(hrec.seq);
                   int bi = static_cast<int>((s - LO) / (HI - LO) * (NB - 1));
                   bi = std::clamp(bi, 0, NB - 1);
@@ -307,8 +315,11 @@ int split_main(int argc, char** argv) {
             dump_params = make_lsd_classify_params(profile);
         }
 
+        uint64_t n_len_filtered = 0;
         while (reader->read(rec)) {
             ++n_total;
+            const int rl = (int)rec.seq.size();
+            if (rl < min_length || (max_length > 0 && rl > max_length)) { ++n_len_filtered; continue; }
             float llr = split_model.score(rec.seq);
             if (score_dump)
                 (*score_dump) << rec.header << '\t' << llr << '\t'
@@ -330,6 +341,8 @@ int split_main(int argc, char** argv) {
 
         log_info("=== Split complete ===");
         log_info("Total reads: " + std::to_string(n_total));
+        if (min_length > 0 || max_length > 0)
+            log_info("Length-filtered (dropped): " + std::to_string(n_len_filtered));
         log_info("Damaged:     " + std::to_string(n_damaged) +
                  " (" + [&]{ char b[16]; std::snprintf(b,sizeof(b),"%.1f%%",
                      n_total ? 100.0*n_damaged/n_total : 0.0); return std::string(b); }() + ")");
