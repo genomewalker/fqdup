@@ -85,6 +85,14 @@ has NO derep call (its `--min-length 25` is `fqdup merge`'s own flag) — nothin
    Guard C3_ALL_DETERMINISTIC — identical md5 across -p 1/2/8, all corpora CHANGED vs old
    (EC-skip fired), +243 representatives each (strict superset, 0 lost). NEW baselines:
    default e6635f57, bucketcap 97924cc1, kappa 5d257c56 (guard_c3.sh).
-4. Cherry-pick wiki docs commit `8078031` (no code collision).
+4. Wiki docs. **Cherry-pick 8078031 turned out MOOT** — phase3-split's history already
+   carries that commit's wiki/ content byte-identical (verified `git diff integration HEAD
+   -- wiki/` empty), and commit (2)'s README is already integration's tip. So instead of a
+   no-op cherry-pick, this step RECONCILES the wiki to the post-7816a2a behavior that
+   8078031 predates: added --min-length (REQUIRED) + --max-length to wiki/Derep.md and
+   wiki/Usage.md CLI tables; added the unconditional short-read EC-skip note (interior<20 →
+   pass through) to wiki/Derep.md; migrated every runnable `fqdup derep` example across
+   wiki/{Derep,Usage,Home,Damage,Damage-Aware-Deduplication}.md to carry `--min-length 30`
+   (block-aware sweep confirms 0 runnable examples miss it; README already carried it).
 5. `git merge --no-ff -s ours integration` — record ancestry after replay ledger audit.
 6. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.

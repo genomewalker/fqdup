@@ -328,6 +328,7 @@ Then use the output to decide:
 ```bash
 fqdup derep \
   -i nonext.deduped.fq.gz -o nonext.final.fq.gz \
+  --min-length 30 \
   --damage-dmax5 0.193 --damage-lambda5 0.246 \
   --damage-dmax3 0.040 --damage-lambda3 0.069 \
   --mask-threshold 0.05
