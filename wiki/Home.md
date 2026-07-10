@@ -169,12 +169,13 @@ fqdup derep_pairs \
 # Add --collapse-damage only if NOT running DART/mapDamage on this output
 fqdup derep \
   -i merged.deduped.fq.gz \
-  -o merged.final.fq.gz
+  -o merged.final.fq.gz \
+  --min-length 30
 ```
 
 ### Standard (no ancient DNA)
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 64G
-fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-error-correct
+fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --min-length 30 --no-error-correct
 ```

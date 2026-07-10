@@ -148,8 +148,13 @@ and reduces to around 5.6 M unique pairs.
 fqdup derep \
   -i merged.deduped.fq.gz \
   -o merged.final.fq.gz \
+  --min-length 30 \
   -c clusters_derep.tsv.gz
 ```
+
+`--min-length` is required: reads shorter than N bp are dropped at ingestion
+before indexing. Set it to your library's minimum retained fragment length
+(30 bp is a common aDNA floor). Add `--max-length N` to also cap the upper end.
 
 PCR error correction is **on by default**. Damage-aware hashing is **off by
 default**, if you run DART or mapDamage on the fqdup output, enabling it would
@@ -190,7 +195,7 @@ For modern DNA, disable damage estimation and error correction explicitly:
 
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
-fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --no-damage --no-error-correct
+fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz --min-length 30 --no-damage --no-error-correct
 ```
 
 ### Structural deduplication only
@@ -211,6 +216,7 @@ them directly and skip Pass 0:
 ```bash
 fqdup derep \
   -i nonext.deduped.fq.gz -o nonext.final.fq.gz \
+  --min-length 30 \
   --damage-dmax5 0.35 --damage-lambda5 0.40 \
   --damage-dmax3 0.15 --damage-lambda3 0.30 \
   --mask-threshold 0.05
@@ -224,7 +230,7 @@ strand matters:
 
 ```bash
 fqdup derep_pairs ... --no-revcomp
-fqdup derep       ... --no-revcomp
+fqdup derep       ... --min-length 30 --no-revcomp
 ```
 
 ---
@@ -328,6 +334,8 @@ At least one of `--out-damaged` / `--out-undamaged` is required.
 |------|-------------|---------|
 | `-i FILE` | Sorted input FASTQ | required |
 | `-o FILE` | Output deduplicated FASTQ | - |
+| `--min-length N` | Drop reads shorter than N bp at ingestion | **required (N ≥ 1)** |
+| `--max-length N` | Drop reads longer than N bp at ingestion | 0 (off; ≥ `--min-length`) |
 | `-c FILE` | Cluster statistics (gzipped TSV) | off |
 | `--out-damaged FILE` | Write LLR-classified damaged reads | - |
 | `--out-undamaged FILE` | Write LLR-classified undamaged reads | - |
