@@ -75,8 +75,16 @@ has NO derep call (its `--min-length 25` is `fqdup merge`'s own flag) — nothin
    and `max<min` CLI errors verified firing. Guard: `--min-length 1` guard variant across
    default/bucketcap/kappa × -p 1/2/8 — must stay byte-identical (corpus floor = 16 bp, so
    `--min-length 1` drops nothing). [guard_c2.sh: **C2_GUARD_ALL_OK**, 9/9 byte-identical.]
-3. `.inc` EC-policy replacement (fold unconditional skip; keep Phase3Runner; zero the
-   schema-facing short_brute_* stats). Guard: determinism + structural invariant; RE-BASELINE.
+3. `.inc` EC-policy replacement (EXECUTED). Folded integration's unconditional short-read
+   EC-skip into `phase3_error_correct.inc` (7 surgical edits): deleted kBruteforceMinLen,
+   short_parents index + its log, the ~55-line child brute-force branch; short-interior
+   children now just `short_interior_skipped++; continue;`. Kept Phase3Runner + alias block.
+   short_brute_evaluated/found/too_small_skipped kept declared/merged/persisted as **0**
+   (schema-facing, cluster_format.cpp:327-329); loss_short_interior_skipped_ now = kept-count.
+   Structural invariant holds BY CONSTRUCTION (edge-generating short path deleted; grep CLEAN).
+   Guard C3_ALL_DETERMINISTIC — identical md5 across -p 1/2/8, all corpora CHANGED vs old
+   (EC-skip fired), +243 representatives each (strict superset, 0 lost). NEW baselines:
+   default e6635f57, bucketcap 97924cc1, kappa 5d257c56 (guard_c3.sh).
 4. Cherry-pick wiki docs commit `8078031` (no code collision).
 5. `git merge --no-ff -s ours integration` — record ancestry after replay ledger audit.
 6. (Deferred, separate) schema-versioned removal/rename of dead short_brute_* fields.
