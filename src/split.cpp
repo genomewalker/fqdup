@@ -38,7 +38,7 @@ static void usage(const char* prog) {
         "                         bulk: exponential model from Pass 0 estimate\n"
         "                         empirical: always run length-stratified LSD scan\n"
         "  --split-threshold F  LLR threshold for damaged call (default: 0.0)\n"
-        "  --min-length N       (REQUIRED) Drop reads shorter than N bp before classify\n"
+        "  --min-length N       Drop reads shorter than N bp before classify (default: 16; 0 = off)\n"
         "  --max-length N       Drop reads longer than N bp before classify (default: off)\n"
         "  --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000)\n"
         "  --model-bin FILE     Reuse full split model from `fqdup profile --model-bin-out`\n"
@@ -55,7 +55,7 @@ int split_main(int argc, char** argv) {
     std::string model_bin_path, damage_json_path;
     bool allow_model_mismatch = false;
     float split_threshold = 0.0f;
-    int min_length = -1;  // REQUIRED: unset sentinel; user must pass --min-length (>= 1)
+    int min_length = 16;  // default 16 bp; 0=disabled (no lower cap)
     int max_length = 0;   // 0=disabled (no upper cap); drop reads longer than this before classify
     int64_t damage_deam_max_reads = 5'000'000;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
@@ -104,8 +104,8 @@ int split_main(int argc, char** argv) {
         usage(argv[0]);
         return 1;
     }
-    if (min_length < 1) {
-        std::cerr << "split: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
+    if (min_length < 0) {
+        std::cerr << "split: --min-length must be >= 0 (0 = disabled)\n";
         return 1;
     }
     if (max_length != 0 && max_length < min_length) {

@@ -931,7 +931,7 @@ private:
     std::string out_undamaged_path_;
     float split_threshold_ = 0.0f;
     DamageSplitModel split_model_;
-    int min_length_ = 0;   // 0=disabled; CLI requires >=1. Reads shorter dropped before indexing.
+    int min_length_ = 0;   // 0=disabled; CLI default 16. Reads shorter dropped before indexing.
     int max_length_ = 0;   // 0=disabled (no upper cap); reads longer dropped before indexing
     uint64_t n_below_min_length_ = 0;  // Pass-1 --min-length drops (never indexed/emitted)
     uint64_t n_above_max_length_ = 0;  // Pass-1 --max-length drops (never indexed/emitted)
@@ -983,7 +983,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --out-damaged FILE   Write LLR-classified damaged reads to FILE (.fq.gz)\n"
         << "  --out-undamaged FILE Write LLR-classified undamaged reads to FILE (.fq.gz)\n"
         << "  --split-threshold F  LLR threshold for split (default 0.0)\n"
-        << "  --min-length N       REQUIRED. Drop reads shorter than N bp before dedup (N >= 1)\n"
+        << "  --min-length N       Drop reads shorter than N bp before dedup (default: 16; 0 = off)\n"
         << "  --max-length N       Drop reads longer than N bp before dedup (0 = off; must be >= --min-length)\n"
         << "  --split-model MODE   auto (default) | bulk | empirical\n"
         << "                         auto     — empirical per-bin if damage detected, else bulk\n"
@@ -1070,7 +1070,7 @@ int derep_main(int argc, char** argv) {
     std::string in_path, out_path, cluster_path, fqcl_path, prior_fqcl_path;
     std::string out_damaged_path, out_undamaged_path;
     float split_threshold = 0.0f;
-    int   min_length = 0;   // 0=disabled (no lower cap)
+    int   min_length = 16;  // default 16 bp; 0=disabled (no lower cap)
     int   max_length = 0;   // 0=disabled (no upper cap)
     enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
     bool use_revcomp = true;
@@ -1319,8 +1319,8 @@ int derep_main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
-    if (min_length < 1) {
-        std::cerr << "Error: --min-length is required and must be >= 1 — set the minimum read length explicitly\n";
+    if (min_length < 0) {
+        std::cerr << "Error: --min-length must be >= 0 (0 = disabled)\n";
         return 1;
     }
     if (max_length != 0 && max_length < min_length) {
