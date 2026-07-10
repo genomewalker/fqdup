@@ -227,6 +227,37 @@
         // largest-single-shard.
         ska::flat_hash_map<int, LenShard> shards;
         std::array<uint64_t, 8> bhist{};
+
+        // Distinct-4mer complexity of an interior, read directly off the 2-bit packed
+        // arena (this streaming engine packs sequences 4 bases/byte; the old ASCII
+        // arena is gone). Repetitive runs (homopolymer/STR/telomere/minisatellite)
+        // collapse to few distinct 4-mers regardless of length; real DNA keeps most
+        // positions distinct. Used to decide whether an oversized candidate bucket is
+        // a technical explosion (cap it) or genuinely abundant biology (keep every
+        // posting). `packed` is the read's packed arena data, `start` the interior's
+        // first base index (= layout.k5); eligible ids are pure ACGT, so every window
+        // is valid and the distinct-4mer mapping is a bijection of the base encoding.
+        auto interior_low_complexity = [](const uint8_t* packed, int start, int ilen,
+                                          double frac) -> bool {
+            if (ilen < 8) return false;              // too short to judge → never cap
+            uint64_t seen[4] = {0,0,0,0};
+            uint32_t kmer = 0; int valid = 0;
+            for (int p = 0; p < ilen; ++p) {
+                int pos = start + p;
+                uint32_t c = (packed[pos >> 2] >> (6 - 2 * (pos & 3))) & 0x3u;
+                kmer = ((kmer << 2) | c) & 0xFFu;    // trailing 4 bases (8 bits)
+                if (p >= 3) { seen[kmer >> 6] |= (1ull << (kmer & 63)); ++valid; }
+            }
+            if (valid <= 0) return false;
+            int distinct = __builtin_popcountll(seen[0]) + __builtin_popcountll(seen[1])
+                         + __builtin_popcountll(seen[2]) + __builtin_popcountll(seen[3]);
+            return (double)distinct < frac * (double)valid;
+        };
+        // Entropy-cap visibility, accumulated across all per-ilen build_shard calls:
+        // oversized buckets seen, capped (low-complexity), spared (high-complexity →
+        // real abundant biology, left uncapped).
+        int64_t ent_oversized = 0, ent_capped = 0, ent_spared = 0;
+
         auto build_shard = [&](int ilen) -> LenShard& {
             auto& sh = shards[ilen];
             auto& tag_entries = build_map[ilen];
@@ -240,14 +271,31 @@
                 while (i < ev.size()) {
                     uint64_t k = ev[i].key;
                     pi.keys.push_back(k);
+                    // Bucket extent [i, j): all postings sharing this part-key.
+                    size_t j = i;
+                    while (j < ev.size() && ev[j].key == k) ++j;
+                    // Decide the effective cap for THIS bucket. In entropy-aware mode an
+                    // oversized bucket is capped only when its representative interior is
+                    // low-complexity; complex buckets (real abundant reads) stay uncapped.
+                    uint32_t cap = errcor_.bucket_cap;  // 0 = no cap
+                    if (cap && errcor_.bucket_cap_lowcomplexity_only && (j - i) > cap) {
+                        ++ent_oversized;
+                        const auto& rlay = get_layout(arena_.length(ev[i].id));
+                        if (!interior_low_complexity(arena_.data(ev[i].id), rlay.k5,
+                                                     rlay.ilen, errcor_.bucket_cap_complexity_frac)) {
+                            cap = 0;  // high-complexity → keep every posting
+                            ++ent_spared;
+                        } else {
+                            ++ent_capped;
+                        }
+                    }
                     uint32_t cnt = 0;
-                    while (i < ev.size() && ev[i].key == k) {
-                        if (errcor_.bucket_cap == 0 || cnt < errcor_.bucket_cap) {
+                    for (; i < j; ++i) {
+                        if (cap == 0 || cnt < cap) {
                             pi.ids.push_back(ev[i].id); cnt++;
                         } else {
                             stats.bucket_overflow_drops++;
                         }
-                        i++;
                     }
                     pi.offsets.push_back(static_cast<uint32_t>(pi.ids.size()));
                     uint32_t blen = pi.offsets.back() - pi.offsets[pi.offsets.size() - 2];
@@ -468,7 +516,9 @@
             // pass it replaced. Kept as sort+unique -- a small average candidate count
             // does not by itself justify removing a well-optimized generic algorithm.
             uint32_t n_cands = 0;
-            const bool unbounded = (errcor_.bucket_cap == 0);
+            // Entropy-aware mode leaves high-complexity buckets uncapped, so a query can
+            // legitimately return more than 12*bucket_cap postings — grow on demand there.
+            const bool unbounded = (errcor_.bucket_cap == 0) || errcor_.bucket_cap_lowcomplexity_only;
             auto collect = [&](uint32_t pid) {
                 if (unbounded) {
                     if (n_cands >= cand_storage.size()) cand_storage.resize(n_cands + 1);
@@ -645,6 +695,12 @@
             if (has_shard) shards.erase(seg.ilen);
         }
         build_map.clear();  // all long ilens already erased in build_shard; no-op safety
+
+        if (errcor_.bucket_cap && errcor_.bucket_cap_lowcomplexity_only)
+            log_info("Phase 3 entropy-cap: oversized buckets=" + std::to_string(ent_oversized)
+                     + " capped(low-complexity)=" + std::to_string(ent_capped)
+                     + " spared(high-complexity)=" + std::to_string(ent_spared)
+                     + " postings_dropped=" + std::to_string(stats.bucket_overflow_drops));
 
         // Merge per-thread state. B2 sorts mismatches deterministically, but
         // we concat in tid order so the same -j N gives byte-identical output.

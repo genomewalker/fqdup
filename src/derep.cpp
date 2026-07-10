@@ -1025,6 +1025,8 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
         << "  --errcor-snp-min-count INT   SNP veto: min absolute sig_count (default: 1)\n"
         << "  --errcor-bucket-cap INT      Max pair-key bucket size (default: 0 = unlimited)\n"
+        << "  --errcor-bucket-cap-lowcomplexity  Cap only low-complexity buckets; spare high-complexity (real abundance)\n"
+        << "  --errcor-bucket-cap-complexity-frac FLOAT  Distinct-4mer frac below which an interior is low-complexity (default: 0.5)\n"
         << "  --errcor-snp-cutoff INT      Low-coverage cutoff (default: 10)\n"
         << "  --errcor-snp-factor FLOAT    Low-coverage SNP multiplier (default: 1.75)\n"
         << "  -p, --threads INT            Worker threads for Phase 3 + compressed I/O (default: 0 = HW, capped at 16 for writer)\n"
@@ -1164,6 +1166,10 @@ int derep_main(int argc, char** argv) {
             if (v < 0) { std::cerr << "Error: --errcor-bucket-cap must be >= 0 (0 = unlimited), got " << v << "\n"; return 1; }
             errcor.bucket_cap = static_cast<uint32_t>(v);
             bucket_cap_explicit = true;
+        } else if (arg == "--errcor-bucket-cap-lowcomplexity") {
+            errcor.bucket_cap_lowcomplexity_only = true;
+        } else if (arg == "--errcor-bucket-cap-complexity-frac" && i + 1 < argc) {
+            errcor.bucket_cap_complexity_frac = std::stod(argv[++i]);
         } else if (arg == "--errcor-snp-cutoff" && i + 1 < argc) {
             long v = std::stol(argv[++i]);
             if (v < 1) { std::cerr << "Error: --errcor-snp-cutoff must be >= 1, got " << v << "\n"; return 1; }

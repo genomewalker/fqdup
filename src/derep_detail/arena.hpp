@@ -29,6 +29,16 @@ struct ErrCorParams {
     uint32_t snp_low_cov_cutoff = 10;
     double   snp_low_cov_factor = 1.75;
     uint32_t bucket_cap         = 0;
+    // Entropy-aware bucket cap: when true, the cap is applied ONLY to buckets whose
+    // representative interior is low-complexity (repetitive/technical). High-complexity
+    // buckets — genuinely abundant real biology — keep every posting. This confines the
+    // candidate-explosion fix to the sequences that cause it (homopolymer/STR/telomere/
+    // minisatellite runs) and preserves absorption for real duplicates. Data-derived,
+    // no per-library tuning. Off → the cap is blanket (all oversized buckets capped).
+    bool     bucket_cap_lowcomplexity_only = false;
+    // Distinct-4mer fraction below which a representative interior is called
+    // low-complexity (distinct_4mers / (ilen-3)). Real DNA ~0.8+; STR/telomere <0.3.
+    double   bucket_cap_complexity_frac    = 0.5;
     double   pcr_phi            = 5.3e-7;
     double   pcr_rate           = 0.0;
     uint32_t max_h2_count       = 2;
