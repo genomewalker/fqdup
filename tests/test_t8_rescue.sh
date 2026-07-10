@@ -50,10 +50,10 @@ LOG_ON="$TMP/on.log"
 LOG_OFF="$TMP/off.log"
 
 echo "[t8] running with --errcor-rescue-indels"
-"$FQDUP" derep -i "$INPUT" -o "$OUT_ON"  --errcor-rescue-indels 2>&1 | tee "$LOG_ON" >/dev/null
+"$FQDUP" derep --min-length 1 -i "$INPUT" -o "$OUT_ON"  --errcor-rescue-indels 2>&1 | tee "$LOG_ON" >/dev/null
 
 echo "[t8] running WITHOUT rescue (control)"
-"$FQDUP" derep -i "$INPUT" -o "$OUT_OFF" 2>&1 | tee "$LOG_OFF" >/dev/null
+"$FQDUP" derep --min-length 1 -i "$INPUT" -o "$OUT_OFF" 2>&1 | tee "$LOG_OFF" >/dev/null
 
 # When the rescue path fires it logs lines under "Phase 3 indel rescue (T8):".
 if grep -q "Phase 3 indel rescue (T8)" "$LOG_ON"; then
@@ -95,7 +95,7 @@ LOG_DEL="$TMP/del.log"
 # Tiny synthetic input has no B1 edges → log_pi_ratio fits to 0, so the
 # unweighted indel S would be exactly -α_del·1. Use α=0 + mask_bonus>0 to
 # get S>0 deterministically; production defaults are intentionally α=2.0.
-"$FQDUP" derep -i "$INPUT2" -o "$TMP/out_del.fq" --errcor-rescue-indels \
+"$FQDUP" derep --min-length 1 -i "$INPUT2" -o "$TMP/out_del.fq" --errcor-rescue-indels \
     --rescue-alpha-del 0.0 --rescue-alpha-ins 0.0 --rescue-mask-bonus 1.0 2>&1 | tee "$LOG_DEL" >/dev/null
 
 # The substantive check is that the L-1 deletion pair was DETECTED by the
@@ -129,7 +129,7 @@ QCHI3=""; for ((i=0; i<${#CHILD3_DEL2}; ++i)); do QCHI3="${QCHI3}I"; done
     printf "@d2_1\n%s\n+\n%s\n" "$CHILD3_DEL2" "$QCHI3"
 } > "$INPUT3"
 LOG_DLEN2="$TMP/dlen2.log"
-"$FQDUP" derep -i "$INPUT3" -o "$TMP/out_dlen2.fq" --errcor-rescue-indels \
+"$FQDUP" derep --min-length 1 -i "$INPUT3" -o "$TMP/out_dlen2.fq" --errcor-rescue-indels \
     --rescue-alpha-del 0.0 --rescue-alpha-ins 0.0 --rescue-mask-bonus 1.0 \
     2>&1 | tee "$LOG_DLEN2" >/dev/null
 ed2=$(awk '/Banded ed=0\/1\/2/{print $NF; exit}' "$LOG_DLEN2")
@@ -162,7 +162,7 @@ INPUT4="$TMP/in_evict.fq"
     printf "@sib_1\n%s\n+\n%s\n" "$SIB" "$QB"
 } > "$INPUT4"
 LOG_EVICT="$TMP/evict.log"
-"$FQDUP" derep -i "$INPUT4" -o "$TMP/out_evict.fq" --errcor-rescue-indels \
+"$FQDUP" derep --min-length 1 -i "$INPUT4" -o "$TMP/out_evict.fq" --errcor-rescue-indels \
     --rescue-alpha-del 0.0 --rescue-alpha-ins 0.0 --rescue-mask-bonus 1.0 \
     2>&1 | tee "$LOG_EVICT" >/dev/null
 # Just assert the rescue block ran without crash and stats are sane.
@@ -175,10 +175,10 @@ fi
 # ── Test 5: -t 1 vs -t 8 produce identical output on the same fixture ────────
 OUT_T1="$TMP/out_t1.fq"
 OUT_T8="$TMP/out_t8.fq"
-"$FQDUP" derep -i "$INPUT2" -o "$OUT_T1" --errcor-rescue-indels -t 1 \
+"$FQDUP" derep --min-length 1 -i "$INPUT2" -o "$OUT_T1" --errcor-rescue-indels -t 1 \
     --rescue-alpha-del 0.0 --rescue-alpha-ins 0.0 --rescue-mask-bonus 1.0 \
     >/dev/null 2>&1
-"$FQDUP" derep -i "$INPUT2" -o "$OUT_T8" --errcor-rescue-indels -t 8 \
+"$FQDUP" derep --min-length 1 -i "$INPUT2" -o "$OUT_T8" --errcor-rescue-indels -t 8 \
     --rescue-alpha-del 0.0 --rescue-alpha-ins 0.0 --rescue-mask-bonus 1.0 \
     >/dev/null 2>&1
 if ! diff -q "$OUT_T1" "$OUT_T8" >/dev/null 2>&1; then
