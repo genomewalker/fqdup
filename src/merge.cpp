@@ -793,6 +793,7 @@ struct MergeOpts {
     // (merged + unmerged mates). Override with --min-length. NOTE: this changes merge
     // output vs the 15nt WIN1 reference (intentional — new clean-data policy for DART).
     int   min_length    = 30;
+    int   max_length    = 0;   // 0=disabled (no upper cap); drop reads longer than this on all emit paths
     int   skip_terminal = 0;
     int   clip_5p       = 0;   // 0=disabled; hard-clip N bases from R1 5' end before merge
     int   poly_g_min_run = 0;   // 0=disabled; trim 3' poly-G runs >= this length
@@ -1312,6 +1313,7 @@ static void accum_overlap_subst(OverlapSubstCounts& cnt,
 static bool passes_qc(const FastqRecord& rec, const MergeOpts& opts,
                       float complexity_entropy_lo, float complexity_dom_hi) {
     if ((int)rec.seq.size() < opts.min_length) return false;
+    if (opts.max_length > 0 && (int)rec.seq.size() > opts.max_length) return false;
     if (opts.max_n_rate < 1.0f) {
         int ns = (int)std::count(rec.seq.begin(), rec.seq.end(), 'N');
         if ((float)ns / (float)rec.seq.size() > opts.max_n_rate) return false;
@@ -1714,6 +1716,7 @@ static void usage() {
         "  --min-overlap N    Minimum overlap length (default: 11)\n"
         "  --max-mm-rate F    Max mismatch rate in overlap (default: 0.08)\n"
         "  --min-length N     Discard reads shorter than N bp, all emit paths (default: 30)\n"
+        "  --max-length N     Discard reads longer than N bp, all emit paths (default: off)\n"
         "  --json FILE        Write comprehensive lossless merge-QC report (JSON)\n"
         "  --clip-r1-5p N     Hard-clip N bases from R1 5' end before overlap (removes adapter stubs)\n"
         "  --min-entropy F    Discard low-complexity merged reads; Shannon entropy floor in bits\n"
@@ -1799,6 +1802,7 @@ int merge_main(int argc, char** argv) {
         else if (a == "--min-overlap"      && i+1 < argc) opts.min_ov       = std::stoi(argv[++i]);
         else if (a == "--max-mm-rate"      && i+1 < argc) opts.max_mm_rate  = std::stof(argv[++i]);
         else if (a == "--min-length"       && i+1 < argc) opts.min_length   = std::stoi(argv[++i]);
+        else if (a == "--max-length"       && i+1 < argc) opts.max_length   = std::stoi(argv[++i]);
         else if (a == "--json"             && i+1 < argc) opts.json_out     = argv[++i];
         else if (a == "--adapter1"         && i+1 < argc) opts.adapter1       = argv[++i];
         else if (a == "--adapter2"         && i+1 < argc) opts.adapter2       = argv[++i];
@@ -1923,6 +1927,8 @@ int merge_main(int argc, char** argv) {
               << "  min-overlap=" << opts.min_ov
               << " max-mm-rate=" << opts.max_mm_rate
               << " min-length=" << opts.min_length;
+    if (opts.max_length > 0)
+        std::cerr << " max-length=" << opts.max_length;
     if (opts.clip_5p > 0)
         std::cerr << " clip-r1-5p=" << opts.clip_5p;
     if (opts.poly_g_min_run > 0)
@@ -2260,6 +2266,7 @@ int merge_main(int argc, char** argv) {
             j << "  \"params\": {\"min_overlap\": " << opts.min_ov
               << ", \"max_mismatch_rate\": " << opts.max_mm_rate
               << ", \"min_length\": " << opts.min_length
+              << ", \"max_length\": " << opts.max_length
               << ", \"poly_g_min_run\": " << opts.poly_g_min_run << "},\n";
             j << "  \"counts\": {\n";
             j << "    \"pairs_in\": " << pairs_in << ",\n";
