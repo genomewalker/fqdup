@@ -62,6 +62,7 @@ extern "C" {
 #include "fqdup/fastq_common.hpp"
 #include "fqdup/logger.hpp"
 #include "flat_hash_map.hpp"
+#include "derep_detail/sharded_index.hpp"
 
 #include "derep_detail/encoding.hpp"
 #include "derep_detail/packed_ops.hpp"
@@ -785,10 +786,11 @@ private:
         };
         std::vector<WriteEntry> records_to_write;
         records_to_write.reserve(index_.size());
-        for (const auto& [fingerprint, entry] : index_) {
-            if (!is_error_.empty() && is_error_[entry.seq_id]) continue;
+        index_.for_each([&](const SequenceFingerprint& fingerprint,
+                            const IndexEntry& entry) {
+            if (!is_error_.empty() && is_error_[entry.seq_id]) return;
             records_to_write.push_back({entry.record_index, fingerprint, entry.count});
-        }
+        });
         std::sort(records_to_write.begin(), records_to_write.end(),
                   [](const WriteEntry& a, const WriteEntry& b) {
                       return a.record_index < b.record_index;
@@ -797,10 +799,10 @@ private:
         n_unique_clusters_ = n_to_write;
 
         // Free index_ and is_error_ — no longer needed; records_to_write has everything.
-        // index_ is the largest single structure in the run (68.7 GB on a 355 M-unique
-        // library at load 0.5; 34.4 GB at kIndexMaxLoad), so this is the biggest drop
-        // before the write loop begins.
-        { decltype(index_) tmp; std::swap(index_, tmp); }
+        // index_ is the largest single structure in the run (32 GB measured on a
+        // 355 M-unique library at kIndexMaxLoad), so this is the biggest drop before
+        // the write loop begins.
+        index_.release();
         { std::vector<bool> tmp; std::swap(is_error_, tmp); }
 #ifdef __linux__
         if (mallctl != nullptr) {
@@ -919,7 +921,8 @@ private:
     std::vector<ChildMismatch> fqcl_mismatches_;
     std::vector<uint32_t>      fqcl_parent_chain_;
 
-    ska::flat_hash_map<SequenceFingerprint, IndexEntry, SequenceFingerprintHash> index_;
+    fqdup::derep_detail::ShardedIndex<SequenceFingerprint, IndexEntry,
+                                      SequenceFingerprintHash> index_;
 
     // Phase 3 error correction state (populated only when errcor_.enabled)
     SeqArena          arena_;

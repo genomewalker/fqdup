@@ -86,11 +86,11 @@
         std::vector<uint32_t> id_fwd_count(N, 0);
         // Reverse map: seq_id → IndexEntry* for representative propagation during absorption.
         std::vector<IndexEntry*> seq_entry(N, nullptr);
-        for (auto& [fp, entry] : index_) {
+        index_.for_each([&](const SequenceFingerprint&, IndexEntry& entry) {
             id_count[entry.seq_id] = entry.count;
             id_fwd_count[entry.seq_id] = entry.fwd_count;
             seq_entry[entry.seq_id] = &entry;
-        }
+        });
 
         // Accumulated mass per cluster: starts as Pass-1 count, grows as children
         // are absorbed.  Used for B3 boundary check only — the SNP veto still uses
@@ -2085,11 +2085,11 @@
         // cluster TSV reflect absorbed PCR error reads, not just the original
         // representative count.  acc_count is a local — must be written back before
         // phase3_error_correct() returns.
-        for (auto& [fp, entry] : index_) {
+        index_.for_each([&](const SequenceFingerprint&, IndexEntry& entry) {
             if (entry.seq_id < static_cast<uint32_t>(acc_count.size()) &&
                 !is_error_[entry.seq_id])
                 entry.count = acc_count[entry.seq_id];
-        }
+        });
 
         stats.log();
         // Persist for write_fqcl_ → metadata.
