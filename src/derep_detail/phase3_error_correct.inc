@@ -27,8 +27,15 @@
         // member list is only needed by the T5.6 adj-len probe, which uses a
         // separate length-agnostic map. Keep this one count-only — saves a
         // vector header per bundle (~24 B × ~N/avg_occ on capture data).
+        // Sized by DISTINCT bundle keys, not by N. reserve(N) assumed every read
+        // lands in its own bundle — the opposite of what a bundle is for — and
+        // ska's reserve() silently clamps the load factor to 0.5, so it took
+        // next_pow2(2N) = 2^30 slots x 24 B = 24 GB. Growing organically at 0.75
+        // (honoured on growth, unlike reserve) costs 24 B x next_pow2(D/0.75).
+        // Never iterated (find/operator[] only), so bucket_count cannot reach the
+        // output and this is byte-identity-safe by construction.
         ska::flat_hash_map<uint64_t, uint32_t> bundle_occ_map;
-        bundle_occ_map.reserve(N);
+        bundle_occ_map.max_load_factor(0.75f);
         {
             std::vector<uint8_t> dec;
             std::vector<char>    asc;
@@ -59,7 +66,7 @@
         ska::flat_hash_map<uint64_t, uint32_t> rescue_bundle_occ_map;
         if (errcor_.rescue_indels && !errcor_.legacy_veto && errcor_.empirical) {
             rescue_bundle_key_of.assign(N, 0);
-            rescue_bundle_occ_map.reserve(N);
+            rescue_bundle_occ_map.max_load_factor(0.75f);  // see bundle_occ_map above
             std::vector<uint8_t> dec;
             std::vector<char>    asc;
             for (uint32_t id = 0; id < N; ++id) {
@@ -938,8 +945,17 @@
                 for (const auto& lbset : local_bundles) bins_b += set_bytes(lbset);
                 for (const auto& bins : local_bins)
                     for (const auto& s : bins) bins_b += set_bytes(s);
+                // The bundle occupancy maps were the last blind spot: reserve(N)
+                // took 24 GB each and never appeared here, so 48 GB of the peak
+                // was attributed to a "doubling transient" that did not exist.
+                using OccSlot = ska::detailv3::sherwood_v3_entry<
+                    std::pair<uint64_t, uint32_t>>;
+                uint64_t occ_b = static_cast<uint64_t>(
+                                     bundle_occ_map.bucket_count() +
+                                     rescue_bundle_occ_map.bucket_count()) *
+                                 sizeof(OccSlot);
                 uint64_t total_b = index_b + arena_b + qual_b + counts_b + fpi_b +
-                                   mm_b + slab_b + db_b + bins_b;
+                                   mm_b + slab_b + db_b + bins_b + occ_b;
                 unsigned long vmhwm_kb = 0;
                 if (FILE* f = std::fopen("/proc/self/status", "r")) {
                     char line[256];
@@ -966,6 +982,10 @@
                          fld("counts(id+acc+bundle_key)", counts_b) +
                          fld("FlatPairIndex_peakshard", fpi_b) + fld("mismatches", mm_b) +
                          fld("interior_slab", slab_b) +
+                         fld("bundle_occ_maps", occ_b) +
+                         "[keys=" + std::to_string(bundle_occ_map.size()) + "+" +
+                         std::to_string(rescue_bundle_occ_map.size()) + " of N=" +
+                         std::to_string(N) + "] " +
                          fld("distinct_bundles~", db_b) + fld("fit_accum~", bins_b) +
                          "| TOTAL_accounted=" + std::to_string(total_b) + "|" + gb(total_b) + "GB" +
                          "  VmHWM=" + std::to_string(static_cast<uint64_t>(vmhwm_kb) * 1024ull) +
