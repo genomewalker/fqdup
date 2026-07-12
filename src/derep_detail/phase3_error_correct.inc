@@ -179,47 +179,45 @@
         // one of the 6 pair-keys fires.  Covers both H=1 and H=2.
         static constexpr int kPairA[6] = {0, 0, 0, 1, 1, 2};
         static constexpr int kPairB[6] = {1, 2, 3, 2, 3, 3};
-        ska::flat_hash_map<int, std::array<std::vector<BuildEntry>, 6>> build_map;
-        build_map.reserve(64);
         struct LenShard { std::array<FlatPairIndex, 6> pi; };
 
-        uint64_t n_parents = 0;
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            int L = arena_.length(id);
-            const auto& lay = get_layout(L);
-            if (lay.ilen < kMinInteriorLen) continue;
-
-            auto t0 = clk::now();
-            if (scratch.size() < static_cast<size_t>(lay.nbytes))
-                scratch.resize(lay.nbytes);
-            const uint8_t* psrc = arena_.data(id);
-            int starts[4] = {lay.k5,
-                             lay.k5 + lay.s0,
-                             lay.k5 + lay.s0 + lay.s1,
-                             lay.k5 + lay.s0 + lay.s1 + lay.s2};
-            int sizes[4]  = {lay.s0, lay.s1, lay.s2, lay.s3};
-            int nbs[4]    = {lay.nb0, lay.nb1, lay.nb2, lay.nb3};
-            uint8_t* parts[4] = {scratch.data(),
-                                 scratch.data() + lay.nb0,
-                                 scratch.data() + lay.nb0 + lay.nb1,
-                                 scratch.data() + lay.nb0 + lay.nb1 + lay.nb2};
-            for (int p = 0; p < 4; ++p)
-                extract_packed_part(psrc, starts[p], sizes[p], parts[p]);
-            uint64_t h[4];
-            for (int p = 0; p < 4; ++p)
-                h[p] = XXH3_64bits(parts[p], nbs[p]);
-            auto t1 = clk::now();
-
-            auto& entries = build_map[lay.ilen];
-            for (int t = 0; t < 6; ++t)
-                entries[t].push_back({pair_key(h[kPairA[t]], h[kPairB[t]], t, lay.ilen), id});
-            auto t2 = clk::now();
-
-            stats.decode_hash_parent_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            stats.insert_ms             += std::chrono::duration<double, std::milli>(t2 - t1).count();
-            n_parents++;
+        // Group eligible ids by interior length so each ilen owns a contiguous
+        // window in `order`. Sorted by (ilen, id) ascending, so an ilen's window
+        // lists its ids in exactly the order the old [0,N) scan visited them --
+        // which is what lets build_shard() fill that ilen's postings just-in-time
+        // and still produce bit-identical FlatPairIndex buckets.
+        std::vector<uint32_t> order;
+        struct IlenSeg { int ilen; uint32_t lo, hi; };
+        std::vector<IlenSeg> ilen_segs;
+        {
+            std::vector<std::pair<int, uint32_t>> tmp;
+            tmp.reserve(N);
+            for (uint32_t id = 0; id < N; ++id) {
+                if (!arena_.is_eligible(id)) continue;
+                int il = get_layout(arena_.length(id)).ilen;
+                tmp.emplace_back(il, id);  // include tiny ids too: the worker visits
+            }                              // and counts them exactly as the [0,N) scan did
+            std::sort(tmp.begin(), tmp.end(),
+                      [](const std::pair<int, uint32_t>& a,
+                         const std::pair<int, uint32_t>& b) {
+                          return a.first != b.first ? a.first < b.first
+                                                    : a.second < b.second;
+                      });
+            order.reserve(tmp.size());
+            for (size_t i = 0; i < tmp.size();) {
+                int il = tmp[i].first;
+                uint32_t lo = static_cast<uint32_t>(order.size());
+                while (i < tmp.size() && tmp[i].first == il) {
+                    order.push_back(tmp[i].second);
+                    ++i;
+                }
+                ilen_segs.push_back({il, lo, static_cast<uint32_t>(order.size())});
+            }
         }
+
+        uint64_t n_parents = 0;
+        for (const auto& seg : ilen_segs)
+            if (seg.ilen >= kMinInteriorLen) n_parents += seg.hi - seg.lo;
         stats.parents_indexed = n_parents;
         log_info("Phase 3: indexed " + std::to_string(n_parents) +
                  " sequences (directed monotone ascent, all eligible)");
@@ -272,9 +270,64 @@
         // real abundant biology, left uncapped).
         int64_t ent_oversized = 0, ent_capped = 0, ent_spared = 0;
 
-        auto build_shard = [&](int ilen) -> LenShard& {
+        // Largest single ilen's posting arrays, sampled while live (same reason as
+        // fpi_peak_b: they are gone by the time the mem breakdown runs).
+        uint64_t post_peak_b = 0;
+
+        auto build_shard = [&](const IlenSeg& seg) -> LenShard& {
+            const int ilen = seg.ilen;
             auto& sh = shards[ilen];
-            auto& tag_entries = build_map[ilen];
+
+            // Postings for THIS ilen only, built just-in-time from the ilen's window
+            // in `order`. Materialising every ilen's postings up front cost
+            // 6 x sizeof(BuildEntry)(16 B) x n_parents(350,534,710) = 33.65 GB before
+            // std::vector growth slack -- the largest single term in the run, and
+            // invisible to the mem breakdown because it was fully drained by the time
+            // that logger fires. Peak collapses to the largest single ilen.
+            std::array<std::vector<BuildEntry>, 6> tag_entries;
+            {
+                std::vector<uint8_t> scratch;
+                for (uint32_t oi = seg.lo; oi < seg.hi; ++oi) {
+                    const uint32_t id  = order[oi];
+                    const auto&    lay = get_layout(arena_.length(id));
+
+                    auto t0 = clk::now();
+                    if (scratch.size() < static_cast<size_t>(lay.nbytes))
+                        scratch.resize(lay.nbytes);
+                    const uint8_t* psrc = arena_.data(id);
+                    int starts[4] = {lay.k5,
+                                     lay.k5 + lay.s0,
+                                     lay.k5 + lay.s0 + lay.s1,
+                                     lay.k5 + lay.s0 + lay.s1 + lay.s2};
+                    int sizes[4]  = {lay.s0, lay.s1, lay.s2, lay.s3};
+                    int nbs[4]    = {lay.nb0, lay.nb1, lay.nb2, lay.nb3};
+                    uint8_t* parts[4] = {scratch.data(),
+                                         scratch.data() + lay.nb0,
+                                         scratch.data() + lay.nb0 + lay.nb1,
+                                         scratch.data() + lay.nb0 + lay.nb1 + lay.nb2};
+                    for (int p = 0; p < 4; ++p)
+                        extract_packed_part(psrc, starts[p], sizes[p], parts[p]);
+                    uint64_t h[4];
+                    for (int p = 0; p < 4; ++p)
+                        h[p] = XXH3_64bits(parts[p], nbs[p]);
+                    auto t1 = clk::now();
+
+                    for (int t = 0; t < 6; ++t)
+                        tag_entries[t].push_back(
+                            {pair_key(h[kPairA[t]], h[kPairB[t]], t, lay.ilen), id});
+                    auto t2 = clk::now();
+
+                    stats.decode_hash_parent_ms +=
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    stats.insert_ms +=
+                        std::chrono::duration<double, std::milli>(t2 - t1).count();
+                }
+                uint64_t pb = 0;
+                for (const auto& ev : tag_entries)
+                    pb += static_cast<uint64_t>(ev.capacity()) * sizeof(BuildEntry);
+                post_peak_b = std::max(post_peak_b, pb);
+            }
+
             for (int t = 0; t < 6; ++t) {
                 auto& ev = tag_entries[t];
                 std::sort(ev.begin(), ev.end(),
@@ -317,8 +370,9 @@
                     bhist[std::min(b, 7u)]++;
                 }
                 pi.build_directory();  // O(1) key lookup, replaces per-probe lower_bound
+                ev.clear();
+                ev.shrink_to_fit();    // drop this tag's postings as soon as it is indexed
             }
-            build_map.erase(ilen);  // free this ilen's build entries once shard is built
             return sh;
         };
 
@@ -351,39 +405,9 @@
             return interior_slab.data() + interior_off[id];
         };
 
-        // Group children by interior length so each shard's children are a
-        // contiguous window in `order`; the driver builds/frees one ilen's shard
-        // around its window. Only ids with a real interior (>= kMinInteriorLen)
-        // ever generate edges; shorter ids are skipped by the worker. Output is
-        // order-invariant, so grouping by (ilen,id) instead of id is byte-identical.
-        std::vector<uint32_t> order;
-        struct IlenSeg { int ilen; uint32_t lo, hi; };
-        std::vector<IlenSeg> ilen_segs;
-        {
-            std::vector<std::pair<int, uint32_t>> tmp;
-            tmp.reserve(N);
-            for (uint32_t id = 0; id < N; ++id) {
-                if (!arena_.is_eligible(id)) continue;
-                int il = get_layout(arena_.length(id)).ilen;
-                tmp.emplace_back(il, id);  // include tiny ids too: the worker visits
-            }                              // and counts them exactly as the [0,N) scan did
-            std::sort(tmp.begin(), tmp.end(),
-                      [](const std::pair<int, uint32_t>& a,
-                         const std::pair<int, uint32_t>& b) {
-                          return a.first != b.first ? a.first < b.first
-                                                    : a.second < b.second;
-                      });
-            order.reserve(tmp.size());
-            for (size_t i = 0; i < tmp.size();) {
-                int il = tmp[i].first;
-                uint32_t lo = static_cast<uint32_t>(order.size());
-                while (i < tmp.size() && tmp[i].first == il) {
-                    order.push_back(tmp[i].second);
-                    ++i;
-                }
-                ilen_segs.push_back({il, lo, static_cast<uint32_t>(order.size())});
-            }
-        }
+        // `order` / `ilen_segs` are built above, before the parent index, because
+        // build_shard() now drives its just-in-time posting fill off each ilen's
+        // window.
 
         unsigned n_threads = errcor_.threads;
         if (n_threads == 0) n_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -696,7 +720,7 @@
             seg_chunks = (seg_hi - seg_lo + kChunkSize - 1) / kChunkSize;
             const bool has_shard = seg.ilen >= kMinInteriorLen;
             if (has_shard) {
-                const LenShard& ls_mem = build_shard(seg.ilen);
+                const LenShard& ls_mem = build_shard(seg);
                 uint64_t b = 0;
                 for (const auto& pi : ls_mem.pi)
                     b += static_cast<uint64_t>(pi.keys.capacity())    * sizeof(*pi.keys.data()) +
@@ -717,7 +741,6 @@
             }
             if (has_shard) shards.erase(seg.ilen);
         }
-        build_map.clear();  // all long ilens already erased in build_shard; no-op safety
 
         if (errcor_.bucket_cap && errcor_.bucket_cap_lowcomplexity_only)
             log_info("Phase 3 entropy-cap: oversized buckets=" + std::to_string(ent_oversized)
@@ -954,8 +977,13 @@
                                      bundle_occ_map.bucket_count() +
                                      rescue_bundle_occ_map.bucket_count()) *
                                  sizeof(OccSlot);
+                // Streamed per-ilen like FlatPairIndex, so report the largest single
+                // shard's postings. This term used to be built for ALL ilens at once
+                // (33.65 GB) and was drained before this logger ran -- it was the
+                // entire 39 GB residual between TOTAL_accounted and VmHWM.
+                uint64_t post_b = post_peak_b;
                 uint64_t total_b = index_b + arena_b + qual_b + counts_b + fpi_b +
-                                   mm_b + slab_b + db_b + bins_b + occ_b;
+                                   mm_b + slab_b + db_b + bins_b + occ_b + post_b;
                 unsigned long vmhwm_kb = 0;
                 if (FILE* f = std::fopen("/proc/self/status", "r")) {
                     char line[256];
@@ -980,7 +1008,8 @@
                          fld("index", index_b) +
                          fld("read_arena", arena_b) + fld("qual_arena", qual_b) +
                          fld("counts(id+acc+bundle_key)", counts_b) +
-                         fld("FlatPairIndex_peakshard", fpi_b) + fld("mismatches", mm_b) +
+                         fld("FlatPairIndex_peakshard", fpi_b) +
+                         fld("postings_peakshard", post_b) + fld("mismatches", mm_b) +
                          fld("interior_slab", slab_b) +
                          fld("bundle_occ_maps", occ_b) +
                          "[keys=" + std::to_string(bundle_occ_map.size()) + "+" +
