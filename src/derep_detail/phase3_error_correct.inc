@@ -296,10 +296,47 @@
         // Largest single ilen's posting arrays, sampled while live (same reason as
         // fpi_peak_b: they are gone by the time the mem breakdown runs).
         uint64_t post_peak_b = 0;
+        uint64_t slab_peak_b = 0;
+
+        // Interior slab, streamed per ilen alongside the shard. rank_of[id] is id's
+        // 0-based position inside its own ilen's window in `order`; entries for other
+        // ilens are stale and never read (see interior_ptr below).
+        std::vector<uint32_t> rank_of(N, 0);
+        std::vector<uint8_t>  seg_slab;
+        int                   seg_nb = 0;
 
         auto build_shard = [&](const IlenSeg& seg) -> LenShard& {
             const int ilen = seg.ilen;
             auto& sh = shards[ilen];
+
+            // Extract every parent's full interior ONCE, so the per-candidate B1 loop
+            // reads it (a pointer deref) instead of re-extracting it per child — that
+            // re-extraction was the 38% __memmove_evex in the perf profile.
+            //
+            // Held for ONE ilen, not all N. Both interior_ptr() call sites sit behind
+            // `arena_.length(pid) == L` and take pids from this shard's postings, so
+            // only ids in this seg are ever dereferenced. The all-ids slab cost
+            // 5.45 GB of interiors + 2.64 GB of uint64 offsets = 8.10 GB; this costs
+            // rank_of (1.32 GB) + the largest single ilen (0.06 GB).
+            //
+            // Load-bearing: `ilen` is a pure function of L (get_layout reads L and the
+            // profile, never the bases), so every id in this seg shares this ilen and
+            // therefore the stride `seg_nb`. If ilen ever becomes content-dependent,
+            // this becomes silent memory corruption — hence the assert.
+            seg_nb = (ilen + 3) / 4;
+            seg_slab.assign(static_cast<size_t>(seg.hi - seg.lo) *
+                                static_cast<size_t>(seg_nb), 0);
+            for (uint32_t oi = seg.lo; oi < seg.hi; ++oi) {
+                const uint32_t id  = order[oi];
+                const auto&    lay = get_layout(arena_.length(id));
+                assert(lay.ilen == ilen);
+                rank_of[id] = oi - seg.lo;
+                extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
+                                    seg_slab.data() +
+                                        static_cast<uint64_t>(oi - seg.lo) * seg_nb);
+            }
+            slab_peak_b = std::max(slab_peak_b,
+                                   static_cast<uint64_t>(seg_slab.capacity()));
 
             // Postings for THIS ilen only, built just-in-time from the ilen's window
             // in `order`. Materialising every ilen's postings up front cost
@@ -400,32 +437,14 @@
         };
 
         // ── Phase B1: collect ChildMismatch records (parallel) ──────────────
-        // Pre-warm layout_cache before workers start so it becomes read-only, and
-        // build a per-id interior slab: extract each eligible long-interior id's
-        // full interior ONCE here, so the per-candidate B1 loop reads it (a pointer
-        // deref) instead of re-extracting it per child. That re-extraction was the
-        // 38% __memmove_evex in the perf profile. Output-preserving: at the B1 use
-        // site the parent's length == the child's length (checked there), so the
-        // id's own layout used here is the exact layout used at the comparison.
-        std::vector<uint64_t> interior_off(static_cast<size_t>(N) + 1, 0);
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            const auto& lay = get_layout(arena_.length(id));
-            if (lay.ilen >= kMinInteriorLen)
-                interior_off[id + 1] = static_cast<uint64_t>((lay.ilen + 3) / 4);
-        }
-        for (uint32_t id = 0; id < N; ++id)
-            interior_off[id + 1] += interior_off[id];
-        std::vector<uint8_t> interior_slab(interior_off[N]);
-        for (uint32_t id = 0; id < N; ++id) {
-            if (!arena_.is_eligible(id)) continue;
-            const auto& lay = get_layout(arena_.length(id));
-            if (lay.ilen < kMinInteriorLen) continue;
-            extract_packed_part(arena_.data(id), lay.k5, lay.ilen,
-                                interior_slab.data() + interior_off[id]);
-        }
+        // The interior slab holds only the CURRENT ilen (filled by build_shard, which
+        // the driver calls single-threaded before the workers start). Valid for ids in
+        // that ilen's window only: both call sites below guard on
+        // `arena_.length(pid) == L` and draw pids from this ilen's postings, so the
+        // stride is that ilen's `seg_nb` and the byte read is the same one the
+        // all-ids slab held.
         auto interior_ptr = [&](uint32_t id) -> const uint8_t* {
-            return interior_slab.data() + interior_off[id];
+            return seg_slab.data() + static_cast<uint64_t>(rank_of[id]) * seg_nb;
         };
 
         // `order` / `ilen_segs` are built above, before the parent index, because
@@ -985,7 +1004,10 @@
                 // (sampled at build time) rather than the live sum, which is 0 here.
                 uint64_t fpi_b  = fpi_peak_b;
                 uint64_t mm_b   = vcap(mismatches);
-                uint64_t slab_b = vcap(interior_slab) + vcap(interior_off);
+                // Streamed per-ilen like the shard: the resident cost is rank_of plus
+                // the largest single ilen's slab (sampled at build time; the live one
+                // is the last, not the biggest).
+                uint64_t slab_b = vcap(rank_of) + slab_peak_b;
                 uint64_t db_b   = set_bytes(distinct_bundles);
                 uint64_t bins_b = 0;
                 for (const auto& lbset : local_bundles) bins_b += set_bytes(lbset);
