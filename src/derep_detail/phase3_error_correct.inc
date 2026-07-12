@@ -228,6 +228,11 @@
         ska::flat_hash_map<int, LenShard> shards;
         std::array<uint64_t, 8> bhist{};
 
+        // Largest single shard's FlatPairIndex footprint, sampled while that shard is
+        // still live. The mem breakdown below runs at B2, after every shards.erase(),
+        // so it would otherwise report FlatPairIndex=0 and hide ~20% of the peak.
+        uint64_t fpi_peak_b = 0;
+
         // Distinct-4mer complexity of an interior, read directly off the 2-bit packed
         // arena (this streaming engine packs sequences 4 bases/byte; the old ASCII
         // arena is gone). Repetitive runs (homopolymer/STR/telomere/minisatellite)
@@ -681,7 +686,16 @@
             seg_hi = seg.hi;
             seg_chunks = (seg_hi - seg_lo + kChunkSize - 1) / kChunkSize;
             const bool has_shard = seg.ilen >= kMinInteriorLen;
-            if (has_shard) build_shard(seg.ilen);
+            if (has_shard) {
+                const LenShard& ls_mem = build_shard(seg.ilen);
+                uint64_t b = 0;
+                for (const auto& pi : ls_mem.pi)
+                    b += static_cast<uint64_t>(pi.keys.capacity())    * sizeof(*pi.keys.data()) +
+                         static_cast<uint64_t>(pi.offsets.capacity()) * sizeof(*pi.offsets.data()) +
+                         static_cast<uint64_t>(pi.ids.capacity())     * sizeof(*pi.ids.data()) +
+                         static_cast<uint64_t>(pi.dir.capacity())     * sizeof(*pi.dir.data());
+                fpi_peak_b = std::max(fpi_peak_b, b);
+            }
             next_chunk.store(0, std::memory_order_relaxed);
             if (n_threads == 1) {
                 b1_worker(0);
@@ -900,11 +914,16 @@
                                    vcap(qual_arena_.lengths);
                 uint64_t counts_b = vcap(id_count) + vcap(acc_count) +
                                     vcap(bundle_key_of) + vcap(rescue_bundle_key_of);
-                uint64_t fpi_b = 0;
-                for (const auto& kv : shards)
-                    for (const auto& pi : kv.second.pi)
-                        fpi_b += vcap(pi.keys) + vcap(pi.offsets) + vcap(pi.ids) +
-                                 vcap(pi.dir);
+                // The dedup index is the largest single structure in the run and was
+                // absent from this breakdown until now, leaving ~38% of VmHWM
+                // unattributed. Slot is sherwood_v3_entry, not the bare pair.
+                using IndexSlot = ska::detailv3::sherwood_v3_entry<
+                    std::pair<SequenceFingerprint, IndexEntry>>;
+                uint64_t index_b = static_cast<uint64_t>(index_.bucket_count()) *
+                                   sizeof(IndexSlot);
+                // Streamed: only one shard is ever live, so report the largest one
+                // (sampled at build time) rather than the live sum, which is 0 here.
+                uint64_t fpi_b  = fpi_peak_b;
                 uint64_t mm_b   = vcap(mismatches);
                 uint64_t slab_b = vcap(interior_slab) + vcap(interior_off);
                 uint64_t db_b   = set_bytes(distinct_bundles);
@@ -912,8 +931,8 @@
                 for (const auto& lbset : local_bundles) bins_b += set_bytes(lbset);
                 for (const auto& bins : local_bins)
                     for (const auto& s : bins) bins_b += set_bytes(s);
-                uint64_t total_b = arena_b + qual_b + counts_b + fpi_b + mm_b +
-                                   slab_b + db_b + bins_b;
+                uint64_t total_b = index_b + arena_b + qual_b + counts_b + fpi_b +
+                                   mm_b + slab_b + db_b + bins_b;
                 unsigned long vmhwm_kb = 0;
                 if (FILE* f = std::fopen("/proc/self/status", "r")) {
                     char line[256];
@@ -929,10 +948,16 @@
                 auto fld = [&](const char* n, uint64_t b) {
                     return std::string(n) + "=" + std::to_string(b) + "|" + gb(b) + "GB ";
                 };
-                log_info("Phase 3 mem breakdown: " +
+                char lf[64];
+                std::snprintf(lf, sizeof(lf), "index_[%zu slots @load %.2f] ",
+                              index_.bucket_count(),
+                              index_.size() / static_cast<double>(
+                                  index_.bucket_count() ? index_.bucket_count() : 1));
+                log_info("Phase 3 mem breakdown: " + std::string(lf) +
+                         fld("index", index_b) +
                          fld("read_arena", arena_b) + fld("qual_arena", qual_b) +
                          fld("counts(id+acc+bundle_key)", counts_b) +
-                         fld("FlatPairIndex", fpi_b) + fld("mismatches", mm_b) +
+                         fld("FlatPairIndex_peakshard", fpi_b) + fld("mismatches", mm_b) +
                          fld("interior_slab", slab_b) +
                          fld("distinct_bundles~", db_b) + fld("fit_accum~", bins_b) +
                          "| TOTAL_accounted=" + std::to_string(total_b) + "|" + gb(total_b) + "GB" +

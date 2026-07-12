@@ -282,12 +282,31 @@ private:
                  " clusters, " + std::to_string(prior_counts_.size()) + " with count > 1");
     }
 
+    // index_ slot = sherwood_v3_entry<pair<SequenceFingerprint,IndexEntry>> = 64 B.
+    // At ska's default max_load_factor 0.5 a 355 M-unique library needs 2^30 slots
+    // = 68.7 GB, only 33 % occupied — ~46 GB of empty table, the single largest term
+    // in the derep peak (measured: 68.7 of 179 GB VmHWM). Robin-hood probing holds up
+    // well past 0.5, so raise the ceiling and let 355 M entries live in 2^29 slots
+    // (34.4 GB, load 0.66).
+    //
+    // Must be applied via rehash(), NOT reserve(): flat_hash_map.hpp:805 sizes
+    // reserve() with min(0.5, _max_load_factor), so reserve() silently ignores any
+    // load factor above 0.5. rehash() (…:626) and the growth check (…:827) both
+    // honour it.
+    //
+    // Byte-identical: index_ is iterated at exactly one site (see pass2) and the
+    // result is immediately sorted by record_index, so slot order cannot reach the
+    // output.
+    static constexpr float kIndexMaxLoad = 0.75f;
+
     void pass1(const std::string& in_path) {
+        index_.max_load_factor(kIndexMaxLoad);
+
         // Pre-reserve hash map + arenas based on input file size. Without this,
-        // ska::flat_hash_map (max_load_factor=0.5) regrows ~26 times to reach
-        // 100M entries, and SeqArena::packed doubles ~30 times — each regrow is
-        // a full re-hash + memcpy of the existing data. On a 6.3 GB compressed
-        // input this single change saves ~30 minutes of wall time.
+        // ska::flat_hash_map regrows ~26 times to reach 100M entries, and
+        // SeqArena::packed doubles ~30 times — each regrow is a full re-hash +
+        // memcpy of the existing data. On a 6.3 GB compressed input this single
+        // change saves ~30 minutes of wall time.
         //
         // Estimate: ~250 B per uncompressed FASTQ record (typical aDNA SE).
         // Compressed gz is ~5×, so compressed_bytes / 50 ≈ records.
@@ -308,7 +327,8 @@ private:
                              std::to_string(est_records) +
                              " entries (heuristic from input size " +
                              std::to_string(fsize / (1024 * 1024)) + " MB)");
-                    index_.reserve(est_records);
+                    index_.rehash(static_cast<size_t>(
+                        std::ceil(est_records / static_cast<double>(kIndexMaxLoad))));
                     if (errcor_.enabled) {
                         arena_.offsets.reserve(est_records);
                         arena_.lengths.reserve(est_records);
@@ -783,7 +803,9 @@ private:
         n_unique_clusters_ = n_to_write;
 
         // Free index_ and is_error_ — no longer needed; records_to_write has everything.
-        // Frees ~10 GB (index_) before the write loop begins.
+        // index_ is the largest single structure in the run (68.7 GB on a 355 M-unique
+        // library at load 0.5; 34.4 GB at kIndexMaxLoad), so this is the biggest drop
+        // before the write loop begins.
         { decltype(index_) tmp; std::swap(index_, tmp); }
         { std::vector<bool> tmp; std::swap(is_error_, tmp); }
 #ifdef __linux__
