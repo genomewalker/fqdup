@@ -27,18 +27,23 @@
         // member list is only needed by the T5.6 adj-len probe, which uses a
         // separate length-agnostic map. Keep this one count-only — saves a
         // vector header per bundle (~24 B × ~N/avg_occ on capture data).
-        // Sized by DISTINCT bundle keys, not by N. reserve(N) assumed every read
-        // lands in its own bundle — the opposite of what a bundle is for — and
-        // ska's reserve() silently clamps the load factor to 0.5, so it took
-        // next_pow2(2N) = 2^30 slots x 24 B = 24 GB. Growing organically at 0.75
-        // (honoured on growth, unlike reserve) costs 24 B x next_pow2(D/0.75).
-        // Never iterated (find/operator[] only), so bucket_count cannot reach the
-        // output and this is byte-identity-safe by construction.
-        ska::flat_hash_map<uint64_t, uint32_t> bundle_occ_map;
+        // Occupancy is only ever read through bundle_occ_of() below, which returns 1
+        // for any key it fails to find. So ONLY keys with occupancy >= 2 need to be
+        // stored: a singleton's absence already encodes its count. On this data
+        // 352,925,555 of 354,647,264 keys are singletons (99.5%), so a map over every
+        // key spent 12.00 GB recording the value 1. (It was worse before: reserve(N)
+        // took 24 GB, because ska's reserve() silently clamps the load factor to 0.5.)
+        //
+        // Count by sorting a scratch copy of the keys, keep only the repeated ones,
+        // then drop the copy. Stored values are unchanged, and the map is never
+        // iterated (find/operator[] only), so this is byte-identical by construction.
+        ska::flat_hash_map<uint64_t, uint32_t> bundle_occ_map;  // occ >= 2 only
         bundle_occ_map.max_load_factor(0.75f);
         {
-            std::vector<uint8_t> dec;
-            std::vector<char>    asc;
+            std::vector<uint8_t>  dec;
+            std::vector<char>     asc;
+            std::vector<uint64_t> keys;
+            keys.reserve(N);
             for (uint32_t id = 0; id < N; ++id) {
                 if (!arena_.is_eligible(id)) continue;
                 int L = arena_.length(id);
@@ -48,7 +53,15 @@
                 uint64_t k = fqdup::bundlekey::from_decoded(
                     asc.data(), L, fqdup::bundlekey::kDefaultEndK);
                 bundle_key_of[id] = k;
-                ++bundle_occ_map[k];
+                keys.push_back(k);
+            }
+            std::sort(keys.begin(), keys.end());
+            for (size_t i = 0; i < keys.size();) {
+                size_t j = i;
+                while (j < keys.size() && keys[j] == keys[i]) ++j;
+                if (j - i > 1)
+                    bundle_occ_map.emplace(keys[i], static_cast<uint32_t>(j - i));
+                i = j;
             }
         }
         auto bundle_occ_of = [&](uint32_t id) -> uint64_t {
@@ -66,9 +79,11 @@
         ska::flat_hash_map<uint64_t, uint32_t> rescue_bundle_occ_map;
         if (errcor_.rescue_indels && !errcor_.legacy_veto && errcor_.empirical) {
             rescue_bundle_key_of.assign(N, 0);
-            rescue_bundle_occ_map.max_load_factor(0.75f);  // see bundle_occ_map above
-            std::vector<uint8_t> dec;
-            std::vector<char>    asc;
+            rescue_bundle_occ_map.max_load_factor(0.75f);
+            std::vector<uint8_t>  dec;
+            std::vector<char>     asc;
+            std::vector<uint64_t> keys;   // occ >= 2 only; see bundle_occ_map above
+            keys.reserve(N);
             for (uint32_t id = 0; id < N; ++id) {
                 if (!arena_.is_eligible(id)) continue;
                 int L = arena_.length(id);
@@ -78,7 +93,15 @@
                 uint64_t k = fqdup::bundlekey::from_decoded_no_len(
                     asc.data(), L, fqdup::bundlekey::kDefaultEndK);
                 rescue_bundle_key_of[id] = k;
-                ++rescue_bundle_occ_map[k];
+                keys.push_back(k);
+            }
+            std::sort(keys.begin(), keys.end());
+            for (size_t i = 0; i < keys.size();) {
+                size_t j = i;
+                while (j < keys.size() && keys[j] == keys[i]) ++j;
+                if (j - i > 1)
+                    rescue_bundle_occ_map.emplace(keys[i], static_cast<uint32_t>(j - i));
+                i = j;
             }
         }
         auto rescue_bundle_occ_of = [&](uint32_t id) -> uint64_t {
