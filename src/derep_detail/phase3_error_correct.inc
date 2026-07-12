@@ -82,7 +82,7 @@
 
         is_error_.assign(N, false);
 
-        std::vector<uint64_t> id_count(N, 0);
+        std::vector<uint32_t> id_count(N, 0);
         std::vector<uint32_t> id_fwd_count(N, 0);
         // Reverse map: seq_id → IndexEntry* for representative propagation during absorption.
         std::vector<IndexEntry*> seq_entry(N, nullptr);
@@ -95,7 +95,7 @@
         // Accumulated mass per cluster: starts as Pass-1 count, grows as children
         // are absorbed.  Used for B3 boundary check only — the SNP veto still uses
         // id_count (original Pass-1 count) so the ratio threshold remains calibrated.
-        std::vector<uint64_t> acc_count(id_count);
+        std::vector<uint32_t> acc_count(id_count);
 
         // Scratch for packed interior hashing
         std::vector<uint8_t> scratch;

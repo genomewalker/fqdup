@@ -387,7 +387,7 @@ private:
                     uint64_t h = XXH3_64bits(rec.seq.data(), rec.seq.size());
                     auto pit = prior_counts_.find(h);
                     if (pit != prior_counts_.end())
-                        it->second.count = pit->second;
+                        it->second.count = IndexEntry::narrow(pit->second);
                 }
                 if (profile_.enabled)
                     it->second.damage_score = compute_damage_score(rec.seq, profile_);
@@ -423,7 +423,7 @@ private:
                 if (profile_.enabled) {
                     uint8_t score = compute_damage_score(rec.seq, profile_);
                     if (score > it->second.damage_score) {
-                        it->second.record_index = record_idx;
+                        it->second.record_index = IndexEntry::narrow(record_idx);
                         it->second.damage_score = score;
                     }
                 }
@@ -534,7 +534,7 @@ private:
                 } else {
                     it->second.count++;
                     if (profile_.enabled && dsc[i] > it->second.damage_score) {
-                        it->second.record_index = record_idx;
+                        it->second.record_index = IndexEntry::narrow(record_idx);
                         it->second.damage_score = dsc[i];
                     }
                 }

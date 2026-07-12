@@ -349,15 +349,38 @@ struct Phase3Stats {
     }
 };
 
+// record_index and count are both bounded by the number of reads in the input:
+// record_index is a read's position in it, count is how many reads collapsed onto
+// this fingerprint. Holding them as uint64_t was pure headroom -- the largest clay
+// library is 435 M reads, three orders of magnitude below the uint32_t ceiling.
+//
+// The width matters far out of proportion to the field, because this struct is
+// replicated across every slot of the dedup index. Narrowing both takes
+// sherwood_v3_entry<pair<SequenceFingerprint, IndexEntry>> from 64 B to 56 B,
+// which is 4.3 GB off a 355 M-unique library. No stored value changes.
+//
+// ceiling: inputs above UINT32_MAX (4.29 G) reads; upgrade: widen record_index and
+// count back to uint64_t. kMaxRecords below makes that a loud error, not a wrap.
 struct IndexEntry {
-    uint64_t record_index;
-    uint64_t count;
+    uint32_t record_index;
+    uint32_t count;
     uint32_t seq_id;
+    uint32_t fwd_count;      // reads arriving in canonical (fwd) orientation
     uint8_t  damage_score;
-    uint32_t fwd_count = 0;  // reads arriving in canonical (fwd) orientation
 
-    IndexEntry() : record_index(0), count(1), seq_id(0), damage_score(0), fwd_count(0) {}
-    explicit IndexEntry(uint64_t idx) : record_index(idx), count(1), seq_id(0), damage_score(0), fwd_count(0) {}
+    static constexpr uint64_t kMaxRecords = std::numeric_limits<uint32_t>::max();
+
+    static uint32_t narrow(uint64_t v) {
+        if (v > kMaxRecords)
+            throw std::runtime_error(
+                "derep: input exceeds 4.29 G reads — IndexEntry.record_index/count "
+                "are uint32_t; widen them to uint64_t to support this input");
+        return static_cast<uint32_t>(v);
+    }
+
+    IndexEntry() : record_index(0), count(1), seq_id(0), fwd_count(0), damage_score(0) {}
+    explicit IndexEntry(uint64_t idx)
+        : record_index(narrow(idx)), count(1), seq_id(0), fwd_count(0), damage_score(0) {}
 };
 
 // 2-bit packed sequence arena. ~4× memory reduction vs ASCII.
