@@ -147,6 +147,10 @@ public:
                  std::to_string(total_reads_) + " reads");
 
         if (errcor_.enabled) {
+            // Pass 1 has fixed the unique count, and Phase 3 has not allocated yet:
+            // the only point where the run can refuse a doomed peak cheaply.
+            preflight_memory();
+
             // Compute D_eff from duplication ratio.  Used both for PCR rate estimation
             // and coverage regime auto-detection.
             // Under PCR kinetics: D_eff = log2(total_reads / unique_reads).
@@ -956,7 +960,78 @@ private:
     uint64_t n_below_min_length_ = 0;  // Pass-1 --min-length drops (never indexed/emitted)
     uint64_t n_above_max_length_ = 0;  // Pass-1 --max-length drops (never indexed/emitted)
 
+    double max_mem_gb_ = 0.0;  // 0 = disabled
+
+    // Preflight the run's peak once Pass 1 has fixed the unique count, and abort
+    // there rather than letting the run discover the ceiling by being OOM-killed
+    // several hours in. This is the only point where the count is known and Phase 3
+    // has not allocated yet.
+    //
+    //   base = max( VmHWM already reached, VmRSS now + Phase-3 growth )
+    //
+    // Both halves are needed. VmHWM covers a peak the process has ALREADY survived
+    // in Pass 1 (reader buffers, index growth) -- on a 6 M-read library that peak is
+    // 2.27 GB while RSS at this point is only 1.14 GB, so an RSS-based estimate
+    // would promise a run fits in less memory than it has already used. The RSS term
+    // covers the opposite regime: at 355 M uniques Phase 3 is the peak and Pass 1
+    // never came near it.
+    //
+    // Phase-3 growth counts only the allocations that are pure functions of N. The
+    // rest -- the largest ilen's shard and postings, the mismatch records, the
+    // bundle-occupancy maps, the fit accumulators -- is B1-derived and, with
+    // bucket_cap=0, formally unbounded. kPeakFactor covers those plus allocator
+    // slack: it is the ratio of measured VmHWM to this base on the reference runs
+    // (355 M uniques: 83.68 / 69.4 = 1.21; 6 M: 2.27 / 2.27 = 1.00).
+    //
+    // ceiling: kPeakFactor is calibrated on two libraries. A library with an
+    // unusually dominant single ilen, or --bucket-cap 0 on low-complexity data,
+    // can exceed it -- this is an estimate, not a guarantee.
+    // upgrade: log measured VmHWM / base from each run and widen to the observed max.
+    void preflight_memory() const {
+        if (max_mem_gb_ <= 0.0) return;
+        constexpr double kPeakFactor = 1.25;
+        constexpr double kGiB        = 1073741824.0;
+
+        unsigned long rss_kb = 0, hwm_kb = 0;
+        if (FILE* f = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), f)) {
+                std::sscanf(line, "VmRSS: %lu kB", &rss_kb);
+                std::sscanf(line, "VmHWM: %lu kB", &hwm_kb);
+            }
+            std::fclose(f);
+        }
+        const uint64_t N = index_.size();
+        // id_count(4) + acc_count(4) + bundle_key_of(8) + rank_of(4), plus
+        // rescue_bundle_key_of(8) when the rescue-indel path allocates it.
+        const bool rescue = errcor_.rescue_indels && !errcor_.legacy_veto &&
+                            errcor_.empirical;
+        const uint64_t per_read = 20ull + (rescue ? 8ull : 0ull);
+        const double rss_gb = static_cast<double>(rss_kb) * 1024.0 / kGiB;
+        const double hwm_gb = static_cast<double>(hwm_kb) * 1024.0 / kGiB;
+        const double p3_gb  = rss_gb + static_cast<double>(N * per_read) / kGiB;
+        const double base_gb = std::max(hwm_gb, p3_gb);
+        const double est_gb  = base_gb * kPeakFactor;
+
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "--max-mem %.1f GB: estimated peak=%.2f GB "
+                      "= max(VmHWM %.2f, resident %.2f + %llu B/read x %llu uniques "
+                      "= %.2f) x %.2f",
+                      max_mem_gb_, est_gb, hwm_gb, rss_gb,
+                      static_cast<unsigned long long>(per_read),
+                      static_cast<unsigned long long>(N), p3_gb, kPeakFactor);
+        log_info(msg);
+        if (est_gb > max_mem_gb_)
+            throw std::runtime_error(
+                "estimated peak " + std::to_string(est_gb).substr(0, 6) +
+                " GB exceeds --max-mem " + std::to_string(max_mem_gb_).substr(0, 6) +
+                " GB. Raise --max-mem, or lower the peak with --no-error-correct "
+                "(skips Phase 3 entirely).");
+    }
+
 public:
+    void set_max_mem(double gb) { max_mem_gb_ = gb; }
     void set_length_filter(int mn, int mx) { min_length_ = mn; max_length_ = mx; }
     void set_split_paths(std::string damaged, std::string undamaged,
                          float threshold = 0.0f) {
@@ -1005,6 +1080,7 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "  --split-threshold F  LLR threshold for split (default 0.0)\n"
         << "  --min-length N       Drop reads shorter than N bp before dedup (default: 16; 0 = off)\n"
         << "  --max-length N       Drop reads longer than N bp before dedup (0 = off; must be >= --min-length)\n"
+        << "  --max-mem GB         Abort after Pass 1 if the estimated Phase-3 peak exceeds GB (0 = off)\n"
         << "  --split-model MODE   auto (default) | bulk | empirical\n"
         << "                         auto     — empirical per-bin if damage detected, else bulk\n"
         << "                         bulk     — bulk exponential only, no extra file pass\n"
@@ -1092,6 +1168,7 @@ int derep_main(int argc, char** argv) {
     float split_threshold = 0.0f;
     int   min_length = 16;  // default 16 bp; 0=disabled (no lower cap)
     int   max_length = 0;   // 0=disabled (no upper cap)
+    double max_mem_gb = 0.0;  // 0=disabled; preflight-abort ceiling for the Phase-3 peak
     enum class SplitModelMode { Auto, Bulk, Empirical } split_model_mode = SplitModelMode::Auto;
     bool use_revcomp = true;
 
@@ -1144,6 +1221,8 @@ int derep_main(int argc, char** argv) {
             min_length = std::stoi(argv[++i]);
         } else if (arg == "--max-length" && i + 1 < argc) {
             max_length = std::stoi(argv[++i]);
+        } else if (arg == "--max-mem" && i + 1 < argc) {
+            max_mem_gb = std::stod(argv[++i]);
         } else if (arg == "--split-model" && i + 1 < argc) {
             std::string m(argv[++i]);
             if      (m == "auto")     split_model_mode = SplitModelMode::Auto;
@@ -1592,6 +1671,7 @@ int derep_main(int argc, char** argv) {
         }
         engine.set_split_model(DamageSplitModel::build(lsd_data, profile));
         engine.set_length_filter(min_length, max_length);
+        engine.set_max_mem(max_mem_gb);
         engine.process(in_path, out_path, cluster_path);
         log_info("=== Deduplication complete ===");
     } catch (const std::exception& e) {
