@@ -10,11 +10,110 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace fqdup::derep_detail {
+
+// ---------------------------------------------------------------------------
+// Block-chunked storage for the derep arenas.
+//
+// std::vector grows by doubling: it allocates the new buffer, copies into it,
+// then frees the old one — so both are resident at the same instant. The number
+// of unique reads cannot be known before Pass 1 (it depends on the duplication
+// rate), so the reserve() heuristic in derep.cpp is routinely low and every
+// arena overflows it. On a 355 M-unique library that single mechanism cost
+// ~63 GB transient on the quality bytes and ~16 GB on the packed sequence — the
+// bulk of the derep peak. Blocks are allocated once and never move, so peak
+// residency equals what is actually stored and growth costs exactly one block.
+//
+// Element blocks are fixed-count; the byte arena below is fixed-size. Neither
+// type offers reserve(): growth never copies, so an undersized estimate costs
+// nothing and there is no capacity left to overshoot.
+template <typename T, unsigned Shift = 22>  // 4 Mi elements per block
+class ChunkedVec {
+  public:
+    static constexpr size_t kPerBlock = size_t{1} << Shift;
+    static constexpr size_t kMask     = kPerBlock - 1;
+
+    void push_back(const T& v) {
+        const size_t bi = n_ >> Shift;
+        if (bi >= blocks_.size()) blocks_.emplace_back(new T[kPerBlock]());
+        blocks_[bi][n_ & kMask] = v;
+        ++n_;
+    }
+
+    T&       operator[](size_t i)       { return blocks_[i >> Shift][i & kMask]; }
+    const T& operator[](size_t i) const { return blocks_[i >> Shift][i & kMask]; }
+    size_t   size()  const { return n_; }
+    bool     empty() const { return n_ == 0; }
+    uint64_t bytes_alloc() const {
+        return static_cast<uint64_t>(blocks_.size()) * kPerBlock * sizeof(T);
+    }
+
+  private:
+    std::vector<std::unique_ptr<T[]>> blocks_;
+    size_t                            n_ = 0;
+};
+
+// Variable-length byte spans, addressed by a virtual offset. Same no-realloc
+// property as ChunkedVec, plus two guarantees the consumers depend on:
+//
+//   * A record's bytes never straddle a block, so at(off) hands back a pointer
+//     the caller can read the whole record through (decode_range and
+//     extract_packed_part both take a raw uint8_t* and walk it).
+//   * Every block keeps kSlack readable trailing bytes, because
+//     extract_packed_part (packed_ops.hpp:261) deliberately loads one byte past
+//     the record it is decoding. That byte's bits are always masked off again at
+//     :265, so its value cannot reach the output — but it must be addressable.
+//     This replaces the single trailing pad byte the vector layout needed.
+//
+// A record that will not fit in the current block's remainder skips to the next
+// block; at ~100 bp reads the abandoned tail averages well under a kilobyte.
+//
+// Block size trades granularity waste (the partly-filled last block is resident
+// in full) against the length of blocks_. 64 MiB keeps waste negligible at both
+// ends: a 6 M-read subset overshoots by <64 MiB rather than by a whole GiB, and
+// a 355 M-read library needs only ~560 blocks for its ~35 GB of quality bytes.
+class BlockBytes {
+  public:
+    static constexpr unsigned kShift = 26;  // 64 MiB blocks
+    static constexpr uint64_t kBlock = uint64_t{1} << kShift;
+    static constexpr uint64_t kMask  = kBlock - 1;
+    static constexpr uint64_t kSlack = 8;
+
+    // Zeroed span for the caller to fill in place (SeqArena packs 2-bit lanes
+    // straight into it). Returns the virtual offset.
+    uint64_t alloc(uint64_t n) {
+        if ((cur_ & kMask) + n + kSlack > kBlock) cur_ = (cur_ & ~kMask) + kBlock;
+        const size_t bi = static_cast<size_t>(cur_ >> kShift);
+        while (blocks_.size() <= bi) blocks_.emplace_back(new uint8_t[kBlock]());
+        const uint64_t off = cur_;
+        cur_ += n;
+        return off;
+    }
+
+    uint64_t append(const uint8_t* src, uint64_t n) {
+        const uint64_t off = alloc(n);
+        if (n) std::memcpy(at(off), src, n);
+        return off;
+    }
+
+    uint8_t*       at(uint64_t off)       { return blocks_[off >> kShift].get() + (off & kMask); }
+    const uint8_t* at(uint64_t off) const { return blocks_[off >> kShift].get() + (off & kMask); }
+
+    uint64_t bytes_used() const { return cur_; }
+
+    uint64_t bytes_alloc() const {
+        return static_cast<uint64_t>(blocks_.size()) * kBlock;
+    }
+
+  private:
+    std::vector<std::unique_ptr<uint8_t[]>> blocks_;
+    uint64_t                                cur_ = 0;
+};
 
 struct ErrCorParams {
     bool     enabled            = false;
@@ -265,10 +364,10 @@ struct IndexEntry {
 // Non-ACGT bases are encoded as A=0 and the sequence is flagged ineligible
 // so Phase 3 skips it.
 struct SeqArena {
-    std::vector<uint8_t>  packed;
-    std::vector<uint64_t> offsets;
-    std::vector<uint16_t> lengths;
-    std::vector<uint8_t>  eligible;  // 1 byte/read, no proxy bit-extract
+    BlockBytes             packed;
+    ChunkedVec<uint64_t>   offsets;
+    ChunkedVec<uint16_t>   lengths;
+    ChunkedVec<uint8_t>    eligible;  // 1 byte/read, no proxy bit-extract
 
     uint32_t append(const std::string& seq) {
         if (seq.size() > 65535u)
@@ -278,10 +377,10 @@ struct SeqArena {
         uint32_t id    = static_cast<uint32_t>(offsets.size());
         uint16_t L     = static_cast<uint16_t>(seq.size());
         int      nbytes = (L + 3) / 4;
-        offsets.push_back(packed.size());
+        uint64_t off   = packed.alloc(static_cast<uint64_t>(nbytes));
+        offsets.push_back(off);
         lengths.push_back(L);
-        packed.resize(packed.size() + nbytes, 0);
-        uint8_t* dst = packed.data() + offsets[id];
+        uint8_t* dst = packed.at(off);
         bool ok = true;
         int i = 0, byte = 0;
         while (i < L) {
@@ -304,10 +403,10 @@ struct SeqArena {
             throw std::runtime_error("SeqArena overflow: more than 4 G unique sequences");
         uint32_t id    = static_cast<uint32_t>(offsets.size());
         int      nbytes = (L + 3) / 4;
-        offsets.push_back(packed.size());
+        uint64_t off   = packed.alloc(static_cast<uint64_t>(nbytes));
+        offsets.push_back(off);
         lengths.push_back(static_cast<uint16_t>(L));
-        packed.resize(packed.size() + nbytes, 0);
-        uint8_t* dst = packed.data() + offsets[id];
+        uint8_t* dst = packed.at(off);
         bool ok = true;
         int i = 0, byte = 0;
         while (i < L) {
@@ -323,7 +422,7 @@ struct SeqArena {
         return id;
     }
 
-    const uint8_t* data(uint32_t id)        const { return packed.data() + offsets[id]; }
+    const uint8_t* data(uint32_t id)        const { return packed.at(offsets[id]); }
     uint16_t       length(uint32_t id)      const { return lengths[id]; }
     bool           is_eligible(uint32_t id) const { return eligible[id]; }
     size_t         size()                   const { return offsets.size(); }
@@ -360,19 +459,17 @@ struct SeqArena {
 // Indexed by the same uint32_t id returned by SeqArena.append(). Append
 // must occur in lockstep with the seq arena.
 struct QualArena {
-    std::vector<uint8_t>  bytes;
-    std::vector<uint64_t> offsets;
-    std::vector<uint16_t> lengths;
+    BlockBytes           bytes;
+    ChunkedVec<uint64_t> offsets;
+    ChunkedVec<uint16_t> lengths;
 
     uint32_t append(const std::string& qual) {
         if (qual.size() > 65535u)
             throw std::runtime_error("Quality too long for arena (>65535 bp)");
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.size());
+        offsets.push_back(bytes.append(reinterpret_cast<const uint8_t*>(qual.data()),
+                                       qual.size()));
         lengths.push_back(static_cast<uint16_t>(qual.size()));
-        bytes.insert(bytes.end(),
-                     reinterpret_cast<const uint8_t*>(qual.data()),
-                     reinterpret_cast<const uint8_t*>(qual.data()) + qual.size());
         return id;
     }
 
@@ -380,11 +477,9 @@ struct QualArena {
         if (L > 65535)
             throw std::runtime_error("Quality too long for arena (>65535 bp)");
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.size());
+        offsets.push_back(bytes.append(reinterpret_cast<const uint8_t*>(data_in),
+                                       static_cast<uint64_t>(L)));
         lengths.push_back(static_cast<uint16_t>(L));
-        bytes.insert(bytes.end(),
-                     reinterpret_cast<const uint8_t*>(data_in),
-                     reinterpret_cast<const uint8_t*>(data_in) + L);
         return id;
     }
 
@@ -392,7 +487,7 @@ struct QualArena {
     // Returns id; q_at() will yield kNoQual.
     uint32_t append_empty() {
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.size());
+        offsets.push_back(bytes.alloc(0));
         lengths.push_back(0);
         return id;
     }
@@ -404,7 +499,7 @@ struct QualArena {
     uint8_t q_at(uint32_t id, int pos) const {
         if (id >= lengths.size()) return kNoQual;
         if (lengths[id] == 0 || pos < 0 || pos >= lengths[id]) return kNoQual;
-        uint8_t v = bytes[offsets[id] + pos];
+        uint8_t v = *bytes.at(offsets[id] + static_cast<uint64_t>(pos));
         return v >= 33 ? static_cast<uint8_t>(v - 33) : kNoQual;
     }
 

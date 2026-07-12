@@ -12,8 +12,10 @@
         const uint32_t N = static_cast<uint32_t>(arena_.size());
         if (N == 0) return;
 
-        // Trailing padding for safe extraction in extract_packed_part
-        arena_.packed.push_back(0);
+        // The trailing pad byte extract_packed_part needs is now structural:
+        // BlockBytes keeps kSlack readable bytes at the end of every block
+        // (arena.hpp), so the last record's one-byte over-read is in bounds
+        // without appending to the arena here.
 
         // T5.3: precompute bundle_key + bundle occupancy for LR prior. The
         // bundle_key (start_kmer ⊕ end_kmer) is our reference-free locus
@@ -908,10 +910,15 @@
                     return static_cast<uint64_t>(s.bucket_count()) * 8ull +
                            static_cast<uint64_t>(s.size()) * 32ull;
                 };
-                uint64_t arena_b = vcap(arena_.packed) + vcap(arena_.offsets) +
-                                   vcap(arena_.lengths) + vcap(arena_.eligible);
-                uint64_t qual_b  = vcap(qual_arena_.bytes) + vcap(qual_arena_.offsets) +
-                                   vcap(qual_arena_.lengths);
+                // Block-chunked (arena.hpp): allocated == resident, and there is no
+                // doubling transient hiding on top of these numbers.
+                uint64_t arena_b = arena_.packed.bytes_alloc() +
+                                   arena_.offsets.bytes_alloc() +
+                                   arena_.lengths.bytes_alloc() +
+                                   arena_.eligible.bytes_alloc();
+                uint64_t qual_b  = qual_arena_.bytes.bytes_alloc() +
+                                   qual_arena_.offsets.bytes_alloc() +
+                                   qual_arena_.lengths.bytes_alloc();
                 uint64_t counts_b = vcap(id_count) + vcap(acc_count) +
                                     vcap(bundle_key_of) + vcap(rescue_bundle_key_of);
                 // The dedup index is the largest single structure in the run and was
@@ -1323,10 +1330,8 @@
             // or sum(P) < b3_min_mass (events too rare to matter).
             int rep_L = 0;
             {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
-                std::vector<uint16_t> ls(arena_.lengths.begin(), arena_.lengths.end());
-#pragma GCC diagnostic pop
+                std::vector<uint16_t> ls(arena_.lengths.size());
+                for (size_t i = 0; i < ls.size(); ++i) ls[i] = arena_.lengths[i];
                 if (!ls.empty()) {
                     std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
                     rep_L = static_cast<int>(ls[ls.size() / 2]);

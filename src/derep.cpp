@@ -302,16 +302,20 @@ private:
     void pass1(const std::string& in_path) {
         index_.max_load_factor(kIndexMaxLoad);
 
-        // Pre-reserve hash map + arenas based on input file size. Without this,
-        // ska::flat_hash_map regrows ~26 times to reach 100M entries, and
-        // SeqArena::packed doubles ~30 times — each regrow is a full re-hash +
-        // memcpy of the existing data. On a 6.3 GB compressed input this single
-        // change saves ~30 minutes of wall time.
+        // Pre-reserve the hash map based on input file size. Without this,
+        // ska::flat_hash_map regrows ~26 times to reach 100M entries, and each
+        // regrow is a full re-hash of the existing data. On a 6.3 GB compressed
+        // input this single change saves ~30 minutes of wall time.
+        //
+        // The arenas need no equivalent: they are block-chunked (arena.hpp), so
+        // growth appends a block rather than reallocating, and an estimate this
+        // rough would only mislead them. It is necessarily rough — the number of
+        // *unique* reads depends on the duplication rate, which is not knowable
+        // before Pass 1 runs. On the clay libraries it lands 1.7× low.
         //
         // Estimate: ~250 B per uncompressed FASTQ record (typical aDNA SE).
         // Compressed gz is ~5×, so compressed_bytes / 50 ≈ records.
-        // Use 0.6× safety factor (we'd rather one regrow at the end than
-        // over-reserve memory by 2×).
+        // Use 0.6× safety factor.
         try {
             std::error_code ec;
             auto fsize = std::filesystem::file_size(in_path, ec);
@@ -323,22 +327,12 @@ private:
                 est_records = static_cast<size_t>(est_records * 0.6);
                 est_records = std::min(est_records, size_t{500'000'000});
                 if (est_records >= 100'000) {
-                    log_info("Pass 1: pre-reserving capacity for ~" +
+                    log_info("Pass 1: pre-reserving index capacity for ~" +
                              std::to_string(est_records) +
                              " entries (heuristic from input size " +
                              std::to_string(fsize / (1024 * 1024)) + " MB)");
                     index_.rehash(static_cast<size_t>(
                         std::ceil(est_records / static_cast<double>(kIndexMaxLoad))));
-                    if (errcor_.enabled) {
-                        arena_.offsets.reserve(est_records);
-                        arena_.lengths.reserve(est_records);
-                        arena_.eligible.reserve(est_records);
-                        // ~100 bp avg sequence → 25 bytes packed
-                        arena_.packed.reserve(est_records * 25);
-                        qual_arena_.offsets.reserve(est_records);
-                        qual_arena_.lengths.reserve(est_records);
-                        qual_arena_.bytes.reserve(est_records * 100);
-                    }
                 }
             }
         } catch (...) {
