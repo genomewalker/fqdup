@@ -1116,6 +1116,9 @@ static void print_usage(const char* prog, bool advanced = false) {
     std::cerr
         << "\n--- Advanced ---\n"
         << "\nError correction (Phase 3) tuning:\n"
+        << "  --no-b1-damage-adjust        Widen the H=2 damage veto to ANY transition anywhere in the\n"
+        << "                               read (legacy). Default vetoes only terminal-zone,\n"
+        << "                               ss/ds-aware deaminations; this also blocks interior SNPs.\n"
         << "  --b1-kappa-min FLOAT         Interior CT/TV ratio threshold to enable b1_damage_adjust (default: 2.0)\n"
         << "  --b1-cs-min-total INT        Min child reads to apply cross-strand SNP veto (default: 3)\n"
         << "  --errcor-snp-threshold FLOAT SNP veto: sig/parent_count threshold (default: 0.20)\n"
@@ -1241,6 +1244,8 @@ int derep_main(int argc, char** argv) {
             errcor.enabled = true;
         } else if (arg == "--no-error-correct") {
             errcor.enabled = false;
+        } else if (arg == "--no-b1-damage-adjust") {
+            errcor.b1_damage_adjust = false;
         } else if (arg == "--b1-kappa-min" && i + 1 < argc) {
             errcor.b1_kappa_min = std::stod(argv[++i]);
             if (errcor.b1_kappa_min < 0.0) {

@@ -458,6 +458,7 @@
             uint64_t children_scanned       = 0;
             uint64_t total_candidates       = 0;
             uint64_t children_found         = 0;
+            uint64_t h2_dmg_veto            = 0;
             uint64_t short_interior_skipped = 0;
             uint64_t short_brute_evaluated  = 0;
             uint64_t short_brute_found      = 0;
@@ -700,8 +701,14 @@
                             if ((mm2.base_a[0] ^ mm2.base_b[0]) == 3u) return false;
                             if ((mm2.base_a[1] ^ mm2.base_b[1]) == 3u) return false;
                         }
+                        // Deamination is a pre-amplification lesion on the template, so true
+                        // PCR duplicates of one molecule carry identical damage. Two reads
+                        // differing at a terminal deamination are different molecules —
+                        // absorbing one deletes a real damage observation. Veto, never merge.
+                        // This mirrors the H=1 veto (packed_ops.hpp:176) so both paths agree.
                         bool dmg0, dmg1;
                         if (errcor_.b1_damage_adjust) {
+                            // Minimal veto: terminal zone only, ss/ds-aware.
                             dmg0 = is_terminal_damage_mismatch(
                                        mm2.base_a[0], mm2.base_b[0],
                                        mm2.pos[0], lay.ilen, profile_.ss_mode);
@@ -709,12 +716,13 @@
                                        mm2.base_a[1], mm2.base_b[1],
                                        mm2.pos[1], lay.ilen, profile_.ss_mode);
                         } else {
+                            // Legacy broad veto: any transition anywhere in the read. Also
+                            // blocks interior transitions (ordinary SNPs) — kept as an escape
+                            // hatch, not the default: it costs absorption for no damage gain.
                             dmg0 = is_damage_sub_packed(mm2.base_a[0], mm2.base_b[0], errcor_.protect_transversions);
                             dmg1 = is_damage_sub_packed(mm2.base_a[1], mm2.base_b[1], errcor_.protect_transversions);
-                            if (dmg0 || dmg1) return false; // old: reject any damage type
                         }
-                        int h_adj = 2 - (int)dmg0 - (int)dmg1;
-                        if (h_adj == 0) return false; // both terminal damage → skip (Phase 2)
+                        if (dmg0 || dmg1) { ++ls.h2_dmg_veto; return false; }
                         auto cvt = [&](int i, uint16_t p, uint8_t ab, uint8_t pb) {
                             if (rc) {
                                 p  = static_cast<uint16_t>(lay.ilen - 1 - p);
@@ -723,11 +731,7 @@
                             }
                             return std::make_tuple(p, ab, pb);
                         };
-                        if (h_adj == 1) {
-                            int ri = dmg0 ? 1 : 0;
-                            auto [p, ab, pb] = cvt(ri, mm2.pos[ri], mm2.base_b[ri], mm2.base_a[ri]);
-                            local_mm.push_back({pid, cid, p, ab, pb, 0, 0, 0, 1, {}});
-                        } else {
+                        {
                             auto [p0, ab0, pb0] = cvt(0, mm2.pos[0], mm2.base_b[0], mm2.base_a[0]);
                             auto [p1, ab1, pb1] = cvt(1, mm2.pos[1], mm2.base_b[1], mm2.base_a[1]);
                             local_mm.push_back({pid, cid, p0, ab0, pb0, p1, ab1, pb1, 2, {}});
@@ -804,6 +808,7 @@
             stats.children_scanned       += ls.children_scanned;
             stats.total_candidates       += ls.total_candidates;
             stats.children_found         += ls.children_found;
+            stats.h2_dmg_veto            += ls.h2_dmg_veto;
             stats.decode_hash_child_ms   += ls.decode_hash_child_ms;
             stats.query_ms               += ls.query_ms;
             stats.check_ms               += ls.check_ms;
@@ -861,15 +866,10 @@
                 e.mm[i].parent_2b  = pb;
                 e.mm[i].alt_2b     = alt;
                 e.mm[i].qual       = qual_arena_.q_at(cm.child_id, pos_full);
-                const uint32_t dmg_xr = alt ^ pb;
-                const bool is_ct_e  = (dmg_xr == 2u) && ((alt & pb) == 1u);
-                const bool is_ga_e  = (dmg_xr == 2u) && ((alt & pb) == 0u);
-                const bool at_5_e   = mm_pos < kDamageEdgeMargin_T58;
-                const bool at_3_e   = mm_pos >= static_cast<uint16_t>(ilen - kDamageEdgeMargin_T58);
-                e.mm[i].damage_chan = (profile_.ss_mode
-                    ? (is_ct_e && (at_5_e || at_3_e))
-                    : ((is_ct_e && at_5_e) || (is_ga_e && at_3_e))) ? 1 : 0;
-                e.mm[i].p_damage    = (dmg_xr && profile_.enabled)
+                e.mm[i].damage_chan = is_terminal_damage_mismatch(
+                    alt, pb, mm_pos, ilen, profile_.ss_mode,
+                    kDamageEdgeMargin_T58) ? 1 : 0;
+                e.mm[i].p_damage    = ((alt ^ pb) && profile_.enabled)
                                       ? profile_.p_damage_at(pos_full, L) : 0.0;
             };
             fill(0, cm.mismatch_pos, cm.alt_base, cm.parent_base);
@@ -886,15 +886,36 @@
         std::unordered_map<uint32_t, uint32_t> interior_trans_bundle_count;
         uint64_t n_interior_ct = 0;
         uint64_t n_interior_tv = 0;
+        uint64_t n_cand_terminal_dmg = 0;
+        uint64_t n_cand_h1 = 0;
+        uint64_t n_cand_pos_terminal = 0;
+        uint64_t n_ch_5ct = 0, n_ch_5ga = 0, n_ch_3ct = 0, n_ch_3ga = 0;
         if (errcor_.b1_damage_adjust) {
             std::unordered_map<uint32_t, std::unordered_set<uint64_t>> key_to_bundles;
             for (const auto& cm : mismatches) {
                 if (cm.hamming != 1) continue;
+                ++n_cand_h1;
                 const int pid_len = get_layout(static_cast<int>(arena_.length(cm.parent_id))).ilen;
+                {
+                    const bool a5 = cm.mismatch_pos < kDamageEdgeMargin_T58;
+                    const bool a3 = static_cast<int>(cm.mismatch_pos) >=
+                                    pid_len - kDamageEdgeMargin_T58;
+                    if (a5 || a3) ++n_cand_pos_terminal;
+                    const uint8_t pb = cm.parent_base, ab = cm.alt_base;
+                    const bool tr = ((pb ^ ab) == 2u);
+                    const bool ct = tr && ((pb & ab) == 1u);
+                    const bool ga = tr && ((pb & ab) == 0u);
+                    if (a5 && ct) ++n_ch_5ct;
+                    if (a5 && ga) ++n_ch_5ga;
+                    if (a3 && ct) ++n_ch_3ct;
+                    if (a3 && ga) ++n_ch_3ga;
+                }
                 if (is_terminal_damage_mismatch(cm.parent_base, cm.alt_base,
                                                 static_cast<int>(cm.mismatch_pos),
-                                                pid_len, profile_.ss_mode))
+                                                pid_len, profile_.ss_mode)) {
+                    ++n_cand_terminal_dmg;
                     continue;
+                }
                 const uint32_t xr = cm.alt_base ^ cm.parent_base;
                 if (xr == 2u) {
                     ++n_interior_ct;
@@ -1162,6 +1183,41 @@
 
             // For each child, decide: SNP-protected or absorb
             const int pid_ilen = get_layout(static_cast<int>(arena_.length(pid))).ilen;
+
+            // Damage audit, log-only: classify an absorbed edge's mismatch. Reads are
+            // stored canonicalised, so a 5' C->T that got RC-folded shows up as a 3'
+            // G->A -- both arms are the same physical channel.
+            //   zone  : deamination-compatible pair in a terminal zone, either direction
+            //   child : ... and the child is the damaged one (parent C -> child T at 5',
+            //           parent G -> child A at 3'), so absorbing it emits the undamaged
+            //           parent and the terminal C->T is lost from the output.
+            // Counts EDGES, not mismatches: an H=2 edge with two damage-compatible
+            // mismatches is one absorbed read, and reads are the unit we care about.
+            auto audit_absorb = [&](const ChildMismatch& m) {
+                bool zone = false, child_dmg = false;
+                auto one = [&](uint8_t pb, uint8_t ab, uint16_t p) {
+                    const bool at5 = p < kDamageEdgeMargin;
+                    const bool at3 = p >= static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin);
+                    if (!at5 && !at3) return;
+                    const bool ct = ((pb ^ ab) == 2u) && ((pb & ab) == 1u);  // pair {C,T}
+                    const bool ga = ((pb ^ ab) == 2u) && ((pb & ab) == 0u);  // pair {G,A}
+                    if (profile_.ss_mode) {
+                        if (!ct && !ga) return;
+                        zone = true;
+                        if ((pb == 1u && ab == 3u) || (pb == 2u && ab == 0u)) child_dmg = true;
+                    } else {
+                        if (!((at5 && ct) || (at3 && ga))) return;
+                        zone = true;
+                        if ((at5 && pb == 1u && ab == 3u) ||   // C -> T at 5'
+                            (at3 && pb == 2u && ab == 0u))     // G -> A at 3'
+                            child_dmg = true;
+                    }
+                };
+                one(m.parent_base, m.alt_base, m.mismatch_pos);
+                if (m.hamming == 2) one(m.parent_base2, m.alt_base2, m.mismatch_pos2);
+                if (zone)      ++stats.absorb_dmg_zone;
+                if (child_dmg) ++stats.absorb_child_dmg;
+            };
             for (size_t j = parent_start; j < parent_end; ++j) {
                 const ChildMismatch& cm = mismatches[j];
                 uint32_t key = static_cast<uint32_t>(cm.mismatch_pos) * 4u + cm.alt_base;
@@ -1260,6 +1316,7 @@
                             }
                             stats.absorbed++;
                             errcor_absorbed_++;
+                            audit_absorb(cm);
                             if (!fqcl_path_.empty()) {
                                 auto cm_s = cm; cm_s.lr_score = fqcl_lr_h2;
                                 fqcl_mismatches_.push_back(cm_s);
@@ -1270,19 +1327,15 @@
                 }
 
                 // Damage-aware bypass: residual deamination at terminal positions.
-                // DS libraries: C→T at 5' end, G→A at 3' end.
-                // SS libraries: C→T at both ends (G→A is not a damage pattern in SS).
-                // Distinguish C↔T (xr=2, AND=1) from G↔A (xr=2, AND=0).
-                const uint32_t dmg_xr_h1 = cm.alt_base ^ cm.parent_base;
-                const bool is_ct_h1 = (dmg_xr_h1 == 2u) && ((cm.alt_base & cm.parent_base) == 1u);
-                const bool is_ga_h1 = (dmg_xr_h1 == 2u) && ((cm.alt_base & cm.parent_base) == 0u);
-                const bool at_5_h1  = cm.mismatch_pos < kDamageEdgeMargin;
-                const bool at_3_h1  = cm.mismatch_pos >=
-                                          static_cast<uint16_t>(pid_ilen - kDamageEdgeMargin);
-                bool damage_bypass = profile_.enabled && (
-                    profile_.ss_mode
-                    ? (is_ct_h1 && (at_5_h1 || at_3_h1))
-                    : ((is_ct_h1 && at_5_h1) || (is_ga_h1 && at_3_h1)));
+                // Bases are in STORED (RC-canonicalised) coordinates (derep.cpp:404-411),
+                // which is why ss must accept {C,T} OR {G,A} at either end: an original
+                // 5' C→T lands as a stored 3' G→A on the ~half of reads kept revcomp.
+                // is_terminal_damage_mismatch is the single source of truth for that rule.
+                bool damage_bypass = profile_.enabled &&
+                    is_terminal_damage_mismatch(
+                        cm.alt_base, cm.parent_base,
+                        cm.mismatch_pos, pid_ilen, profile_.ss_mode,
+                        kDamageEdgeMargin);
 
                 double eff_snp_threshold = errcor_.snp_threshold *
                     (veto_count < errcor_.snp_low_cov_cutoff ? errcor_.snp_low_cov_factor : 1.0);
@@ -1298,7 +1351,8 @@
                 // Interior transition: C↔T or G↔A at a non-terminal position.
                 // Admitted by b1_damage_adjust but requires calibration-free LRT
                 // (not the empirical model, which was fit on transversion candidates).
-                const bool is_interior_trans_h1 = !damage_bypass && (dmg_xr_h1 == 2u) && b1_active;
+                const bool is_interior_trans_h1 =
+                    !damage_bypass && ((cm.alt_base ^ cm.parent_base) == 2u) && b1_active;
 
                 // T5.8: empirical posterior-odds for H=1.
                 bool absorb_h1;
@@ -1400,6 +1454,7 @@
                         }
                         stats.absorbed++;
                         errcor_absorbed_++;
+                        audit_absorb(cm);
                         if (!fqcl_path_.empty()) {
                             auto cm_s = cm; cm_s.lr_score = fqcl_lr_h1;
                             fqcl_mismatches_.push_back(cm_s);
@@ -2209,6 +2264,43 @@
         log_info("Phase 3 complete: absorbed " + std::to_string(errcor_absorbed_) +
                  " sequences (H=1 directed-ascent + H=2 direct-detection, snp_threshold=" +
                  std::to_string(errcor_.snp_threshold) + ")");
+        {
+            const double den = static_cast<double>(stats.absorbed ? stats.absorbed : 1);
+            char b[192];
+            std::snprintf(b, sizeof(b),
+                          "Phase 3 damage audit: of %llu absorbed edges, %llu (%.2f%%) "
+                          "carry a terminal deamination-compatible mismatch, of which "
+                          "%llu (%.2f%% of absorbed) have the CHILD as the damaged read",
+                          static_cast<unsigned long long>(stats.absorbed),
+                          static_cast<unsigned long long>(stats.absorb_dmg_zone),
+                          100.0 * static_cast<double>(stats.absorb_dmg_zone) / den,
+                          static_cast<unsigned long long>(stats.absorb_child_dmg),
+                          100.0 * static_cast<double>(stats.absorb_child_dmg) / den);
+            log_info(b);
+            std::snprintf(b, sizeof(b),
+                          "Phase 3 damage audit: of %llu H=1 candidate edges, %llu (%.2f%%) "
+                          "sit in a terminal position at all, %llu are "
+                          "terminal-deamination-compatible",
+                          static_cast<unsigned long long>(n_cand_h1),
+                          static_cast<unsigned long long>(n_cand_pos_terminal),
+                          100.0 * static_cast<double>(n_cand_pos_terminal) /
+                              static_cast<double>(n_cand_h1 ? n_cand_h1 : 1),
+                          static_cast<unsigned long long>(n_cand_terminal_dmg));
+            log_info(b);
+            std::snprintf(b, sizeof(b),
+                          "Phase 3 damage audit: H=2 path vetoed %llu edges carrying a "
+                          "terminal deamination (damage preserved, not absorbed)",
+                          static_cast<unsigned long long>(stats.h2_dmg_veto));
+            log_info(b);
+            std::snprintf(b, sizeof(b),
+                          "Phase 3 damage audit: terminal channels 5'C>T=%llu 5'G>A=%llu "
+                          "3'C>T=%llu 3'G>A=%llu",
+                          static_cast<unsigned long long>(n_ch_5ct),
+                          static_cast<unsigned long long>(n_ch_5ga),
+                          static_cast<unsigned long long>(n_ch_3ct),
+                          static_cast<unsigned long long>(n_ch_3ga));
+            log_info(b);
+        }
         log_info("  Joint adj fired: neg=" + std::to_string(n_joint_adj_neg) +
                  " pos=" + std::to_string(n_joint_adj_pos) +
                  " (of " + std::to_string(n_parents_processed) + " parents)");
