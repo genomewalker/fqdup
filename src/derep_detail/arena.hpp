@@ -215,8 +215,15 @@ struct Phase3Stats {
     uint64_t children_scanned    = 0;
     uint64_t parents_indexed     = 0;
     uint64_t children_found      = 0;
+    uint64_t h2_dmg_veto         = 0;
     uint64_t snp_protected       = 0;
     uint64_t absorbed            = 0;
+    // Damage audit (log-only). Of the edges actually absorbed, how many carry a
+    // deamination-compatible mismatch in a terminal zone, and of those, how many
+    // have the CHILD as the damaged read -- those are the ones where absorption
+    // emits the undamaged parent and destroys the damage signal.
+    uint64_t absorb_dmg_zone     = 0;
+    uint64_t absorb_child_dmg    = 0;
     uint64_t short_brute_parents   = 0;
     uint64_t short_brute_evaluated = 0;
     uint64_t short_brute_found     = 0;
