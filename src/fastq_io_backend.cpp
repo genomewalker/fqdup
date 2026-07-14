@@ -9,7 +9,9 @@
 
 #include "fqdup/fastq_common.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <sys/stat.h>
 #include <stdexcept>
 
@@ -126,10 +128,32 @@ static bool is_gzip(const std::string& path) {
 std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
                                                     size_t threads) {
     if (is_gzip(path)) {
+        // ISA-L is the default: it is single-threaded, so rapidgzip's parallel-decode race
+        // (see FastqReaderRapidgzip above) cannot exist by construction. That race silently
+        // truncated a 30 GB sort input and cost 115,146,482 reads with no error anywhere.
+        //
+        // It was reachable because every caller here passes no thread count -- derep.cpp:374,
+        // 466, 825 and sort.cpp:64 all call make_fastq_reader(path) -- so `threads` was 0 and
+        // rapidgzip auto-sized its pool to hardware_concurrency, the worst case for the race.
+        // The `-p 1` in the sort job scripts never reached this layer at all.
+        //
+        // ceiling: single-threaded inflate. If decode ever becomes the bottleneck, parallelise
+        // by MEMBER (our merged files are ~1.32M independent 64 KB members) rather than by
+        // reviving rapidgzip -- member-level parallelism is race-free by construction.
+        // upgrade: FQDUP_READER=rapidgzip restores the old path for A/B measurement only.
+#if defined(HAVE_ISAL)
+        const char* r = std::getenv("FQDUP_READER");
+        const bool want_rapidgzip = (r != nullptr && std::string(r) == "rapidgzip");
 #ifdef HAVE_RAPIDGZIP
-        return std::make_unique<FastqReaderRapidgzip>(path, threads);
-#elif defined(HAVE_ISAL)
+        if (want_rapidgzip)
+            return std::make_unique<FastqReaderRapidgzip>(path, threads);
+#else
+        (void)want_rapidgzip;
+#endif
+        (void)threads;
         return std::make_unique<FastqReaderIgzip>(path);
+#elif defined(HAVE_RAPIDGZIP)
+        return std::make_unique<FastqReaderRapidgzip>(path, threads);
 #endif
     }
     // Plain text (or non-gz): zlib gzopen handles both transparently

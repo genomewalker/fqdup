@@ -179,30 +179,65 @@ private:
         }
     }
 
+    // Two things this must get right, because getting either wrong loses reads in silence:
+    //
+    //  1. MULTI-MEMBER. A .gz may be many concatenated members (our merged files are ~1.32M
+    //     members of 64 KB). isal_inflate parks in ISAL_BLOCK_FINISH at each member end and
+    //     emits nothing further; continuing requires isal_inflate_reset(). Without that we
+    //     would decode member 1 and report a clean EOF -- 435M reads become a few hundred.
+    //
+    //  2. TRUNCATION. A stream that stops mid-member must be an ERROR, not an EOF. This is
+    //     exactly the failure that silently cost FLB08mAss4 115,146,482 reads: the decoder
+    //     ran short and every layer above it treated the stump as a complete file.
     bool refill_decomp_buffer() {
-        if (eof_ && state_->avail_in == 0) return false;
-
-        if (state_->avail_in == 0 && !eof_) {
-            size_t bytes_read = fread(input_buffer_, 1, GZBUF_SIZE, fp_);
-            if (bytes_read == 0) {
-                eof_ = true;
-                if (state_->avail_in == 0) return false;
-            } else {
-                state_->next_in  = input_buffer_;
-                state_->avail_in = static_cast<uint32_t>(bytes_read);
+        while (true) {
+            if (state_->avail_in == 0 && !eof_) {
+                size_t bytes_read = fread(input_buffer_, 1, GZBUF_SIZE, fp_);
+                if (bytes_read == 0) {
+                    if (ferror(fp_))
+                        throw std::runtime_error("Read error on '" + path_ + "'");
+                    eof_ = true;
+                } else {
+                    state_->next_in  = input_buffer_;
+                    state_->avail_in = static_cast<uint32_t>(bytes_read);
+                }
             }
+
+            if (state_->avail_in == 0 && eof_) {
+                // The only legitimate way to end: the last member completed.
+                if (state_->block_state != ISAL_BLOCK_FINISH)
+                    throw std::runtime_error(
+                        "Truncated gzip input '" + path_ +
+                        "': stream ends mid-member (data lost, or missing gzip footer) after " +
+                        std::to_string(record_count_) + " records");
+                return false;
+            }
+
+            // Previous member ended and bytes remain -> start the next one. isal_inflate_reset
+            // is not documented to preserve the input cursor, so carry it across explicitly.
+            if (state_->block_state == ISAL_BLOCK_FINISH) {
+                uint8_t*       ni = state_->next_in;
+                const uint32_t ai = state_->avail_in;
+                isal_inflate_reset(state_);
+                state_->crc_flag = ISAL_GZIP;   // re-arm CRC32/ISIZE checking for this member
+                state_->next_in  = ni;
+                state_->avail_in = ai;
+            }
+
+            state_->next_out  = decomp_buffer_;
+            state_->avail_out = GZBUF_SIZE;
+
+            int ret = isal_inflate(state_);
+            if (ret < 0)
+                throw std::runtime_error("ISA-L decompression error " + std::to_string(ret) +
+                                         " in '" + path_ + "' after " +
+                                         std::to_string(record_count_) + " records");
+
+            decomp_buffer_used_ = GZBUF_SIZE - state_->avail_out;
+            decomp_buffer_pos_  = 0;
+            if (decomp_buffer_used_ > 0) return true;
+            // Zero bytes out: member boundary or input exhausted. Loop -- do NOT report EOF here.
         }
-
-        state_->next_out  = decomp_buffer_;
-        state_->avail_out = GZBUF_SIZE;
-
-        int ret = isal_inflate(state_);
-        if (ret < 0)
-            throw std::runtime_error("ISA-L decompression error: " + std::to_string(ret));
-
-        decomp_buffer_used_ = GZBUF_SIZE - state_->avail_out;
-        decomp_buffer_pos_  = 0;
-        return decomp_buffer_used_ > 0;
     }
 
     std::string    path_;
