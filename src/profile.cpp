@@ -276,7 +276,11 @@ int profile_main(int argc, char** argv) {
         // window); only count qualifying reads (L>=LSD_L_MIN) toward the cap so
         // se_scan_buf holds exactly the first pre_scan_reads qualifying reads in
         // file order (consumed later for LSD edges + re-fed into the full pass).
-        while (reader_se->read(rec) && (pre_scan_reads == 0 || n < pre_scan_reads)) {
+        // Cap BEFORE read(): with `read(rec) && n < cap` the && short-circuits left-to-right,
+        // so the iteration that hits the cap still consumed a record -- one that never reached
+        // se_scan_buf (loop body skipped) and never reached the full pass (reader_se stays open
+        // and resumes after it). Exactly one read vanished per run.
+        while ((pre_scan_reads == 0 || n < pre_scan_reads) && reader_se->read(rec)) {
             if (static_cast<int>(rec.seq.size()) >= LSD_L_MIN) ++n;
             se_scan_buf.push_back(std::move(rec));
         }
