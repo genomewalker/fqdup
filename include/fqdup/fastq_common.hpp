@@ -162,20 +162,31 @@ public:
     uint64_t record_count() const override { return record_count_; }
 
 private:
+    // memchr + one append per buffer span, not push_back per byte. The byte-at-a-time
+    // version ran at ~370 MB/s against ~2.7 GB/s here, and it sits on the serial path of
+    // every tool -- derep alone drags ~60 GB of decompressed FASTQ through it twice, so
+    // the splitter cost was masquerading as decode cost in the rapidgzip A/B (rapidgzip's
+    // reader already bulk-appended: fastq_io_backend.cpp:66-76). Line contents are
+    // identical by construction; this only changes how they are copied.
     bool getline_igzip(std::string& line) {
         line.clear();
-        line.reserve(256);
 
         while (true) {
             if (decomp_buffer_pos_ >= decomp_buffer_used_) {
                 if (!refill_decomp_buffer())
                     return !line.empty();
             }
-            while (decomp_buffer_pos_ < decomp_buffer_used_) {
-                char c = static_cast<char>(decomp_buffer_[decomp_buffer_pos_++]);
-                if (c == '\n') return true;
-                line.push_back(c);
+            const char* base = reinterpret_cast<const char*>(decomp_buffer_) + decomp_buffer_pos_;
+            const size_t avail = decomp_buffer_used_ - decomp_buffer_pos_;
+            const char* nl = static_cast<const char*>(std::memchr(base, '\n', avail));
+            if (nl) {
+                line.append(base, static_cast<size_t>(nl - base));
+                decomp_buffer_pos_ += static_cast<size_t>(nl - base) + 1;
+                return true;
             }
+            // No newline in what's left: take the whole span and refill.
+            line.append(base, avail);
+            decomp_buffer_pos_ = decomp_buffer_used_;
         }
     }
 

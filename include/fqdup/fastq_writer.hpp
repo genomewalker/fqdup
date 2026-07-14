@@ -143,23 +143,26 @@ public:
     // this writer without a dependency on their record type.
     void write_fields(const char* h, size_t hl, const char* s, size_t sl,
                       const char* p, size_t pl, const char* q, size_t ql) {
+        // One call per record, not eight. Both backends buffer internally and take a lock
+        // (or a branch) per call, so a 188M-read merge was paying 1.5 billion of them to
+        // move ~4 short fields. Assemble the record once and hand it over whole: the byte
+        // stream is unchanged, only its call granularity is.
+        rec_buf_.clear();
+        rec_buf_.append(h, hl); rec_buf_.push_back('\n');
+        rec_buf_.append(s, sl); rec_buf_.push_back('\n');
+        rec_buf_.append(p, pl); rec_buf_.push_back('\n');
+        rec_buf_.append(q, ql); rec_buf_.push_back('\n');
+
 #ifdef HAVE_BGZF
         if (bgzfp_) {
-            auto bw = [&](const void* d, size_t n) {
-                if (n && bgzf_write(bgzfp_, d, n) < 0)
-                    throw std::runtime_error("bgzf_write failed writing " + path_);
-            };
-            bw(h, hl); bw("\n", 1); bw(s, sl); bw("\n", 1);
-            bw(p, pl); bw("\n", 1); bw(q, ql); bw("\n", 1);
+            if (bgzf_write(bgzfp_, rec_buf_.data(), rec_buf_.size()) < 0)
+                throw std::runtime_error("bgzf_write failed writing " + path_);
             return;
         }
 #endif
 #ifdef HAVE_ISAL
         if (fp_) {
-            isal_write(h, hl); isal_write("\n", 1);
-            isal_write(s, sl); isal_write("\n", 1);
-            isal_write(p, pl); isal_write("\n", 1);
-            isal_write(q, ql); isal_write("\n", 1);
+            isal_write(rec_buf_.data(), rec_buf_.size());
             return;
         }
 #endif
@@ -168,16 +171,19 @@ public:
                          (int)hl, h, (int)sl, s, (int)pl, p, (int)ql, q) < 0)
                 throw std::runtime_error("gzprintf failed writing FASTQ record");
         } else {
-            plain_out_.write(h, hl).put('\n');
-            plain_out_.write(s, sl).put('\n');
-            plain_out_.write(p, pl).put('\n');
-            plain_out_.write(q, ql).put('\n');
+            // sort's temp chunks land here (written uncompressed by design).
+            plain_out_.write(rec_buf_.data(), static_cast<std::streamsize>(rec_buf_.size()));
             if (!plain_out_.good())
                 throw std::runtime_error("write failed writing " + path_);
         }
     }
 
 private:
+    // Scratch for the one-call-per-record assembly above. A member, not a local, so its
+    // capacity survives across records. Not thread-safe -- but a FastqWriter never was:
+    // two threads sharing one would already interleave record bytes.
+    std::string rec_buf_;
+
 #ifdef HAVE_ISAL
     void isal_write(const char* data, size_t len) {
         stream_.next_in  = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(data));
