@@ -223,7 +223,11 @@ int trim_main(int argc, char** argv) {
             scan_buf.reserve(static_cast<size_t>(scan_reads));
         rdr = make_fastq_reader(in_path, static_cast<size_t>(n_threads));
         FastqRecord rec;
-        while (rdr->read(rec) && (scan_reads == 0 || n < scan_reads)) {
+        // Cap BEFORE read(): `read(rec) && n < cap` short-circuits left-to-right, so the
+        // iteration that hits the cap has already consumed a record -- it never lands in
+        // scan_buf (body skipped) and never reaches the producer below (rdr stays open and
+        // resumes after it). That record was silently missing from trim's OUTPUT.
+        while ((scan_reads == 0 || n < scan_reads) && rdr->read(rec)) {
             int L = static_cast<int>(rec.seq.size());
             if (L >= LSD_L_MIN)
                 taph::FrameSelector::update_sample_profile(scan_profile, rec.seq);
