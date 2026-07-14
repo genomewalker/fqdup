@@ -994,32 +994,48 @@ private:
             return b.idx < a.idx;
         };
 
-        std::priority_queue<MergeEntry, std::vector<MergeEntry>, decltype(compare_entries)> pq(compare_entries);
+        // Raw vector + heap algorithms, not std::priority_queue. priority_queue::top() returns
+        // const&, so `MergeEntry e = pq.top()` DEEP-COPIES the whole record (4 strings + key)
+        // once per read -- 188M copies and 188M malloc/free pairs on the only serial loop in
+        // the sort. priority_queue is built on these same algorithms, so the ordering (and the
+        // idx tie-break that makes output deterministic) is bit-for-bit unchanged; we just get
+        // to MOVE the top out and reuse its buffers instead of copying it.
+        std::vector<MergeEntry> heap;
+        heap.reserve(readers.size());
+
+        // Re-key in place. assign() into the entry's existing string reuses its capacity, so
+        // after the first record from each chunk this is a memcpy, not an allocation.
+        auto rekey = [&](MergeEntry& e) {
+            std::string_view id = trim_id(e.record.header);
+            e.sort_key.assign(id.data(), id.size());
+            if (natural_order_) e.nat_key = make_nat_key(e.record.header);
+        };
 
         for (size_t i = 0; i < readers.size(); ++i) {
             MergeEntry e;
             e.idx = i;
             if (readers[i]->read(e.record)) {
-                e.sort_key = std::string(trim_id(e.record.header));
-                if (natural_order_) e.nat_key = make_nat_key(e.record.header);
-                pq.push(std::move(e));
+                rekey(e);
+                heap.push_back(std::move(e));
             }
         }
+        std::make_heap(heap.begin(), heap.end(), compare_entries);
 
         FastqWriter writer(output, compress, threads_);
 
         size_t merged = 0;
-        while (!pq.empty()) {
-            MergeEntry e = pq.top();
-            pq.pop();
+        while (!heap.empty()) {
+            std::pop_heap(heap.begin(), heap.end(), compare_entries);
+            MergeEntry& e = heap.back();   // ours to mutate; not a copy
 
             writer.write(e.record);
             merged++;
 
             if (readers[e.idx]->read(e.record)) {
-                e.sort_key = std::string(trim_id(e.record.header));
-                if (natural_order_) e.nat_key = make_nat_key(e.record.header);
-                pq.push(std::move(e));
+                rekey(e);
+                std::push_heap(heap.begin(), heap.end(), compare_entries);
+            } else {
+                heap.pop_back();           // chunk exhausted
             }
 
             if ((merged % 1000000) == 0) {
