@@ -320,9 +320,13 @@ private:
     // load factor above 0.5. rehash() (…:626) and the growth check (…:827) both
     // honour it.
     //
-    // Byte-identical: index_ is iterated at exactly one site (see pass2) and the
-    // result is immediately sorted by record_index, so slot order cannot reach the
-    // output.
+    // Byte-identical: index_ is iterated at two sites, and neither lets slot order
+    // reach the output. pass2 sorts the iterated result by record_index immediately.
+    // Phase 3 (phase3_error_correct.inc, index_.for_each) writes only indexed slots
+    // -- id_count[seq_id], id_fwd_count[seq_id], seq_entry[seq_id] -- so each entry
+    // lands in its own cell and the visit order is irrelevant. Any layout/load-factor
+    // change is therefore output-neutral; adding an order-DEPENDENT iteration (an
+    // accumulation, a first-wins, a push_back) would break that and the gold md5s.
     static constexpr float kIndexMaxLoad = 0.75f;
 
     void pass1(const std::string& in_path) {
@@ -1024,11 +1028,16 @@ private:
             std::fclose(f);
         }
         const uint64_t N = index_.size();
-        // id_count(4) + acc_count(4) + bundle_key_of(8) + rank_of(4), plus
-        // rescue_bundle_key_of(8) when the rescue-indel path allocates it.
+        // Phase-3 per-unique allocations, all sized N (phase3_error_correct.inc):
+        //   id_count(4) + id_fwd_count(4) + seq_entry(8, IndexEntry*) + acc_count(4)
+        //   + bundle_key_of(8) + rank_of(4)                                    = 32
+        //   + rescue_bundle_key_of(8) when the rescue-indel path allocates it.
+        // id_fwd_count and seq_entry were omitted, so this understated Phase 3 by
+        // 12 B/unique -- ~7.4 GB on a 615 M-unique library. --max-mem then blessed a
+        // run that OOMed anyway, which is the one thing this guard exists to prevent.
         const bool rescue = errcor_.rescue_indels && !errcor_.legacy_veto &&
                             errcor_.empirical;
-        const uint64_t per_read = 20ull + (rescue ? 8ull : 0ull);
+        const uint64_t per_read = 32ull + (rescue ? 8ull : 0ull);
         const double rss_gb = static_cast<double>(rss_kb) * 1024.0 / kGiB;
         const double hwm_gb = static_cast<double>(hwm_kb) * 1024.0 / kGiB;
         const double p3_gb  = rss_gb + static_cast<double>(N * per_read) / kGiB;
