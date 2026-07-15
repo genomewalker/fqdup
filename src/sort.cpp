@@ -63,6 +63,8 @@ public:
     explicit SortReaderBridge(const std::string& path)
         : inner_(make_fastq_reader(path)) {}
 
+    const char* backend_name() const { return inner_->backend_name(); }
+
     // Arena-based read for Phase 1: zero heap allocation per record.
     // StringArena and FastqRecordArena are defined below in the anonymous namespace;
     // this method is defined after them (see bottom of anonymous namespace section).
@@ -540,15 +542,12 @@ public:
         // Estimate input size and adjust chunk size accordingly
         adjust_chunk_size_for_input(input);
 
-        // sort.cpp cannot use rapidgzip (ODR constraint — fastq_io_backend.cpp owns
-        // all rapidgzip symbols). Reader selection is ISA-L or zlib only.
-        log_info("Decompression: " + std::string(
-#ifdef HAVE_ISAL
-            "ISA-L (hardware-accelerated)"
-#else
-            "zlib"
-#endif
-        ));
+        // Reported by the reader, not by #ifdef: sort goes through the same
+        // make_fastq_reader() (SortReaderBridge, above), so FQDUP_READER=rapidgzip
+        // reaches sort too -- the old comment here claimed sort "cannot use rapidgzip",
+        // which was never true of the reader, only of the symbols this TU links.
+        log_info("Decompression: " +
+                 std::string(SortReaderBridge(input).backend_name()));
         log_info("Compression: " + std::string(
 #ifdef HAVE_ISAL
             "ISA-L igzip (hardware-accelerated)"

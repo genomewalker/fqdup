@@ -6,14 +6,19 @@
 #include "fqdup/logger.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace fqdup::derep_detail {
 
@@ -205,11 +210,28 @@ struct ErrCorParams {
 };
 
 struct Phase3Stats {
+    // The five *_ms below are SAMPLED (1 child in kTimingStride=64) and multiplied back
+    // up, and they are SUMMED ACROSS THREADS. They are CPU-ms estimates, not wall. Dividing
+    // by n_threads and comparing to the Phase-3 wall is the only way to read them: on a
+    // 354 M-unique library they summed to ~847 CPU-s against a 616.7 s wall on 8 threads,
+    // i.e. they account for ~17% of the phase. The *_wall_ms below cover the rest.
     double decode_hash_parent_ms = 0;
     double insert_ms             = 0;
     double decode_hash_child_ms  = 0;
     double query_ms              = 0;
     double check_ms              = 0;
+    // True wall clocks, single-threaded regions unless noted.
+    double bundle_wall_ms        = 0;  // serial: decode all + sort N keys
+    double order_wall_ms         = 0;  // serial: sort N (ilen,id) pairs
+    double b1_build_wall_ms      = 0;  // serial: build_shard over all ilen segments
+    double b1_worker_wall_ms     = 0;  // parallel: the b1_worker fan-out
+    double b2_sort_wall_ms       = 0;  // serial: sort the B1 edge list by parent count
+    double b2_model_wall_ms      = 0;  // parallel fit, serial merge: T5.8 empirical model
+    double b2_interior_wall_ms   = 0;  // serial: b1_damage_adjust interior-recurrence loop (subset of b2_model)
+    double b2_fit_wall_ms        = 0;  // parallel: edge_worker fit fan-out (subset of b2_model)
+    double b2_prefetch_wall_ms   = 0;  // serial: offset-sorted bulk qual prefetch before absorption
+    double b2_absorb_wall_ms     = 0;  // serial: directed-ascent absorption loop
+    double b3_wall_ms            = 0;  // serial: damage-aware H>2 merge (b3_enabled)
     uint64_t total_candidates    = 0;
     uint64_t bucket_overflow_drops = 0;
     uint64_t children_scanned    = 0;
@@ -274,7 +296,20 @@ struct Phase3Stats {
     uint64_t b3_cross_bundle_protected = 0;
     void log() const {
         auto f = [](double ms){ return std::to_string(static_cast<int>(ms)) + " ms"; };
-        log_info("Phase 3 timing:");
+        log_info("Phase 3 timing (WALL, single-threaded unless marked):");
+        log_info("  Bundle keys+occ    : " + f(bundle_wall_ms)    + "  [serial]");
+        log_info("  Order sort         : " + f(order_wall_ms)     + "  [serial]");
+        log_info("  B1 build_shard     : " + f(b1_build_wall_ms)  + "  [serial]");
+        log_info("  B1 workers         : " + f(b1_worker_wall_ms) + "  [parallel]");
+        log_info("  B2 edge sort       : " + f(b2_sort_wall_ms)   + "  [serial]");
+        log_info("  B2 empirical model : " + f(b2_model_wall_ms)  + "  [parallel fit]");
+        log_info("    . interior loop  : " + f(b2_interior_wall_ms)+ "  [serial]");
+        log_info("    . fit fan-out    : " + f(b2_fit_wall_ms)     + "  [parallel]");
+        log_info("  B2 qual prefetch   : " + f(b2_prefetch_wall_ms)+ "  [serial]");
+        log_info("  B2 absorption      : " + f(b2_absorb_wall_ms) + "  [serial]");
+        log_info("  B3 H>2 merge       : " + f(b3_wall_ms)        + "  [serial]");
+        log_info("Phase 3 timing (SAMPLED 1/64, extrapolated, summed over threads -> CPU-ms,"
+                 " NOT wall; divide by thread count before comparing to the wall figures above):");
         log_info("  Parent decode+hash : " + f(decode_hash_parent_ms));
         log_info("  Parent insert      : " + f(insert_ms));
         log_info("  Child decode+hash  : " + f(decode_hash_child_ms));
@@ -481,35 +516,80 @@ struct SeqArena {
     }
 };
 
-// Raw-byte quality arena, parallel to SeqArena. Stores Phred+33 ASCII
-// (caller already has it in that form when reading fastq). Phase 3 LR
-// scoring reads qualities only at mismatch positions, so the random-access
-// cost dominates pack/unpack savings — keep it simple and dense.
+// Raw-byte quality arena, parallel to SeqArena. Stores Phred+33 ASCII, written
+// straight to a spill file in Pass 1 and served from it by pread() in Phase 3.
+// The bytes are never resident.
 //
-// Indexed by the same uint32_t id returned by SeqArena.append(). Append
-// must occur in lockstep with the seq arena.
-struct QualArena {
-    BlockBytes           bytes;
+// This was previously dense in RAM, on the reasoning "Phase 3 LR scoring reads
+// qualities only at mismatch positions, so the random-access cost dominates
+// pack/unpack savings — keep it simple and dense". The premise is correct and
+// the conclusion does not follow from it: scoring touching only mismatch
+// positions is precisely the reason the bytes do not belong in RAM.
+//
+// Measured on a 354,647,264-unique clay library: the byte store held 21.46 GB —
+// the second largest structure in the run — to answer 3.7 M single-byte q_at()
+// lookups (EdgeCandidate::mm holds at most two per edge). That is ~3,600
+// resident bytes for every byte ever read. offsets+lengths stay in RAM (3.30 GB
+// combined); only the byte store moves out.
+//
+// pread(), not mmap(): Phase 3 B1 is multi-threaded and pread is thread-safe
+// (it carries its own offset, so there is no shared file position to race on).
+// A mapping would fault a whole 4 KiB page per scattered lookup back into the
+// process RSS — exactly the cost being removed. Page cache still absorbs the
+// reads, but it is kernel-side and reclaimable under pressure.
+//
+// Byte-identical by construction: q_at() returns the same byte for EVERY id.
+// It deliberately makes no attempt to predict WHICH ids get queried. Storing
+// quality only for reads in an occupancy>=2 bundle is tempting and is WRONG —
+// B1 discovers edges through FlatPairIndex k-mer seeds, so a child can pair
+// with a parent from a different bundle, and any read wrongly excluded would
+// silently score as kNoQual instead of failing.
+//
+// Indexed by the same uint32_t id returned by SeqArena.append(). Append must
+// occur in lockstep with the seq arena.
+class QualArena {
+  public:
     ChunkedVec<uint64_t> offsets;
     ChunkedVec<uint16_t> lengths;
 
+    QualArena() = default;
+    QualArena(const QualArena&)            = delete;
+    QualArena& operator=(const QualArena&) = delete;
+    QualArena(QualArena&& o) noexcept { steal(o); }
+    QualArena& operator=(QualArena&& o) noexcept {
+        if (this != &o) { close_spill(); steal(o); }
+        return *this;
+    }
+    ~QualArena() { close_spill(); }
+
+    // Open the spill file. Call once, before Pass 1, only when Phase 3 will run.
+    // Unlinked the moment it exists: the fd keeps it alive, so it cannot outlive
+    // the process even on a crash and there is nothing to clean up afterwards.
+    void open_spill(const std::string& dir) {
+        std::string tmpl = dir + "/fqdup_qual.XXXXXX";
+        std::vector<char> path(tmpl.begin(), tmpl.end());
+        path.push_back('\0');
+        fd_ = ::mkstemp(path.data());
+        if (fd_ < 0)
+            throw std::runtime_error("QualArena: cannot create quality spill file in " +
+                                     dir + ": " + std::strerror(errno));
+        ::unlink(path.data());
+        buf_.reserve(kWriteBuf + 65536);
+    }
+
     uint32_t append(const std::string& qual) {
-        if (qual.size() > 65535u)
-            throw std::runtime_error("Quality too long for arena (>65535 bp)");
-        uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.append(reinterpret_cast<const uint8_t*>(qual.data()),
-                                       qual.size()));
-        lengths.push_back(static_cast<uint16_t>(qual.size()));
-        return id;
+        return append_chars(qual.data(), static_cast<int>(qual.size()));
     }
 
     uint32_t append_chars(const char* data_in, int L) {
         if (L > 65535)
             throw std::runtime_error("Quality too long for arena (>65535 bp)");
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.append(reinterpret_cast<const uint8_t*>(data_in),
-                                       static_cast<uint64_t>(L)));
+        offsets.push_back(write_pos_);
         lengths.push_back(static_cast<uint16_t>(L));
+        buf_.insert(buf_.end(), data_in, data_in + L);
+        write_pos_ += static_cast<uint64_t>(L);
+        if (buf_.size() >= kWriteBuf) flush();
         return id;
     }
 
@@ -517,10 +597,14 @@ struct QualArena {
     // Returns id; q_at() will yield kNoQual.
     uint32_t append_empty() {
         uint32_t id = static_cast<uint32_t>(offsets.size());
-        offsets.push_back(bytes.alloc(0));
+        offsets.push_back(write_pos_);
         lengths.push_back(0);
         return id;
     }
+
+    // Flush the write buffer. MUST be called at the end of Pass 1: Phase 3 reads
+    // through the fd, and anything still buffered would read back as zeroes.
+    void seal() { flush(); }
 
     static constexpr uint8_t kNoQual = 0;  // Phred 0 → P(err)=1.0; LR will fall back to neutral
 
@@ -529,12 +613,143 @@ struct QualArena {
     uint8_t q_at(uint32_t id, int pos) const {
         if (id >= lengths.size()) return kNoQual;
         if (lengths[id] == 0 || pos < 0 || pos >= lengths[id]) return kNoQual;
-        uint8_t v = *bytes.at(offsets[id] + static_cast<uint64_t>(pos));
+        const uint64_t off = offsets[id] + static_cast<uint64_t>(pos);
+        uint8_t v;
+        // Served from the prefetch cache when one is loaded (Phase 3): the bytes
+        // were read once in file-offset order, so this is a memory lookup instead
+        // of a scattered cold single-byte NFS pread. Falls back to pread for any
+        // offset not prefetched.
+        if (!pf_off_.empty()) {
+            auto it = std::lower_bound(pf_off_.begin(), pf_off_.end(), off);
+            v = (it != pf_off_.end() && *it == off)
+                ? pf_byte_[static_cast<size_t>(it - pf_off_.begin())]
+                : pread_raw(off);
+        } else {
+            v = pread_raw(off);
+        }
         return v >= 33 ? static_cast<uint8_t>(v - 33) : kNoQual;
+    }
+
+    // Prefetch the raw spill bytes for a set of (id,pos) accesses into a resident
+    // cache, read ONCE in ascending file-offset order. Replaces the millions of
+    // scattered cold single-byte preads Phase 3 would otherwise issue (each a
+    // syscall that serializes on one fd and stalls on flaky NFS) with a forward
+    // sequential sweep the page cache / NFS readahead can serve cheaply. q_at()
+    // returns the identical byte whether served from cache or pread, so output is
+    // byte-identical. Accesses are filtered by the SAME guard q_at applies, so the
+    // cache covers exactly the bytes q_at will fetch.
+    void prefetch(const std::vector<std::pair<uint32_t, uint32_t>>& accesses) {
+        pf_off_.clear();
+        pf_byte_.clear();
+        if (fd_ < 0 || accesses.empty()) return;
+        std::vector<uint64_t> offs;
+        offs.reserve(accesses.size());
+        for (const auto& [id, pos] : accesses) {
+            if (id >= lengths.size()) continue;
+            if (lengths[id] == 0 || pos >= lengths[id]) continue;
+            offs.push_back(offsets[id] + static_cast<uint64_t>(pos));
+        }
+        if (offs.empty()) return;
+        std::sort(offs.begin(), offs.end());
+        offs.erase(std::unique(offs.begin(), offs.end()), offs.end());
+        pf_off_ = std::move(offs);
+        pf_byte_.resize(pf_off_.size());
+        // Coalesce accesses within kGap into one pread: bytes closer than a page
+        // are cheaper to read together than as two syscalls, and the over-read is
+        // bounded by kGap per gap. Wider gaps stay separate but still ascend, so
+        // readahead keeps them warm.
+        constexpr uint64_t kGap = 4096;
+        std::vector<uint8_t> chunk;
+        size_t i = 0, n = pf_off_.size();
+        while (i < n) {
+            uint64_t start = pf_off_[i], end = start + 1;
+            size_t j = i + 1;
+            while (j < n && pf_off_[j] - end < kGap) { end = pf_off_[j] + 1; ++j; }
+            size_t len = static_cast<size_t>(end - start);
+            chunk.resize(len);
+            size_t got = 0;
+            while (got < len) {
+                ssize_t r = ::pread(fd_, chunk.data() + got, len - got,
+                                    static_cast<off_t>(start + got));
+                if (r < 0) { if (errno == EINTR) continue;
+                    throw std::runtime_error(std::string("QualArena::prefetch pread: ") +
+                                             std::strerror(errno)); }
+                if (r == 0)
+                    throw std::runtime_error("QualArena::prefetch: short read at offset " +
+                                             std::to_string(start + got));
+                got += static_cast<size_t>(r);
+            }
+            for (size_t k = i; k < j; ++k)
+                pf_byte_[k] = chunk[static_cast<size_t>(pf_off_[k] - start)];
+            i = j;
+        }
     }
 
     uint16_t length(uint32_t id) const { return id < lengths.size() ? lengths[id] : 0; }
     size_t   size()              const { return offsets.size(); }
+
+    // Resident bytes. The spilled byte store is deliberately absent.
+    uint64_t bytes_resident() const {
+        return offsets.bytes_alloc() + lengths.bytes_alloc();
+    }
+    uint64_t bytes_spilled() const { return write_pos_; }
+
+  private:
+    static constexpr size_t kWriteBuf = 8u << 20;  // 8 MiB
+
+    void flush() {
+        const uint8_t* p = buf_.data();
+        size_t n = buf_.size();
+        while (n) {
+            ssize_t w = ::write(fd_, p, n);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error(std::string("QualArena: quality spill write failed: ") +
+                                         std::strerror(errno));
+            }
+            p += w;
+            n -= static_cast<size_t>(w);
+        }
+        buf_.clear();
+    }
+
+    void close_spill() {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+    }
+
+    // Single raw byte at a file offset. Loud on short read: scoring an edge
+    // against a quality we did not read is worse than aborting.
+    uint8_t pread_raw(uint64_t off) const {
+        uint8_t v = 0;
+        ssize_t n;
+        do { n = ::pread(fd_, &v, 1, static_cast<off_t>(off)); } while (n < 0 && errno == EINTR);
+        if (n != 1)
+            throw std::runtime_error("QualArena: quality spill read failed at offset " +
+                                     std::to_string(off) + ": " +
+                                     (n < 0 ? std::strerror(errno) : "short read"));
+        return v;
+    }
+
+    void steal(QualArena& o) {
+        offsets    = std::move(o.offsets);
+        lengths    = std::move(o.lengths);
+        buf_       = std::move(o.buf_);
+        pf_off_    = std::move(o.pf_off_);
+        pf_byte_   = std::move(o.pf_byte_);
+        fd_        = o.fd_;
+        write_pos_ = o.write_pos_;
+        o.fd_        = -1;
+        o.write_pos_ = 0;
+    }
+
+    std::vector<uint8_t> buf_;
+    // Prefetch cache: sorted file offsets and their raw bytes, filled by
+    // prefetch(). Empty outside Phase 3, so q_at() preads as before.
+    std::vector<uint64_t> pf_off_;
+    std::vector<uint8_t>  pf_byte_;
+    uint64_t             write_pos_ = 0;
+    int                  fd_        = -1;
 };
 
 struct FlatPairIndex {

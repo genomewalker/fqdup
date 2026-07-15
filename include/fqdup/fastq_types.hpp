@@ -41,9 +41,16 @@ public:
     virtual ~FastqReaderBase() = default;
     virtual bool read(FastqRecord& rec) = 0;
     virtual uint64_t record_count() const = 0;
+    // The reader names itself. Call sites used to log the backend from #ifdef
+    // HAVE_RAPIDGZIP, i.e. "was it compiled in" -- not "was it selected". derep
+    // therefore printed "Decompression: rapidgzip" on runs that decoded with
+    // ISA-L, which is precisely the line an operator reads to confirm the
+    // parallel-decode race is not in play.
+    virtual const char* backend_name() const = 0;
 };
 
-// Factory: returns the best available backend (rapidgzip > ISA-L > zlib).
+// Factory: returns ISA-L when available, else zlib. rapidgzip only on an explicit
+// FQDUP_READER=rapidgzip (its parallel decode races; see fastq_io_backend.cpp).
 // threads: decompression thread budget for rapidgzip (0 = auto from hardware_concurrency).
 // Callers that already have worker pools should pass their own thread count to avoid
 // oversubscription. Implemented in src/fastq_io_backend.cpp.

@@ -105,15 +105,9 @@ public:
                  const std::string& cluster_path) {
 
         log_info("Decompression threads per reader: " + std::to_string(decomp_threads_));
-        log_info("Decompression: " + std::string(
-#ifdef HAVE_RAPIDGZIP
-            "rapidgzip (parallel multi-threaded)"
-#elif defined(HAVE_ISAL)
-            "ISA-L (hardware-accelerated)"
-#else
-            "zlib"
-#endif
-        ));
+        // Reported from the reader in pass1(), not from #ifdef HAVE_RAPIDGZIP: the flag
+        // says what was compiled in, not what was selected, so this line used to print
+        // "rapidgzip" on runs that decoded with ISA-L.
 
         log_info("Pass 1: Build index");
         pass1(ext_path, non_path);
@@ -166,6 +160,7 @@ private:
     void pass1(const std::string& ext_path, const std::string& non_path) {
         auto ext_reader = make_fastq_reader(ext_path, decomp_threads_);
         auto non_reader = make_fastq_reader(non_path, decomp_threads_);
+        log_info("Decompression: " + std::string(ext_reader->backend_name()));
         FastqRecord ext_rec, non_rec;
         uint64_t record_idx = 0;
 

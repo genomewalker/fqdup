@@ -101,6 +101,12 @@ private:
         }
     }
 
+public:
+    const char* backend_name() const override {
+        return "rapidgzip (parallel, RACES on large gz over NFS -- FQDUP_READER=rapidgzip is set)";
+    }
+
+private:
     std::unique_ptr<rapidgzip::ParallelGzipReader<>> reader_;
     std::string       path_;
     std::vector<char> buffer_;
@@ -181,6 +187,11 @@ public:
     }
 
     uint64_t record_count() const override { return total_; }
+
+    // Every chained file goes through make_fastq_reader, so they all share a backend.
+    const char* backend_name() const override {
+        return cur_ ? cur_->backend_name() : "(no input)";
+    }
 
 private:
     std::vector<std::string> paths_;

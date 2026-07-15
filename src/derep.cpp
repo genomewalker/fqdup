@@ -111,6 +111,18 @@ public:
           prior_fqcl_path_(std::move(prior_fqcl_path)),
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
+    // Where the Phase-3 quality spill lives. $TMPDIR when set — on this cluster it
+    // points at node-local scratch, and /tmp does not persist across nodes.
+    // Otherwise sit next to the output, which is by definition a writable directory
+    // the caller already sized for this run. The file is unlinked as soon as it is
+    // created (arena.hpp), so nothing is left behind even if the run dies.
+    static std::string spill_dir(const std::string& out_path) {
+        if (const char* t = std::getenv("TMPDIR"))
+            if (*t) return std::string(t);
+        const auto slash = out_path.find_last_of('/');
+        return slash == std::string::npos ? std::string(".") : out_path.substr(0, slash);
+    }
+
     void process(const std::string& in_path,
                  const std::string& out_path,
                  const std::string& cluster_path) {
@@ -125,20 +137,28 @@ public:
         log_info("=== Two-pass single-file deduplication ===");
         if (!prior_fqcl_path_.empty()) load_prior_fqcl(prior_fqcl_path_);
         log_info("Pass 1: Build lightweight index");
-        log_info("Decompression: " + std::string(
-#ifdef HAVE_RAPIDGZIP
-            "rapidgzip (parallel multi-threaded)"
-#elif defined(HAVE_ISAL)
-            "ISA-L (hardware-accelerated)"
-#else
-            "zlib"
-#endif
-        ));
+        // The "Decompression: ..." line moved into pass1(), where the reader actually
+        // exists. Here it was derived from #ifdef HAVE_RAPIDGZIP -- whether rapidgzip was
+        // COMPILED IN, not whether it was SELECTED -- so it printed "rapidgzip" on every
+        // ISA-L run. make_fastq_reader() has defaulted to ISA-L since d1f732d.
+
+        // Phase-3 qualities are spilled, not held: 21.46 GB of Phred bytes on the
+        // 354 M-unique clay library existed to serve ~3.7 M single-byte q_at()
+        // lookups. Opened only when Phase 3 will actually run, since that is the
+        // only consumer (the emit pass re-reads qualities from the input).
+        if (errcor_.enabled) qual_arena_.open_spill(spill_dir(out_path));
 
         auto t_pass1_begin = clk::now();
         pass1(in_path);
+        if (errcor_.enabled) qual_arena_.seal();
         auto t_pass1_end = clk::now();
         log_info("Phase timer: Pass 1 = " + fmt_secs(t_pass1_end - t_pass1_begin));
+        if (errcor_.enabled)
+            log_info("Quality spill: " +
+                     std::to_string(qual_arena_.bytes_spilled() / (1024ull * 1024ull)) +
+                     " MB on disk, " +
+                     std::to_string(qual_arena_.bytes_resident() / (1024ull * 1024ull)) +
+                     " MB resident (offsets+lengths)");
 
         size_t index_mb = (index_.size() *
                            sizeof(std::pair<SequenceFingerprint, IndexEntry>)) /
@@ -372,6 +392,7 @@ private:
 
     void pass1_serial(const std::string& in_path) {
         auto reader = make_fastq_reader(in_path);
+        log_info("Decompression: " + std::string(reader->backend_name()));
         FastqRecord rec;
         uint64_t record_idx = 0;
 
@@ -464,6 +485,7 @@ private:
         std::vector<uint8_t>       fwd, dsc;     // n
 
         auto reader = make_fastq_reader(in_path);
+        log_info("Decompression: " + std::string(reader->backend_name()));
         FastqRecord rec;
         uint64_t record_idx = 0;
 
