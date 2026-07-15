@@ -118,6 +118,8 @@ static inline XXH128_hash_t canonical_hash(const std::string& seq, bool use_revc
 #ifdef HAVE_ISAL
 class FastqReaderIgzip : public FastqReaderBase {
 public:
+    const char* backend_name() const override { return "ISA-L igzip (single-threaded, race-free)"; }
+
     FastqReaderIgzip(const std::string& path)
         : path_(path), eof_(false), decomp_buffer_pos_(0), decomp_buffer_used_(0),
           record_count_(0) {
@@ -269,6 +271,8 @@ private:
 
 class FastqReader : public FastqReaderBase {
 public:
+    const char* backend_name() const override { return "zlib"; }
+
     explicit FastqReader(const std::string& path)
         : path_(path), gzfp_(nullptr), record_count_(0) {
 

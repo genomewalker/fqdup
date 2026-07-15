@@ -39,6 +39,10 @@
         // iterated (find/operator[] only), so this is byte-identical by construction.
         ska::flat_hash_map<uint64_t, uint32_t> bundle_occ_map;  // occ >= 2 only
         bundle_occ_map.max_load_factor(0.75f);
+        // Serial: decodes every eligible sequence and sorts N keys. On 354 M uniques that
+        // is a full single-threaded pass over the arena before any worker starts, and it
+        // was outside every existing timer.
+        auto t_bundle0 = std::chrono::steady_clock::now();
         {
             std::vector<uint8_t>  dec;
             std::vector<char>     asc;
@@ -64,6 +68,9 @@
                 i = j;
             }
         }
+        const double bundle_wall_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_bundle0).count();
         auto bundle_occ_of = [&](uint32_t id) -> uint64_t {
             auto it = bundle_occ_map.find(bundle_key_of[id]);
             return it == bundle_occ_map.end() ? 1u : it->second;
@@ -212,6 +219,10 @@
         std::vector<uint32_t> order;
         struct IlenSeg { int ilen; uint32_t lo, hi; };
         std::vector<IlenSeg> ilen_segs;
+        // Serial, single-threaded, ~350 M elements, and until now untimed. One second
+        // saved here is one second of wall; one second saved inside b1_worker costs
+        // n_threads CPU-seconds to buy. Measure before optimising either.
+        auto t_order0 = clk::now();
         {
             std::vector<std::pair<int, uint32_t>> tmp;
             tmp.reserve(N);
@@ -237,6 +248,8 @@
                 ilen_segs.push_back({il, lo, static_cast<uint32_t>(order.size())});
             }
         }
+        const double order_wall_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - t_order0).count();
 
         uint64_t n_parents = 0;
         for (const auto& seg : ilen_segs)
@@ -760,11 +773,20 @@
         // from sum-of-all-shards to the single largest shard. Edges are intra-ilen
         // and output is order-invariant, so this is byte-identical to the old
         // all-shards-resident pass.
+        // WALL clocks, not the sampled per-child timers below. The five timers in
+        // b1_worker are 1-in-64 sampled and multiplied by kTimingStride, and they sum to
+        // ~847 CPU-s against a 616.7 s Phase-3 wall on 8 threads -- i.e. ~106 s
+        // wall-equivalent, leaving ~83% of the phase unattributed. These two wall clocks
+        // split B1 into its serial (build_shard) and parallel (worker) halves so that gap
+        // stops being a matter of inference.
+        double b1_build_wall_ms  = 0.0;
+        double b1_worker_wall_ms = 0.0;
         for (const auto& seg : ilen_segs) {
             seg_lo = seg.lo;
             seg_hi = seg.hi;
             seg_chunks = (seg_hi - seg_lo + kChunkSize - 1) / kChunkSize;
             const bool has_shard = seg.ilen >= kMinInteriorLen;
+            auto t_bs0 = clk::now();
             if (has_shard) {
                 const LenShard& ls_mem = build_shard(seg);
                 uint64_t b = 0;
@@ -775,6 +797,9 @@
                          static_cast<uint64_t>(pi.dir.capacity())     * sizeof(*pi.dir.data());
                 fpi_peak_b = std::max(fpi_peak_b, b);
             }
+            auto t_bs1 = clk::now();
+            b1_build_wall_ms += std::chrono::duration<double, std::milli>(t_bs1 - t_bs0).count();
+
             next_chunk.store(0, std::memory_order_relaxed);
             if (n_threads == 1) {
                 b1_worker(0);
@@ -785,6 +810,8 @@
                 b1_worker(0);
                 for (auto& th : ts) th.join();
             }
+            b1_worker_wall_ms +=
+                std::chrono::duration<double, std::milli>(clk::now() - t_bs1).count();
             if (has_shard) shards.erase(seg.ilen);
         }
 
@@ -804,6 +831,10 @@
             mismatches.insert(mismatches.end(), v.begin(), v.end());
             std::vector<ChildMismatch>().swap(v);
         }
+        stats.bundle_wall_ms    = bundle_wall_ms;
+        stats.order_wall_ms     = order_wall_ms;
+        stats.b1_build_wall_ms  = b1_build_wall_ms;
+        stats.b1_worker_wall_ms = b1_worker_wall_ms;
         for (const auto& ls : per_thread_stats) {
             stats.children_scanned       += ls.children_scanned;
             stats.total_candidates       += ls.total_candidates;
@@ -834,6 +865,7 @@
             return id;
         };
 
+        auto t_b2sort0 = clk::now();
         std::sort(mismatches.begin(), mismatches.end(),
                   [&id_count](const ChildMismatch& a, const ChildMismatch& b) {
                       uint64_t ca = id_count[a.parent_id], cb = id_count[b.parent_id];
@@ -842,6 +874,9 @@
                       if (a.mismatch_pos != b.mismatch_pos) return a.mismatch_pos < b.mismatch_pos;
                       return a.alt_base < b.alt_base;
                   });
+        auto t_b2model0 = clk::now();
+        stats.b2_sort_wall_ms =
+            std::chrono::duration<double, std::milli>(t_b2model0 - t_b2sort0).count();
 
         // ── T5.8: empirical posterior-odds model ────────────────────────────
         // Build EdgeCandidate features for every B1 edge and fit the model
@@ -849,7 +884,14 @@
         // log(π_pcr/π_real) from singleton-vs-recurring split). The fitted
         // model replaces lr_threshold + kP_real_uniform + kBundlePrior_alpha.
         constexpr int kDamageEdgeMargin_T58 = 5;
-        auto build_edge = [&](const ChildMismatch& cm) -> fqdup::errcor_emp::EdgeCandidate {
+        // with_qual=false skips the per-mismatch q_at() — a single-byte pread from
+        // the disk-spilled quality arena that serializes 8 fit threads on one NFS fd.
+        // The empirical-model fit (accumulate_edge) bins only on subst/term/occ/damage
+        // and inserts bundle_key; it never reads e.mm[].qual, so the pread it triggers
+        // is pure waste there. Absorption (which scores via emp_model.score, reading
+        // m.qual) keeps with_qual=true. Output is byte-identical either way.
+        auto build_edge = [&](const ChildMismatch& cm,
+                              bool with_qual = true) -> fqdup::errcor_emp::EdgeCandidate {
             const int L  = static_cast<int>(arena_.length(cm.child_id));
             const int k5 = get_layout(L).k5;
             const int ilen = get_layout(L).ilen;
@@ -865,7 +907,9 @@
                 e.mm[i].pos        = pos_full;
                 e.mm[i].parent_2b  = pb;
                 e.mm[i].alt_2b     = alt;
-                e.mm[i].qual       = qual_arena_.q_at(cm.child_id, pos_full);
+                e.mm[i].qual       = with_qual
+                                     ? qual_arena_.q_at(cm.child_id, pos_full)
+                                     : QualArena::kNoQual;
                 e.mm[i].damage_chan = is_terminal_damage_mismatch(
                     alt, pb, mm_pos, ilen, profile_.ss_mode,
                     kDamageEdgeMargin_T58) ? 1 : 0;
@@ -890,6 +934,7 @@
         uint64_t n_cand_h1 = 0;
         uint64_t n_cand_pos_terminal = 0;
         uint64_t n_ch_5ct = 0, n_ch_5ga = 0, n_ch_3ct = 0, n_ch_3ga = 0;
+        auto t_interior0 = clk::now();
         if (errcor_.b1_damage_adjust) {
             std::unordered_map<uint32_t, std::unordered_set<uint64_t>> key_to_bundles;
             for (const auto& cm : mismatches) {
@@ -947,7 +992,11 @@
                      " TV=" + std::to_string(n_interior_tv) + ")" + verdict);
         }
 
+        stats.b2_interior_wall_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - t_interior0).count();
+
         fqdup::errcor_emp::ErrCorEmpiricalModel emp_model;
+        auto t_fit0 = clk::now();
         if (errcor_.empirical && !errcor_.legacy_veto && !mismatches.empty()) {
             // WIN 1: stream edges into the empirical model instead of
             // materializing the full all_edges vector (~43GB at full scale).
@@ -969,7 +1018,7 @@
                 auto& bins = local_bins[t];
                 bins.assign(fqdup::errcor_emp::kNumBins, {});
                 for (size_t j = lo; j < hi; ++j) {
-                    emp_model.accumulate_edge(bins, build_edge(mismatches[j]));
+                    emp_model.accumulate_edge(bins, build_edge(mismatches[j], /*with_qual=*/false));
                     lb.insert(bundle_key_of[mismatches[j].parent_id]);
                 }
             };
@@ -986,6 +1035,8 @@
             std::unordered_set<uint64_t> distinct_bundles;
             for (auto& lb : local_bundles)
                 distinct_bundles.insert(lb.begin(), lb.end());
+            stats.b2_fit_wall_ms =
+                std::chrono::duration<double, std::milli>(clk::now() - t_fit0).count();
             // ── Phase-3 peak memory accounting (LOG-ONLY; byte-identical) ─────
             // Emitted at the Phase-3 resident peak: every large B1 structure is
             // still live (read arena, FlatPairIndex shards, interior slab,
@@ -1009,9 +1060,9 @@
                                    arena_.offsets.bytes_alloc() +
                                    arena_.lengths.bytes_alloc() +
                                    arena_.eligible.bytes_alloc();
-                uint64_t qual_b  = qual_arena_.bytes.bytes_alloc() +
-                                   qual_arena_.offsets.bytes_alloc() +
-                                   qual_arena_.lengths.bytes_alloc();
+                // Resident only. The Phred bytes themselves live in a spill file and
+                // are pread() on demand (arena.hpp), so they are page cache, not RSS.
+                uint64_t qual_b  = qual_arena_.bytes_resident();
                 uint64_t counts_b = vcap(id_count) + vcap(acc_count) +
                                     vcap(bundle_key_of) + vcap(rescue_bundle_key_of);
                 // The dedup index is the largest single structure in the run and was
@@ -1101,6 +1152,31 @@
                 log_info("    occ_bin[" + std::to_string(o) + "] = " + buf);
             }
         }
+        auto t_pf0 = clk::now();
+        stats.b2_model_wall_ms =
+            std::chrono::duration<double, std::milli>(t_pf0 - t_b2model0).count();
+        // Offset-sorted bulk qual prefetch. Absorption's build_edge() reads one
+        // Phred byte per mismatch via q_at() -- a scattered single-byte pread from
+        // the disk-spilled arena. Gather every (child_id, pos_full) it will touch,
+        // sort by file offset, and pull them in one forward sequential sweep so the
+        // NFS readahead works with us instead of against us. Byte-identical: q_at()
+        // serves the same bytes from the cache, falling back to pread on a miss.
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> qa;
+            qa.reserve(mismatches.size() + mismatches.size() / 8);
+            for (const auto& cm : mismatches) {
+                const int k5 = get_layout(static_cast<int>(arena_.length(cm.child_id))).k5;
+                qa.emplace_back(cm.child_id,
+                                static_cast<uint32_t>(cm.mismatch_pos) + static_cast<uint32_t>(k5));
+                if (cm.hamming == 2)
+                    qa.emplace_back(cm.child_id,
+                                    static_cast<uint32_t>(cm.mismatch_pos2) + static_cast<uint32_t>(k5));
+            }
+            qual_arena_.prefetch(qa);
+        }
+        auto t_b2abs0 = clk::now();
+        stats.b2_prefetch_wall_ms =
+            std::chrono::duration<double, std::milli>(t_b2abs0 - t_pf0).count();
         auto joint_dispersion_adj = [](
             const std::vector<std::pair<uint32_t,uint64_t>>& pac,
             uint64_t veto_count,
@@ -1464,6 +1540,10 @@
             }
         }
 
+        auto t_b30 = clk::now();
+        stats.b2_absorb_wall_ms =
+            std::chrono::duration<double, std::milli>(t_b30 - t_b2abs0).count();
+
         // ── Phase B3: damage-aware H>2 merge ───────────────────────────────
         // For heavily damaged ancient DNA (d_max ≥ b3_min_dmax), PCR copies of
         // the same molecule can accumulate 3–5 deamination differences in the
@@ -1672,6 +1752,7 @@
                          " cross_bundle_protected=" + std::to_string(stats.b3_cross_bundle_protected));
             }
         }
+        stats.b3_wall_ms = std::chrono::duration<double, std::milli>(clk::now() - t_b30).count();
 
         // ── T5.6: Adjacent-length (L±1) probe ──────────────────────────────
         // Catches PCR siblings differing by a single insertion/deletion at any
