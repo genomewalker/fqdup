@@ -933,7 +933,7 @@ private:
 
 
     void merge_chunks(const std::string& output) {
-        bool compress = (output.size() > 3 && output.substr(output.size() - 3) == ".gz");
+        bool compress = (output_wants_gzip(output));
         if (sorted_files_.size() == 1) {
             if (!compress) {
                 // Plain output: rename the uncompressed temp file directly.

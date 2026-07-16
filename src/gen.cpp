@@ -10,6 +10,7 @@
 //
 // Usage: fqdup gen -o OUTPUT [options]
 
+#include "fqdup/fastq_writer.hpp"  // output_wants_gzip
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -179,7 +180,7 @@ int gen_main(int argc, char** argv) {
     std::string qual(read_len, q_char);
 
     // Open output
-    bool   gz_out = out_path.size() > 3 && out_path.substr(out_path.size() - 3) == ".gz";
+    bool   gz_out = output_wants_gzip(out_path);
     gzFile gzout  = nullptr;
     FILE*  fout   = nullptr;
     if (gz_out) {

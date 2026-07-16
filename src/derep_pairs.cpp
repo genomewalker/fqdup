@@ -211,10 +211,8 @@ private:
                const std::string& out_non_path,
                const std::string& cluster_path,
                const std::string& fqcl_path) {
-        bool compress_ext = (out_ext_path.size() > 3 &&
-                             out_ext_path.substr(out_ext_path.size() - 3) == ".gz");
-        bool compress_non = (out_non_path.size() > 3 &&
-                             out_non_path.substr(out_non_path.size() - 3) == ".gz");
+        bool compress_ext = (output_wants_gzip(out_ext_path));
+        bool compress_non = (output_wants_gzip(out_non_path));
 
         FastqWriter ext_writer(out_ext_path, compress_ext, write_threads_);
         FastqWriter non_writer(out_non_path, compress_non, write_threads_);

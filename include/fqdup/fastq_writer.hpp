@@ -32,6 +32,24 @@
 #include <htslib/bgzf.h>
 #endif
 
+// Should output at `path` be gzip-compressed? Compression is chosen from the NAME, so this is the
+// one place that decision lives -- callers must not re-derive it with an ad-hoc `endswith(".gz")`,
+// because that silently writes PLAIN fastq behind a .gz name when the path carries an atomic-rename
+// temp suffix (the classic write-to-`out.fq.gz.tmp`-then-rename pattern). Strip one known temp
+// suffix, then honour the real extension.
+inline bool output_wants_gzip(std::string path) {
+    static const char* const kTempSuffixes[] = {
+        ".tmp", ".part", ".partial", ".inprogress", ".building", ".incomplete"};
+    for (const char* suf : kTempSuffixes) {
+        const size_t n = std::strlen(suf);
+        if (path.size() > n && path.compare(path.size() - n, n, suf) == 0) {
+            path.resize(path.size() - n);
+            break;  // strip at most one temp suffix
+        }
+    }
+    return path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
+}
+
 class FastqWriter {
 public:
     FastqWriter(const std::string& path, bool compress, int n_threads = 1)

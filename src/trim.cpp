@@ -265,8 +265,7 @@ int trim_main(int argc, char** argv) {
     int64_t n_in = 0, n_out = 0, n_clipped5 = 0, n_clipped3 = 0, n_dropped = 0;
     uint64_t total_batches = 0;  // set by producer after pushing all batches
 
-    bool compress = out_path.size() >= 3 &&
-                    out_path.compare(out_path.size() - 3, 3, ".gz") == 0;
+    bool compress = output_wants_gzip(out_path);
     FastqWriter writer(out_path, compress, write_threads);
 
     std::thread writer_thread([&] {

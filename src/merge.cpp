@@ -1951,21 +1951,20 @@ int merge_main(int argc, char** argv) {
         std::cerr << " max-n-rate=" << opts.max_n_rate;
     std::cerr << "\n";
 
-    bool compress_out = out_path.size() >= 3 &&
-                        out_path.compare(out_path.size() - 3, 3, ".gz") == 0;
+    bool compress_out = output_wants_gzip(out_path);
     FastqWriter merged_writer(out_path, compress_out, wrt_threads);
 
     std::unique_ptr<FastqWriter> r1_writer, r2_writer, orphan_writer;
     if (!r1_out_path.empty()) {
-        bool c = r1_out_path.size() >= 3 && r1_out_path.compare(r1_out_path.size()-3,3,".gz")==0;
+        bool c = output_wants_gzip(r1_out_path);
         r1_writer = std::make_unique<FastqWriter>(r1_out_path, c, wrt_threads);
     }
     if (!r2_out_path.empty()) {
-        bool c = r2_out_path.size() >= 3 && r2_out_path.compare(r2_out_path.size()-3,3,".gz")==0;
+        bool c = output_wants_gzip(r2_out_path);
         r2_writer = std::make_unique<FastqWriter>(r2_out_path, c, wrt_threads);
     }
     if (!orphan_out_path.empty()) {
-        bool c = orphan_out_path.size() >= 3 && orphan_out_path.compare(orphan_out_path.size()-3,3,".gz")==0;
+        bool c = output_wants_gzip(orphan_out_path);
         orphan_writer = std::make_unique<FastqWriter>(orphan_out_path, c, wrt_threads);
     }
     // Mate-preserved orphan streams. When given, orphan-R1 (molecule 5', C->T frame) and
@@ -1973,11 +1972,11 @@ int merge_main(int argc, char** argv) {
     // estimator never conflates the two channels. Fallback: combined --orphan-out.
     std::unique_ptr<FastqWriter> orphan_r1_writer, orphan_r2_writer;
     if (!orphan_r1_out_path.empty()) {
-        bool c = orphan_r1_out_path.size() >= 3 && orphan_r1_out_path.compare(orphan_r1_out_path.size()-3,3,".gz")==0;
+        bool c = output_wants_gzip(orphan_r1_out_path);
         orphan_r1_writer = std::make_unique<FastqWriter>(orphan_r1_out_path, c, wrt_threads);
     }
     if (!orphan_r2_out_path.empty()) {
-        bool c = orphan_r2_out_path.size() >= 3 && orphan_r2_out_path.compare(orphan_r2_out_path.size()-3,3,".gz")==0;
+        bool c = output_wants_gzip(orphan_r2_out_path);
         orphan_r2_writer = std::make_unique<FastqWriter>(orphan_r2_out_path, c, wrt_threads);
     }
 
