@@ -49,11 +49,10 @@ public:
     virtual const char* backend_name() const = 0;
 };
 
-// Factory: returns ISA-L when available, else zlib. rapidgzip only on an explicit
-// FQDUP_READER=rapidgzip (its parallel decode races; see fastq_io_backend.cpp).
-// threads: decompression thread budget for rapidgzip (0 = auto from hardware_concurrency).
-// Callers that already have worker pools should pass their own thread count to avoid
-// oversubscription. Implemented in src/fastq_io_backend.cpp.
+// Factory: ISA-L (igzip) for gz when available, else zlib; zlib for plain/stdin.
+// `threads` is ignored for decode (ISA-L is single-threaded) and kept only for signature
+// compatibility. rapidgzip was removed 2026-07-16 (raced on NFS + 9.7x slower than ISA-L;
+// see fastq_io_backend.cpp). Implemented in src/fastq_io_backend.cpp.
 std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
                                                     size_t threads = 0);
 

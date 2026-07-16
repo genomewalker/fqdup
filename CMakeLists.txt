@@ -62,23 +62,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(flat_hash_map)
 
-# rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
-# Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
-set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-if(ISAL_INCLUDE_DIR AND ISAL_LIB)
-    set(LIBRAPIDARCHIVE_WITH_ISAL ON  CACHE BOOL "" FORCE)
-else()
-    set(LIBRAPIDARCHIVE_WITH_ISAL OFF CACHE BOOL "" FORCE)
-endif()
-FetchContent_Declare(
-    librapidarchive
-    GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-    UPDATE_DISCONNECTED TRUE
-)
-FetchContent_MakeAvailable(librapidarchive)
+# rapidgzip removed 2026-07-16: its parallel-decode path raced on large gz over NFS (silent
+# read loss, invisible to gzip -t) AND measured 9.7x slower than ISA-L on the KapK profile.
+# fqdup decodes gz with ISA-L (igzip) via FastqReaderIgzip; this drops the librapidarchive
+# FetchContent dependency and the ODR constraint it imposed on fastq_io_backend.cpp entirely.
 
 # libtaph — reference-free aDNA damage estimation library (deamination,
 # 8-oxoG, PCR, length/GC mixture model). Provides taph::FrameSelector::{update,
@@ -151,10 +138,9 @@ target_link_libraries(fqdup PRIVATE
     Threads::Threads
     ${XXHASH_LIB}
     ${ZSTD_LIB}
-    rapidgzip::rapidgzip
     taph
 )
-target_compile_definitions(fqdup PRIVATE HAVE_RAPIDGZIP HAVE_BBHASH)
+target_compile_definitions(fqdup PRIVATE HAVE_BBHASH)
 target_compile_options(fqdup PRIVATE -O2 -march=${FQDUP_MARCH})
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
