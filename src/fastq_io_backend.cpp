@@ -1,11 +1,14 @@
 // fastq_io_backend.cpp
-// Implements make_fastq_reader() — the only translation unit that includes
-// rapidgzip headers, keeping its non-inline symbols out of all other TUs.
-
-#ifdef HAVE_RAPIDGZIP
-#include <rapidgzip/rapidgzip.hpp>
-#include <filereader/Standard.hpp>
-#endif
+// Implements make_fastq_reader(): ISA-L (igzip) for gz, zlib for plain/stdin.
+//
+// rapidgzip was removed 2026-07-16. Its parallel-decode path raced on large gz over NFS and
+// SILENTLY truncated a 30 GB sort input, costing 115,146,482 reads with no error anywhere;
+// `gzip -t` cannot see it (a race-truncated member is a complete, valid gzip). It was also
+// MEASURED 9.7x SLOWER than ISA-L on the exact KapK profile (job 20189414: 2427.85 s vs
+// 250.98 s, cpu 132% vs 1046% — the "parallel" decoder just stalled on the filer). Both worse,
+// no upside, so retire it rather than fix it. If decode ever becomes the bottleneck, parallelise
+// by gzip MEMBER (the merged files are ~1.32M independent 64 KB members) — race-free by
+// construction, unlike rapidgzip's shared-state inflate.
 
 #include "fqdup/fastq_common.hpp"
 #include <algorithm>
@@ -14,111 +17,6 @@
 #include <string>
 #include <sys/stat.h>
 #include <stdexcept>
-
-namespace {
-
-#ifdef HAVE_RAPIDGZIP
-class FastqReaderRapidgzip : public FastqReaderBase {
-public:
-    explicit FastqReaderRapidgzip(const std::string& path, size_t threads = 0)
-        : path_(path), buffer_pos_(0), buffer_used_(0), eof_(false), record_count_(0) {
-        buffer_.resize(GZBUF_SIZE);
-        // ceiling: rapidgzip 0.16 parallel decode races on large (>1GB) gz over NFS
-        //   at high thread counts — nondeterministic SIGBUS / spurious mid-stream
-        //   truncation (empirically clean at 4, corrupt at 24). Bound decode
-        //   concurrency independent of compute -p; clamp the 0/"auto" case too,
-        //   since auto = hardware_concurrency (the node's full core count) is the
-        //   worst offender. upgrade: root-cause/patch the rapidgzip race or bump
-        //   the pin, then raise or remove this cap.
-        constexpr size_t kMaxDecodeThreads = 4;
-        const size_t decode_threads =
-            (threads == 0) ? kMaxDecodeThreads : std::min(threads, kMaxDecodeThreads);
-        reader_ = std::make_unique<rapidgzip::ParallelGzipReader<>>(
-            std::make_unique<rapidgzip::StandardFileReader>(path),
-            decode_threads,
-            GZBUF_SIZE
-        );
-        struct stat st{};
-        compressed_size_ = (::stat(path.c_str(), &st) == 0)
-                               ? static_cast<uint64_t>(st.st_size) : 0;
-    }
-
-    bool read(FastqRecord& rec) override {
-        if (!readline(rec.header)) return false;
-        if (!readline(rec.seq))
-            throw std::runtime_error("Truncated FASTQ: missing sequence line after header '" +
-                                     rec.header + "' (record " +
-                                     std::to_string(record_count_ + 1) + ")");
-        if (!readline(rec.plus))
-            throw std::runtime_error("Truncated FASTQ: missing '+' line after sequence in record " +
-                                     std::to_string(record_count_ + 1));
-        if (!readline(rec.qual))
-            throw std::runtime_error("Truncated FASTQ: missing quality line in record " +
-                                     std::to_string(record_count_ + 1));
-        record_count_++;
-        return true;
-    }
-
-    uint64_t record_count() const override { return record_count_; }
-
-private:
-    bool readline(std::string& line) {
-        line.clear();
-        while (true) {
-            for (size_t i = buffer_pos_; i < buffer_used_; ++i) {
-                if (buffer_[i] == '\n') {
-                    line.append(buffer_.data() + buffer_pos_, i - buffer_pos_);
-                    buffer_pos_ = i + 1;
-                    return true;
-                }
-            }
-            if (buffer_pos_ < buffer_used_)
-                line.append(buffer_.data() + buffer_pos_, buffer_used_ - buffer_pos_);
-            buffer_pos_ = 0;
-            buffer_used_ = 0;
-            if (eof_) return !line.empty();
-            const size_t n = reader_->read(buffer_.data(), buffer_.size());
-            if (n == 0) {
-                eof_ = true;
-                // Detect truncated gzip: if rapidgzip stops decoding before the
-                // last compressed byte, the underlying stream lacked a proper
-                // gzip footer (CRC32+ISIZE) — i.e. it was truncated mid-stream.
-                // tellCompressed() returns bits; compare with file size in bits.
-                if (compressed_size_ > 0) {
-                    const uint64_t bits_consumed = reader_->tellCompressed();
-                    const uint64_t bits_total    = compressed_size_ * 8ULL;
-                    // Allow up to 7 bits of padding within the last byte.
-                    if (bits_consumed + 7 < bits_total)
-                        throw std::runtime_error(
-                            "Truncated gzip input '" + path_ +
-                            "': decoded " + std::to_string(bits_consumed / 8) +
-                            "/" + std::to_string(compressed_size_) +
-                            " bytes (missing gzip footer)");
-                }
-                return !line.empty();
-            }
-            buffer_used_ = n;
-        }
-    }
-
-public:
-    const char* backend_name() const override {
-        return "rapidgzip (parallel, RACES on large gz over NFS -- FQDUP_READER=rapidgzip is set)";
-    }
-
-private:
-    std::unique_ptr<rapidgzip::ParallelGzipReader<>> reader_;
-    std::string       path_;
-    std::vector<char> buffer_;
-    size_t            buffer_pos_;
-    size_t            buffer_used_;
-    bool              eof_;
-    uint64_t          record_count_;
-    uint64_t          compressed_size_ = 0;
-};
-#endif  // HAVE_RAPIDGZIP
-
-}  // anonymous namespace
 
 static bool is_gzip(const std::string& path) {
     if (path == "/dev/stdin" || path == "-") return false;  // stdin: FastqReader uses gzdopen(fileno(stdin))
@@ -133,33 +31,15 @@ static bool is_gzip(const std::string& path) {
 
 std::unique_ptr<FastqReaderBase> make_fastq_reader(const std::string& path,
                                                     size_t threads) {
+    (void)threads;  // ISA-L decode is single-threaded; the compute -p never drove decode
     if (is_gzip(path)) {
-        // ISA-L is the default: it is single-threaded, so rapidgzip's parallel-decode race
-        // (see FastqReaderRapidgzip above) cannot exist by construction. That race silently
-        // truncated a 30 GB sort input and cost 115,146,482 reads with no error anywhere.
-        //
-        // It was reachable because every caller here passes no thread count -- derep.cpp:374,
-        // 466, 825 and sort.cpp:64 all call make_fastq_reader(path) -- so `threads` was 0 and
-        // rapidgzip auto-sized its pool to hardware_concurrency, the worst case for the race.
-        // The `-p 1` in the sort job scripts never reached this layer at all.
-        //
-        // ceiling: single-threaded inflate. If decode ever becomes the bottleneck, parallelise
-        // by MEMBER (our merged files are ~1.32M independent 64 KB members) rather than by
-        // reviving rapidgzip -- member-level parallelism is race-free by construction.
-        // upgrade: FQDUP_READER=rapidgzip restores the old path for A/B measurement only.
+        // Single-threaded ISA-L: rapidgzip's parallel-decode race cannot exist by construction,
+        // and it was measured 9.7x faster anyway (see file header). igzip decodes ~98 MB/s here,
+        // I/O-bound on the filer, so parallel decode buys nothing on this workload.
 #if defined(HAVE_ISAL)
-        const char* r = std::getenv("FQDUP_READER");
-        const bool want_rapidgzip = (r != nullptr && std::string(r) == "rapidgzip");
-#ifdef HAVE_RAPIDGZIP
-        if (want_rapidgzip)
-            return std::make_unique<FastqReaderRapidgzip>(path, threads);
-#else
-        (void)want_rapidgzip;
-#endif
-        (void)threads;
         return std::make_unique<FastqReaderIgzip>(path);
-#elif defined(HAVE_RAPIDGZIP)
-        return std::make_unique<FastqReaderRapidgzip>(path, threads);
+#else
+        return std::make_unique<FastqReader>(path);  // zlib fallback when ISA-L is unavailable
 #endif
     }
     // Plain text (or non-gz): zlib gzopen handles both transparently

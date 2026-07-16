@@ -53,7 +53,7 @@ extern "C" {
 }
 #endif
 
-// SortReaderBridge: wraps make_fastq_reader() (rapidgzip/ISA-L/zlib) and bridges
+// SortReaderBridge: wraps make_fastq_reader() (ISA-L/zlib) and bridges
 // its FastqRecord interface to the arena-based read used by Phase 1 chunk creation.
 // Lives outside the anonymous namespace — uses global FastqRecord from fastq_types.hpp.
 class SortReaderBridge {
@@ -543,9 +543,8 @@ public:
         adjust_chunk_size_for_input(input);
 
         // Reported by the reader, not by #ifdef: sort goes through the same
-        // make_fastq_reader() (SortReaderBridge, above), so FQDUP_READER=rapidgzip
-        // reaches sort too -- the old comment here claimed sort "cannot use rapidgzip",
-        // which was never true of the reader, only of the symbols this TU links.
+        // make_fastq_reader() (SortReaderBridge, above), so the logged backend is the one
+        // actually decoding (ISA-L for gz, zlib otherwise) rather than a compile-time guess.
         log_info("Decompression: " +
                  std::string(SortReaderBridge(input).backend_name()));
         log_info("Compression: " + std::string(
