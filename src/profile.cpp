@@ -18,6 +18,7 @@
 #include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
 #include "taph/profile_json.hpp"
+#include "taph/damage_summary.hpp"
 #include "taph/ancient_fraction.hpp"
 #include "taph/llr_table.hpp"
 #include "fqdup/version.hpp"
@@ -61,6 +62,10 @@ static void print_usage(const char* prog) {
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
         << "  --count-table-json FILE    Write Layer-0 stop-channel count tables as JSONL (golden-gate source of truth)\n"
+        << "  --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg). This is the\n"
+        << "                             profile DART consumes via --library-profile: it takes the fit\n"
+        << "                             VERBATIM (pi.state, pi.point, both end shapes) instead of\n"
+        << "                             re-deriving it, so the damage verdict is made once, here.\n"
         << "  --html FILE                Write interactive damage report as self-contained HTML\n"
         << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
@@ -115,6 +120,7 @@ int profile_main(int argc, char** argv) {
     double      mask_threshold = 0.05;
     std::string tsv_path;
     std::string json_path;
+    std::string damage_summary_path;
     std::string damage_json_out;   // scalar damage model for `split --damage-json`
     std::string model_bin_out;     // full split model for `split --model-bin`
     int         json_level        = 2;  // 1=summary, 2=standard, 3=full
@@ -171,6 +177,8 @@ int profile_main(int argc, char** argv) {
             tsv_path = argv[++i];
         } else if (arg == "--json" && i + 1 < argc) {
             json_path = argv[++i];
+        } else if (arg == "--damage-summary" && i + 1 < argc) {
+            damage_summary_path = argv[++i];
         } else if (arg == "--damage-json-out" && i + 1 < argc) {
             damage_json_out = argv[++i];
         } else if (arg == "--model-bin-out" && i + 1 < argc) {
@@ -641,6 +649,41 @@ int profile_main(int argc, char** argv) {
         && !stubs.top_enriched[0].damage_consistent;
 
     const bool is_ss = (dp.library_type == taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+
+    // Certify d_max_3: confounded when the ends carry independent 6-mer families
+    // (rc_overlap_topk==0) and the 3' enriched hexamers are mostly non-damage-consistent.
+    // When confounded on an ss library, override d_max_combined to 5prime_only so the
+    // combined estimate reflects the reliable end rather than the artifact-inflated one.
+    //
+    // This is a DAMAGE CORRECTION, so it runs HERE -- once, unconditionally, before any
+    // consumer reads d_max_combined. It used to live inside the `--json` block and fire at
+    // the very end, which made a scientific correction depend on which report you asked for:
+    //   * `profile` without --json never applied it at all (so the --damage-summary sidecar
+    //     DART consumes carried the artifact-inflated d_max);
+    //   * even WITH --json the stdout report (:1041 "combined d_max=") printed the
+    //     UNCORRECTED value while the JSON printed the corrected one -- the same run
+    //     disagreeing with itself.
+    // hea is computed once here and moved into the JSON payload below.
+    auto hea = taph::compute_hex_end_asymmetry(
+        dp, stubs.top_enriched, stubs.top_enriched_3prime);
+    {
+        const auto& t3 = stubs.top_enriched_3prime;
+        int k3 = std::min(5, (int)t3.size());
+        double dmg_frac_3 = std::numeric_limits<double>::quiet_NaN();
+        if (k3 > 0) {
+            int m = 0;
+            for (int i = 0; i < k3; ++i) if (t3[i].damage_consistent) ++m;
+            dmg_frac_3 = static_cast<double>(m) / k3;
+        }
+        const bool d3_confounded = (hea.rc_overlap_topk == 0)
+                                && (!std::isnan(dmg_frac_3) && dmg_frac_3 < 0.5)
+                                && (dp.fit_offset_3prime >= 1);
+        if (d3_confounded && is_ss
+                && dp.d_max_source != taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY) {
+            dp.d_max_combined = dp.d_max_5prime;
+            dp.d_max_source   = taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
+        }
+    }
 
     // ---- second pass: oxidation-compatible composition score -----------
     // Run when pass-1 found non-trivial 5' damage (gives meaningful q weights).
@@ -1253,31 +1296,9 @@ int profile_main(int argc, char** argv) {
         }
         pji.top_hex_enriched        = stubs.top_enriched;
         pji.top_hex_enriched_3prime = stubs.top_enriched_3prime;
-        {
-            auto hea = taph::compute_hex_end_asymmetry(
-                dp, stubs.top_enriched, stubs.top_enriched_3prime);
-            // Certify d_max_3: confounded when ends carry independent 6-mer families
-            // (rc_overlap_topk==0) and 3' enriched hexamers are mostly non-damage-consistent.
-            // When confounded on an SS library, override d_max_combined to 5prime_only so
-            // the combined estimate reflects the reliable end rather than the artifact-inflated one.
-            const auto& t3 = stubs.top_enriched_3prime;
-            int k3 = std::min(5, (int)t3.size());
-            double dmg_frac_3 = std::numeric_limits<double>::quiet_NaN();
-            if (k3 > 0) {
-                int m = 0;
-                for (int i = 0; i < k3; ++i) if (t3[i].damage_consistent) ++m;
-                dmg_frac_3 = static_cast<double>(m) / k3;
-            }
-            bool d3_confounded = (hea.rc_overlap_topk == 0)
-                              && (!std::isnan(dmg_frac_3) && dmg_frac_3 < 0.5)
-                              && (dp.fit_offset_3prime >= 1);
-            if (d3_confounded && is_ss
-                    && dp.d_max_source != taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY) {
-                dp.d_max_combined = dp.d_max_5prime;
-                dp.d_max_source   = taph::SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
-            }
-            pji.hex_end_asymmetry = std::move(hea);
-        }
+        // The d_max_3 certification + ss override now runs once, unconditionally, right
+        // after the profile is finalized (see above). Only the reporting survives here.
+        pji.hex_end_asymmetry = std::move(hea);
         pji.adapter_clipped      = stubs.adapter_clipped;
         pji.adapter3_clipped     = stubs.adapter3_clipped;
         pji.flag_hex_artifact    = stubs.flag_hex_artifact;
@@ -1454,6 +1475,20 @@ int profile_main(int argc, char** argv) {
 
         taph::profile_to_json(dp, j, pji);
         std::cout << "JSON written: " << json_path << "\n";
+    }
+
+    // The sidecar DART consumes via --library-profile. apply_to() takes this VERBATIM --
+    // pi.state, pi.point, and BOTH end shapes -- so the damage verdict is fitted once, here,
+    // and DART cannot re-derive a different one. dp carries the d_max_3 certification because
+    // that correction now runs unconditionally at finalize time, not inside a report block.
+    if (!damage_summary_path.empty()) {
+        if (!taph::write_damage_summary(damage_summary_path,
+                                        taph::DamageSummary::from_profile(dp))) {
+            std::cerr << "Error: cannot write damage summary: " << damage_summary_path << "\n";
+            return 1;
+        }
+        std::cout << "Damage summary written: " << damage_summary_path
+                  << "  (DART: --library-profile " << damage_summary_path << ")\n";
     }
 
     if (!count_table_path.empty()) {
