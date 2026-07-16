@@ -297,7 +297,7 @@ int split_main(int argc, char** argv) {
         // --- Streaming classification pass ---
         unsigned writer_threads = std::min(threads, 16u);
         auto is_gz = [](const std::string& p) {
-            return p.size() > 3 && p.substr(p.size()-3) == ".gz";
+            return output_wants_gzip(p);
         };
 
         std::unique_ptr<FastqWriter> writer_dam, writer_und;

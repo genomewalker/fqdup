@@ -755,8 +755,10 @@ private:
     void pass2(const std::string& in_path,
                const std::string& out_path,
                const std::string& cluster_path) {
-        bool compress = (out_path.size() > 3 &&
-                         out_path.substr(out_path.size() - 3) == ".gz");
+        // Robust to atomic-rename temp suffixes (out.fq.gz.tmp): output_wants_gzip strips a known
+        // temp suffix before the .gz check, so a write-then-rename does not silently emit plain
+        // fastq behind a .gz name. (fqdup issue: KapK derep wrote 38 plain "dedup.fq.gz" this way.)
+        bool compress = output_wants_gzip(out_path);
 
         // Multi-thread compressed output via BGZF (htslib). Cap at 16: BGZF
         // throughput plateaus there and extra threads just steal from the read
@@ -769,16 +771,14 @@ private:
 
         std::unique_ptr<FastqWriter> writer_dam, writer_und;
         if (!out_damaged_path_.empty()) {
-            bool c = out_damaged_path_.size() > 3 &&
-                     out_damaged_path_.substr(out_damaged_path_.size()-3) == ".gz";
             writer_dam = std::make_unique<FastqWriter>(
-                out_damaged_path_, c, static_cast<int>(writer_threads));
+                out_damaged_path_, output_wants_gzip(out_damaged_path_),
+                static_cast<int>(writer_threads));
         }
         if (!out_undamaged_path_.empty()) {
-            bool c = out_undamaged_path_.size() > 3 &&
-                     out_undamaged_path_.substr(out_undamaged_path_.size()-3) == ".gz";
             writer_und = std::make_unique<FastqWriter>(
-                out_undamaged_path_, c, static_cast<int>(writer_threads));
+                out_undamaged_path_, output_wants_gzip(out_undamaged_path_),
+                static_cast<int>(writer_threads));
         }
         bool do_split = writer_dam || writer_und;
 

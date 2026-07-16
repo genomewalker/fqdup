@@ -1197,8 +1197,7 @@ void ExtendEngine::pass2_extend_write() {
 
     // ── Writer thread — ordered resequencer ─────────────────────────────────
     auto writer_fn = [&]() {
-        const bool compress = (out_path_.size() > 3 &&
-                               out_path_.substr(out_path_.size() - 3) == ".gz");
+        const bool compress = (output_wants_gzip(out_path_));
         FastqWriter fqw(out_path_, compress, cfg_.n_threads);
 
         int64_t local_ext = 0, local_ext5 = 0, local_ext3 = 0;
