@@ -1482,8 +1482,14 @@ int profile_main(int argc, char** argv) {
     // and DART cannot re-derive a different one. dp carries the d_max_3 certification because
     // that correction now runs unconditionally at finalize time, not inside a report block.
     if (!damage_summary_path.empty()) {
+        // pi_damaged_point carries the length-stratified joint mixture prevalence
+        // (lsd.pi_joint_damaged), the empirical-Bayes prior -- NOT dp.pi_damaged (the raw,
+        // inflated terminal-ratio that would double-count the per-read damage evidence).
+        // If the joint did not resolve (bins empty / pi_joint_damaged <= 0), pass -1.0 so the
+        // summary field stays undetermined and DART's apply_to guard drops to no-auth tier.
+        const double lsd_prior = lsd.bins.empty() ? -1.0 : lsd.pi_joint_damaged;
         if (!taph::write_damage_summary(damage_summary_path,
-                                        taph::DamageSummary::from_profile(dp))) {
+                                        taph::DamageSummary::from_profile(dp, lsd_prior))) {
             std::cerr << "Error: cannot write damage summary: " << damage_summary_path << "\n";
             return 1;
         }
