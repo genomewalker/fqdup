@@ -202,7 +202,7 @@
         Phase3Stats stats;
         using clk = std::chrono::steady_clock;
 
-        // ── Phase A: index parents (count > min_parent_count) ──────────────
+        // ── Phase A: index every sequence as a potential parent ────────────
         struct BuildEntry { uint64_t key; uint32_t id; };
         // Tags 0-5: pair-hash for all C(4,2)=6 combinations of 4 parts.
         // 4-way pigeonhole: if H(child,parent)≤2, at least 2 of 4 parts match →
@@ -359,6 +359,11 @@
             // that logger fires. Peak collapses to the largest single ilen.
             std::array<std::vector<BuildEntry>, 6> tag_entries;
             {
+                // Exact final size is known: one entry per id in the window, per tag.
+                // Without this each of the 6 vectors doubles its way up and carries
+                // 1.17-1.25x growth slack at the moment of peak.
+                for (auto& ev : tag_entries) ev.reserve(seg.hi - seg.lo);
+
                 std::vector<uint8_t> scratch;
                 for (uint32_t oi = seg.lo; oi < seg.hi; ++oi) {
                     const uint32_t id  = order[oi];
