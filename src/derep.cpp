@@ -588,8 +588,11 @@ private:
     }
 
     // Phase 3: parent-centric mismatch pattern detection.
-    // Indexes sequences with count > min_parent_count as parents, then for each
-    // potential child (count <= min_parent_count) finds all H=1 parent neighbours.
+    // EVERY sequence is indexed as a potential parent -- there is no count floor
+    // (min_parent_count is not enforced anywhere; a previous version of this comment
+    // claimed it was). The only edge rule is that the parent must outrank the child on
+    // (count, -id), so a count-1 singleton CAN parent another count-1 singleton with a
+    // higher id. Dropping count-1 ids from the parent index would change the output.
     // A child is absorbed unless the mismatch pattern is recurrent (SNP veto):
     //   sig_count_weighted >= snp_min_count AND
     //   sig_count_weighted / parent_count >= snp_threshold.
