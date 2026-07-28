@@ -1,4 +1,6 @@
 build/
+build-*/
+build_*/
 *.log
 # Internal benchmarks using external tools not included in the repo
 tests/bench_swarm.sh
