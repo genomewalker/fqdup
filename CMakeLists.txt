@@ -179,73 +179,49 @@ target_link_libraries(test_syncmer_index PRIVATE ${XXHASH_LIB} ${ZSTD_LIB})
 target_compile_options(test_syncmer_index PRIVATE -O2)
 add_test(NAME syncmer_index COMMAND test_syncmer_index)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
-    add_test(NAME smoke
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh $<TARGET_FILE:fqdup>)
-endif()
+add_test(NAME smoke
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh $<TARGET_FILE:fqdup>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh)
-    add_test(NAME damage_auto
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME damage_auto
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_polyg.sh)
-    add_test(NAME merge_polyg
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_polyg.sh
-                     $<TARGET_FILE:fqdup>)
-endif()
+add_test(NAME merge_polyg
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_polyg.sh
+                 $<TARGET_FILE:fqdup>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_complexity.sh)
-    add_test(NAME merge_complexity
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_complexity.sh
-                     $<TARGET_FILE:fqdup>)
-endif()
+add_test(NAME merge_complexity
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_merge_complexity.sh
+                 $<TARGET_FILE:fqdup>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh)
-    add_test(NAME io_failures
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME io_failures
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_failures.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_math_invariants.sh)
-    add_test(NAME math_invariants
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_math_invariants.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME math_invariants
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_math_invariants.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backends.sh)
-    add_test(NAME backends
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backends.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME backends
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backends.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh)
-    add_test(NAME extend_dmgcor
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_genome_frags>)
-endif()
+add_test(NAME extend_dmgcor
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_extend_dmgcor.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_genome_frags>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage.sh)
-    add_test(NAME damage
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage.sh
-                     $<TARGET_FILE:fqdup>)
-endif()
+add_test(NAME damage
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage.sh
+                 $<TARGET_FILE:fqdup>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh)
-    add_test(NAME errcor
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh
-                     $<TARGET_FILE:fqdup>)
-endif()
+add_test(NAME errcor
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_errcor.sh
+                 $<TARGET_FILE:fqdup>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hexamer_confound.sh)
-    add_test(NAME hexamer_confound
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hexamer_confound.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME hexamer_confound
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hexamer_confound.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh)
-    add_test(NAME pipeline
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh
-                     $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
-endif()
+add_test(NAME pipeline
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
