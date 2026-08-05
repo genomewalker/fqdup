@@ -57,7 +57,8 @@ static void print_usage(const char* prog) {
         << "                             3' counters. Read 3' ends ignored (adapter zone).\n"
         << "\nOptions:\n"
         << "  -p N                       Worker threads (default: all cores)\n"
-        << "  --library-type auto|ds|ss  Library type for 3'-end interpretation (default: auto)\n"
+        << "  --library-type auto|ds|ss  Library type for 3'-end interpretation (default: auto;\n"
+        << "                             when omitted, inherits a merge-declared type from --subst-in)\n"
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
@@ -227,6 +228,26 @@ int profile_main(int argc, char** argv) {
             std::cerr << "Error: unknown argument: " << arg << "\n";
             print_usage(argv[0]);
             return 1;
+        }
+    }
+
+    // Declare-once library type: when --library-type is absent, adopt a merge-DECLARED
+    // type from the first v3 bsubst trailer (explicit --library-type still wins; a merge
+    // AUTO-detected type does not propagate — only an explicit `merge --library-type` does).
+    // Keeps the CLI coherent: declare the type once at merge, profile honors it via --subst-in.
+    if (forced_lib == taph::SampleDamageProfile::LibraryType::UNKNOWN && !subst_in_paths.empty()) {
+        FILE* bf = fopen(subst_in_paths[0].c_str(), "rb");
+        if (bf) {
+            uint8_t m[8];
+            // trailer follows magic(8)+pairs(8)+bases(8)+npos(4)+fwd(3840)+rev(3840)+all(128)
+            if (fread(m, 1, 8, bf) == 8 && memcmp(m, BMAGIC_V3, 8) == 0
+                && fseek(bf, 8 + 8 + 4 + 3840 + 3840 + 128, SEEK_CUR) == 0) {
+                uint8_t ss8 = 0, src8 = 0;  // src8: 1=declared at merge, 0=auto-detected
+                if (fread(&ss8, 1, 1, bf) == 1 && fread(&src8, 1, 1, bf) == 1 && src8)
+                    forced_lib = ss8 ? taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED
+                                     : taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+            }
+            fclose(bf);
         }
     }
 
