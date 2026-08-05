@@ -1483,8 +1483,10 @@ int profile_main(int argc, char** argv) {
     // that correction now runs unconditionally at finalize time, not inside a report block.
     if (!damage_summary_path.empty()) {
         // pi_damaged_point carries the length-stratified joint mixture prevalence
-        // (lsd.pi_joint_damaged), the empirical-Bayes prior -- NOT dp.pi_damaged (the raw,
-        // inflated terminal-ratio that would double-count the per-read damage evidence).
+        // (lsd.pi_joint_damaged), a mixture over length x GC cells -- NOT dp.pi_damaged (the
+        // pooled terminal ratio damaged_obs/total_obs, a different and DamageConfidence-gated
+        // estimand). Both are functionals of the same terminal-deamination channel, so the
+        // mixture value is used as an empirical-Bayes PRIOR, not as independent evidence.
         // If the joint did not resolve (bins empty / pi_joint_damaged <= 0), pass -1.0 so the
         // summary field stays undetermined and DART's apply_to guard drops to no-auth tier.
         const double lsd_prior = lsd.bins.empty() ? -1.0 : lsd.pi_joint_damaged;
