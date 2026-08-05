@@ -32,7 +32,7 @@ static void usage(const char* prog) {
         "  --out-damaged  FILE  Write damaged reads here\n"
         "  --out-undamaged FILE Write undamaged reads here\n"
         "\nOptions:\n"
-        "  --library-type STR   ds (default), ss, or auto (inferred from profile)\n"
+        "  --library-type STR   ds, ss, or auto (default; inferred from profile)\n"
         "  --split-model STR    auto (default), bulk, or empirical\n"
         "                         auto: empirical when d_max5>0.01, else bulk\n"
         "                         bulk: exponential model from Pass 0 estimate\n"
