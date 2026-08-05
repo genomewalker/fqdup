@@ -26,6 +26,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -1701,8 +1702,9 @@ static void usage() {
         "Optimized for ancient DNA: high damage-tolerance (--max-mm-rate 0.08 default),\n"
         "Bayesian quality consensus at overlap, incremental-Hamming overlap detection.\n\n"
         "Required:\n"
-        "  -1 FILE            R1 (forward) reads (.fastq.gz or plain)\n"
-        "  -2 FILE            R2 (reverse) reads (.fastq.gz or plain)\n"
+        "  -1 FILE[,FILE...]  R1 (forward) reads (.fastq.gz or plain). Repeatable, or one\n"
+        "                     comma-separated list; all lanes stream into a single output.\n"
+        "  -2 FILE[,FILE...]  R2 (reverse) reads; same lane order as -1.\n"
         "  -o FILE            Output: merged reads (.fastq.gz)\n\n"
         "Optional output:\n"
         "  --r1-out FILE      Unmerged R1 reads (adapter-trimmed if --adapter1 given)\n"
@@ -1783,10 +1785,14 @@ int merge_main(int argc, char** argv) {
     MergeOpts opts;
     int n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 
+    auto push_csv = [](std::vector<std::string>& v, const std::string& s) {  // one flag, comma-separated list
+        std::stringstream ss(s); std::string t;
+        while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(t);
+    };
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if      ((a == "-1")               && i+1 < argc) r1_paths.push_back(argv[++i]);
-        else if ((a == "-2")               && i+1 < argc) r2_paths.push_back(argv[++i]);
+        if      ((a == "-1")               && i+1 < argc) push_csv(r1_paths, argv[++i]);
+        else if ((a == "-2")               && i+1 < argc) push_csv(r2_paths, argv[++i]);
         else if ((a == "-o")               && i+1 < argc) out_path     = argv[++i];
         else if (a == "--r1-out"           && i+1 < argc) r1_out_path      = argv[++i];
         else if (a == "--r2-out"           && i+1 < argc) r2_out_path      = argv[++i];
