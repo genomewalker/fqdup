@@ -806,6 +806,7 @@ struct MergeOpts {
     std::string adapter2;
     std::string adapter_5p_linker;              // library 5' construct clipped from unmerged reads
     std::string forced_library_type;            // "ss"/"ds" declared override; ""=auto-detect
+    bool  strict_library_type = false;          // abort if declared type contradicts confident detection
     std::string json_out;                       // --json: comprehensive lossless merge-QC report
     std::vector<std::string> extra_adapters1;   // additional R1 adapters to try (from --adapter-fasta)
     std::vector<std::string> tech_seqs;          // ALL learned technical constructs (multi-adapter QC)
@@ -1730,6 +1731,10 @@ static void usage() {
         "  --no-internal-panel  Disable built-in aDNA construct read-through trimming (default: ON;\n"
         "                       --internal-panel kept as a no-op for back-compat)\n\n"
         "Performance:\n"
+        "  --library-type ds|ss  Override auto-detected library type (default: auto-detect;\n"
+        "                     declared type is written into --subst-binary for profile/derep to inherit)\n"
+        "  --strict-library-type  Abort if a declared --library-type contradicts a confident\n"
+        "                     geometry call (default: warn and proceed)\n"
         "  -p N               Threads (default: all cores)\n"
         "  -h, --help         Show this help\n\n"
         "Notes:\n"
@@ -1800,6 +1805,7 @@ int merge_main(int argc, char** argv) {
         else if (a == "--orphanr1-out"     && i+1 < argc) orphan_r1_out_path = argv[++i];
         else if (a == "--orphanr2-out"     && i+1 < argc) orphan_r2_out_path = argv[++i];
         else if (a == "--library-type"     && i+1 < argc) opts.forced_library_type = argv[++i];
+        else if (a == "--strict-library-type")            opts.strict_library_type = true;
         else if (a == "--damage-out"       && i+1 < argc) opts.damage_out  = argv[++i];
         else if (a == "--subst-out"        && i+1 < argc) opts.subst_out   = argv[++i];
         else if (a == "--subst-binary"     && i+1 < argc) opts.subst_binary = argv[++i];
@@ -1922,8 +1928,24 @@ int merge_main(int argc, char** argv) {
     bool is_ss = det.is_ss;
     std::string lib_type_source = det.type_from_panel ? "panel" : "detected";
     float lib_type_conf = det.type_confidence;
+    const bool  detected_is_ss = det.is_ss;
+    const float detected_conf  = det.type_confidence;
     if (opts.forced_library_type == "ss")      { is_ss = true;  lib_type_source = "declared"; lib_type_conf = 1.f; }
     else if (opts.forced_library_type == "ds") { is_ss = false; lib_type_source = "declared"; lib_type_conf = 1.f; }
+    // Guard: a declared type that contradicts a confident geometry call is almost always a
+    // mistake, and it propagates silently (bsubst -> profile/derep, model -> split). Flag it
+    // loudly; --strict-library-type makes it fatal.
+    if (!opts.forced_library_type.empty() && is_ss != detected_is_ss && detected_conf >= 0.80f) {
+        std::cerr << "WARNING: --library-type " << (is_ss ? "ss" : "ds")
+                  << " contradicts geometry auto-detection (" << (detected_is_ss ? "ss" : "ds")
+                  << ", conf=" << detected_conf << "). Proceeding with the declared type; 3' damage"
+                  << " and 5' linker handling will likely be wrong. Omit --library-type to auto-detect"
+                  << (opts.strict_library_type ? ".\n" : ", or --strict-library-type to make this fatal.\n");
+        if (opts.strict_library_type) {
+            std::cerr << "Error: --strict-library-type set and declared type contradicts detection; aborting.\n";
+            return 1;
+        }
+    }
     // ds libraries carry no extra 5' linker; a linker learned on a ds library would risk
     // clipping a real biological 5', so gate the linker on ss (I1 / design §2.2).
     if (!is_ss) opts.adapter_5p_linker.clear();
