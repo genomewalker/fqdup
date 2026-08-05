@@ -46,7 +46,7 @@ static void usage(const char* prog) {
         "  --damage-json FILE   Reuse scalar model from `fqdup profile --damage-json-out`\n"
         "                         (one LSD pass to build bins). Digest-validated.\n"
         "  --allow-model-mismatch  Permit a model whose input digest differs (off by default)\n"
-        "  -t N                 Threads (default: all available, capped at 16 for I/O)\n"
+        "  -p N                 Threads (default: all available, capped at 16 for I/O)\n"
         "  -h, --help           Show this help\n";
 }
 
@@ -75,7 +75,7 @@ int split_main(int argc, char** argv) {
         else if (a == "--model-bin" && i+1 < argc)              { model_bin_path = argv[++i]; }
         else if (a == "--damage-json" && i+1 < argc)            { damage_json_path = argv[++i]; }
         else if (a == "--allow-model-mismatch")                 { allow_model_mismatch = true; }
-        else if ((a == "-t" || a == "--threads") && i+1 < argc) { threads = static_cast<unsigned>(std::stoi(argv[++i])); }
+        else if ((a == "-p" || a == "--threads" || a == "-t") && i+1 < argc) { threads = static_cast<unsigned>(std::stoi(argv[++i])); }  // -t: back-compat alias for -p
         else if (a == "--library-type" && i+1 < argc) {
             std::string m = argv[++i];
             if      (m == "ds")   forced_library_type = taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;

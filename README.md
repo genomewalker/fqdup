@@ -569,7 +569,7 @@ Options:
                             (one LSD pass to build bins); digest-validated
   --allow-model-mismatch  Permit a model whose input digest differs (off by default)
   --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000; 0=all)
-  -t N                    Threads (default: all available, capped at 16 for I/O)
+  -p N                    Threads (default: all available, capped at 16 for I/O)
 ```
 
 ### `fqdup view`

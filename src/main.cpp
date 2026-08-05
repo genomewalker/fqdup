@@ -46,7 +46,7 @@ static void usage(const char* prog) {
               << "  " << prog << " derep_pairs -n merged.sorted.fq.gz -e extended.sorted.fq.gz \\\n"
               << "                            -o-non nonext.deduped.fq.gz -o-ext ext.deduped.fq.gz\n"
               << "  " << prog << " derep       -i nonext.deduped.fq.gz -o nonext.final.fq.gz \\\n"
-              << "                            --damage-auto --error-correct\n";
+              << "                            --damage report --library-type ds\n";
 }
 
 int main(int argc, char** argv) {
