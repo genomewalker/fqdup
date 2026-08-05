@@ -274,6 +274,8 @@ fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
                              subsequent fqdup derep --collapse-damage run.
   --tsv FILE                 Write per-position frequency table as TSV
   --json FILE                Write full damage profile as JSON
+  --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg) for
+                             DART --library-profile (v3 carries pi_damaged_point)
   --html FILE                Write interactive damage report as self-contained HTML
   --length-bins SPEC         Length-stratified damage curves: auto | N | e1,e2,...
   --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
@@ -288,6 +290,13 @@ Prints a human-readable report: library type with BIC scores, d_max/lambda per e
 per-position deamination frequencies, and the positions that exceed the mask threshold.
 Use the output to decide whether `--collapse-damage` is warranted, verify the library-type
 call, or supply parameters directly to `fqdup extend` / `fqdup derep`.
+
+`--damage-summary FILE` writes a compact binary DamageSummary sidecar (`.tdmg`) carrying the
+finalized per-library damage parameters, for consumption by DART's `--library-profile`. The v3
+format adds `pi_damaged_point`, the mixture-based damaged-molecule prevalence used as an
+empirical-Bayes prior downstream; it is `-1.0` when the length-stratified joint mixture does not
+resolve. This is the same terminal-deamination signal DART would otherwise self-profile, so it is
+a prior, not independent evidence.
 
 The `--json` output includes the complete machine-readable profile:
 
