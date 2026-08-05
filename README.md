@@ -545,11 +545,10 @@ the input once. Input does **not** need to be sorted. Useful for splitting
 already-deduplicated reads or as a fast pre-filter before `fqdup derep`.
 
 ```
-fqdup split -i INPUT --min-length N [options]
+fqdup split -i INPUT [options]
 
 Required:
   -i FILE                 Input FASTQ (raw or .gz); does not need to be sorted
-  --min-length N          Reads shorter than N bp routed to neither output (REQUIRED, >= 1)
 
 Outputs (at least one required):
   --out-damaged  FILE     Write damaged reads here
@@ -562,6 +561,13 @@ Options:
                             bulk      — bulk exponential model only
                             empirical — always run length-stratified LSD scan
   --split-threshold F     LLR threshold for damaged call (default: 0.0)
+  --min-length N          Drop reads shorter than N bp before classify (default: 16; 0 = off)
+  --max-length N          Drop reads longer than N bp before classify (default: off)
+  --model-bin FILE        Reuse full split model from `fqdup profile --model-bin-out`
+                            (zero estimation: no Pass-0, no LSD scan); digest-validated
+  --damage-json FILE      Reuse scalar model from `fqdup profile --damage-json-out`
+                            (one LSD pass to build bins); digest-validated
+  --allow-model-mismatch  Permit a model whose input digest differs (off by default)
   --damage-deam-sample N  Max reads for Pass 0 damage scan (default: 5000000; 0=all)
   -t N                    Threads (default: all available, capped at 16 for I/O)
 ```
