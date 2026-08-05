@@ -1137,6 +1137,8 @@ static void print_usage(const char* prog, bool advanced = false) {
         << "                                    WARNING: distorts per-position damage rates;\n"
         << "                                    do NOT use upstream of metaDMG/mapDamage.\n"
         << "  --library-type T     auto (default) | ds | ss | unknown\n"
+        << "  --subst-in FILE      inherit a merge-declared library type from a bsubst\n"
+        << "                       (when --library-type is omitted; explicit type wins)\n"
         << "  --damage-dmax N[,N]  Manual d_max override (skips fit). \"0.21,0.13\" = 5',3'\n"
         << "  --damage-clip-pass M off | report (default) | refit\n"
         << "  --damage-scan N      Reads sampled for QC + adapter scan (default: 1000000; 0=all)\n"
@@ -1235,6 +1237,7 @@ int derep_main(int argc, char** argv) {
     int    pcr_cycles     = 0;
     double pcr_efficiency = 1.0;
     double pcr_phi        = 5.3e-7;
+    std::string subst_in_path;  // optional bsubst: inherit merge-declared library type
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -1443,6 +1446,8 @@ int derep_main(int argc, char** argv) {
                 std::cerr << "Error: --damage-clip-pass must be off|report|refit, got " << v << "\n";
                 return 1;
             }
+        } else if (arg == "--subst-in" && i + 1 < argc) {
+            subst_in_path = argv[++i];
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "Error: Unknown argument: " << arg << "\n\n";
             print_usage(argv[0]);
@@ -1456,6 +1461,25 @@ int derep_main(int argc, char** argv) {
         std::cerr << "Error: Missing required arguments (-i and -o)\n\n";
         print_usage(argv[0]);
         return 1;
+    }
+
+    // Declare-once fallback: inherit a merge-DECLARED library type from a bsubst trailer
+    // when --library-type is absent (explicit --library-type wins; a merge auto-detected
+    // type does not propagate). Symmetric with `profile --subst-in`.
+    if (forced_library_type == taph::SampleDamageProfile::LibraryType::UNKNOWN && !subst_in_path.empty()) {
+        static const uint8_t BMAGIC_V3[8] = {'B','S','U','B','S','T',0x03,0x00};
+        FILE* bf = fopen(subst_in_path.c_str(), "rb");
+        if (bf) {
+            uint8_t m[8];  // trailer follows magic(8)+pairs(8)+bases(8)+npos(4)+fwd(3840)+rev(3840)+all(128)
+            if (fread(m, 1, 8, bf) == 8 && memcmp(m, BMAGIC_V3, 8) == 0
+                && fseek(bf, 8 + 8 + 4 + 3840 + 3840 + 128, SEEK_CUR) == 0) {
+                uint8_t ss8 = 0, src8 = 0;  // src8: 1=declared at merge, 0=auto-detected
+                if (fread(&ss8, 1, 1, bf) == 1 && fread(&src8, 1, 1, bf) == 1 && src8)
+                    forced_library_type = ss8 ? taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED
+                                              : taph::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+            }
+            fclose(bf);
+        }
     }
     if (min_length < 0) {
         std::cerr << "Error: --min-length must be >= 0 (0 = disabled)\n";
