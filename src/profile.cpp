@@ -198,7 +198,8 @@ int profile_main(int argc, char** argv) {
         } else if (arg == "--html" && i + 1 < argc) {
             html_path = argv[++i];
         } else if (arg == "--subst-in" && i + 1 < argc) {
-            subst_in_paths.push_back(argv[++i]);
+            std::stringstream ss_si(argv[++i]); std::string t_si;  // one flag, comma-separated list
+            while (std::getline(ss_si, t_si, ',')) if (!t_si.empty()) subst_in_paths.push_back(t_si);
         } else if (arg == "--no-oxog") {
             run_oxog = false;
         } else if (arg == "--min-length" && i + 1 < argc) {

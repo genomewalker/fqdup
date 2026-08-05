@@ -223,7 +223,8 @@ incremental-Hamming overlap detection. An upstream alternative to
 fqdup merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz --min-length N [options]
 
 Required:
-  -1 FILE / -2 FILE          R1 / R2 input FASTQ
+  -1 FILE[,...] / -2 FILE[,...]  R1 / R2 input FASTQ; repeatable or comma-separated
+                             (multiple lanes stream into one merged output + one bsubst)
   -o FILE                    Output: merged reads
   --min-length N             Read-length floor, all emit paths (REQUIRED, >= 1)
 
