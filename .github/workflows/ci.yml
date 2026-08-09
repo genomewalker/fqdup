@@ -24,8 +24,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/_deps
-          key: deps-v2-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: deps-v2-
+          # Exact-match only. No restore-keys: a prefix fallback restores a stale build/_deps
+          # (old libtaph) whenever the key changes, which is what broke the damage_auto test.
+          # The key tracks CMakeLists.txt, where libtaph is now pinned to a SHA, so bumping the
+          # pin invalidates the cache correctly.
+          key: deps-v3-${{ hashFiles('CMakeLists.txt') }}
 
       - name: Configure
         run: |

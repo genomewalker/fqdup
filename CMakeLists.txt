@@ -88,7 +88,10 @@ endif()
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-    GIT_TAG        main
+    # Pin to a SHA, not main: a floating tag is not reproducible and, combined with the CI
+    # FetchContent cache (keyed on this file), silently builds against a stale cached libtaph.
+    # Bump this when a new libtaph is intended — that also re-keys the CI cache.
+    GIT_TAG        41e85662be291166e03d4da0290d883f0f50dc88
     GIT_SHALLOW    FALSE
 )
 set(TAPH_MARCH "${FQDUP_MARCH}" CACHE STRING "" FORCE)
