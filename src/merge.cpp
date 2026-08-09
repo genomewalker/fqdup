@@ -359,6 +359,13 @@ static void consensus_merge(const FastqRecord& r1,
         (h.back() == '1' || h.back() == '2'))
         h.resize(h.size() - 2);
     out.plus = "+";
+    // The overlap can never exceed either read. A spurious longer ov (seen on degenerate
+    // poly-A/poly-G pairs whose overlap search mis-locks) would index past r1.seq / rc2_seq,
+    // reading the string's NUL terminator and adjacent heap as bases+quals — emitting 0x00
+    // bases and impossible qualities. Clamp to the valid span of both reads.
+    if (r2_start < 0) r2_start = 0;
+    int max_ov = std::min((int)r1.seq.size(), (int)rc2_seq.size() - r2_start);
+    if (ov > max_ov) ov = std::max(max_ov, 0);
     out.seq.resize(ov);
     out.qual.resize(ov);
 
@@ -1633,7 +1640,8 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     // (circular — rejects ~1-2% genuine inserts by construction); overlap
                     // verification IS the complexity check. passes_qc(0.f,1.0f) keeps only the
                     // absolute floors (min_length / max_n_rate / min_entropy).
-                    if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
+                    if (is_technical_read(mr.merged.seq, opts.tech_seqs) ||
+                        is_homopolymer_read(mr.merged.seq)) {
                         ++out.n_dropped; note_frag_drop(mr.merged.seq);
                     } else if (passes_qc(mr.merged, opts, 0.f, 1.0f)) {
                         ++out.n_merged;
@@ -1669,9 +1677,11 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 
             // Adapter dimer on the merged read (5' adapter, shifted/mismatch match the
             // strict trim missed) → no real insert; drop. Dominant bucket-explosion lineage.
-            if (is_technical_read(mr.merged.seq, opts.tech_seqs)) {
+            if (is_technical_read(mr.merged.seq, opts.tech_seqs) ||
+                is_homopolymer_read(mr.merged.seq)) {
                 ++out.n_dropped; note_frag_drop(mr.merged.seq);
-            // No low-complexity gate on merged reads (circular — see above); absolute floors only.
+            // Homopolymer inserts already dropped above; the data-derived complexity gate stays
+            // off here (circular — see above), so passes_qc applies absolute floors only.
             } else if (!passes_qc(mr.merged, opts, 0.f, 1.0f)) {
                 emit_unmerged(r1, r2, out);
             } else {
