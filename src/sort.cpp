@@ -739,6 +739,23 @@ private:
             writer_threads.emplace_back(writer_func);
         }
 
+        // If the reader below throws (corrupt/truncated gzip), the stack unwinds past the
+        // normal join loop; a joinable std::thread destroyed mid-unwind calls std::terminate
+        // -> SIGABRT with no usable message. This guard drains and joins the writers on every
+        // exit path, so the reader's exception reaches sort_main's handler as a clean error.
+        struct WriterJoinGuard {
+            std::vector<std::thread>& threads;
+            std::atomic<bool>& done;
+            std::condition_variable& qcv;
+            std::condition_variable& rcv;
+            ~WriterJoinGuard() {
+                done.store(true);
+                qcv.notify_all();
+                rcv.notify_all();
+                for (auto& t : threads) if (t.joinable()) t.join();
+            }
+        } writer_join_guard{writer_threads, done_reading, queue_cv, reader_cv};
+
         // Get initial buffer from pool
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
@@ -1142,6 +1159,9 @@ int sort_main(int argc, char** argv) {
         log_info("=== Complete ===");
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "Error: sort failed (corrupt or truncated input?)\n";
         return 1;
     }
 
