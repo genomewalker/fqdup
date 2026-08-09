@@ -112,15 +112,18 @@ public:
           total_reads_(0), errcor_absorbed_(0), n_unique_clusters_(0) {}
 
     // Where the Phase-3 quality spill lives. $TMPDIR when set — on this cluster it
-    // points at node-local scratch, and /tmp does not persist across nodes.
-    // Otherwise sit next to the output, which is by definition a writable directory
-    // the caller already sized for this run. The file is unlinked as soon as it is
-    // created (arena.hpp), so nothing is left behind even if the run dies.
-    static std::string spill_dir(const std::string& out_path) {
+    // points at node-local scratch, and /tmp does not persist across nodes (so it is
+    // never used as a fallback). Otherwise sit next to the INPUT: it is a real file in
+    // a writable directory holding this run's data, whereas the output may be a
+    // non-writable special path (e.g. -o /dev/null, whose directory is /dev). If the
+    // input's directory is not writable, open_spill raises a clear error and the caller
+    // sets TMPDIR. The file is unlinked as soon as it is created (arena.hpp), so nothing
+    // is left behind even if the run dies.
+    static std::string spill_dir(const std::string& in_path) {
         if (const char* t = std::getenv("TMPDIR"))
             if (*t) return std::string(t);
-        const auto slash = out_path.find_last_of('/');
-        return slash == std::string::npos ? std::string(".") : out_path.substr(0, slash);
+        const auto slash = in_path.find_last_of('/');
+        return slash == std::string::npos ? std::string(".") : in_path.substr(0, slash);
     }
 
     void process(const std::string& in_path,
@@ -146,7 +149,7 @@ public:
         // 354 M-unique clay library existed to serve ~3.7 M single-byte q_at()
         // lookups. Opened only when Phase 3 will actually run, since that is the
         // only consumer (the emit pass re-reads qualities from the input).
-        if (errcor_.enabled) qual_arena_.open_spill(spill_dir(out_path));
+        if (errcor_.enabled) qual_arena_.open_spill(spill_dir(in_path));
 
         auto t_pass1_begin = clk::now();
         pass1(in_path);
