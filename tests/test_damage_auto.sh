@@ -43,10 +43,12 @@ echo "  True: dmax5=$DMAX5  dmax3=$DMAX3  lambda=$LAMBDA"
     --dmax5 $DMAX5 --dmax3 $DMAX3 --lambda5 $LAMBDA --lambda3 $LAMBDA \
     --seed 42 > "$TMPDIR/est.fq"
 
-"$FQDUP" sort -i "$TMPDIR/est.fq" -o "$TMPDIR/est.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>/dev/null
+"$FQDUP" sort -i "$TMPDIR/est.fq" -o "$TMPDIR/est.sorted.fq" --max-memory 512M -t "$TMPDIR" 2>"$TMPDIR/sort.log" \
+    || { rc=$?; echo "SORT FAILED (rc=$rc):"; cat "$TMPDIR/sort.log"; exit 1; }
 
 "$FQDUP" derep --min-length 1 -i "$TMPDIR/est.sorted.fq" -o /dev/null \
-    --collapse-damage 2>"$TMPDIR/est.log"
+    --collapse-damage 2>"$TMPDIR/est.log" \
+    || { rc=$?; echo "DEREP FAILED (rc=$rc):"; cat "$TMPDIR/est.log"; exit 1; }
 
 EST5=$(grep "5'-end: d_max=" "$TMPDIR/est.log" | sed 's/.*d_max=\([^ ]*\) .*/\1/')
 EST3=$(grep "3'-end: d_max=" "$TMPDIR/est.log" | sed 's/.*d_max=\([^ ]*\) .*/\1/')
