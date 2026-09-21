@@ -816,17 +816,33 @@ private:
             }
         }
 
+        // 24 B, was 40 B. Pass 2 reserves index_.size() of these -- capacity is one per
+        // UNIQUE READ, not per surviving read (error reads are filtered on push_back, so
+        // size() ends up smaller than capacity). The width is therefore multiplied by
+        // ~3e8 on a production library: 12.0 GB -> 7.2 GB of reserved capacity. That is
+        // an allocation-size saving; it bounds, but does not by itself prove, the change
+        // in process peak RSS.
+        // Only these four values are consumed: the two hash halves for the cluster TSV,
+        // record_index to match the stream, and count. SequenceFingerprint::seq_len was
+        // carried but never read — the TSV prints rec.seq.size(), re-read from the record.
+        // record_index and count are uint32 in IndexEntry (commit 00288f8) and are copied
+        // from it, so narrowing here stores the same values; IndexEntry::kMaxRecords makes
+        // an over-range input a loud error rather than a wrap.
         struct WriteEntry {
-            uint64_t            record_index;
-            SequenceFingerprint fingerprint;
-            uint64_t            count;
+            uint64_t hash_lo;
+            uint64_t hash_hi;
+            uint32_t record_index;
+            uint32_t count;
         };
+        static_assert(sizeof(WriteEntry) == 24, "WriteEntry must stay 24 B: it is "
+                                                "reserved once per unique read");
         std::vector<WriteEntry> records_to_write;
         records_to_write.reserve(index_.size());
         index_.for_each([&](const SequenceFingerprint& fingerprint,
                             const IndexEntry& entry) {
             if (!is_error_.empty() && is_error_[entry.seq_id]) return;
-            records_to_write.push_back({entry.record_index, fingerprint, entry.count});
+            records_to_write.push_back({fingerprint.hash_lo, fingerprint.hash_hi,
+                                        entry.record_index, entry.count});
         });
         std::sort(records_to_write.begin(), records_to_write.end(),
                   [](const WriteEntry& a, const WriteEntry& b) {
@@ -873,8 +889,8 @@ private:
 
                 if (cluster_gz) {
                     if (gzprintf(cluster_gz, "%016lx%016lx\t%lu\t%lu\n",
-                                 static_cast<unsigned long>(entry.fingerprint.hash_hi),
-                                 static_cast<unsigned long>(entry.fingerprint.hash_lo),
+                                 static_cast<unsigned long>(entry.hash_hi),
+                                 static_cast<unsigned long>(entry.hash_lo),
                                  static_cast<unsigned long>(rec.seq.size()),
                                  static_cast<unsigned long>(entry.count)) < 0)
                         throw std::runtime_error(
@@ -884,8 +900,8 @@ private:
                 else if (cluster_bgz) {
                     char buf[80];
                     int n = std::snprintf(buf, sizeof(buf), "%016lx%016lx\t%lu\t%lu\n",
-                                          static_cast<unsigned long>(entry.fingerprint.hash_hi),
-                                          static_cast<unsigned long>(entry.fingerprint.hash_lo),
+                                          static_cast<unsigned long>(entry.hash_hi),
+                                          static_cast<unsigned long>(entry.hash_lo),
                                           static_cast<unsigned long>(rec.seq.size()),
                                           static_cast<unsigned long>(entry.count));
                     if (n <= 0 || bgzf_write(cluster_bgz, buf, static_cast<size_t>(n)) < 0)
