@@ -1,0 +1,169 @@
+// Native family (duplicate) correction pre-pass: C++ port of famcorrect_r4.mjs (FAMILY_PREREG.md Revision 4).
+// Must be byte-identical to the JS reference on R1.fastq, R2.fastq, family-edits.tsv and families.tsv.
+// Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
+#include "family.hpp"
+#include <algorithm>
+#include <cmath>
+#include <array>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <sys/stat.h>
+
+namespace {
+constexpr int KEYLEN = 20, MAXMIS = 8, MAXN = 2, BLOCKS = 9, MAXCOMP = 12, MAXDIAM = 16, ADSEED = 10, ADZONE = 2 * KEYLEN;
+constexpr double DUST_MAX = 0.10, MAXDIS = 0.5;
+constexpr bool g_rev8 = true;
+// --phred-unresolved (arm r8qkeep): an unresolved family column sets each copy to -10log10 P(copy wrong), with
+// P(allele a true) proportional to prod_{i in a}(1-e_i) * prod_{j not in a} e_j/3 from the copies own qualities, clamped to Q2..Q40 (the data floor; Q0 makes risk 1, rejected downstream), instead of Q2
+constexpr bool g_phred = true;
+const std::array<std::string, 2> ADAPTERS{"AGATCGGAAGAGCACACGTCTGAACTCCAG", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAG"};
+
+using Read = fqdup::r8qkeep::FamilyRead;
+using Pair = fqdup::r8qkeep::FamilyPair;
+
+std::string base_id(const std::string& h) {
+    std::string x = h.substr(1, h.find_first_of(" \t") == std::string::npos ? std::string::npos : h.find_first_of(" \t") - 1);
+    if (x.size() > 2 && x[x.size() - 2] == '/' && (x.back() == '1' || x.back() == '2')) x.resize(x.size() - 2);
+    return x;
+}
+std::vector<Read> read_fastq(const std::string& path) {
+    std::ifstream f(path); if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<Read> out; std::string h, s, p, q;
+    while (std::getline(f, h)) { if (!std::getline(f, s) || !std::getline(f, p) || !std::getline(f, q)) throw std::runtime_error("truncated " + path); out.push_back({h, base_id(h), s, q}); }
+    return out;
+}
+// native full_complexity::overlap_is_low_complexity (window 64)
+bool low_complexity(const std::string& seq) {
+    const int len = int(seq.size()); if (len < 5) return false;
+    auto b2 = [](char c) { switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; } return -1; };
+    const int nt = len - 2, wt = std::min(62, nt); if (wt < 2) return false;
+    std::vector<int> tri(nt); for (int i = 0; i < nt; ++i) { int a = b2(seq[i]), b = b2(seq[i + 1]), c = b2(seq[i + 2]); tri[i] = (a < 0 || b < 0 || c < 0) ? -1 : a * 16 + b * 4 + c; }
+    int cnt[64] = {}; long valid = 0, score = 0;
+    auto add = [&](int t) { if (t >= 0) { score += cnt[t]; ++cnt[t]; ++valid; } };
+    auto del = [&](int t) { if (t >= 0) { --cnt[t]; score -= cnt[t]; --valid; } };
+    auto exceeds = [&]() { return valid >= 2 && double(score) / (double(valid) * (valid - 1) / 2) > DUST_MAX; };
+    for (int i = 0; i < wt; ++i) add(tri[i]); if (exceeds()) return true;
+    for (int i = wt; i < nt; ++i) { del(tri[i - wt]); add(tri[i]); if (exceeds()) return true; }
+    return false;
+}
+int mismatches(const std::string& a, const std::string& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
+
+struct Group { std::vector<int> m; bool oversize = false; int diameter = 0; };
+struct Column { int n = 0; std::vector<std::pair<char, std::vector<int>>> votes; int top = -1; }; // votes in first-seen order
+
+std::vector<std::string> keys_of(const std::vector<Pair>& P) {
+    std::vector<std::string> keys(P.size());
+    for (size_t i = 0; i < P.size(); ++i) {
+        const auto &a = P[i].r[0].s, &b = P[i].r[1].s; if (int(a.size()) < KEYLEN || int(b.size()) < KEYLEN) continue;
+        std::string k = a.substr(0, KEYLEN) + b.substr(0, KEYLEN);
+        if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
+        if (!g_rev8) {
+            if (low_complexity(a) || low_complexity(b)) continue;
+            bool adapter = false; for (int s = 0; s < 2; ++s) { auto at = P[i].r[s].s.find(ADAPTERS[s].substr(0, ADSEED)); if (at != std::string::npos && int(at) < ADZONE) adapter = true; }
+            if (!adapter) keys[i] = k;
+        } else { // Revision 8: complexity on the biological prefix (before adapter seed or terminal G>=10 run); adapter must start at >= KEYLEN
+            bool ok = true;
+            for (int s = 0; s < 2 && ok; ++s) { const auto& r = P[i].r[s].s; auto at = r.find(ADAPTERS[s].substr(0, ADSEED)); if (at != std::string::npos && int(at) < KEYLEN) { ok = false; break; }
+                size_t e = r.size(); if (at != std::string::npos) e = std::min(e, at); size_t g = r.size(); while (g > 0 && r[g - 1] == 'G') --g; if (r.size() - g >= 10) e = std::min(e, g);
+                if (low_complexity(r.substr(0, e))) ok = false; }
+            if (ok) keys[i] = k;
+        }
+    }
+    return keys;
+}
+std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys) {
+    const int n = int(P.size()); keys = keys_of(P);
+    std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
+    auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
+    std::unordered_map<std::string, std::vector<int>> buckets;
+    for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }
+    std::set<std::pair<int, int>> tested;
+    for (auto& [k, ids] : buckets) for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) {
+        int i = ids[x], j = ids[y]; if (!tested.insert({i, j}).second) continue;
+        if (mismatches(keys[i], keys[j]) <= MAXMIS) { int a = find(i), b = find(j); if (a != b) parent[a] = b; } }
+    std::vector<int> order; std::map<int, int> slot; std::vector<Group> groups;
+    for (int i = 0; i < n; ++i) if (!keys[i].empty()) { int r = find(i); auto it = slot.find(r); if (it == slot.end()) { slot[r] = int(groups.size()); groups.push_back({}); it = slot.find(r); } groups[it->second].m.push_back(i); }
+    std::vector<Group> out;
+    for (auto& g : groups) { if (g.m.size() < 2) continue; int diam = 0;
+        if (int(g.m.size()) <= MAXCOMP) for (size_t x = 0; x < g.m.size(); ++x) for (size_t y = x + 1; y < g.m.size(); ++y) diam = std::max(diam, mismatches(keys[g.m[x]], keys[g.m[y]]));
+        g.oversize = int(g.m.size()) > MAXCOMP || diam > MAXDIAM; g.diameter = diam; out.push_back(g); }
+    return out;
+}
+std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
+    size_t L = 0; for (int i : g) L = std::max(L, P[i].r[side].s.size());
+    std::vector<Column> cols(L);
+    for (size_t c = 0; c < L; ++c) { auto& col = cols[c];
+        for (int i : g) { const auto& s = P[i].r[side].s; if (c >= s.size() || s[c] == 'N') continue; ++col.n; char b = s[c];
+            auto it = std::find_if(col.votes.begin(), col.votes.end(), [&](auto& v) { return v.first == b; });
+            if (it == col.votes.end()) col.votes.push_back({b, {i}}); else it->second.push_back(i); }
+        int top = -1; for (size_t v = 0; v < col.votes.size(); ++v) if (top < 0 || col.votes[v].second.size() > col.votes[top].second.size()) top = int(v);
+        bool tie = false; if (top >= 0) for (size_t v = 0; v < col.votes.size(); ++v) if (int(v) != top && col.votes[v].second.size() == col.votes[top].second.size()) tie = true;
+        col.top = tie ? -1 : top; }
+    return cols;
+}
+bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
+    std::map<std::pair<int, int>, int> shared; long multi = 0, cover = 0;
+    for (int side = 0; side < 2; ++side) for (auto& col : columns(P, g, side)) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
+    if (cover && double(multi) / cover > MAXDIS) return true;
+    for (int side = 0; side < 2; ++side) for (auto& col : columns(P, g, side)) { if (col.top < 0) continue;
+        for (size_t v = 0; v < col.votes.size(); ++v) { if (int(v) == col.top || col.votes[v].second.size() < 2) continue; const auto& ids = col.votes[v].second;
+            for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) ++shared[{ids[x], ids[y]}]; } }
+    for (auto& [k, v] : shared) if (v >= 2) return true;
+    return false;
+}
+int qv(const Read& r, size_t c) { return r.q[c] - 33; }
+// --damage-safe (DAMAGE_PREREG.md, validated): never change a C<->T / G<->A base, nor lower its Q, at read position < 10
+// or within 10 positions before the first adapter-seed occurrence in that read.
+constexpr int DSZONE = 10;
+bool transition(char a, char b) { return (a == 'C' && b == 'T') || (a == 'T' && b == 'C') || (a == 'G' && b == 'A') || (a == 'A' && b == 'G'); }
+bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) return true; auto at = r.s.find(ADAPTERS[side].substr(0, ADSEED)); return at != std::string::npos && c < at && int(c) >= int(at) - DSZONE; }
+} // namespace
+
+namespace fqdup::r8qkeep {
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2) {
+        constexpr bool damage_safe = false;
+        if (R1.size() != R2.size()) throw std::runtime_error("pair count");
+        std::vector<Pair> P; P.reserve(R1.size());
+        for (size_t i = 0; i < R1.size(); ++i) { if (R1[i].id != R2[i].id) throw std::runtime_error("pair order " + R1[i].id); P.push_back({R1[i].id, {R1[i], R2[i]}}); }
+        std::vector<std::string> keys; auto groups = families(P, keys);
+        std::vector<char> disband(groups.size()); for (size_t k = 0; k < groups.size(); ++k) disband[k] = groups[k].oversize || second_molecule(P, groups[k].m);
+        std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
+            std::map<int, int> hiq;
+            for (int side = 0; side < 2; ++side) { auto cols = columns(P, g0, side);
+                for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c]; if (col.top < 0) continue; int topq = -1; for (int i : col.votes[col.top].second) topq = std::max(topq, qv(P[i].r[side], c));
+                    if (topq < 30) continue; for (size_t v = 0; v < col.votes.size(); ++v) if (int(v) != col.top) for (int i : col.votes[v].second) if (qv(P[i].r[side], c) >= 30) ++hiq[i]; } }
+            std::vector<int> g; for (int i : g0) if (hiq[i] < 2) g.push_back(i);
+            excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
+            ++fam; members += long(g.size());
+            for (int side = 0; side < 2; ++side) { auto cols = columns(P, g, side);
+                for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
+                    auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
+                        r.s[c] = base; r.q[c] = char(q + 33); ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
+                    if (col.n >= 3 && col.votes.size() == 1) { ++confirmed; for (int i : col.votes[0].second) set(i, col.votes[0].first, std::max(qv(P[i].r[side], c), 30)); }
+                    else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
+                        ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
+                        for (auto& v : col.votes) for (int i : v.second) { if (damage_safe && v.first != top && transition(v.first, top) && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, top, q); } }
+                    else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::vector<double> w(col.votes.size(), 1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
+                        for (size_t a = 0; a < col.votes.size(); ++a) { auto& v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto& w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
+        }
+        std::ostringstream f, stats;
+        f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
+          for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
+              for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
+                  << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
+        return {std::move(P), "pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str(), f.str(), stats.str()};
+}
+std::vector<FamilyRead> read_family_fastq(const std::string& path) { return read_fastq(path); }
+}
+
