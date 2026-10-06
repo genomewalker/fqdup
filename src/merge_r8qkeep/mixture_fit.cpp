@@ -1,6 +1,6 @@
 #include "mixture_fit.hpp"
-#include "js_number.hpp"
-#include "js_math.hpp"
+#include "shortest_double.hpp"
+#include "fdlibm.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -14,12 +14,12 @@ double sum(const Values& values) { double out=0;for(double v:values)out+=v;retur
 double logsum(const Values& values) {
     const double m=*std::max_element(values.begin(),values.end());
     if(!std::isfinite(m))throw std::runtime_error("all mixture components impossible");
-    double s=0;for(double x:values)s+=js_math::exp(x-m);
-    return m+js_math::log(s);
+    double s=0;for(double x:values)s+=fqdup::fdlibm::exp(x-m);
+    return m+fqdup::fdlibm::log(s);
 }
 }
 std::vector<PairLikelihood> read_census_likelihood(std::istream& census) {
-    const auto likelihood=[](double d,bool agree){return js_math::log(std::max(1e-15,std::min(1-1e-15,agree?1-d:d)));};
+    const auto likelihood=[](double d,bool agree){return fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,agree?1-d:d)));};
     std::array<std::array<double,2>,mixture_components> flat{};
     for(int j=1;j<mixture_components;++j){const double r=double(j-1)/64,e=.75*(r*r),d=2*e-4*e*e/3;flat[j]={likelihood(d,true),likelihood(d,false)};}
     std::vector<PairLikelihood> pairs;std::unordered_map<std::string,std::size_t> slots;
@@ -44,12 +44,12 @@ std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs) 
     auto& w=result.weights;w.fill(1.0/mixture_components);
     double old=-std::numeric_limits<double>::infinity();
     for(;result.iterations<1000;++result.iterations) {
-        Values count{},logw{};for(int j=0;j<mixture_components;++j)logw[j]=js_math::log(w[j]);
+        Values count{},logw{};for(int j=0;j<mixture_components;++j)logw[j]=fqdup::fdlibm::log(w[j]);
         double ll=0;
         for(const auto& p:pairs) {
             Values a;for(int j=0;j<mixture_components;++j)a[j]=p.log_likelihood[j]+logw[j];
             const double z=logsum(a);ll+=z;
-            for(int j=0;j<mixture_components;++j)count[j]+=js_math::exp(a[j]-z);
+            for(int j=0;j<mixture_components;++j)count[j]+=fqdup::fdlibm::exp(a[j]-z);
         }
         Values next;for(int j=0;j<mixture_components;++j)next[j]=std::max(count[j]/pairs.size(),1e-300);
         const double mass=sum(next);for(double& x:next)x/=mass;
@@ -60,7 +60,7 @@ std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs) 
         old=ll;
     }
     std::vector<Values> densities;densities.reserve(pairs.size());
-    for(const auto& p:pairs) { Values a;const double m=*std::max_element(p.log_likelihood.begin(),p.log_likelihood.end());for(int j=0;j<mixture_components;++j)a[j]=js_math::exp(p.log_likelihood[j]-m);densities.push_back(a); }
+    for(const auto& p:pairs) { Values a;const double m=*std::max_element(p.log_likelihood.begin(),p.log_likelihood.end());for(int j=0;j<mixture_components;++j)a[j]=fqdup::fdlibm::exp(p.log_likelihood[j]-m);densities.push_back(a); }
     result.kkt_gap=std::numeric_limits<double>::infinity();
     for(;result.polish_iterations<10000;++result.polish_iterations) {
         std::vector<double> den;den.reserve(densities.size());
@@ -80,12 +80,12 @@ std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs) 
         w[hi]+=alpha;w[lo]-=alpha;if(w[lo]<1e-15)w[lo]=0;
         const double mass=sum(w);for(double& x:w)x/=mass;
     }
-    for(const auto& p:pairs){Values a;for(int j=0;j<mixture_components;++j)a[j]=p.log_likelihood[j]+js_math::log(w[j]);result.log_likelihood+=logsum(a);}
+    for(const auto& p:pairs){Values a;for(int j=0;j<mixture_components;++j)a[j]=p.log_likelihood[j]+fqdup::fdlibm::log(w[j]);result.log_likelihood+=logsum(a);}
     return result;
 }
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits) {
     std::string out="FQDUP_PAIR_MIXTURE_V1 64\n";
-    for(int f=0;f<2;++f){const auto& fit=fits[f];if(fit&&!fit->converged)throw std::runtime_error("unconverged mixture");out+=std::to_string(f)+" "+std::to_string(fit?fit->training_pairs:0);for(int j=0;j<mixture_components;++j)out+=" "+js_number(fit?fit->weights[j]:0);out+='\n';}
+    for(int f=0;f<2;++f){const auto& fit=fits[f];if(fit&&!fit->converged)throw std::runtime_error("unconverged mixture");out+=std::to_string(f)+" "+std::to_string(fit?fit->training_pairs:0);for(int j=0;j<mixture_components;++j)out+=" "+shortest_double(fit?fit->weights[j]:0);out+='\n';}
     return out;
 }
 }

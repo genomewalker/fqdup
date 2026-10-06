@@ -1,10 +1,10 @@
-#include "js_number.hpp"
+#include "shortest_double.hpp"
 #include <charconv>
 #include <cmath>
 #include <stdexcept>
 #include <string>
 namespace fqdup::r8qkeep {
-std::string js_number(double value) {
+std::string shortest_double(double value) {
     if (std::isnan(value)) return "NaN";
     if (std::isinf(value)) return std::signbit(value) ? "-Infinity" : "Infinity";
     if (value == 0) return "0";

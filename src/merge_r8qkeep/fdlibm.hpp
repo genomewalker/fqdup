@@ -1,5 +1,6 @@
 #pragma once
-namespace fqdup::r8qkeep::js_math {
+// V8-ported fdlibm routines preserve prior-fit arithmetic for byte reproducibility.
+namespace fqdup::fdlibm {
 double exp(double x);
 double log(double x);
 double log1p(double x);

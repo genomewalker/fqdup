@@ -14,13 +14,13 @@
 // Copyright 2016 the V8 project authors. All rights reserved.
 
 // Vendored from Node v22.20.0 / V8 ieee754.cc; algorithm bodies retained.
-#include "js_math.hpp"
+#include "fdlibm.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <type_traits>
-namespace fqdup::r8qkeep::js_math {
+namespace fqdup::fdlibm {
 namespace base {
 template<class To,class From> To bit_cast(const From& value) { static_assert(sizeof(To)==sizeof(From));To out;std::memcpy(&out,&value,sizeof(out));return out; }
 inline double Divide(double numerator,double denominator) { return numerator/denominator; }
