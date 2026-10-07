@@ -1,4 +1,6 @@
 #include "census.hpp"
+#include "ordered_chunks.hpp"
+#include <string_view>
 #include "string_input.hpp"
 #include "fdlibm.hpp"
 #include "shortest_double.hpp"
@@ -43,7 +45,31 @@ fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::
     return r;
 }
 }
-CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug) {
+CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start) {
+    if(threads>1) {
+        // Duplicate IDs share an accumulator in the frozen serial algorithm.
+        // Keep that path unchanged; otherwise each pair's sums are independent.
+        std::vector<std::string_view> ids;ids.reserve(pairs.size());for(const auto& p:pairs)ids.emplace_back(p.id);
+        std::sort(ids.begin(),ids.end());const bool unique=std::adjacent_find(ids.begin(),ids.end())==ids.end();
+        std::vector<std::string_view>().swap(ids);
+        if(unique) {
+            const auto count=std::count(native.native_tsv.begin(),native.native_tsv.end(),'\n')+(!native.native_tsv.empty()&&native.native_tsv.back()!='\n');
+            if(std::size_t(count)!=pairs.size())throw std::runtime_error("native census row count");
+            CensusResult result;result.nominal_pairs.reserve(pairs.size());bool first=true;
+            ordered_text_chunks(native.native_tsv,std::min(threads,4),start,[&](const std::string& text,std::size_t offset){
+                const auto n=std::count(text.begin(),text.end(),'\n')+(!text.empty()&&text.back()!='\n');
+                std::vector<FamilyPair> block(pairs.begin()+offset-start,pairs.begin()+offset-start+n);
+                NativeResult part;part.native_tsv=text;return census(block,part,debug,1,offset);
+            },[&](CensusResult part){
+                const auto append=[&](std::string& target,const std::string& text){target+=first?text:text.substr(text.find('\n')+1);};
+                if(debug){append(result.nominal_tsv,part.nominal_tsv);append(result.full_tsv,part.full_tsv);}
+                result.proposed_edits_tsv+=part.proposed_edits_tsv;
+                for(auto& p:part.nominal_pairs)result.nominal_pairs.push_back(std::move(p));
+                for(auto& p:part.full_pairs)result.full_pairs.push_back(std::move(p));first=false;
+            });
+            if(!pairs.empty())return result;
+        }
+    }
     LikelihoodAccumulator nominal_pairs,full_pairs;
     std::ostringstream nominal,full,edits;nominal.precision(17);
     nominal<<"id\tfold\ti\tk\tq1_bin\tq2_bin\te1\te2\tbase1\trc_base2\tcertified\n";
@@ -58,7 +84,7 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
     }
     StringInputBuffer buffer(native.native_tsv);std::istream table(&buffer);std::string line;std::size_t row=0;
     while(std::getline(table,line)) {
-        if(row>=pairs.size())throw std::runtime_error("extra native row");const auto v=fields(line);const auto& p=pairs[row];const auto index=row++;
+        if(row>=pairs.size())throw std::runtime_error("extra native row");const auto v=fields(line);const auto& p=pairs[row];const auto index=start+row++;
         if(v[0]!=p.r[0].h||v[3]!=p.r[1].h||v[1]!=p.r[0].s||v[4]!=p.r[1].s)throw std::runtime_error("native census input registry");
         if(v[6]!="unmerged")continue;
         const auto rc=fqalign::reverse_complement(v[11]);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;

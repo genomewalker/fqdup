@@ -9,7 +9,7 @@ class RepairPipeline {
     std::shared_ptr<Impl> impl_;
 public:
     RepairPipeline(const std::string& nominal_prior,const std::string& full_prior);
-    RoutingResult route(const std::string& native_tsv,bool debug=true) const;
-    std::string repair(const std::string& input_tsv,int mode,double cutoff,std::size_t start=0) const;
+    RoutingResult route(const std::string& native_tsv,bool debug=true,int threads=1,std::size_t start=0) const;
+    std::string repair(const std::string& input_tsv,int mode,double cutoff,std::size_t start=0,int threads=1) const;
 };
 }

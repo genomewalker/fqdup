@@ -1,4 +1,5 @@
 #include "repair.hpp"
+#include "ordered_chunks.hpp"
 #include "string_input.hpp"
 #include <algorithm>
 #include <array>
@@ -33,8 +34,9 @@ struct RepairPipeline::Impl {
     Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
-RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug) const {
-    const auto& model=impl_->nominal;fqalign::QualityProcessor processor;StringInputBuffer buffer(native_tsv);std::istream input(&buffer);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=0;
+RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int threads,std::size_t start) const {
+    if(threads>1){RoutingResult result;ordered_text_chunks(native_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return route(chunk,debug,1,offset);},[&](RoutingResult part){result.routed_tsv+=part.routed_tsv;result.audit_tsv+=part.audit_tsv;result.routed.insert(result.routed.end(),part.routed.begin(),part.routed.end());for(auto& s:part.replacements)result.replacements.push_back(std::move(s));});return result;}
+    const auto& model=impl_->nominal;fqalign::QualityProcessor processor;StringInputBuffer buffer(native_tsv);std::istream input(&buffer);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=start;
     while(std::getline(input,line)) {
         auto v=split(line);if(v.size()!=13)throw std::runtime_error("route columns");bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;
         if(v[6]=="merged") {
@@ -58,8 +60,9 @@ RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug) co
     }
     result.routed_tsv=out.str();result.audit_tsv=audit.str();return result;
 }
-std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start) const {
+std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start,int threads) const {
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
+    if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1);},[&](std::string part){result+=part;});return result;}
     const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=start;
     while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;{
         NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false);
