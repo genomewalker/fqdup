@@ -33,7 +33,7 @@ struct RepairPipeline::Impl {
     Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
-RoutingResult RepairPipeline::route(const std::string& native_tsv) const {
+RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug) const {
     const auto& model=impl_->nominal;fqalign::QualityProcessor processor;StringInputBuffer buffer(native_tsv);std::istream input(&buffer);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=0;
     while(std::getline(input,line)) {
         auto v=split(line);if(v.size()!=13)throw std::runtime_error("route columns");bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;
@@ -52,13 +52,15 @@ RoutingResult RepairPipeline::route(const std::string& native_tsv) const {
                 if(valid&&worst>=.49){routed=true;reason="uncertain_merge";v[6]="unmerged";v[7]=v[0];v[8]=v[1].substr(0,insert);v[9]=v[2].substr(0,insert);v[10]=v[3];v[11]=v[4].substr(0,insert);v[12]=v[5].substr(0,insert);}
             }}
         }
-        audit<<row++<<'\t'<<routed<<'\t'<<insert<<'\t'<<worst<<'\t'<<reason<<'\n';for(std::size_t k=0;k<v.size();++k){if(k)out<<'\t';out<<v[k];}out<<'\n';result.routed.push_back(routed);
+        if(debug)audit<<row<<'\t'<<routed<<'\t'<<insert<<'\t'<<worst<<'\t'<<reason<<'\n';++row;
+        std::string replacement;if(routed||debug){for(std::size_t k=0;k<v.size();++k){if(k)replacement+='\t';replacement+=v[k];}replacement+='\n';}
+        if(debug)out<<replacement;result.routed.push_back(routed);result.replacements.push_back(routed?std::move(replacement):std::string());
     }
     result.routed_tsv=out.str();result.audit_tsv=audit.str();return result;
 }
-std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut) const {
+std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start) const {
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
-    const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=0;
+    const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=start;
     while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;{
         NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false);
         MergeRecord r;r.merged={v[7],v[8],v[9]};r.unmerged2={v[10],v[11],v[12]};
