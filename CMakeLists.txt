@@ -114,6 +114,15 @@ add_executable(fqdup
     src/split.cpp
     src/trim.cpp
     src/merge.cpp
+    src/merge_r8qkeep/cli.cpp
+    src/merge_r8qkeep/pipeline.cpp
+    src/merge_r8qkeep/family.cpp
+    src/merge_r8qkeep/native_xc.cpp
+    src/merge_r8qkeep/census.cpp
+    src/merge_r8qkeep/fdlibm.cpp
+    src/merge_r8qkeep/shortest_double.cpp
+    src/merge_r8qkeep/mixture_fit.cpp
+    src/merge_r8qkeep/repair.cpp
     src/profile.cpp
     src/damage_profile_estimate.cpp
     src/damage_profile_lsd.cpp
@@ -142,6 +151,16 @@ target_link_libraries(fqdup PRIVATE
 )
 target_compile_definitions(fqdup PRIVATE HAVE_BBHASH)
 target_compile_options(fqdup PRIVATE -O2 -march=${FQDUP_MARCH})
+
+# The native snapshot's headers must not change other subcommands' include paths.
+set_source_files_properties(src/merge_r8qkeep/native_xc.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/merge_r8qkeep/native_headers")
+set_source_files_properties(src/merge_r8qkeep/census.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/merge_r8qkeep/census_headers")
+set_source_files_properties(
+    src/merge_r8qkeep/fdlibm.cpp src/merge_r8qkeep/mixture_fit.cpp
+    src/merge_r8qkeep/census.cpp src/merge_r8qkeep/repair.cpp
+    src/merge_r8qkeep/pipeline.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 if(ISAL_INCLUDE_DIR AND ISAL_LIB)
     target_include_directories(fqdup PRIVATE ${ISAL_INCLUDE_DIR})

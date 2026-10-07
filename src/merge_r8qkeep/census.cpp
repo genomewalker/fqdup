@@ -1,6 +1,8 @@
 #include "census.hpp"
 #include "fdlibm.hpp"
 #include "shortest_double.hpp"
+#define fqalign fqdup_r8qkeep_census_alignment
+#define fqrepair fqdup_r8qkeep_census_repair
 #include "native_quality.hpp"
 #include "full_correspondence.hpp"
 #include "full_complexity.hpp"

@@ -1,3 +1,7 @@
+#define fqdup fqdup_r8qkeep_native_headers
+#define fqalign fqdup_r8qkeep_native_alignment
+#define fqquality fqdup_r8qkeep_native_quality
+#define fqrepair fqdup_r8qkeep_native_repair
 #include "fqdup/terminal_construct.hpp"
 #include "fqdup/quality_compatibility.hpp"
 #include "fqdup/adaptive_gap_evidence.hpp"
@@ -2757,6 +2761,10 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 
 
 } // namespace fqdup_native_xc_internal
+#undef fqdup
+#undef fqalign
+#undef fqquality
+#undef fqrepair
 #include "native.hpp"
 namespace fqdup::r8qkeep {
 NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSettings& settings) {

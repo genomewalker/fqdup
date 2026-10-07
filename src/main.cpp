@@ -18,6 +18,7 @@ int gen_main(int argc, char** argv);
 int view_main(int argc, char** argv);
 int trim_main(int argc, char** argv);
 int merge_main(int argc, char** argv);
+int merge_r8qkeep_main(int argc, char** argv);
 // consensus_main: TEMP DISABLED — WIP refactor (task #20). Stubbed to keep linker happy.
 static int consensus_main(int, char**) {
     std::cerr << "fqdup consensus: temporarily disabled (WIP refactor, task #20)\n";
@@ -66,7 +67,7 @@ int main(int argc, char** argv) {
     if (sub == "gen")         return gen_main(argc - 1, argv + 1);
     if (sub == "view")        return view_main(argc - 1, argv + 1);
     if (sub == "trim")        return trim_main(argc - 1, argv + 1);
-    if (sub == "merge")       return merge_main(argc - 1, argv + 1);
+    if (sub == "merge")       return merge_r8qkeep_main(argc - 1, argv + 1);
     if (sub == "consensus")   return consensus_main(argc - 1, argv + 1);
 
     if (sub == "-h" || sub == "--help") {
