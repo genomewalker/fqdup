@@ -25,8 +25,8 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
     const int concurrent=std::max(1,std::min(4,threads)),per_fit=std::max(1,threads/concurrent);
     for(int begin=0;begin<4;begin+=concurrent){std::array<std::future<std::optional<MixtureFit>>,4> futures;
-        for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<PairLikelihood> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(p);
-            if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit](){return fit_mixture(training,per_fit);});else fits[mode][f]=fit_mixture(training,per_fit);}
+        for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<const PairLikelihood*> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(&p);
+            if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit](){return fit_mixture_views(training,per_fit);});else fits[mode][f]=fit_mixture_views(training,per_fit);}
         if(concurrent>1)for(int k=begin;k<std::min(4,begin+concurrent);++k)fits[k/2][k%2]=futures[k].get();
     }
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");

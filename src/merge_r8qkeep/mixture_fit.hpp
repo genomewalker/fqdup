@@ -33,6 +33,7 @@ struct MixtureFit {
 };
 // Input pairs and folds must preserve the census's first-seen ordering.
 std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,int threads=1);
+std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads=1);
 std::vector<PairLikelihood> read_census_likelihood(std::istream& census);
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits);
 }

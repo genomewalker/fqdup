@@ -62,12 +62,16 @@ void LikelihoodAccumulator::add(const std::string& id,int fold,double e1,double 
     for(int j=1;j<mixture_components;++j)p.log_likelihood[j]+=flat_[j][agree?0:1];
 }
 std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,int threads) {
+    std::vector<const PairLikelihood*> view;view.reserve(pairs.size());for(const auto& pair:pairs)view.push_back(&pair);
+    return fit_mixture_views(view,threads);
+}
+std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads) {
     if(pairs.empty())return std::nullopt;
     threads=std::max(1,threads);
     std::vector<ExactExpCache> exp(threads);
     std::unordered_map<const Values*,std::size_t,BitsHash,BitsEqual> slots;
     std::vector<const Values*> keys;std::vector<std::size_t> group;group.reserve(pairs.size());
-    for(const auto& pair:pairs){const auto* key=&pair.log_likelihood;auto [it,inserted]=slots.emplace(key,keys.size());if(inserted)keys.push_back(key);group.push_back(it->second);}
+    for(const auto* pair:pairs){const auto* key=&pair->log_likelihood;auto [it,inserted]=slots.emplace(key,keys.size());if(inserted)keys.push_back(key);group.push_back(it->second);}
     struct Terms {Values responsibility;double log_sum=0;};
     std::vector<Terms> terms(keys.size());
     MixtureFit result;result.training_pairs=pairs.size();
