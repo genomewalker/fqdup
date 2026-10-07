@@ -4,6 +4,7 @@
 #include "family.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <fstream>
@@ -86,10 +87,23 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
     std::unordered_map<std::string, std::vector<int>> buckets;
     for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }
-    std::set<std::pair<int, int>> tested;
-    for (auto& [k, ids] : buckets) for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) {
-        int i = ids[x], j = ids[y]; if (!tested.insert({i, j}).second) continue;
-        if (mismatches(keys[i], keys[j]) <= MAXMIS) { int a = find(i), b = find(j); if (a != b) parent[a] = b; } }
+    // Reproduce the original unordered-bucket traversal and first pair encounter
+    // without retaining an O(candidate-pairs) tree. A pair is new iff it shares
+    // no earlier bucket; ranks require only BLOCKS integers per input pair.
+    std::vector<std::array<int,BLOCKS>> rank(n);for(auto& r:rank)r.fill(-1);
+    int next_rank=0;
+    for(const auto& [k,ids]:buckets){const int block=k[0]-'0';for(int i:ids)rank[i][block]=next_rank;++next_rank;}
+    int current_rank=0;std::uint64_t candidates=0,unique=0;
+    for (auto& [k, ids] : buckets) {
+        for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) {
+            int i=ids[x],j=ids[y];++candidates;bool earlier=false;
+            for(int block=0;block<BLOCKS;++block)if(rank[i][block]>=0&&rank[i][block]<current_rank&&rank[i][block]==rank[j][block]){earlier=true;break;}
+            if(earlier)continue;++unique;
+            if(mismatches(keys[i],keys[j])<=MAXMIS){int a=find(i),b=find(j);if(a!=b)parent[a]=b;}
+        }
+        ++current_rank;
+    }
+    if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_CANDIDATES pairs="<<n<<" buckets="<<buckets.size()<<" candidates="<<candidates<<" unique="<<unique<<" rank_bytes="<<rank.capacity()*sizeof(rank[0])<<'\n';
     std::vector<int> order; std::map<int, int> slot; std::vector<Group> groups;
     for (int i = 0; i < n; ++i) if (!keys[i].empty()) { int r = find(i); auto it = slot.find(r); if (it == slot.end()) { slot[r] = int(groups.size()); groups.push_back({}); it = slot.find(r); } groups[it->second].m.push_back(i); }
     std::vector<Group> out;
@@ -166,4 +180,3 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
 }
 std::vector<FamilyRead> read_family_fastq(const std::string& path) { return read_fastq(path); }
 }
-
