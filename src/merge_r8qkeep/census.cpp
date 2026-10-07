@@ -42,7 +42,8 @@ fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::
     return r;
 }
 }
-CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native) {
+CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug) {
+    LikelihoodAccumulator nominal_pairs,full_pairs;
     std::ostringstream nominal,full,edits;nominal.precision(17);
     nominal<<"id\tfold\ti\tk\tq1_bin\tq2_bin\te1\te2\tbase1\trc_base2\tcertified\n";
     full<<"id\tfold\ti\tk\tb1\tb2\te1\te2\ta\tb\tcert\n";
@@ -52,7 +53,7 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         const auto g=fqalign::quality_independent_geometry(a.s,b.s);if(!g.eligible)continue;
         const auto rc=fqalign::reverse_complement(b.s);const auto c=banded.align(a.s,rc,g.insert);if(!c.eligible)continue;
         const int f=fold(p);
-        for(auto [i,j]:c.invariant){if(a.s[i]=='N'||rc[j]=='N')continue;const int k=int(b.s.size())-1-j;const auto e1=fqalign::phred_error(a.q[i]),e2=fqalign::phred_error(b.q[k]);const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();nominal<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<bin(a.q[i])<<'\t'<<bin(b.q[k])<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<cert<<'\n';}
+        for(auto [i,j]:c.invariant){if(a.s[i]=='N'||rc[j]=='N')continue;const int k=int(b.s.size())-1-j;const auto e1=fqalign::phred_error(a.q[i]),e2=fqalign::phred_error(b.q[k]);nominal_pairs.add(p.id,f,e1,e2,a.s[i]==rc[j]);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();nominal<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<bin(a.q[i])<<'\t'<<bin(b.q[k])<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<cert<<'\n';}}
     }
     std::istringstream table(native.native_tsv);std::string line;std::size_t row=0;
     while(std::getline(table,line)) {
@@ -60,12 +61,12 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         if(v[0]!=p.r[0].h||v[3]!=p.r[1].h||v[1]!=p.r[0].s||v[4]!=p.r[1].s)throw std::runtime_error("native census input registry");
         if(v[6]!="unmerged")continue;
         const auto rc=fqalign::reverse_complement(v[11]);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;
-        if(c.eligible){const int f=fold(p),length=int(v[11].size());for(auto [i,j]:c.invariant){const int k=length-1-j,q1=int(static_cast<unsigned char>(p.r[0].q[i]))-33,q2=int(static_cast<unsigned char>(p.r[1].q[k]))-33;const double e1=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q1/10.0))),e2=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q2/10.0)));const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();full<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<q1/5<<'\t'<<q2/5<<'\t'<<shortest_double(e1)<<'\t'<<shortest_double(e2)<<'\t'<<p.r[0].s[i]<<'\t'<<fqalign::reverse_complement(std::string(1,p.r[1].s[k]))<<'\t'<<cert<<'\n';}}
+        if(c.eligible){const int f=fold(p),length=int(v[11].size());for(auto [i,j]:c.invariant){const int k=length-1-j,q1=int(static_cast<unsigned char>(p.r[0].q[i]))-33,q2=int(static_cast<unsigned char>(p.r[1].q[k]))-33;const double e1=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q1/10.0))),e2=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q2/10.0)));const char b=fqalign::reverse_complement(std::string(1,p.r[1].s[k]))[0];full_pairs.add(p.id,f,e1,e2,p.r[0].s[i]==b);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();full<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<q1/5<<'\t'<<q2/5<<'\t'<<shortest_double(e1)<<'\t'<<shortest_double(e2)<<'\t'<<p.r[0].s[i]<<'\t'<<b<<'\t'<<cert<<'\n';}}}
         const auto proposed=fqrepair::full_trusted_correspondence(v[8],rc);edits<<index<<'\t'<<proposed.eligible<<'\t'<<proposed.reason<<'\t'<<proposed.invariant.size()<<'\t';bool first=true;
         if(proposed.eligible)for(auto [i,j]:proposed.invariant){const int k=int(v[11].size())-1-j;const char a=v[8].at(i),b=rc.at(j);const int q1=int(static_cast<unsigned char>(v[9].at(i)))-33,q2=int(static_cast<unsigned char>(v[12].at(k)))-33;if(a=='N'||b=='N'||a==b||q1==q2)continue;const int mate=q1<q2?1:2,pos=mate==1?i:k,donor=mate==1?k:i;const char base=mate==1?b:fqalign::reverse_complement(std::string(1,a))[0];if(!first)edits<<';';first=false;edits<<mate<<':'<<pos<<':'<<donor<<':'<<base<<':'<<std::max(1,std::abs(q1-q2));}
         edits<<'\n';
     }
     if(row!=pairs.size())throw std::runtime_error("missing native row");
-    return {nominal.str(),full.str(),edits.str()};
+    return {debug?nominal.str():"",debug?full.str():"",edits.str(),nominal_pairs.take(),full_pairs.take()};
 }
 }
