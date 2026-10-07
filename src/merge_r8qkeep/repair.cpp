@@ -1,4 +1,5 @@
 #include "repair.hpp"
+#include "string_input.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -33,7 +34,7 @@ struct RepairPipeline::Impl {
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
 RoutingResult RepairPipeline::route(const std::string& native_tsv) const {
-    const auto& model=impl_->nominal;fqalign::QualityProcessor processor;std::istringstream input(native_tsv);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=0;
+    const auto& model=impl_->nominal;fqalign::QualityProcessor processor;StringInputBuffer buffer(native_tsv);std::istream input(&buffer);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=0;
     while(std::getline(input,line)) {
         auto v=split(line);if(v.size()!=13)throw std::runtime_error("route columns");bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;
         if(v[6]=="merged") {
@@ -57,7 +58,7 @@ RoutingResult RepairPipeline::route(const std::string& native_tsv) const {
 }
 std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut) const {
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
-    const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;std::istringstream input(input_tsv);std::ostringstream output;std::string line;std::size_t index=0;
+    const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=0;
     while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;{
         NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false);
         MergeRecord r;r.merged={v[7],v[8],v[9]};r.unmerged2={v[10],v[11],v[12]};

@@ -1,4 +1,5 @@
 #include "census.hpp"
+#include "string_input.hpp"
 #include "fdlibm.hpp"
 #include "shortest_double.hpp"
 #define fqalign fqdup_r8qkeep_census_alignment
@@ -55,7 +56,7 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         const int f=fold(p);
         for(auto [i,j]:c.invariant){if(a.s[i]=='N'||rc[j]=='N')continue;const int k=int(b.s.size())-1-j;const auto e1=fqalign::phred_error(a.q[i]),e2=fqalign::phred_error(b.q[k]);nominal_pairs.add(p.id,f,e1,e2,a.s[i]==rc[j]);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();nominal<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<bin(a.q[i])<<'\t'<<bin(b.q[k])<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<cert<<'\n';}}
     }
-    std::istringstream table(native.native_tsv);std::string line;std::size_t row=0;
+    StringInputBuffer buffer(native.native_tsv);std::istream table(&buffer);std::string line;std::size_t row=0;
     while(std::getline(table,line)) {
         if(row>=pairs.size())throw std::runtime_error("extra native row");const auto v=fields(line);const auto& p=pairs[row];const auto index=row++;
         if(v[0]!=p.r[0].h||v[3]!=p.r[1].h||v[1]!=p.r[0].s||v[4]!=p.r[1].s)throw std::runtime_error("native census input registry");

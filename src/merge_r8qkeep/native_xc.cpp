@@ -2768,7 +2768,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #include "native.hpp"
 #include "memory_status.hpp"
 namespace fqdup::r8qkeep {
-NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSettings& settings,bool trace) {
+static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, const NativeSettings& settings,bool trace,bool audit) {
     using namespace ::fqdup_native_xc_internal;
     const auto memory=[&](const char* name){if(trace)std::cerr<<"MERGE_MEMORY native_"<<name<<memory_status()<<'\n';};
     memory("start");
@@ -2800,11 +2800,11 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
     MergeBatch batch;
     if (!out.pop_ordered(0, batch)) throw std::runtime_error("native batch missing");
     memory("batch_ready");
-    NativeResult result; result.outcomes_jsonl = batch.outcomes_jsonl;
+    NativeResult result;if(audit)result.outcomes_jsonl = batch.outcomes_jsonl;
     auto append = [](std::string& text, const FastqRecord& r) {
         text += r.header + "\n" + r.seq + "\n" + r.plus + "\n" + r.qual + "\n";
     };
-    for (const auto& record : batch.records) {
+    if(audit)for (const auto& record : batch.records) {
         if (record.is_merged) { if (!record.merged.seq.empty()) append(result.merged_fq, record.merged); }
         else if (record.is_orphan) { if (!record.merged.seq.empty()) append(result.orphan_fq, record.merged); }
         else {
@@ -2815,7 +2815,7 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
     std::istringstream outcomes(batch.outcomes_jsonl); std::string line;
     memory("parent_strings");
     std::size_t row = 0, emitted = 0;
-    result.native_outcomes_json = "[";
+    if(audit)result.native_outcomes_json = "[";
     while (std::getline(outcomes, line)) {
         if (row >= pairs.size()) throw std::runtime_error("extra native disposition");
         const auto marker = line.rfind(",\"outcome\":\"");
@@ -2832,12 +2832,25 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
         }
         for (std::size_t i=0;i<fields.size();++i) { if(i)result.native_tsv += '\t';result.native_tsv += fields[i]; }
         result.native_tsv += '\n';
-        if(row)result.native_outcomes_json += ',';
-        result.native_outcomes_json += line; ++row;
+        if(audit){if(row)result.native_outcomes_json += ',';result.native_outcomes_json += line;}++row;
     }
     if(row != pairs.size() || emitted != batch.records.size()) throw std::runtime_error("native disposition cardinality");
-    result.native_outcomes_json += "]\n";
+    if(audit)result.native_outcomes_json += "]\n";
     memory("serialized");
+    return result;
+}
+NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit){
+    NativeResult result;if(audit)result.native_outcomes_json="[";
+    bool first=true;
+    for(std::size_t begin=0;begin<pairs.size();begin+=PAIR_BATCH_SZ){const auto end=std::min(pairs.size(),begin+PAIR_BATCH_SZ);
+        std::vector<FamilyPair> chunk(pairs.begin()+begin,pairs.begin()+end);
+        auto part=merge_native_chunk(chunk,settings,trace&&begin==0,audit);
+        result.native_tsv+=part.native_tsv;
+        if(audit){result.merged_fq+=part.merged_fq;result.r1_fq+=part.r1_fq;result.r2_fq+=part.r2_fq;result.orphan_fq+=part.orphan_fq;result.outcomes_jsonl+=part.outcomes_jsonl;
+            if(!first)result.native_outcomes_json+=',';result.native_outcomes_json+=part.native_outcomes_json.substr(1,part.native_outcomes_json.size()-3);first=false;}
+    }
+    if(audit)result.native_outcomes_json+="]\n";
+    if(trace)std::cerr<<"MERGE_MEMORY native_chunks_done"<<memory_status()<<'\n';
     return result;
 }
 }

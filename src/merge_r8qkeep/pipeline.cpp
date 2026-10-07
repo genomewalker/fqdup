@@ -1,5 +1,6 @@
 #include "pipeline.hpp"
 #include "memory_status.hpp"
+#include "string_input.hpp"
 #include <algorithm>
 #include <array>
 #include <future>
@@ -10,14 +11,14 @@
 namespace fqdup::r8qkeep {
 namespace {
 std::vector<std::string> fields(const std::string& line){std::vector<std::string> out;std::size_t begin=0;for(;;){const auto end=line.find('\t',begin);out.push_back(line.substr(begin,end==std::string::npos?end:end-begin));if(end==std::string::npos)return out;begin=end+1;}}
-std::vector<std::string> rows(const std::string& text){std::istringstream input(text);std::vector<std::string> out;std::string line;while(std::getline(input,line))out.push_back(std::move(line));return out;}
+std::vector<std::string> rows(const std::string& text){StringInputBuffer buffer(text);std::istream input(&buffer);std::vector<std::string> out;std::string line;while(std::getline(input,line))out.push_back(std::move(line));return out;}
 std::string id(const std::string& h){auto space=h.find_first_of(" \t");auto s=h.substr(1,space==std::string::npos?space:space-1);if(s.size()>2&&s[s.size()-2]=='/'&&(s.back()=='1'||s.back()=='2'))s.resize(s.size()-2);return s;}
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
-    LibraryPipeline out;out.family=correct_family(std::move(r1),std::move(r2));stage("family");out.native=merge_native(out.family.pairs,settings,timings||debug);stage("native");out.observations=census(out.family.pairs,out.native,debug);stage("census");
+    LibraryPipeline out;out.family=correct_family(std::move(r1),std::move(r2));stage("family");out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");out.observations=census(out.family.pairs,out.native,debug);stage("census");
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
     const int concurrent=std::max(1,std::min(4,threads)),per_fit=std::max(1,threads/concurrent);
