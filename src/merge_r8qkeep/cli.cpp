@@ -1,4 +1,5 @@
 #include "pipeline.hpp"
+#include "memory_status.hpp"
 #include "fqdup/fastq_types.hpp"
 #include <algorithm>
 #include <cmath>
@@ -35,7 +36,7 @@ int merge_r8qkeep_main(int argc,char** argv){
         if(multiple)for(const auto& text:cuts)if(!std::filesystem::create_directory(out/text))throw std::runtime_error("duplicate cutoff directory");
         auto library=prepare_library(input(r1),input(r2),settings,threads,debug,timings);
         std::mutex report_mutex;
-        const auto emit=[&](std::size_t i){const auto start=std::chrono::steady_clock::now();auto final=emit_library(library,number(cuts[i]));const auto target=multiple?out/cuts[i]:out;write(target/"merged.fq",final.merged);write(target/"r1.fq",final.r1);write(target/"r2.fq",final.r2);write(target/"orphan.fq",final.orphan);write(target/"outcomes.jsonl",final.outcomes);if(timings){std::lock_guard<std::mutex> lock(report_mutex);std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<cuts[i]<<" seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<'\n';}};
+        const auto emit=[&](std::size_t i){const auto start=std::chrono::steady_clock::now();auto final=emit_library(library,number(cuts[i]));const auto target=multiple?out/cuts[i]:out;write(target/"merged.fq",final.merged);write(target/"r1.fq",final.r1);write(target/"r2.fq",final.r2);write(target/"orphan.fq",final.orphan);write(target/"outcomes.jsonl",final.outcomes);if(timings||debug){std::lock_guard<std::mutex> lock(report_mutex);std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<cuts[i]<<" seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<memory_status()<<'\n';}};
         for(std::size_t begin=0;begin<cuts.size();begin+=threads){std::vector<std::future<void>> pending;for(std::size_t i=begin;i<std::min(cuts.size(),begin+std::size_t(threads));++i){if(threads==1)emit(i);else pending.push_back(std::async(std::launch::async,emit,i));}for(auto& job:pending)job.get();}
         if(debug){std::filesystem::create_directory(out/"debug");write(out/"debug"/"family-edits.tsv",library.family.edits_tsv);write(out/"debug"/"families.tsv",library.family.families_tsv);write(out/"debug"/"stats.json",library.family.stats_json);write(out/"debug"/"native.tsv",library.native.native_tsv);write(out/"debug"/"nominal.tsv",library.observations.nominal_tsv);write(out/"debug"/"full.tsv",library.observations.full_tsv);write(out/"debug"/"proposed-edits.tsv",library.observations.proposed_edits_tsv);write(out/"debug"/"nominal.txt",library.nominal_prior);write(out/"debug"/"full.txt",library.full_prior);write(out/"debug"/"routed.tsv",library.routing.routed_tsv);write(out/"debug"/"route-audit.tsv",library.routing.audit_tsv);}
         return 0;

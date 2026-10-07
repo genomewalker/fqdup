@@ -2766,9 +2766,12 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #undef fqquality
 #undef fqrepair
 #include "native.hpp"
+#include "memory_status.hpp"
 namespace fqdup::r8qkeep {
-NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSettings& settings) {
+NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSettings& settings,bool trace) {
     using namespace ::fqdup_native_xc_internal;
+    const auto memory=[&](const char* name){if(trace)std::cerr<<"MERGE_MEMORY native_"<<name<<memory_status()<<'\n';};
+    memory("start");
     MergeOpts opts;
     opts.adapter1 = settings.adapter1;
     opts.adapter2 = settings.adapter2;
@@ -2790,11 +2793,13 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
         native.r2.plus = "+"; native.r2.qual = pair.r[1].q;
         input.pairs.push_back(std::move(native));
     }
+    memory("input_copied");
     PairQueue in(1); MergeOutQueue out(1);
     in.push(std::move(input)); in.set_done();
     merge_worker(in, out, opts, nullptr, nullptr);
     MergeBatch batch;
     if (!out.pop_ordered(0, batch)) throw std::runtime_error("native batch missing");
+    memory("batch_ready");
     NativeResult result; result.outcomes_jsonl = batch.outcomes_jsonl;
     auto append = [](std::string& text, const FastqRecord& r) {
         text += r.header + "\n" + r.seq + "\n" + r.plus + "\n" + r.qual + "\n";
@@ -2808,6 +2813,7 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
         }
     }
     std::istringstream outcomes(batch.outcomes_jsonl); std::string line;
+    memory("parent_strings");
     std::size_t row = 0, emitted = 0;
     result.native_outcomes_json = "[";
     while (std::getline(outcomes, line)) {
@@ -2831,6 +2837,7 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs, const NativeSett
     }
     if(row != pairs.size() || emitted != batch.records.size()) throw std::runtime_error("native disposition cardinality");
     result.native_outcomes_json += "]\n";
+    memory("serialized");
     return result;
 }
 }
