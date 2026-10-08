@@ -8,6 +8,25 @@
 #include <cstdio>
 #include <ctime>
 namespace fqdup::r8qkeep {
+// Index ranges borrow records directly; no per-row TSV or string copies.
+template<class Work,class Consume>
+void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
+    const int workers=std::max(1,std::min(threads,8));
+    const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
+    using Result=decltype(work(row_offset,std::size_t{}));
+    const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
+    const auto start=std::chrono::steady_clock::now();std::size_t chunks=0,pos=0;
+    while(pos<count){
+        std::vector<std::future<Result>> pending;pending.reserve(workers);
+        for(int w=0;w<workers&&pos<count;++w){
+            const auto begin=pos,n=std::min(chunk_rows,count-pos);pos+=n;++chunks;
+            pending.push_back(std::async(std::launch::async,[&,begin,n]{return work(row_offset+begin,n);}));
+        }
+        for(auto& result:pending)consume(result.get());
+    }
+    if(profile)std::fprintf(stderr,"CHUNK_PROFILE stage=%s workers=%d chunk_rows=%zu max_inflight=%d rows=%zu chunks=%zu wall=%.6f\n",label,workers,chunk_rows,workers,count,chunks,std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+}
+
 // Bound outstanding row chunks and consume results in original input order.
 template<class Work,class Consume>
 void ordered_text_chunks(const std::string& text,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="chunks") {

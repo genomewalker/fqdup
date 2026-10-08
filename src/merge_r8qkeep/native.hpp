@@ -1,5 +1,6 @@
 #pragma once
 #include "family.hpp"
+#include "stage_records.hpp"
 namespace fqdup::r8qkeep {
 struct NativeSettings {
     std::string adapter1 = "AGATCGGAAGAGCACACGTCTGAACTCCAG";
@@ -10,6 +11,7 @@ struct NativeSettings {
     float max_mismatch_rate = 0.08f;
 };
 struct NativeResult {
+    std::vector<NativeRecord> records;
     std::string merged_fq, r1_fq, r2_fq, orphan_fq, outcomes_jsonl;
     std::string native_tsv, native_outcomes_json;
 };

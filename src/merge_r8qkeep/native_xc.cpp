@@ -2800,7 +2800,7 @@ static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, con
     MergeBatch batch;
     if (!out.pop_ordered(0, batch)) throw std::runtime_error("native batch missing");
     memory("batch_ready");
-    NativeResult result;if(audit)result.outcomes_jsonl = batch.outcomes_jsonl;
+    NativeResult result;result.records.reserve(pairs.size());if(audit)result.outcomes_jsonl = batch.outcomes_jsonl;
     auto append = [](std::string& text, const FastqRecord& r) {
         text += r.header + "\n" + r.seq + "\n" + r.plus + "\n" + r.qual + "\n";
     };
@@ -2823,15 +2823,15 @@ static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, con
         const auto begin = marker + 12;
         const std::string kind = line.substr(begin, line.find('"', begin) - begin);
         const auto& pair = pairs[row];
-        std::array<std::string,13> fields{pair.r[0].h,pair.r[0].s,pair.r[0].q,pair.r[1].h,pair.r[1].s,pair.r[1].q,kind,"","","","","",""};
+        NativeRecord native;native.raw=&pair;native.outcome=kind;
         if (kind != "dropped") {
             if (emitted >= batch.records.size()) throw std::runtime_error("missing native output");
-            const auto& record = batch.records[emitted++];
-            fields[7] = record.merged.header; fields[8] = record.merged.seq; fields[9] = record.merged.qual;
-            if (kind == "unmerged") { fields[10] = record.unmerged2.header; fields[11] = record.unmerged2.seq; fields[12] = record.unmerged2.qual; }
+            auto& record = batch.records[emitted++];
+            native.first={std::move(record.merged.header),std::move(record.merged.seq),std::move(record.merged.qual)};
+            if(kind=="unmerged")native.second={std::move(record.unmerged2.header),std::move(record.unmerged2.seq),std::move(record.unmerged2.qual)};
         }
-        for (std::size_t i=0;i<fields.size();++i) { if(i)result.native_tsv += '\t';result.native_tsv += fields[i]; }
-        result.native_tsv += '\n';
+        if(audit)result.native_tsv+=native_record_tsv(native);
+        result.records.push_back(std::move(native));
         if(audit){if(row)result.native_outcomes_json += ',';result.native_outcomes_json += line;}++row;
     }
     if(row != pairs.size() || emitted != batch.records.size()) throw std::runtime_error("native disposition cardinality");
@@ -2840,12 +2840,13 @@ static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, con
     return result;
 }
 NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit){
-    NativeResult result;if(audit)result.native_outcomes_json="[";
+    NativeResult result;result.records.reserve(pairs.size());if(audit)result.native_outcomes_json="[";
     bool first=true;
     for(std::size_t begin=0;begin<pairs.size();begin+=PAIR_BATCH_SZ){const auto end=std::min(pairs.size(),begin+PAIR_BATCH_SZ);
         std::vector<FamilyPair> chunk(pairs.begin()+begin,pairs.begin()+end);
         auto part=merge_native_chunk(chunk,settings,trace&&begin==0,audit);
-        result.native_tsv+=part.native_tsv;
+        if(audit)result.native_tsv+=part.native_tsv;
+        for(std::size_t i=0;i<part.records.size();++i){part.records[i].raw=&pairs[begin+i];result.records.push_back(std::move(part.records[i]));}
         if(audit){result.merged_fq+=part.merged_fq;result.r1_fq+=part.r1_fq;result.r2_fq+=part.r2_fq;result.orphan_fq+=part.orphan_fq;result.outcomes_jsonl+=part.outcomes_jsonl;
             if(!first)result.native_outcomes_json+=',';result.native_outcomes_json+=part.native_outcomes_json.substr(1,part.native_outcomes_json.size()-3);first=false;}
     }

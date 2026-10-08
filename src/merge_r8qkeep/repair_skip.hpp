@@ -3,7 +3,7 @@
 struct RepairSkipBound {
     static constexpr int64_t scale=1000000000000LL;
     explicit RepairSkipBound(const fqquality::PairMixture&) {}
-    static bool supported(const std::vector<std::string>& v) {
+    template<class Row> static bool supported(const Row& v) {
         if(v.size()!=13||v[6]!="merged"||v[8].empty()||v[8].size()>512||v[8].size()!=v[9].size())return false;
         if(v[1].size()!=v[2].size()||v[4].size()!=v[5].size())return false;
         if(!std::numeric_limits<double>::is_iec559||std::fegetround()!=FE_TONEAREST)return false;
@@ -14,7 +14,7 @@ struct RepairSkipBound {
     // Called only with the router's fitted nominal posterior and correspondence,
     // when eligible geometry has insert == emitted length. These are exactly the
     // inputs the mode-9 guard recomputes. Cache a sum, never 66 weights per row.
-    static int64_t weighted_sum(const std::vector<std::string>& v,
+    template<class Row> static int64_t weighted_sum(const Row& v,
                                const fqalign::PairRisk& pr,
                                const fqquality::PairMixture::Audit& audit) {
         if(!supported(v)||!pr.correspondence.eligible||!audit.supported)return -1;
@@ -48,7 +48,7 @@ struct RepairSkipBound {
         for(size_t i=0;i<v[8].size();++i)sum+=int64_t(std::floor(upper[i]*scale+.5));
         return sum;
     }
-    bool unchanged(const std::vector<std::string>& v,const fqquality::PairMixture& model,double cut,int64_t cached=-1) const {
+    template<class Row> bool unchanged(const Row& v,const fqquality::PairMixture& model,double cut,int64_t cached=-1) const {
         if(v.size()!=13||!std::isfinite(cut)||cut<0||cut>1)return false;
         if(v[6]=="dropped")return true;
         if(!supported(v))return false;
@@ -67,7 +67,7 @@ inline std::string serialize_repair(const Batch& batch,size_t index){
     const auto& r=batch.records.back();const char* outcome=r.is_merged?"merged":r.is_orphan?(r.orphan_r1?"orphan_r1":"orphan_r2"):"unmerged";
     out<<outcome<<'\t'<<r.merged.header<<'\t'<<r.merged.seq<<'\t'<<r.merged.qual<<'\t'<<r.unmerged2.header<<'\t'<<r.unmerged2.seq<<'\t'<<r.unmerged2.qual<<'\n';return out.str();
 }
-inline std::string native_full_span(const std::vector<std::string>& v,size_t index){
+template<class Row> inline std::string native_full_span(const Row& v,size_t index){
     Batch batch;if(v[6]=="dropped")return serialize_repair(batch,index);
     MergeRecord r;r.merged={v[7],v[8],v[9]};r.unmerged2={v[10],v[11],v[12]};r.is_merged=v[6]=="merged";r.is_orphan=v[6]=="orphan_r1"||v[6]=="orphan_r2";r.orphan_r1=v[6]=="orphan_r1";
     const auto tag=[](Record& rec,const char* channel,int mate){if(rec.seq.empty())return;rec.header+=" FQT=v1;ch="+std::string(channel)+";m="+std::to_string(mate)+";olen="+std::to_string(rec.seq.size())+";s=0;e="+std::to_string(rec.seq.size());};

@@ -18,11 +18,6 @@
 #include <stdexcept>
 namespace fqdup::r8qkeep {
 namespace {
-std::array<std::string,13> fields(const std::string& line) {
-    std::array<std::string,13> out;std::size_t begin=0;
-    for(std::size_t i=0;i<out.size();++i){const auto end=line.find('\t',begin);out[i]=line.substr(begin,end==std::string::npos?end:end-begin);if(i+1<out.size()&&end==std::string::npos)throw std::runtime_error("native column count");if(i+1==out.size()&&end!=std::string::npos)throw std::runtime_error("extra native columns");begin=end==std::string::npos?line.size():end+1;}
-    return out;
-}
 int fold(const FamilyPair& p) {std::uint64_t h=14695981039346656037ULL;for(unsigned char c:p.r[0].s+"|"+p.r[1].s){h^=c;h*=1099511628211ULL;}return h&1;}
 int bin(char q) {const int edges[]={0,3,8,13,18,23,28,33,38,94},v=int(static_cast<unsigned char>(q))-33;int k=0;while(k<8&&v>=edges[k+1])++k;return k;}
 fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::string& a,const std::string& b) {
@@ -46,6 +41,9 @@ fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::
 }
 }
 CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start) {
+    ParsedNativeRecords parsed;
+    if(native.records.empty()&&!native.native_tsv.empty())parsed=parse_native_records(native.native_tsv);
+    const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
     if(threads>1) {
         // Duplicate IDs share an accumulator in the frozen serial algorithm.
         // Keep that path unchanged; otherwise each pair's sums are independent.
@@ -53,13 +51,12 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         std::sort(ids.begin(),ids.end());const bool unique=std::adjacent_find(ids.begin(),ids.end())==ids.end();
         std::vector<std::string_view>().swap(ids);
         if(unique) {
-            const auto count=std::count(native.native_tsv.begin(),native.native_tsv.end(),'\n')+(!native.native_tsv.empty()&&native.native_tsv.back()!='\n');
+            const auto count=native_rows.size();
             if(std::size_t(count)!=pairs.size())throw std::runtime_error("native census row count");
             CensusResult result;result.nominal_pairs.reserve(pairs.size());bool first=true;
-            ordered_text_chunks(native.native_tsv,std::min(threads,4),start,[&](const std::string& text,std::size_t offset){
-                const auto n=std::count(text.begin(),text.end(),'\n')+(!text.empty()&&text.back()!='\n');
+            ordered_index_chunks(native_rows.size(),std::min(threads,4),start,[&](std::size_t offset,std::size_t n){
                 std::vector<FamilyPair> block(pairs.begin()+offset-start,pairs.begin()+offset-start+n);
-                NativeResult part;part.native_tsv=text;return census(block,part,debug,1,offset);
+                NativeResult part;const auto range=native_rows.slice(offset-start,n);part.records.assign(range.begin(),range.end());return census(block,part,debug,1,offset);
             },[&](CensusResult part){
                 const auto append=[&](std::string& target,const std::string& text){target+=first?text:text.substr(text.find('\n')+1);};
                 if(debug){append(result.nominal_tsv,part.nominal_tsv);append(result.full_tsv,part.full_tsv);}
@@ -82,9 +79,9 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         const int f=fold(p);
         for(auto [i,j]:c.invariant){if(a.s[i]=='N'||rc[j]=='N')continue;const int k=int(b.s.size())-1-j;const auto e1=fqalign::phred_error(a.q[i]),e2=fqalign::phred_error(b.q[k]);nominal_pairs.add(p.id,f,e1,e2,a.s[i]==rc[j]);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();nominal<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<bin(a.q[i])<<'\t'<<bin(b.q[k])<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<cert<<'\n';}}
     }
-    StringInputBuffer buffer(native.native_tsv);std::istream table(&buffer);std::string line;std::size_t row=0;
-    while(std::getline(table,line)) {
-        if(row>=pairs.size())throw std::runtime_error("extra native row");const auto v=fields(line);const auto& p=pairs[row];const auto index=start+row++;
+    std::size_t row=0;
+    for(const auto& v:native_rows) {
+        if(row>=pairs.size())throw std::runtime_error("extra native row");const auto& p=pairs[row];const auto index=start+row++;
         if(v[0]!=p.r[0].h||v[3]!=p.r[1].h||v[1]!=p.r[0].s||v[4]!=p.r[1].s)throw std::runtime_error("native census input registry");
         if(v[6]!="unmerged")continue;
         const auto rc=fqalign::reverse_complement(v[11]);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;
