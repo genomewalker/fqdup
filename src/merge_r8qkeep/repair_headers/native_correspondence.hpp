@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "alignment_cache.hpp"
 namespace fqalign {
 // Same alignment space/score/band/delta/cap as gapped_corr.py.
 // Enumeration stops at cap+1: rejected counts are lower bounds, never exact claims.
@@ -25,6 +26,9 @@ class BandedCorrespondence {
  static int sub(char a,char b) {return a==b&&a!='N'?1:-1;}
  public:
  Correspondence align(const std::string&a,const std::string&b,int insert) {
+  return alignment_cache::get<BandedCorrespondence>(a,b,insert,[&]{return align_uncached(a,b,insert);});
+ }
+ Correspondence align_uncached(const std::string&a,const std::string&b,int insert) {
   Correspondence out;
   if(a.size()>512||b.size()>512){out.reason="unsupported_read_length";return out;}
   if(a.empty()||b.empty()){out.reason="empty_read";return out;}

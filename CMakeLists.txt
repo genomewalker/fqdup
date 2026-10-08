@@ -259,3 +259,8 @@ add_executable(test_task24_lookup_tables tests/task24_lookup_tables.cpp)
 target_compile_options(test_task24_lookup_tables PRIVATE -ffp-contract=off)
 target_link_libraries(test_task24_lookup_tables PRIVATE Threads::Threads)
 add_test(NAME task24_lookup_tables COMMAND test_task24_lookup_tables)
+
+add_executable(test_task24_alignment_cache tests/task24_alignment_cache.cpp)
+target_compile_options(test_task24_alignment_cache PRIVATE -ffp-contract=off)
+target_link_libraries(test_task24_alignment_cache PRIVATE Threads::Threads)
+add_test(NAME task24_alignment_cache COMMAND test_task24_alignment_cache)

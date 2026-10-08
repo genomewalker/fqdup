@@ -31,16 +31,23 @@ fqquality::PairMixture model(const std::string& text){std::istringstream input(t
 namespace fqdup::r8qkeep {
 using namespace ::fqdup_r8qkeep_repair_internal;
 #include "repair_skip.hpp"
+struct RepairAlignmentCache::Impl {
+    std::size_t start;
+    std::vector<alignment_cache::Pair> pairs;
+    Impl(std::size_t s,std::size_t n):start(s),pairs(n){}
+};
+RepairAlignmentCache::RepairAlignmentCache(std::size_t s,std::size_t n):impl_(std::make_shared<Impl>(s,n)){}
 struct RepairPipeline::Impl {
     fqquality::PairMixture nominal,full;
     RepairSkipBound bound;
     Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)),bound(nominal){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
-RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int threads,std::size_t start) const {
-    if(threads>1){RoutingResult result;ordered_text_chunks(native_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return route(chunk,debug,1,offset);},[&](RoutingResult part){result.routed_tsv+=part.routed_tsv;result.audit_tsv+=part.audit_tsv;result.routed.insert(result.routed.end(),part.routed.begin(),part.routed.end());result.repair_bounds.insert(result.repair_bounds.end(),part.repair_bounds.begin(),part.repair_bounds.end());for(auto& s:part.replacements)result.replacements.push_back(std::move(s));},"router");return result;}
+RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int threads,std::size_t start,RepairAlignmentCache* cache) const {
+    if(threads>1){RoutingResult result;ordered_text_chunks(native_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return route(chunk,debug,1,offset,cache);},[&](RoutingResult part){result.routed_tsv+=part.routed_tsv;result.audit_tsv+=part.audit_tsv;result.routed.insert(result.routed.end(),part.routed.begin(),part.routed.end());result.repair_bounds.insert(result.repair_bounds.end(),part.repair_bounds.begin(),part.repair_bounds.end());for(auto& s:part.replacements)result.replacements.push_back(std::move(s));},"router");return result;}
     const auto& model=impl_->nominal;fqalign::QualityProcessor processor;StringInputBuffer buffer(native_tsv);std::istream input(&buffer);std::ostringstream out,audit;RoutingResult result;std::string line;std::size_t row=start;
     while(std::getline(input,line)) {
+        alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(row-cache->impl_->start):nullptr);
         auto v=split(line);if(v.size()!=13)throw std::runtime_error("route columns");bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;int64_t repair_bound=-1;
         if(v[6]=="merged") {
             insert=v[8].size();reason="geometry_abstain";const auto g=fqalign::quality_independent_geometry(v[1],v[4]);
@@ -64,11 +71,11 @@ RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int
     }
     result.routed_tsv=out.str();result.audit_tsv=audit.str();return result;
 }
-std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start,int threads,RepairShadow* shadow,const std::vector<bool>* excluded,const std::vector<int64_t>* repair_bounds) const {
+std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start,int threads,RepairShadow* shadow,const std::vector<bool>* excluded,const std::vector<int64_t>* repair_bounds,RepairAlignmentCache* cache) const {
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
-    if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1,shadow,excluded,repair_bounds);},[&](std::string part){result+=part;},mode==9?"repair9":"repair7");return result;}
+    if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1,shadow,excluded,repair_bounds,cache);},[&](std::string part){result+=part;},mode==9?"repair9":"repair7");return result;}
     const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=start;
-    while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;
+    while(std::getline(input,line)){alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(index-cache->impl_->start):nullptr);const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;
     const bool candidate=mode==9&&(!excluded||!excluded->at(index));
     const bool skip=candidate&&impl_->bound.unchanged(v,model,cut,repair_bounds?repair_bounds->at(index):-1);
     const std::string predicted=(skip||(candidate&&shadow))?native_full_span(v,index):std::string();

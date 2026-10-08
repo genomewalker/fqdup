@@ -46,7 +46,7 @@ struct Geometry {
 };
 // Frozen Phase-A search: min overlap 11; selection 30/.30/.45.
 // O(read_length) scratch, rather than an offsets-by-positions matrix.
-inline Geometry quality_independent_geometry(const std::string& a,const std::string& raw_b) {
+inline Geometry quality_independent_geometry_uncached(const std::string& a,const std::string& raw_b) {
     Geometry out;
     if(a.empty()||raw_b.empty()||a.size()>512||raw_b.size()>512)return out;
     const auto b=reverse_complement(raw_b);
@@ -76,6 +76,9 @@ inline Geometry quality_independent_geometry(const std::string& a,const std::str
     }
     out.eligible=out.informative>=30&&out.fraction<=0.30&&out.second>=0.45;
     return out;
+}
+inline Geometry quality_independent_geometry(const std::string& a,const std::string& b) {
+    return alignment_cache::get<Geometry>(a,b,0,[&]{return quality_independent_geometry_uncached(a,b);});
 }
 class QualityProcessor {
     BandedCorrespondence verifier;

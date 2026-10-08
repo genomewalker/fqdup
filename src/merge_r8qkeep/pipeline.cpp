@@ -1,4 +1,5 @@
 #include "pipeline.hpp"
+#include "ordered_chunks.hpp"
 #include "memory_status.hpp"
 #include "string_input.hpp"
 #include <algorithm>
@@ -17,7 +18,7 @@ std::vector<std::string> rows(const std::string& text){StringInputBuffer buffer(
 std::string id(const std::string& h){auto space=h.find_first_of(" \t");auto s=h.substr(1,space==std::string::npos?space:space-1);if(s.size()>2&&s[s.size()-2]=='/'&&(s.back()=='1'||s.back()=='2'))s.resize(s.size()-2);return s;}
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
-LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings){
+LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.family=correct_family(std::move(r1),std::move(r2),threads);stage("family");out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");out.observations=census(out.family.pairs,out.native,debug,threads);stage("census");
@@ -33,7 +34,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
     if(!debug){std::string().swap(out.family.edits_tsv);std::string().swap(out.family.families_tsv);std::string().swap(out.observations.proposed_edits_tsv);}
-    out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);out.routing=out.repair->route(out.native.native_tsv,debug,threads);stage("router");return out;
+    out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);if(!defer_routing){out.routing=out.repair->route(out.native.native_tsv,debug,threads);stage("router");}return out;
 }
 FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
     const auto base=rows(lib.repair->repair(lib.native.native_tsv,9,cutoff,0,1,nullptr,&lib.routing.routed,&lib.routing.repair_bounds));const bool rerouted=std::find(lib.routing.routed.begin(),lib.routing.routed.end(),true)!=lib.routing.routed.end();
@@ -76,5 +77,49 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
     if(start!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
     for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}
     if(profile)std::fprintf(stderr,"EMIT_PROFILE threads=%d rows=%zu chunks=%zu chunk_rows=2048 prepare=%.6f repair_parse=%.6f ordered_assembly_write=%.6f\n",threads,start,chunks,prepare_seconds,repair_seconds,assemble_seconds);
+}
+}
+
+namespace fqdup::r8qkeep {
+void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow) {
+    if(cuts.size()!=directories.size()||cuts.size()!=labels.size())throw std::runtime_error("cutoff cardinality");
+    using Clock=std::chrono::steady_clock;
+    const auto elapsed=[](auto begin){return std::chrono::duration<double>(Clock::now()-begin).count();};
+    std::vector<std::array<std::ofstream,5>> files(cuts.size());
+    const char* names[]={"merged.fq","r1.fq","r2.fq","orphan.fq","outcomes.jsonl"};
+    for(std::size_t c=0;c<cuts.size();++c)for(int j=0;j<5;++j){files[c][j].open(std::filesystem::path(directories[c])/names[j],std::ios::binary);if(!files[c][j])throw std::runtime_error("open output");}
+    std::vector<RepairShadow> counters(cuts.size());
+    struct Chunk { std::vector<FinalOutput> outputs;std::vector<double> seconds;double router_seconds=0;std::string routed,audit;std::size_t count=0; };
+    std::vector<double> seconds(cuts.size());double router_seconds=0;std::size_t count=0;
+    ordered_text_chunks(lib.native.native_tsv,threads,0,[&](const std::string& native,std::size_t start){
+        Chunk chunk;chunk.count=std::count(native.begin(),native.end(),'\n');chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
+        // Each worker owns this chunk through every cutoff. Global row identity
+        // is restored at assembly; route/repair masks and cache use local rows.
+        RepairAlignmentCache cache(0,chunk.count);const auto route_begin=Clock::now();
+        const auto routing=lib.repair->route(native,debug,1,0,&cache);chunk.router_seconds=elapsed(route_begin);
+        std::string routed;bool alternative=false;const auto native_rows=rows(native);
+        for(std::size_t i=0;i<chunk.count;++i){if(routing.routed.at(i)){alternative=true;routed+=routing.replacements.at(i);}else routed+=native_rows[i]+"\n";}
+        if(debug){chunk.routed=routing.routed_tsv;for(const auto& line:rows(routing.audit_tsv)){auto tab=line.find('\t');if(tab==std::string::npos)throw std::runtime_error("audit row");chunk.audit+=std::to_string(start+std::stoull(line.substr(0,tab)))+line.substr(tab)+"\n";}}
+        for(std::size_t c=0;c<cuts.size();++c){const auto begin=Clock::now();auto& out=chunk.outputs[c];
+            const auto base=rows(lib.repair->repair(native,9,cuts[c],0,1,shadow?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache));
+            const auto changed=alternative?rows(lib.repair->repair(routed,7,cuts[c],0,1,nullptr,nullptr,nullptr,&cache)):std::vector<std::string>{};
+            if(base.size()!=chunk.count||(alternative&&changed.size()!=chunk.count))throw std::runtime_error("chunk cardinality");
+            for(std::size_t i=0;i<chunk.count;++i){const auto v=fields(routing.routed[i]?changed[i]:base[i]);if(v.size()!=8||std::stoull(v[0])!=i)throw std::runtime_error("chunk order");
+                const auto& pair=lib.family.pairs.at(start+i);const auto add=[&](int j,std::string& text){if(id(v[j])!=pair.id)throw std::runtime_error("record identity");text+=v[j]+"\n"+v[j+1]+"\n+\n"+v[j+2]+"\n";};
+                if(v[1]=="merged")add(2,out.merged);else if(v[1]=="unmerged"){add(2,out.r1);add(5,out.r2);}else if(v[1]=="orphan_r1"||v[1]=="orphan_r2")add(2,out.orphan);else if(v[1]!="dropped")throw std::runtime_error("chunk outcome");
+                out.outcomes+="{\"r1_header\":";json_string(out.outcomes,pair.r[0].h);out.outcomes+=",\"r2_header\":";json_string(out.outcomes,pair.r[1].h);out.outcomes+=",\"outcome\":";json_string(out.outcomes,v[1]);out.outcomes+="}\n";
+            }
+            chunk.seconds[c]=elapsed(begin);
+        }
+        return chunk;
+    },[&](Chunk chunk){count+=chunk.count;router_seconds+=chunk.router_seconds;
+        if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;}
+        for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];const auto& out=chunk.outputs[c];files[c][0]<<out.merged;files[c][1]<<out.r1;files[c][2]<<out.r2;files[c][3]<<out.orphan;files[c][4]<<out.outcomes;}
+    },"all_cutoffs");
+    if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    for(auto& group:files)for(auto& file:group){file.close();if(!file)throw std::runtime_error("write output");}
+    if(timings||debug)std::cerr<<"MERGE_STAGE router seconds="<<router_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
+    for(std::size_t c=0;c<cuts.size();++c){if(shadow)std::cerr<<"REPAIR_SHADOW cutoff="<<labels[c]<<" skip_and_unchanged="<<counters[c].skip_and_unchanged.load()<<" skip_but_changed="<<counters[c].skip_but_changed.load()<<" noskip_unchanged="<<counters[c].noskip_unchanged.load()<<" noskip_changed="<<counters[c].noskip_changed.load()<<'\n';
+        if(timings||debug)std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<labels[c]<<" seconds="<<seconds[c]<<" timing_basis=worker_elapsed_excluding_write"<<memory_status()<<'\n';}
 }
 }

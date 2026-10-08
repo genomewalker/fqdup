@@ -11,6 +11,9 @@ class SelfCorrespondence {
  static int sub(char a,char b) {return a==b&&a!='N'?1:-1;}
  public:
  FullResult align(const std::string&a,const std::string&b) {
+  return alignment_cache::get<SelfCorrespondence>(a,b,0,[&]{return align_uncached(a,b);});
+ }
+ FullResult align_uncached(const std::string&a,const std::string&b) {
   FullResult result;auto& out=result.corr;
   if(a.size()>512||b.size()>512){out.reason="unsupported_read_length";return result;}
   if(a.empty()||b.empty()){out.reason="empty_read";return result;}
