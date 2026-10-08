@@ -20,7 +20,7 @@ void json_string(std::string& out,const std::string& s){static const char hex[]=
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
-    LibraryPipeline out;out.family=correct_family(std::move(r1),std::move(r2));stage("family");out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");out.observations=census(out.family.pairs,out.native,debug,threads);stage("census");
+    LibraryPipeline out;out.family=correct_family(std::move(r1),std::move(r2),threads);stage("family");out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");out.observations=census(out.family.pairs,out.native,debug,threads);stage("census");
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
     const int concurrent=std::max(1,std::min(4,threads)),per_fit=std::max(1,threads/concurrent);

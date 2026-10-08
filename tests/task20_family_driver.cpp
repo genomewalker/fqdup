@@ -5,9 +5,9 @@
 #include <stdexcept>
 int main(int argc, char** argv) {
     try {
-        if (argc != 4) throw std::runtime_error("usage: family_driver R1 R2 NEW_OUTPUT_DIR");
+        if (argc != 4 && argc != 5) throw std::runtime_error("usage: family_driver R1 R2 NEW_OUTPUT_DIR [THREADS]");
         if (!std::filesystem::create_directory(argv[3])) throw std::runtime_error("output directory exists");
-        auto result = fqdup::r8qkeep::correct_family(fqdup::r8qkeep::read_family_fastq(argv[1]), fqdup::r8qkeep::read_family_fastq(argv[2]));
+        auto result = fqdup::r8qkeep::correct_family(fqdup::r8qkeep::read_family_fastq(argv[1]), fqdup::r8qkeep::read_family_fastq(argv[2]), argc == 5 ? std::stoi(argv[4]) : 1);
         const std::string out = argv[3];
         for (int mate = 0; mate < 2; ++mate) {
             std::ofstream f(out + (mate ? "/R2.fastq" : "/R1.fastq"));

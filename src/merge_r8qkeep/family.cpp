@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -64,9 +65,9 @@ struct Column { int n = 0; std::vector<std::pair<char, std::vector<int>>> votes;
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Enumerate exact neighborhoods (including the frozen N/N mismatch rule).
 // Union roots are not output: groups/members are emitted by ascending read id.
-bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent){
+bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64){
     const auto code=[](char c){switch(c){case 'A':return 0;case 'C':return 1;case 'G':return 2;case 'T':return 3;case 'N':return 4;default:return -1;}};
-    for(const auto& key:keys)if(!key.empty()){if(key.size()!=40)return false;for(char c:key)if(code(c)<0)return false;}
+    for(const auto& key:keys)if(!key.empty()){if(key.size()!=40||std::count(key.begin(),key.end(), 'N')>MAXN)return false;for(char c:key)if(code(c)<0)return false;}
     const auto started=std::chrono::steady_clock::now();
     const auto root=[&](int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
     const auto unite=[&](int i,int j){i=root(i);j=root(j);if(i!=j)parent[i]=j;};
@@ -78,25 +79,72 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     std::size_t cells=0,max_bucket=0;
     for(int part=0;part<3;++part){for(std::size_t i=0;i<representative.size();++i)index[part][packed(keys[representative[i]],part)].push_back(i);cells+=index[part].size();for(const auto& entry:index[part])max_bucket=std::max(max_bucket,entry.second.size());}
     const auto generated=std::chrono::steady_clock::now();
-    std::vector<std::size_t> seen(representative.size(),0);std::uint64_t lookups=0,candidates=0,verified=0;
-    for(std::size_t query=0;query<representative.size();++query){const auto& key=keys[representative[query]];
-        for(int part=0;part<3;++part){const int length=bounds[part+1]-bounds[part];std::vector<int> normal,npos;
-            for(int p=0;p<length;++p)(key[bounds[part]+p]=='N'?npos:normal).push_back(p);
-            std::vector<std::uint64_t> bases{packed(key,part)};
-            for(int p:npos){std::vector<std::uint64_t> next;for(auto base:bases)for(int c=0;c<5;++c)next.push_back((base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p)));bases=std::move(next);}
-            const int budget=2-int(npos.size());
-            const auto lookup=[&](std::uint64_t value){++lookups;const auto it=index[part].find(value);if(it==index[part].end())return;candidates+=it->second.size();
-                for(int other:it->second){if(std::size_t(other)>=query||seen[other]==query+1)continue;seen[other]=query+1;++verified;
-                    if(root(representative[query])==root(representative[other]))continue;
-                    if(mismatches(key,keys[representative[other]])<=MAXMIS)unite(representative[query],representative[other]);}};
-            for(auto base:bases){lookup(base);if(budget<1)continue;
-                for(std::size_t a=0;a<normal.size();++a){const int p=normal[a],original=code(key[bounds[part]+p]);
-                    for(int c=0;c<5;++c)if(c!=original){const auto first=(base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p));lookup(first);if(budget<2)continue;
-                        for(std::size_t b=a+1;b<normal.size();++b){const int q=normal[b],second=code(key[bounds[part]+q]);for(int d=0;d<5;++d)if(d!=second)lookup((first&~(std::uint64_t(7)<<(3*q)))|(std::uint64_t(d)<<(3*q)));}}}
+    // A fixed global batch, independent of -p. No per-worker seen array or index.
+    // Workers never access parent; union order stays query/block/neighborhood order.
+    struct Slot {
+        std::array<int,64> edges{};
+        std::size_t size=0;
+        bool overflow=false;
+        std::uint64_t lookups=0,candidates=0,verified=0;
+    };
+    std::array<Slot,256> slots{};
+    edge_limit=std::min(edge_limit,slots[0].edges.size());
+    const int workers=std::max(1,std::min(threads,8));
+    const auto& shared_index=index;
+    const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
+        const auto& key=keys[representative[query]];
+        for(int part=0;part<3;++part){
+            const int length=bounds[part+1]-bounds[part];
+            std::array<int,14> normal{},npos{};int normals=0,ns=0;
+            for(int p=0;p<length;++p){if(key[bounds[part]+p]=='N')npos[ns++]=p;else normal[normals++]=p;}
+            // keys_of admits at most two Ns; reject other callers before indexing.
+            std::array<std::uint64_t,25> bases{};bases[0]=packed(key,part);int count=1;
+            for(int ni=0;ni<ns;++ni){const int p=npos[ni],old=count;
+                for(int b=old-1;b>=0;--b){const auto base=bases[b];for(int c=0;c<5;++c)bases[5*b+c]=(base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p));}count*=5;}
+            const int budget=2-ns;
+            const auto lookup=[&](std::uint64_t value){
+                ++result.lookups;const auto it=shared_index[part].find(value);if(it==shared_index[part].end())return;
+                result.candidates+=it->second.size();
+                for(int other:it->second){
+                    if(std::size_t(other)>=query)continue;
+                    const auto& candidate=keys[representative[other]];
+                    // This candidate was visited in an earlier block iff that
+                    // block has <=2 mismatches, including N/N as a mismatch.
+                    bool earlier=false;
+                    for(int block=0;block<part&&!earlier;++block){int m=0;
+                        for(int p=bounds[block];p<bounds[block+1];++p)m+=key[p]=='N'||candidate[p]=='N'||key[p]!=candidate[p];
+                        earlier=m<=2;}
+                    if(earlier)continue;
+                    ++result.verified;
+                    if(serial&&root(representative[query])==root(representative[other]))continue;
+                    if(mismatches(key,candidate)>MAXMIS)continue;
+                    if(serial)unite(representative[query],representative[other]);
+                    else if(result.size<edge_limit)result.edges[result.size++]=other;
+                    else result.overflow=true;
+                }
+            };
+            for(int bi=0;bi<count;++bi){const auto base=bases[bi];lookup(base);if(result.overflow)return;if(budget<1)continue;
+                for(int a=0;a<normals;++a){const int p=normal[a],original=code(key[bounds[part]+p]);
+                    for(int c=0;c<5;++c)if(c!=original){const auto first=(base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p));lookup(first);if(result.overflow)return;if(budget<2)continue;
+                        for(int b=a+1;b<normals;++b){const int q=normal[b],second=code(key[bounds[part]+q]);for(int d=0;d<5;++d)if(d!=second){lookup((first&~(std::uint64_t(7)<<(3*q)))|(std::uint64_t(d)<<(3*q)));if(result.overflow)return;}}}
+                }
             }
         }
+    };
+    std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
+    for(std::size_t begin=0;begin<representative.size();begin+=slots.size()){
+        const auto count=std::min(slots.size(),representative.size()-begin);
+        const auto work=[&](int worker){for(std::size_t s=worker;s<count;s+=workers){slots[s]=Slot{};enumerate(begin+s,slots[s],false);}};
+        if(workers==1)work(0);
+        else {std::array<std::future<void>,8> jobs;for(int w=0;w<workers;++w)jobs[w]=std::async(std::launch::async,work,w);for(int w=0;w<workers;++w)jobs[w].get();}
+        for(std::size_t s=0;s<count;++s){auto& result=slots[s];
+            if(result.overflow){++overflows;result=Slot{};enumerate(begin+s,result,true);}
+            else for(std::size_t e=0;e<result.size;++e)unite(representative[begin+s],representative[result.edges[e]]);
+            lookups+=result.lookups;candidates+=result.candidates;verified+=result.verified;
+        }
     }
-    if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS")){const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
+    if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))
+{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<sizeof(slots)<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
     return true;
 }
 
@@ -120,11 +168,11 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P) {
     }
     return keys;
 }
-std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys) {
+std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads) {
     const int n = int(P.size()); keys = keys_of(P);
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-    if(!neighbor_families(keys,parent)){
+    if(!neighbor_families(keys,parent,threads)){
     std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
     std::unordered_map<std::string, std::vector<int>> buckets;
     for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }
@@ -185,13 +233,13 @@ bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) retu
 } // namespace
 
 namespace fqdup::r8qkeep {
-FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2) {
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads) {
         constexpr bool damage_safe = false;
         if (R1.size() != R2.size()) throw std::runtime_error("pair count");
         std::vector<Pair> P; P.reserve(R1.size());
         for (size_t i = 0; i < R1.size(); ++i) { if (R1[i].id != R2[i].id) throw std::runtime_error("pair order " + R1[i].id); P.push_back({R1[i].id, {std::move(R1[i]), std::move(R2[i])}}); }
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
-        std::vector<std::string> keys; auto groups = families(P, keys);
+        std::vector<std::string> keys; auto groups = families(P, keys, threads);
         std::vector<char> disband(groups.size()); for (size_t k = 0; k < groups.size(); ++k) disband[k] = groups[k].oversize || second_molecule(P, groups[k].m);
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = 0; gi < groups.size(); ++gi) {

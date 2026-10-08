@@ -249,3 +249,8 @@ add_executable(test_task23_repair_skip tests/task23_repair_skip.cpp)
 target_compile_options(test_task23_repair_skip PRIVATE -ffp-contract=off)
 target_link_libraries(test_task23_repair_skip PRIVATE Threads::Threads)
 add_test(NAME task23_repair_skip COMMAND test_task23_repair_skip)
+
+add_executable(test_task23_family_parallel tests/task23_family_parallel.cpp)
+target_compile_options(test_task23_family_parallel PRIVATE -ffp-contract=off)
+target_link_libraries(test_task23_family_parallel PRIVATE Threads::Threads)
+add_test(NAME task23_family_parallel COMMAND test_task23_family_parallel)
