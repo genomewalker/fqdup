@@ -62,6 +62,25 @@ struct PairMixture {
   double d=t==0?e1+e2-4*e1*e2/3:2*e-4*e*e/3;
   return {clipped_log(agree?1-d:d),conditional(t==0?e1:e,t==0?e2:e,agree)};
  }
+ // Bound to one immutable posterior. Collisions only evict an entry; the
+ // full quality/agreement key is checked before reusing the ordered sums.
+ struct ConditionalProducts {
+  struct Entry {unsigned key=0;std::pair<double,double> risk{};};
+  const std::array<double,K>& posterior;
+  std::array<Entry,64> entries{};
+  explicit ConditionalProducts(const std::array<double,K>& p):posterior(p){}
+  std::pair<double,double> get(char q1,char q2,bool agree){
+   const unsigned key=1+static_cast<unsigned char>(q1)+
+       (unsigned(static_cast<unsigned char>(q2))<<8)+(unsigned(agree)<<16);
+   auto& entry=entries[(key*2654435761U)>>26];
+   if(entry.key!=key){
+    double p1=0,p2=0;
+    for(int z=0;z<K;++z){auto p=lookup(z,q1,q2,agree).risk;p1+=posterior[z]*p.first;p2+=posterior[z]*p.second;}
+    entry={key,{p1,p2}};
+   }
+   return entry.risk;
+  }
+ };
  struct Audit {int fold=-1;size_t n=0;double nominal=0,flat=0;bool supported=false;std::array<double,K> posterior{};};
  struct CachedApply {
   const PairMixture* model;
@@ -108,6 +127,7 @@ struct PairMixture {
   if((mode==2||mode==4)&&post[0]>=.5)return false;
   for(size_t i=0;i<q1.size();++i)risk.r1.at(i)=post[0]*fqalign::phred_error(q1[i])+flat;
   for(size_t i=0;i<q2.size();++i)risk.r2.at(i)=post[0]*fqalign::phred_error(q2[i])+flat;
+  ConditionalProducts conditional_products(post);
   // All columns including N are kept when forming blocks, matching the native
   // verifier. N is neither an agreeing flank nor a conditional-risk update.
   for(size_t begin=0;begin<cols.size();){size_t end=begin+1;while(end<cols.size()&&cols[end].first==cols[end-1].first+1&&cols[end].second==cols[end-1].second+1)++end;
@@ -116,9 +136,8 @@ struct PairMixture {
     if(s1.at(i)=='N'||rc.at(j)=='N')continue;
     bool cert=std::find(risk.correspondence.certified.begin(),risk.correspondence.certified.end(),std::pair<int,int>{i,j})!=risk.correspondence.certified.end();
     if(!full_trusted&&!cert&&(agree||before<5||total-before<5))continue;
-    double p1=0,p2=0;
-    for(int z=0;z<K;++z){auto p=lookup(z,q1.at(i),q2.at(k),agree).risk;p1+=post[z]*p.first;p2+=post[z]*p.second;}
-    risk.r1.at(i)=p1;risk.r2.at(k)=p2;
+    const auto conditional=conditional_products.get(q1.at(i),q2.at(k),agree);
+    risk.r1.at(i)=conditional.first;risk.r2.at(k)=conditional.second;
    }begin=end;
   }
   if(active_cache)active_cache->push_back({this,mode,full_trusted,s1,q1,s2,q2,

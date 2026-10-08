@@ -8,6 +8,21 @@ static std::string prior(int component){
     return out.str();
 }
 int main(){
+    // Cached conditional sums must match the original order bit-for-bit,
+    // including collisions, both agreement states and subnormal posteriors.
+    for(int variant=0;variant<3;++variant){
+        std::array<double,fqquality::PairMixture::K> post{};
+        for(int j=0;j<int(post.size());++j)post[j]=variant==0?1.0/post.size():variant==1?std::ldexp(1.0,-j-1000):(j==0?1.0:0.0);
+        fqquality::PairMixture::ConditionalProducts products(post);
+        for(int repeat=0;repeat<2;++repeat)for(int q1=33;q1<=126;q1+=7)for(int q2=33;q2<=126;q2+=11)for(bool agree:{false,true}){
+            double p1=0,p2=0;
+            for(int z=0;z<int(post.size());++z){auto risk=fqquality::PairMixture::lookup(z,char(q1),char(q2),agree).risk;p1+=post[z]*risk.first;p2+=post[z]*risk.second;}
+            const auto expected=std::make_pair(p1,p2);
+            require(products.get(char(q1),char(q2),agree)==expected);
+            require(products.get(char(q1),char(q2),agree)==expected);
+        }
+    }
+
     std::mt19937 rng(2503);std::size_t positives=0,negatives=0;
     for(int component:{-1,0,40,65}){
         RepairPipeline pipeline(prior(component),prior(component));
