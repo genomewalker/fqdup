@@ -65,13 +65,31 @@ std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,i
     std::vector<const PairLikelihood*> view;view.reserve(pairs.size());for(const auto& pair:pairs)view.push_back(&pair);
     return fit_mixture_views(view,threads);
 }
-std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads) {
+template<bool Counts>
+static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLikelihood*>& pairs,int threads) {
     if(pairs.empty())return std::nullopt;
     threads=std::max(1,threads);
     std::vector<ExactExpCache> exp(threads);
     std::unordered_map<const Values*,std::size_t,BitsHash,BitsEqual> slots;
     std::vector<const Values*> keys;std::vector<std::size_t> group;group.reserve(pairs.size());
     for(const auto* pair:pairs){const auto* key=&pair->log_likelihood;auto [it,inserted]=slots.emplace(key,keys.size());if(inserted)keys.push_back(key);group.push_back(it->second);}
+    std::vector<std::size_t> multiplicity;
+    if constexpr(Counts){
+        // Numeric ordering of the exact IEEE bit patterns, independent of IDs,
+        // arrival order, hash iteration, and worker scheduling.
+        std::sort(keys.begin(),keys.end(),[](const Values* a,const Values* b){
+            for(int j=0;j<mixture_components;++j){std::uint64_t x,y;std::memcpy(&x,&(*a)[j],sizeof(x));std::memcpy(&y,&(*b)[j],sizeof(y));if(x!=y)return x<y;}
+            return false;
+        });
+        slots.clear();
+        for(std::size_t i=0;i<keys.size();++i)slots.emplace(keys[i],i);
+        multiplicity.resize(keys.size());
+        for(const auto* pair:pairs){
+            if(pair->fold!=pairs.front()->fold)throw std::invalid_argument("counts fit requires one training fold");
+            ++multiplicity[slots.at(&pair->log_likelihood)];
+        }
+        group.resize(keys.size());for(std::size_t i=0;i<group.size();++i)group[i]=i;
+    }
     struct Terms {Values responsibility;double log_sum=0;};
     std::vector<Terms> terms(keys.size());
     MixtureFit result;result.training_pairs=pairs.size();
@@ -83,7 +101,7 @@ std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikeliho
         double ll=0;
         parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+logw[j];auto& t=terms[i];t.log_sum=logsum(a,exp[worker]);for(int j=0;j<mixture_components;++j)t.responsibility[j]=exp[worker](a[j]-t.log_sum);});
         // Every floating-point reduction still visits every original pair in order.
-        for(std::size_t index:group){const auto& t=terms[index];ll+=t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=t.responsibility[j];}
+        for(std::size_t index:group){const auto& t=terms[index];if constexpr(Counts){const double n=multiplicity[index];ll+=n*t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=n*t.responsibility[j];}else{ll+=t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=t.responsibility[j];}}
         Values next;for(int j=0;j<mixture_components;++j)next[j]=std::max(count[j]/pairs.size(),1e-300);
         const double mass=sum(next);for(double& x:next)x/=mass;
         if(ll+1e-7<old)throw std::runtime_error("EM likelihood decreased");
@@ -100,14 +118,14 @@ std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikeliho
         parallel_terms(densities.size(),threads,[&](std::size_t i,int){double d=0;for(int j=0;j<mixture_components;++j)d+=densities[i][j]*w[j];table_den[i]=d;});
         std::vector<double> den;den.reserve(pairs.size());for(auto index:group)den.push_back(table_den[index]);
         Values gradient{};
-        for(std::size_t i=0;i<den.size();++i){if(!(den[i]>0))throw std::runtime_error("density underflow");const auto& density=densities[group[i]];for(int j=0;j<mixture_components;++j)gradient[j]+=density[j]/den[i];}
+        for(std::size_t i=0;i<den.size();++i){if(!(den[i]>0))throw std::runtime_error("density underflow");const auto& density=densities[group[i]];for(int j=0;j<mixture_components;++j){if constexpr(Counts)gradient[j]+=multiplicity[i]*(density[j]/den[i]);else gradient[j]+=density[j]/den[i];}}
         const int hi=static_cast<int>(std::max_element(gradient.begin(),gradient.end())-gradient.begin());
         result.kkt_gap=gradient[hi]-pairs.size();
         if(result.kkt_gap<=1e-6*pairs.size()){result.converged=true;break;}
         int lo=-1;for(int j=0;j<mixture_components;++j)if(w[j]>1e-14&&(lo<0||gradient[j]<gradient[lo]))lo=j;
         if(lo<0||lo==hi)break;
         std::vector<double> b;b.reserve(den.size());for(std::size_t i=0;i<den.size();++i)b.push_back((densities[group[i]][hi]-densities[group[i]][lo])/den[i]);
-        const auto derivative=[&](double alpha){double d=0;for(double v:b)d+=v/(1+alpha*v);return d;};
+        const auto derivative=[&](double alpha){double d=0;if constexpr(Counts){for(std::size_t i=0;i<b.size();++i){const double v=b[i];d+=multiplicity[i]*(v/(1+alpha*v));}}else{for(double v:b)d+=v/(1+alpha*v);}return d;};
         double alpha=w[lo];
         if(derivative(alpha)<0){double lower=0,upper=alpha;for(int z=0;z<55;++z){const double mid=(lower+upper)/2;if(derivative(mid)>0)lower=mid;else upper=mid;}alpha=(lower+upper)/2;}
         if(!(alpha>0))break;
@@ -115,10 +133,12 @@ std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikeliho
         const double mass=sum(w);for(double& x:w)x/=mass;
     }
     parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+fqdup::fdlibm::log(w[j]);terms[i].log_sum=logsum(a,exp[worker]);});
-    for(auto index:group)result.log_likelihood+=terms[index].log_sum;
+    for(auto index:group){if constexpr(Counts)result.log_likelihood+=multiplicity[index]*terms[index].log_sum;else result.log_likelihood+=terms[index].log_sum;}
     for(const auto& cache:exp){result.exp_calls+=cache.calls();result.exp_cache_hits+=cache.hits();}
     return result;
 }
+std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<false>(pairs,threads);}
+std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<true>(pairs,threads);}
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits) {
     std::string out="FQDUP_PAIR_MIXTURE_V1 64\n";
     for(int f=0;f<2;++f){const auto& fit=fits[f];if(fit&&!fit->converged)throw std::runtime_error("unconverged mixture");out+=std::to_string(f)+" "+std::to_string(fit?fit->training_pairs:0);for(int j=0;j<mixture_components;++j)out+=" "+shortest_double(fit?fit->weights[j]:0);out+='\n';}
