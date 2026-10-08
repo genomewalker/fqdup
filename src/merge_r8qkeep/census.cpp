@@ -86,6 +86,9 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
         if(v[6]!="unmerged")continue;
         const auto rc=fqalign::reverse_complement(v[11]);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;
         if(c.eligible){const int f=fold(p),length=int(v[11].size());for(auto [i,j]:c.invariant){const int k=length-1-j,q1=int(static_cast<unsigned char>(p.r[0].q[i]))-33,q2=int(static_cast<unsigned char>(p.r[1].q[k]))-33;const double e1=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q1/10.0))),e2=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q2/10.0)));const char b=fqalign::reverse_complement(std::string(1,p.r[1].s[k]))[0];full_pairs.add(p.id,f,e1,e2,p.r[0].s[i]==b);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();full<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<q1/5<<'\t'<<q2/5<<'\t'<<shortest_double(e1)<<'\t'<<shortest_double(e2)<<'\t'<<p.r[0].s[i]<<'\t'<<b<<'\t'<<cert<<'\n';}}}
+        // Proposed edits are a debug view; repair computes its own corrections.
+        // Training observations above retain the same geometry and accumulation.
+        if(!debug)continue;
         const auto proposed=fqrepair::full_trusted_correspondence(v[8],rc);edits<<index<<'\t'<<proposed.eligible<<'\t'<<proposed.reason<<'\t'<<proposed.invariant.size()<<'\t';bool first=true;
         if(proposed.eligible)for(auto [i,j]:proposed.invariant){const int k=int(v[11].size())-1-j;const char a=v[8].at(i),b=rc.at(j);const int q1=int(static_cast<unsigned char>(v[9].at(i)))-33,q2=int(static_cast<unsigned char>(v[12].at(k)))-33;if(a=='N'||b=='N'||a==b||q1==q2)continue;const int mate=q1<q2?1:2,pos=mate==1?i:k,donor=mate==1?k:i;const char base=mate==1?b:fqalign::reverse_complement(std::string(1,a))[0];if(!first)edits<<';';first=false;edits<<mate<<':'<<pos<<':'<<donor<<':'<<base<<':'<<std::max(1,std::abs(q1-q2));}
         edits<<'\n';
