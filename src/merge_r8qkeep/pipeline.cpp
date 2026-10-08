@@ -36,7 +36,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);out.routing=out.repair->route(out.native.native_tsv,debug,threads);stage("router");return out;
 }
 FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
-    const auto base=rows(lib.repair->repair(lib.native.native_tsv,9,cutoff,0,1,nullptr,&lib.routing.routed));const bool rerouted=std::find(lib.routing.routed.begin(),lib.routing.routed.end(),true)!=lib.routing.routed.end();
+    const auto base=rows(lib.repair->repair(lib.native.native_tsv,9,cutoff,0,1,nullptr,&lib.routing.routed,&lib.routing.repair_bounds));const bool rerouted=std::find(lib.routing.routed.begin(),lib.routing.routed.end(),true)!=lib.routing.routed.end();
     std::string sparse_table;if(rerouted&&lib.routing.routed_tsv.empty()){StringInputBuffer buffer(lib.native.native_tsv);std::istream input(&buffer);std::string line;std::size_t index=0;while(std::getline(input,line)){sparse_table+=lib.routing.routed.at(index)?lib.routing.replacements.at(index):line+"\n";++index;}}
     const auto alternative=rerouted?rows(lib.repair->repair(lib.routing.routed_tsv.empty()?sparse_table:lib.routing.routed_tsv,7,cutoff)):std::vector<std::string>{};
     if(base.size()!=lib.family.pairs.size()||lib.routing.routed.size()!=base.size()||(rerouted&&alternative.size()!=base.size()))throw std::runtime_error("stage cardinality");
@@ -61,7 +61,7 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
             position=end+1;++count;
         }
         if(profile)prepare_seconds+=elapsed(prepare_start);const auto repair_start=Clock::now();
-        const auto base=rows(lib.repair->repair(native,9,cutoff,start,threads,shadow,&lib.routing.routed));
+        const auto base=rows(lib.repair->repair(native,9,cutoff,start,threads,shadow,&lib.routing.routed,&lib.routing.repair_bounds));
         const auto changed=alternative?rows(lib.repair->repair(routed,7,cutoff,start,threads)):std::vector<std::string>{};
         if(profile)repair_seconds+=elapsed(repair_start);const auto assemble_start=Clock::now();
         if(base.size()!=count||(alternative&&changed.size()!=count))throw std::runtime_error("chunk cardinality");
