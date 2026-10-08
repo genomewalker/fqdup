@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 using namespace fqdup::r8qkeep;
@@ -52,6 +53,17 @@ int main(){
     require(expanded && expanded->converged,"expanded fit convergence");
     require(std::abs(expanded->log_likelihood-counts->log_likelihood)<1e-7,"expanded objective mismatch");
     for(int j=0;j<mixture_components;++j)require(std::abs(expanded->weights[j]-counts->weights[j])<2e-5,"expanded weights mismatch");
+    require(counts->exp_calls==counts->unique_likelihoods*mixture_components,"counts exp must run once per cell/component");
+    // Impossible components, severe scaling, and exact-zero polished weights.
+    std::vector<PairLikelihood> sparse(7);
+    for(auto& p:sparse){p.log_likelihood.fill(-std::numeric_limits<double>::infinity());p.log_likelihood[0]=-10000;p.log_likelihood[1]=-10800;}
+    const auto sparse_fit=fit_mixture_counts(view(sparse));
+    require(sparse_fit && sparse_fit->converged && sparse_fit->weights[0]>.999999,"scaled sparse fit");
+    repeated_objective(sparse,*sparse_fit);
+    identical(*sparse_fit,*fit_mixture_counts(view(sparse),8));
+    for(auto& p:sparse)p.log_likelihood.fill(-std::numeric_limits<double>::infinity());
+    bool impossible=false;try{fit_mixture_counts(view(sparse));}catch(const std::runtime_error&){impossible=true;}
+    require(impossible,"impossible cell accepted");
     identical(*counts,*fit_mixture_counts(view(pairs),8));
     std::reverse(pairs.begin(),pairs.end());
     identical(*counts,*fit_mixture_counts(view(pairs),8));

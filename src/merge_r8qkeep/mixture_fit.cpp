@@ -95,11 +95,40 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     MixtureFit result;result.training_pairs=pairs.size();
     result.unique_likelihoods=keys.size();
     auto& w=result.weights;w.fill(1.0/mixture_components);
+    // Counts reuses these row-normalized likelihoods for EM and polishing.
+    // Full deliberately keeps its original log-domain arithmetic and ordering.
+    std::vector<Values> densities(keys.size());
+    std::vector<double> row_max;
+    if constexpr(Counts){
+        row_max.resize(keys.size());
+        parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+            const auto& p=*keys[i];
+            const double m=*std::max_element(p.begin(),p.end());
+            if(!std::isfinite(m))throw std::runtime_error("all mixture components impossible");
+            row_max[i]=m;
+            for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);
+        });
+    }
     double old=-std::numeric_limits<double>::infinity();
     for(;result.iterations<1000;++result.iterations) {
         Values count{},logw{};for(int j=0;j<mixture_components;++j)logw[j]=fqdup::fdlibm::log(w[j]);
         double ll=0;
-        parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+logw[j];auto& t=terms[i];t.log_sum=logsum(a,exp[worker]);for(int j=0;j<mixture_components;++j)t.responsibility[j]=exp[worker](a[j]-t.log_sum);});
+        parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+            auto& t=terms[i];
+            if constexpr(Counts){
+                double s=0;
+                for(int j=0;j<mixture_components;++j){t.responsibility[j]=w[j]*densities[i][j];s+=t.responsibility[j];}
+                if(s>0){
+                    t.log_sum=row_max[i]+fqdup::fdlibm::log(s);
+                    for(double& r:t.responsibility)r/=s;
+                    return;
+                }
+                // A zero scaled denominator must use the original log path.
+            }
+            Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+logw[j];
+            t.log_sum=logsum(a,exp[worker]);
+            for(int j=0;j<mixture_components;++j)t.responsibility[j]=exp[worker](a[j]-t.log_sum);
+        });
         // Every floating-point reduction still visits every original pair in order.
         for(std::size_t index:group){const auto& t=terms[index];if constexpr(Counts){const double n=multiplicity[index];ll+=n*t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=n*t.responsibility[j];}else{ll+=t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=t.responsibility[j];}}
         Values next;for(int j=0;j<mixture_components;++j)next[j]=std::max(count[j]/pairs.size(),1e-300);
@@ -110,8 +139,7 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         if(std::isfinite(old)&&ll-old<=1e-8*(1+std::abs(old))&&delta<=1e-6){result.converged=true;++result.iterations;break;}
         old=ll;
     }
-    std::vector<Values> densities(keys.size());
-    parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){const auto& p=*keys[i];const double m=*std::max_element(p.begin(),p.end());for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);});
+    if constexpr(!Counts)parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){const auto& p=*keys[i];const double m=*std::max_element(p.begin(),p.end());for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);});
     result.kkt_gap=std::numeric_limits<double>::infinity();
     for(;result.polish_iterations<10000;++result.polish_iterations) {
         std::vector<double> table_den(densities.size());
@@ -132,7 +160,14 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         w[hi]+=alpha;w[lo]-=alpha;if(w[lo]<1e-15)w[lo]=0;
         const double mass=sum(w);for(double& x:w)x/=mass;
     }
-    parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+fqdup::fdlibm::log(w[j]);terms[i].log_sum=logsum(a,exp[worker]);});
+    parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+        if constexpr(Counts){
+            double s=0;for(int j=0;j<mixture_components;++j)s+=w[j]*densities[i][j];
+            if(s>0){terms[i].log_sum=row_max[i]+fqdup::fdlibm::log(s);return;}
+        }
+        Values a;for(int j=0;j<mixture_components;++j)a[j]=(*keys[i])[j]+fqdup::fdlibm::log(w[j]);
+        terms[i].log_sum=logsum(a,exp[worker]);
+    });
     for(auto index:group){if constexpr(Counts)result.log_likelihood+=multiplicity[index]*terms[index].log_sum;else result.log_likelihood+=terms[index].log_sum;}
     for(const auto& cache:exp){result.exp_calls+=cache.calls();result.exp_cache_hits+=cache.hits();}
     return result;
