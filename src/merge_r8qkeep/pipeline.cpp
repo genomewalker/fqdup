@@ -43,11 +43,15 @@ FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
     FinalOutput out;for(std::size_t i=0;i<base.size();++i){const auto v=fields(lib.routing.routed[i]?alternative[i]:base[i]);if(v.size()!=8||std::stoull(v[0])!=i)throw std::runtime_error("stage order");const auto& pair=lib.family.pairs[i];const auto add=[&](int j,std::string& text){if(id(v[j])!=pair.id)throw std::runtime_error("stage record identity");text+=v[j]+"\n"+v[j+1]+"\n+\n"+v[j+2]+"\n";};if(v[1]=="merged")add(2,out.merged);else if(v[1]=="unmerged"){add(2,out.r1);add(5,out.r2);}else if(v[1]=="orphan_r1"||v[1]=="orphan_r2")add(2,out.orphan);else if(v[1]!="dropped")throw std::runtime_error("stage outcome");out.outcomes+="{\"r1_header\":";json_string(out.outcomes,pair.r[0].h);out.outcomes+=",\"r2_header\":";json_string(out.outcomes,pair.r[1].h);out.outcomes+=",\"outcome\":";json_string(out.outcomes,v[1]);out.outcomes+="}\n";}return out;
 }
 void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::string& directory,int threads){
+    const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
+    using Clock=std::chrono::steady_clock;double prepare_seconds=0,repair_seconds=0,assemble_seconds=0;std::size_t chunks=0;
+    const auto elapsed=[](auto t){return std::chrono::duration<double>(Clock::now()-t).count();};
     const std::filesystem::path path=directory;
     std::array<std::ofstream,5> files;const char* names[]={"merged.fq","r1.fq","r2.fq","orphan.fq","outcomes.jsonl"};
     for(int i=0;i<5;++i){files[i].open(path/names[i],std::ios::binary);if(!files[i])throw std::runtime_error("open output");}
     std::size_t position=0,start=0;
     while(position<lib.native.native_tsv.size()){
+        const auto prepare_start=Clock::now();
         std::string native,routed;std::size_t count=0;bool alternative=false;
         while(count<2048&&position<lib.native.native_tsv.size()){
             const auto end=lib.native.native_tsv.find('\n',position);if(end==std::string::npos)throw std::runtime_error("unterminated native row");
@@ -56,8 +60,10 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
             if(lib.routing.routed[index]){alternative=true;routed+=lib.routing.replacements.at(index);}else routed+=line;
             position=end+1;++count;
         }
+        if(profile)prepare_seconds+=elapsed(prepare_start);const auto repair_start=Clock::now();
         const auto base=rows(lib.repair->repair(native,9,cutoff,start,threads));
         const auto changed=alternative?rows(lib.repair->repair(routed,7,cutoff,start,threads)):std::vector<std::string>{};
+        if(profile)repair_seconds+=elapsed(repair_start);const auto assemble_start=Clock::now();
         if(base.size()!=count||(alternative&&changed.size()!=count))throw std::runtime_error("chunk cardinality");
         for(std::size_t i=0;i<count;++i){const auto index=start+i;const auto v=fields(lib.routing.routed[index]?changed[i]:base[i]);if(v.size()!=8||std::stoull(v[0])!=index)throw std::runtime_error("chunk order");
             const auto& pair=lib.family.pairs.at(index);const auto add=[&](int j,int channel){if(id(v[j])!=pair.id)throw std::runtime_error("record identity");files[channel]<<v[j]<<'\n'<<v[j+1]<<"\n+\n"<<v[j+2]<<'\n';};
@@ -65,8 +71,10 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
             std::string outcome="{\"r1_header\":";json_string(outcome,pair.r[0].h);outcome+=",\"r2_header\":";json_string(outcome,pair.r[1].h);outcome+=",\"outcome\":";json_string(outcome,v[1]);outcome+="}\n";files[4]<<outcome;
         }
         start+=count;
+        if(profile)assemble_seconds+=elapsed(assemble_start);++chunks;
     }
     if(start!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
     for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}
+    if(profile)std::fprintf(stderr,"EMIT_PROFILE threads=%d rows=%zu chunks=%zu chunk_rows=2048 prepare=%.6f repair_parse=%.6f ordered_assembly_write=%.6f\n",threads,start,chunks,prepare_seconds,repair_seconds,assemble_seconds);
 }
 }
