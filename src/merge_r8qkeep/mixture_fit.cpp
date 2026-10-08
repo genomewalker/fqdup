@@ -2,6 +2,8 @@
 #include "shortest_double.hpp"
 #include "fdlibm.hpp"
 #include "exact_exp_cache.hpp"
+#include "worker_pool.hpp"
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -15,13 +17,30 @@ namespace {
 using Values = std::array<double,mixture_components>;
 struct BitsHash {std::size_t operator()(const Values* p)const {std::uint64_t hash=14695981039346656037ULL;for(double x:*p){std::uint64_t bits;std::memcpy(&bits,&x,sizeof(bits));hash^=bits;hash*=1099511628211ULL;}return hash;}};
 struct BitsEqual {bool operator()(const Values* a,const Values* b)const{return std::memcmp(a->data(),b->data(),sizeof(double)*mixture_components)==0;}};
-template<class Function> void parallel_terms(std::size_t count,int threads,Function function){
-    const int workers=std::max(1,std::min<int>(threads,count));
-    if(workers==1){for(std::size_t i=0;i<count;++i)function(i,0);return;}
-    std::vector<std::future<void>> jobs;
-    for(int w=0;w<workers;++w)jobs.push_back(std::async(std::launch::async,[&,w](){for(std::size_t i=count*w/workers;i<count*(w+1)/workers;++i)function(i,w);}));
-    for(auto& job:jobs)job.get();
-}
+class FitWorkers {
+    int threads_;
+    std::unique_ptr<WorkerPool> pool_;
+    std::vector<std::future<void>> jobs_;
+public:
+    explicit FitWorkers(int threads):threads_(threads){
+        if(threads>1)pool_=std::make_unique<WorkerPool>(threads);
+        jobs_.reserve(threads);
+    }
+    template<class Function> void run(std::size_t count,Function function){
+        const int workers=std::max(1,std::min<int>(threads_,count));
+        if(workers==1){for(std::size_t i=0;i<count;++i)function(i,0);return;}
+        jobs_.clear();
+        try {
+            for(int w=0;w<workers;++w)jobs_.push_back(pool_->submit([&,w]{
+                for(std::size_t i=count*w/workers;i<count*(w+1)/workers;++i)function(i,w);
+            }));
+            for(auto& job:jobs_)job.get();
+        }catch(...){
+            for(auto& job:jobs_)if(job.valid())job.wait();
+            throw;
+        }
+    }
+};
 double sum(const Values& values) { double out=0;for(double v:values)out+=v;return out; }
 double logsum(const Values& values, ExactExpCache& exp) {
     const double m=*std::max_element(values.begin(),values.end());
@@ -69,7 +88,6 @@ template<bool Counts>
 static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLikelihood*>& pairs,int threads) {
     if(pairs.empty())return std::nullopt;
     threads=std::max(1,threads);
-    std::vector<ExactExpCache> exp(threads);
     std::unordered_map<const Values*,std::size_t,BitsHash,BitsEqual> slots;
     std::vector<const Values*> keys;std::vector<std::size_t> group;group.reserve(pairs.size());
     for(const auto* pair:pairs){const auto* key=&pair->log_likelihood;auto [it,inserted]=slots.emplace(key,keys.size());if(inserted)keys.push_back(key);group.push_back(it->second);}
@@ -90,6 +108,10 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         }
         group.resize(keys.size());for(std::size_t i=0;i<group.size();++i)group[i]=i;
     }
+    // Tiny fits stay serial; term arithmetic and ordered reductions are identical.
+    if(keys.size()<64)threads=1;
+    FitWorkers workers(threads);
+    std::vector<ExactExpCache> exp(threads);
     struct Terms {Values responsibility;double log_sum=0;};
     std::vector<Terms> terms(keys.size());
     MixtureFit result;result.training_pairs=pairs.size();
@@ -101,7 +123,7 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     std::vector<double> row_max;
     if constexpr(Counts){
         row_max.resize(keys.size());
-        parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+        workers.run(keys.size(),[&](std::size_t i,int worker){
             const auto& p=*keys[i];
             const double m=*std::max_element(p.begin(),p.end());
             if(!std::isfinite(m))throw std::runtime_error("all mixture components impossible");
@@ -109,11 +131,12 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
             for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);
         });
     }
+    const auto em_begin=std::chrono::steady_clock::now();
     double old=-std::numeric_limits<double>::infinity();
     for(;result.iterations<1000;++result.iterations) {
         Values count{},logw{};for(int j=0;j<mixture_components;++j)logw[j]=fqdup::fdlibm::log(w[j]);
         double ll=0;
-        parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+        workers.run(keys.size(),[&](std::size_t i,int worker){
             auto& t=terms[i];
             if constexpr(Counts){
                 double s=0;
@@ -139,12 +162,14 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         if(std::isfinite(old)&&ll-old<=1e-8*(1+std::abs(old))&&delta<=1e-6){result.converged=true;++result.iterations;break;}
         old=ll;
     }
-    if constexpr(!Counts)parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){const auto& p=*keys[i];const double m=*std::max_element(p.begin(),p.end());for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);});
+    result.em_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-em_begin).count();
+    if constexpr(!Counts)workers.run(keys.size(),[&](std::size_t i,int worker){const auto& p=*keys[i];const double m=*std::max_element(p.begin(),p.end());for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);});
     result.kkt_gap=std::numeric_limits<double>::infinity();
+    std::vector<double> table_den(densities.size()),den(group.size()),b(group.size());
+    const auto polish_begin=std::chrono::steady_clock::now();
     for(;result.polish_iterations<10000;++result.polish_iterations) {
-        std::vector<double> table_den(densities.size());
-        parallel_terms(densities.size(),threads,[&](std::size_t i,int){double d=0;for(int j=0;j<mixture_components;++j)d+=densities[i][j]*w[j];table_den[i]=d;});
-        std::vector<double> den;den.reserve(pairs.size());for(auto index:group)den.push_back(table_den[index]);
+        workers.run(densities.size(),[&](std::size_t i,int){double d=0;for(int j=0;j<mixture_components;++j)d+=densities[i][j]*w[j];table_den[i]=d;});
+        for(std::size_t i=0;i<group.size();++i)den[i]=table_den[group[i]];
         Values gradient{};
         for(std::size_t i=0;i<den.size();++i){if(!(den[i]>0))throw std::runtime_error("density underflow");const auto& density=densities[group[i]];for(int j=0;j<mixture_components;++j){if constexpr(Counts)gradient[j]+=multiplicity[i]*(density[j]/den[i]);else gradient[j]+=density[j]/den[i];}}
         const int hi=static_cast<int>(std::max_element(gradient.begin(),gradient.end())-gradient.begin());
@@ -152,7 +177,7 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         if(result.kkt_gap<=1e-6*pairs.size()){result.converged=true;break;}
         int lo=-1;for(int j=0;j<mixture_components;++j)if(w[j]>1e-14&&(lo<0||gradient[j]<gradient[lo]))lo=j;
         if(lo<0||lo==hi)break;
-        std::vector<double> b;b.reserve(den.size());for(std::size_t i=0;i<den.size();++i)b.push_back((densities[group[i]][hi]-densities[group[i]][lo])/den[i]);
+        for(std::size_t i=0;i<den.size();++i)b[i]=(densities[group[i]][hi]-densities[group[i]][lo])/den[i];
         const auto derivative=[&](double alpha){double d=0;if constexpr(Counts){for(std::size_t i=0;i<b.size();++i){const double v=b[i];d+=multiplicity[i]*(v/(1+alpha*v));}}else{for(double v:b)d+=v/(1+alpha*v);}return d;};
         double alpha=w[lo];
         if(derivative(alpha)<0){double lower=0,upper=alpha;for(int z=0;z<55;++z){const double mid=(lower+upper)/2;if(derivative(mid)>0)lower=mid;else upper=mid;}alpha=(lower+upper)/2;}
@@ -160,7 +185,8 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         w[hi]+=alpha;w[lo]-=alpha;if(w[lo]<1e-15)w[lo]=0;
         const double mass=sum(w);for(double& x:w)x/=mass;
     }
-    parallel_terms(keys.size(),threads,[&](std::size_t i,int worker){
+    result.polish_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-polish_begin).count();
+    workers.run(keys.size(),[&](std::size_t i,int worker){
         if constexpr(Counts){
             double s=0;for(int j=0;j<mixture_components;++j)s+=w[j]*densities[i][j];
             if(s>0){terms[i].log_sum=row_max[i]+fqdup::fdlibm::log(s);return;}

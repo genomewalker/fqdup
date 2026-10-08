@@ -32,6 +32,21 @@ static void repeated_objective(const std::vector<PairLikelihood>& pairs,const Mi
     require(gap<=1.01e-6*pairs.size(),"weighted fit violates KKT tolerance");
 }
 int main(){
+    // More than 64 distinct cells exercises persistent workers, including unwind.
+    std::vector<PairLikelihood> parallel(96);
+    for(std::size_t i=0;i<parallel.size();++i){
+        parallel[i].id=std::to_string(i);
+        for(int j=0;j<mixture_components;++j)
+            parallel[i].log_likelihood[j]=(j==int(i%3)?0.0:-20.0)-.001*i;
+    }
+    const auto parallel_view=view(parallel);
+    identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
+    identical(*fit_mixture_views(parallel_view,1),*fit_mixture_views(parallel_view,8));
+    auto poison=parallel;poison.back().log_likelihood.fill(-std::numeric_limits<double>::infinity());
+    bool worker_error=false;
+    try{fit_mixture_counts(view(poison),8);}catch(const std::runtime_error&){worker_error=true;}
+    require(worker_error,"worker exception was lost");
+    identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
     require(!fit_mixture_counts({}),"empty counts fit");
     std::vector<PairLikelihood> one(19);
     const auto single=fit_mixture_counts(view(one));

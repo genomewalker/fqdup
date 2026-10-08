@@ -32,7 +32,8 @@ void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::si
         }
     }catch(...){
         // All references captured by jobs remain alive until they have drained.
-        for(auto& future:pending)if(future.valid())future.wait();
+        // Also drain a submitted job if storing its future failed to allocate.
+        pool.stop();
         throw;
     }
     if(profile)std::fprintf(stderr,"CHUNK_PROFILE stage=%s workers=%d chunk_rows=%zu max_inflight=%d rows=%zu chunks=%zu wall=%.6f\n",label,workers,chunk_rows,workers,count,chunks,std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());

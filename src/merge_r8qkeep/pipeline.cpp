@@ -45,7 +45,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
         if(concurrent>1)for(int k=begin;k<std::min(4,begin+concurrent);++k)fits[k/2][k%2]=futures[k].get();
     }
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
-    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';}
+    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
     if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");}
     if(defer_routing){NativeResult empty;empty.native_tsv=std::move(out.native.native_tsv);out.native=std::move(empty);}
