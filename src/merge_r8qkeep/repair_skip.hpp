@@ -34,11 +34,9 @@ struct RepairSkipBound {
             const char chosen=v[8][i];
             const int mate=chosen==v[1][i]?1:chosen==rc[j]?2:0;
             if(!mate)return -1;
-            const double e1=fqalign::phred_error(v[2].at(i)),e2=fqalign::phred_error(v[5].at(k));
             double value=0;
             for(int z=0;z<fqquality::PairMixture::K;++z){
-                const double e=fqquality::PairMixture::component(z);
-                const auto cp=fqquality::PairMixture::conditional(z==0?e1:e,z==0?e2:e,v[1][i]==rc[j]);
+                const auto cp=fqquality::PairMixture::lookup(z,v[2].at(i),v[5].at(k),v[1][i]==rc[j]).risk;
                 value+=audit.posterior[z]*(mate==1?cp.first:cp.second);
             }
             // Identical normalization and ordered dot product; SKIP.md proves

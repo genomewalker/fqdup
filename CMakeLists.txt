@@ -254,3 +254,8 @@ add_executable(test_task23_family_parallel tests/task23_family_parallel.cpp)
 target_compile_options(test_task23_family_parallel PRIVATE -ffp-contract=off)
 target_link_libraries(test_task23_family_parallel PRIVATE Threads::Threads)
 add_test(NAME task23_family_parallel COMMAND test_task23_family_parallel)
+
+add_executable(test_task24_lookup_tables tests/task24_lookup_tables.cpp)
+target_compile_options(test_task24_lookup_tables PRIVATE -ffp-contract=off)
+target_link_libraries(test_task24_lookup_tables PRIVATE Threads::Threads)
+add_test(NAME task24_lookup_tables COMMAND test_task24_lookup_tables)

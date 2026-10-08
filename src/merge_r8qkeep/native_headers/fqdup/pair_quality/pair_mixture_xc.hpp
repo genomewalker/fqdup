@@ -24,11 +24,43 @@ struct PairMixture {
   for(size_t i=0;i<q2.size();++i)risk.r2.at(i)=std::max(risk.r2.at(i),weights[training][0]*fqalign::phred_error(q2[i])+flat);
   return true;
  }
- static double component(int j){return .75*std::pow(double(j-1)/grid,2);}
+ static double component_direct(int j){return .75*std::pow(double(j-1)/grid,2);}
  static double clipped_log(double p){return std::log(std::clamp(p,1e-15,1-1e-15));}
  static std::pair<double,double> conditional(double e1,double e2,bool agree){
   if(agree){double a=e1*e2/3,den=(1-e1)*(1-e2)+a;return den>0?std::pair<double,double>{a/den,a/den}:std::pair<double,double>{1,1};}
   double d=e1+e2-4*e1*e2/3;return d>0?std::pair<double,double>{e1*(1-e2/3)/d,e2*(1-e1/3)/d}:std::pair<double,double>{1,1};
+ }
+ // Tables retain the exact scalar expressions and ordered accumulation below.
+ // Function-local initialization is thread safe; no per-row allocations.
+ struct Entry {double log;std::pair<double,double> risk;};
+ struct Tables {
+  std::array<double,K> components{};
+  std::array<std::array<Entry,2>,K> fixed{};
+  std::array<std::array<Entry,2>,94*94> nominal{};
+ };
+ static const Tables& tables(){
+  static const Tables value=[] {
+   Tables out;
+   for(int t=0;t<K;++t){double e=component_direct(t);out.components[t]=e;
+    if(t)for(int a=0;a<2;++a){double d=2*e-4*e*e/3;out.fixed[t][a]={clipped_log(a?1-d:d),conditional(e,e,a)};}
+   }
+   for(int q1=33;q1<=126;++q1)for(int q2=33;q2<=126;++q2){
+    double e1=fqalign::phred_error(char(q1)),e2=fqalign::phred_error(char(q2)),d=e1+e2-4*e1*e2/3;
+    for(int a=0;a<2;++a)out.nominal[(q1-33)*94+q2-33][a]={clipped_log(a?1-d:d),conditional(e1,e2,a)};
+   }
+   return out;
+  }();
+  return value;
+ }
+ static double component(int t){return t>=0&&t<K?tables().components[t]:component_direct(t);}
+ static Entry lookup(int t,char q1,char q2,bool agree){
+  const unsigned a=static_cast<unsigned char>(q1),b=static_cast<unsigned char>(q2);
+  if(t>=0&&t<K&&a>=33&&a<=126&&b>=33&&b<=126)
+   return t?tables().fixed[t][agree]:tables().nominal[(a-33)*94+b-33][agree];
+  // Preserve the original Phred validation and scalar path outside the domain.
+  double e1=fqalign::phred_error(q1),e2=fqalign::phred_error(q2),e=component_direct(t);
+  double d=t==0?e1+e2-4*e1*e2/3:2*e-4*e*e/3;
+  return {clipped_log(agree?1-d:d),conditional(t==0?e1:e,t==0?e2:e,agree)};
  }
  struct Audit {int fold=-1;size_t n=0;double nominal=0,flat=0;bool supported=false;std::array<double,K> posterior{};};
  static int fold(const std::string& s1,const std::string& s2){uint64_t hash=14695981039346656037ULL;for(unsigned char c:s1){hash^=c;hash*=1099511628211ULL;}hash^='|';hash*=1099511628211ULL;for(unsigned char c:s2){hash^=c;hash*=1099511628211ULL;}return int(hash&1);}
@@ -42,8 +74,8 @@ struct PairMixture {
   std::array<double,K> logpost{},post{};
   for(int j=0;j<K;++j)logpost[j]=weights[training][j]>0?std::log(weights[training][j]):-std::numeric_limits<double>::infinity();
   size_t n=0;for(auto [i,j]:cols){int k=int(s2.size())-1-j;if(s1.at(i)=='N'||rc.at(j)=='N')continue;++n;
-   double e1=fqalign::phred_error(q1.at(i)),e2=fqalign::phred_error(q2.at(k));bool agree=s1.at(i)==rc.at(j);
-   for(int t=0;t<K;++t){double e=component(t),d=t==0?e1+e2-4*e1*e2/3:2*e-4*e*e/3;logpost[t]+=clipped_log(agree?1-d:d);}
+   bool agree=s1.at(i)==rc.at(j);
+   for(int t=0;t<K;++t)logpost[t]+=lookup(t,q1.at(i),q2.at(k),agree).log;
   }
   if(!n)return false;double maximum=*std::max_element(logpost.begin(),logpost.end()),mass=0;if(!std::isfinite(maximum))throw std::runtime_error("empty mixture posterior");
   for(int t=0;t<K;++t){post[t]=std::exp(logpost[t]-maximum);mass+=post[t];}for(double& p:post)p/=mass;
@@ -60,8 +92,8 @@ struct PairMixture {
     if(s1.at(i)=='N'||rc.at(j)=='N')continue;
     bool cert=std::find(risk.correspondence.certified.begin(),risk.correspondence.certified.end(),std::pair<int,int>{i,j})!=risk.correspondence.certified.end();
     if(!full_trusted&&!cert&&(agree||before<5||total-before<5))continue;
-    double e1=fqalign::phred_error(q1.at(i)),e2=fqalign::phred_error(q2.at(k)),p1=0,p2=0;
-    for(int z=0;z<K;++z){double e=component(z);auto p=conditional(z==0?e1:e,z==0?e2:e,agree);p1+=post[z]*p.first;p2+=post[z]*p.second;}
+    double p1=0,p2=0;
+    for(int z=0;z<K;++z){auto p=lookup(z,q1.at(i),q2.at(k),agree).risk;p1+=post[z]*p.first;p2+=post[z]*p.second;}
     risk.r1.at(i)=p1;risk.r2.at(k)=p2;
    }begin=end;
   }
