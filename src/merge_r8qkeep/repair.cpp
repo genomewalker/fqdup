@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cfenv>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -29,9 +30,11 @@ fqquality::PairMixture model(const std::string& text){std::istringstream input(t
 }
 namespace fqdup::r8qkeep {
 using namespace ::fqdup_r8qkeep_repair_internal;
+#include "repair_skip.hpp"
 struct RepairPipeline::Impl {
     fqquality::PairMixture nominal,full;
-    Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)){}
+    RepairSkipBound bound;
+    Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)),bound(nominal){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
 RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int threads,std::size_t start) const {
@@ -60,17 +63,26 @@ RoutingResult RepairPipeline::route(const std::string& native_tsv,bool debug,int
     }
     result.routed_tsv=out.str();result.audit_tsv=audit.str();return result;
 }
-std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start,int threads) const {
+std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double cut,std::size_t start,int threads,RepairShadow* shadow,const std::vector<bool>* excluded) const {
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
-    if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1);},[&](std::string part){result+=part;},mode==9?"repair9":"repair7");return result;}
+    if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1,shadow,excluded);},[&](std::string part){result+=part;},mode==9?"repair9":"repair7");return result;}
     const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=start;
-    while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;{
+    while(std::getline(input,line)){const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;
+    const bool candidate=mode==9&&(!excluded||!excluded->at(index));
+    const bool skip=candidate&&impl_->bound.unchanged(v,model,cut);
+    const std::string predicted=(skip||(candidate&&shadow))?native_full_span(v,index):std::string();
+    if(skip&&!shadow){output<<predicted;++index;continue;}
+    {
         NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false);
         MergeRecord r;r.merged={v[7],v[8],v[9]};r.unmerged2={v[10],v[11],v[12]};
         if(v[6]=="merged"){r.is_merged=true;batch.n_merged=1;}else if(v[6]=="unmerged")batch.n_unmerged=1;else if(v[6]=="orphan_r1"||v[6]=="orphan_r2"){r.is_orphan=true;r.orphan_r1=v[6]=="orphan_r1";batch.n_orphan=1;if(r.orphan_r1)batch.n_orphan_r1=1;else batch.n_orphan_r2=1;}else if(v[6]!="dropped")throw std::runtime_error("native outcome");
         if(v[6]!="dropped")batch.records.push_back(std::move(r));
     }
-    output<<index++<<'\t';if(batch.records.empty()){output<<"dropped\t\t\t\t\t\t\n";continue;}const auto& r=batch.records.back();const char* outcome=r.is_merged?"merged":r.is_orphan?(r.orphan_r1?"orphan_r1":"orphan_r2"):"unmerged";output<<outcome<<'\t'<<r.merged.header<<'\t'<<r.merged.seq<<'\t'<<r.merged.qual<<'\t'<<r.unmerged2.header<<'\t'<<r.unmerged2.seq<<'\t'<<r.unmerged2.qual<<'\n';
+    const auto repaired=serialize_repair(batch,index++);output<<repaired;
+    if(candidate&&shadow){const bool same=predicted==repaired;
+        auto& counter=skip?(same?shadow->skip_and_unchanged:shadow->skip_but_changed):(same?shadow->noskip_unchanged:shadow->noskip_changed);
+        counter.fetch_add(1,std::memory_order_relaxed);
+    }
     }
     return output.str();
 }

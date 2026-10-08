@@ -244,3 +244,8 @@ add_test(NAME hexamer_confound
 add_test(NAME pipeline
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipeline.sh
                  $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic>)
+
+add_executable(test_task23_repair_skip tests/task23_repair_skip.cpp)
+target_compile_options(test_task23_repair_skip PRIVATE -ffp-contract=off)
+target_link_libraries(test_task23_repair_skip PRIVATE Threads::Threads)
+add_test(NAME task23_repair_skip COMMAND test_task23_repair_skip)

@@ -14,6 +14,6 @@ struct LibraryPipeline {
 struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; };
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false);
 FinalOutput emit_library(const LibraryPipeline& library,double cutoff);
-void write_library_outputs(const LibraryPipeline& library,double cutoff,const std::string& directory,int threads=1);
+void write_library_outputs(const LibraryPipeline& library,double cutoff,const std::string& directory,int threads=1,RepairShadow* shadow=nullptr);
 }
 int merge_r8qkeep_main(int argc,char** argv);
