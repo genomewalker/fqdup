@@ -79,7 +79,12 @@ struct MergeRecord {
     bool orphan_r1 = false; // when is_orphan: true=survivor was R1 (molecule 5'), false=R2 (RC 3')
 };
 
+enum class Disposition { unknown,merged,unmerged,orphan_r1,orphan_r2,dropped };
+static const char* disposition_name(Disposition value){
+    switch(value){case Disposition::merged:return "merged";case Disposition::unmerged:return "unmerged";case Disposition::orphan_r1:return "orphan_r1";case Disposition::orphan_r2:return "orphan_r2";case Disposition::dropped:return "dropped";default:return "unknown";}
+}
 struct MergeBatch {
+    std::vector<Disposition> dispositions;
     uint64_t id = 0;
     std::vector<MergeRecord> records;
     std::string outcomes_jsonl; // optional ordered per-input disposition audit
@@ -118,35 +123,37 @@ static void append_outcome_json_string(std::string& dst, const std::string& valu
 // Header copies and JSON accumulation are disabled unless outcomes were requested.
 struct PairOutcomeGuard {
     MergeBatch* batch = nullptr;
+    bool audit=false;
     std::string r1_header, r2_header;
     int64_t merged = 0, unmerged = 0, orphan_r1 = 0, orphan_r2 = 0, dropped = 0;
     PairOutcomeGuard(MergeBatch& out, const ReadPair& pair, bool enabled) {
-        if (!enabled) return;
-        batch = &out;
-        r1_header = pair.r1.header; r2_header = pair.r2.header;
+        batch = &out;audit=enabled;
+        if(audit){r1_header = pair.r1.header; r2_header = pair.r2.header;}
         merged = out.n_merged; unmerged = out.n_unmerged;
         orphan_r1 = out.n_orphan_r1; orphan_r2 = out.n_orphan_r2;
         dropped = out.n_dropped;
     }
     ~PairOutcomeGuard() {
         if (!batch) return;
-        const char* outcome = "unknown";
+        auto outcome = Disposition::unknown;
         const int64_t dm = batch->n_merged - merged;
         const int64_t du = batch->n_unmerged - unmerged;
         const int64_t d1 = batch->n_orphan_r1 - orphan_r1;
         const int64_t d2 = batch->n_orphan_r2 - orphan_r2;
         const int64_t dd = batch->n_dropped - dropped;
         if (dm + du + d1 + d2 + dd == 1) {
-            if (dm == 1) outcome = "merged";
-            else if (du == 1) outcome = "unmerged";
-            else if (d1 == 1) outcome = "orphan_r1";
-            else if (d2 == 1) outcome = "orphan_r2";
-            else if (dd == 1) outcome = "dropped";
+            if (dm == 1) outcome = Disposition::merged;
+            else if (du == 1) outcome = Disposition::unmerged;
+            else if (d1 == 1) outcome = Disposition::orphan_r1;
+            else if (d2 == 1) outcome = Disposition::orphan_r2;
+            else if (dd == 1) outcome = Disposition::dropped;
         }
+        batch->dispositions.push_back(outcome);
+        if(!audit)return;
         auto& text = batch->outcomes_jsonl;
         text += "{\"r1_header\":"; append_outcome_json_string(text, r1_header);
         text += ",\"r2_header\":"; append_outcome_json_string(text, r2_header);
-        text += ",\"outcome\":\""; text += outcome; text += "\"}\n";
+        text += ",\"outcome\":\""; text += disposition_name(outcome); text += "\"}\n";
     }
 };
 
@@ -2768,7 +2775,14 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #include "native.hpp"
 #include "memory_status.hpp"
 namespace fqdup::r8qkeep {
-static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, const NativeSettings& settings,bool trace,bool audit) {
+NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t begin,std::size_t count,const NativeSettings& settings,bool trace,bool audit) {
+    static_assert(native_batch_size==PAIR_BATCH_SZ);
+    if(begin>all.size()||count>all.size()-begin||count>native_batch_size)throw std::runtime_error("native range");
+    struct PairSpan {
+        const FamilyPair* data;std::size_t length;
+        const FamilyPair* begin()const{return data;}const FamilyPair* end()const{return data+length;}
+        std::size_t size()const{return length;}const FamilyPair& operator[](std::size_t i)const{return data[i];}
+    } pairs{all.data()+begin,count};
     using namespace ::fqdup_native_xc_internal;
     const auto memory=[&](const char* name){if(trace)std::cerr<<"MERGE_MEMORY native_"<<name<<memory_status()<<'\n';};
     memory("start");
@@ -2783,7 +2797,7 @@ static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, con
     opts.disable_polyg = true;
     opts.experimental_short_tail = true;
     opts.experimental_gapped_clipping = true;
-    opts.outcomes_out = "in-memory";
+    opts.outcomes_out = audit?"in-memory":"";
     PairBatch input; input.id = 0; input.pairs.reserve(pairs.size());
     for (const auto& pair : pairs) {
         ReadPair native;
@@ -2816,12 +2830,11 @@ static NativeResult merge_native_chunk(const std::vector<FamilyPair>& pairs, con
     memory("parent_strings");
     std::size_t row = 0, emitted = 0;
     if(audit)result.native_outcomes_json = "[";
-    while (std::getline(outcomes, line)) {
+    for (const auto disposition:batch.dispositions) {
         if (row >= pairs.size()) throw std::runtime_error("extra native disposition");
-        const auto marker = line.rfind(",\"outcome\":\"");
-        if (marker == std::string::npos || line.size() < marker + 14) throw std::runtime_error("native disposition format");
-        const auto begin = marker + 12;
-        const std::string kind = line.substr(begin, line.find('"', begin) - begin);
+        if(disposition==Disposition::unknown)throw std::runtime_error("unknown native disposition");
+        if(audit&&!std::getline(outcomes,line))throw std::runtime_error("missing native audit");
+        const std::string kind=disposition_name(disposition);
         const auto& pair = pairs[row];
         NativeRecord native;native.raw=&pair;native.outcome=kind;
         if (kind != "dropped") {
@@ -2843,8 +2856,7 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSetti
     NativeResult result;result.records.reserve(pairs.size());if(audit)result.native_outcomes_json="[";
     bool first=true;
     for(std::size_t begin=0;begin<pairs.size();begin+=PAIR_BATCH_SZ){const auto end=std::min(pairs.size(),begin+PAIR_BATCH_SZ);
-        std::vector<FamilyPair> chunk(pairs.begin()+begin,pairs.begin()+end);
-        auto part=merge_native_chunk(chunk,settings,trace&&begin==0,audit);
+        auto part=merge_native_range(pairs,begin,end-begin,settings,trace&&begin==0,audit);
         if(audit)result.native_tsv+=part.native_tsv;
         for(std::size_t i=0;i<part.records.size();++i){part.records[i].raw=&pairs[begin+i];result.records.push_back(std::move(part.records[i]));}
         if(audit){result.merged_fq+=part.merged_fq;result.r1_fq+=part.r1_fq;result.r2_fq+=part.r2_fq;result.orphan_fq+=part.orphan_fq;result.outcomes_jsonl+=part.outcomes_jsonl;

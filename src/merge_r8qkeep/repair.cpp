@@ -35,7 +35,8 @@ using namespace ::fqdup_r8qkeep_repair_internal;
 struct RepairAlignmentCache::Impl {
     std::size_t start;
     std::vector<alignment_cache::Pair> pairs;
-    Impl(std::size_t s,std::size_t n):start(s),pairs(n){}
+    std::vector<std::vector<fqquality::PairMixture::CachedApply>> posteriors;
+    Impl(std::size_t s,std::size_t n):start(s),pairs(n),posteriors(n){}
 };
 RepairAlignmentCache::RepairAlignmentCache(std::size_t s,std::size_t n):impl_(std::make_shared<Impl>(s,n)){}
 struct RepairPipeline::Impl {
@@ -50,6 +51,7 @@ RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std:
     for(const auto& v:native) {
         NativeRecord replacement;
         alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(row-cache->impl_->start):nullptr);
+        fqquality::PairMixture::CacheScope posterior_scope(cache?&cache->impl_->posteriors.at(row-cache->impl_->start):nullptr);
         bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;int64_t repair_bound=-1;
         const int64_t clean=clean_pair_bound(v,model,processor);
         if(clean>=0&&!debug&&!shadow){repair_bound=clean;}
@@ -85,6 +87,7 @@ std::vector<RepairedRecord> RepairPipeline::repair_records(NativeRecords input,i
     for(std::size_t i=0;i<input.size();++i){
         const auto index=start+i,mask=mask_offset+i;
         alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(index-cache->impl_->start):nullptr);
+        fqquality::PairMixture::CacheScope posterior_scope(cache?&cache->impl_->posteriors.at(index-cache->impl_->start):nullptr);
         if(selected&&!selected->at(mask)){output.emplace_back();continue;}
         const auto& v=replacements?replacements->at(mask):input[i];
         if(v[1].size()!=v[2].size()||v[4].size()!=v[5].size())throw std::runtime_error("raw lengths");

@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include "worker_pool.hpp"
 #include <future>
 #include <string>
 #include <vector>
@@ -8,23 +9,38 @@
 #include <cstdio>
 #include <ctime>
 namespace fqdup::r8qkeep {
-// Index ranges borrow records directly; no per-row TSV or string copies.
+// Index ranges borrow records directly; jobs finish out of order, consumption
+// remains ordered. At most workers futures (and outputs) are retained.
 template<class Work,class Consume>
-void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
+void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
     const int workers=std::max(1,std::min(threads,8));
     const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
     using Result=decltype(work(row_offset,std::size_t{}));
     const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
     const auto start=std::chrono::steady_clock::now();std::size_t chunks=0,pos=0;
-    while(pos<count){
-        std::vector<std::future<Result>> pending;pending.reserve(workers);
-        for(int w=0;w<workers&&pos<count;++w){
-            const auto begin=pos,n=std::min(chunk_rows,count-pos);pos+=n;++chunks;
-            pending.push_back(std::async(std::launch::async,[&,begin,n]{return work(row_offset+begin,n);}));
+    std::deque<std::future<Result>> pending;
+    const auto launch=[&]{
+        const auto begin=pos,n=std::min(chunk_rows,count-pos);pos+=n;++chunks;
+        pending.push_back(pool.submit([work,begin,n,row_offset]{return work(row_offset+begin,n);}));
+    };
+    try {
+        while(pos<count&&pending.size()<std::size_t(workers))launch();
+        while(!pending.empty()){
+            auto result=pending.front().get();pending.pop_front();
+            if(pos<count)launch();
+            consume(std::move(result));
         }
-        for(auto& result:pending)consume(result.get());
+    }catch(...){
+        // All references captured by jobs remain alive until they have drained.
+        for(auto& future:pending)if(future.valid())future.wait();
+        throw;
     }
     if(profile)std::fprintf(stderr,"CHUNK_PROFILE stage=%s workers=%d chunk_rows=%zu max_inflight=%d rows=%zu chunks=%zu wall=%.6f\n",label,workers,chunk_rows,workers,count,chunks,std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+}
+template<class Work,class Consume>
+void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
+    WorkerPool pool(std::max(1,std::min(threads,8)));
+    ordered_index_chunks(pool,count,threads,row_offset,std::move(work),std::move(consume),label);
 }
 
 // Bound outstanding row chunks and consume results in original input order.

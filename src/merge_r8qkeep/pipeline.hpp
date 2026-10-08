@@ -5,6 +5,7 @@
 namespace fqdup::r8qkeep {
 struct LibraryPipeline {
     FamilyResult family;
+    NativeSettings native_settings;
     NativeResult native;
     CensusResult observations;
     std::string nominal_prior,full_prior;

@@ -25,16 +25,17 @@ int main(){
             if(trial%6==4){v[6]="dropped";for(int j=7;j<13;++j)v[j].clear();}
             if(trial%6==5){v[6]="unmerged";v[7]=v[0];v[8]=v[1];v[9]=v[2];v[10]=v[3];v[11]=v[4];v[12]=v[5];}
             std::string text;for(std::size_t j=0;j<v.size();++j){if(j)text+='\t';text+=v[j];}text+='\n';
-            const auto reference=pipeline.route(text,true),fast=pipeline.route(text,false);
+            RepairAlignmentCache cache(0,1);
+            const auto reference=pipeline.route(text,true),fast=pipeline.route(text,false,1,0,&cache);
             require(reference.routed==fast.routed&&reference.replacements==fast.replacements);
             for(double cut:{0.0,.0001,.001,.01,.1,.316,.75,1.0}){
                 RepairShadow shadow;
                 const auto expected=pipeline.repair(text,9,cut,0,1,&shadow,&reference.routed,&reference.repair_bounds,nullptr,&fast.clean_bounds);
-                const auto actual=pipeline.repair(text,9,cut,0,1,nullptr,&fast.routed,&fast.repair_bounds,nullptr,&fast.clean_bounds);
+                const auto actual=pipeline.repair(text,9,cut,0,1,nullptr,&fast.routed,&fast.repair_bounds,&cache,&fast.clean_bounds);
                 require(expected==actual&&shadow.clean_but_changed==0&&shadow.skip_but_changed==0);
                 positives+=shadow.clean_and_unchanged;negatives+=shadow.notclean;
                 require(shadow.clean_and_unchanged+shadow.notclean==1);
-                const auto selected=pipeline.repair(text,7,cut,0,1,nullptr,nullptr,nullptr,nullptr,nullptr,&fast.routed);
+                const auto selected=pipeline.repair(text,7,cut,0,1,nullptr,nullptr,nullptr,&cache,nullptr,&fast.routed);
                 if(fast.routed[0])require(selected==pipeline.repair(text,7,cut));
                 else require(selected=="0\tdropped\t\t\t\t\t\t\n");
             }

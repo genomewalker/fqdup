@@ -63,13 +63,37 @@ struct PairMixture {
   return {clipped_log(agree?1-d:d),conditional(t==0?e1:e,t==0?e2:e,agree)};
  }
  struct Audit {int fold=-1;size_t n=0;double nominal=0,flat=0;bool supported=false;std::array<double,K> posterior{};};
+ struct CachedApply {
+  const PairMixture* model;
+  int mode;bool full_trusted;
+  std::string s1,q1,s2,q2;
+  std::vector<std::pair<int,int>> invariant,certified;
+  std::vector<double> r1,r2;
+  Audit audit;
+ };
+ inline static thread_local std::vector<CachedApply>* active_cache=nullptr;
+ struct CacheScope {
+  std::vector<CachedApply>* previous;
+  explicit CacheScope(std::vector<CachedApply>* cache):previous(active_cache){active_cache=cache;}
+  ~CacheScope(){active_cache=previous;}
+ };
  static int fold(const std::string& s1,const std::string& s2){uint64_t hash=14695981039346656037ULL;for(unsigned char c:s1){hash^=c;hash*=1099511628211ULL;}hash^='|';hash*=1099511628211ULL;for(unsigned char c:s2){hash^=c;hash*=1099511628211ULL;}return int(hash&1);}
  bool apply(fqalign::PairRisk& risk,const std::string& s1,const std::string& q1,
             const std::string& s2,const std::string& q2,int mode,Audit* audit=nullptr,bool full_trusted=false)const {
+  Audit cached_audit;
+  if(active_cache&&!audit)audit=&cached_audit;
   if(audit)audit->fold=fold(s1,s2);
   if(!risk.correspondence.eligible)return false;
 
   int training=1-fold(s1,s2);if(!supported[training])return false;
+  if(active_cache)for(const auto& entry:*active_cache){
+   if(entry.model==this&&entry.mode==mode&&entry.full_trusted==full_trusted&&
+      entry.s1==s1&&entry.q1==q1&&entry.s2==s2&&entry.q2==q2&&
+      entry.invariant==risk.correspondence.invariant&&entry.certified==risk.correspondence.certified&&
+      entry.r1.size()==risk.r1.size()&&entry.r2.size()==risk.r2.size()){
+    risk.r1=entry.r1;risk.r2=entry.r2;*audit=entry.audit;return true;
+   }
+  }
   const auto rc=fqalign::reverse_complement(s2);std::vector<std::pair<int,int>> cols;for(auto c:risk.correspondence.invariant)if(s1.at(c.first)!='N'&&rc.at(c.second)!='N')cols.push_back(c);
   std::array<double,K> logpost{},post{};
   for(int j=0;j<K;++j)logpost[j]=weights[training][j]>0?std::log(weights[training][j]):-std::numeric_limits<double>::infinity();
@@ -97,6 +121,8 @@ struct PairMixture {
     risk.r1.at(i)=p1;risk.r2.at(k)=p2;
    }begin=end;
   }
+  if(active_cache)active_cache->push_back({this,mode,full_trusted,s1,q1,s2,q2,
+      risk.correspondence.invariant,risk.correspondence.certified,risk.r1,risk.r2,*audit});
   return true;
  }
 };
