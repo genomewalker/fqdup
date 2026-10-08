@@ -113,13 +113,13 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         // Each worker owns this chunk through every cutoff. Global row identity
         // is restored at assembly; route/repair masks and cache use local rows.
         RepairAlignmentCache cache(0,chunk.count);const auto route_begin=Clock::now();
-        const auto routing=lib.repair->route(native,debug,1,0,&cache);chunk.router_seconds=elapsed(route_begin);
+        const auto routing=lib.repair->route(native,debug,1,0,&cache,shadow);chunk.router_seconds=elapsed(route_begin);
         std::string routed;bool alternative=false;const auto native_rows=rows(native);
         for(std::size_t i=0;i<chunk.count;++i){if(routing.routed.at(i)){alternative=true;routed+=routing.replacements.at(i);}else routed+=native_rows[i]+"\n";}
         if(debug){chunk.routed=routing.routed_tsv;for(const auto& line:rows(routing.audit_tsv)){auto tab=line.find('\t');if(tab==std::string::npos)throw std::runtime_error("audit row");chunk.audit+=std::to_string(start+std::stoull(line.substr(0,tab)))+line.substr(tab)+"\n";}}
         for(std::size_t c=0;c<cuts.size();++c){const auto begin=Clock::now();auto& out=chunk.outputs[c];
-            const auto base=rows(lib.repair->repair(native,9,cuts[c],0,1,shadow?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache));
-            const auto changed=alternative?rows(lib.repair->repair(routed,7,cuts[c],0,1,nullptr,nullptr,nullptr,&cache)):std::vector<std::string>{};
+            const auto base=rows(lib.repair->repair(native,9,cuts[c],0,1,shadow?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache,&routing.clean_bounds));
+            const auto changed=alternative?rows(lib.repair->repair(routed,7,cuts[c],0,1,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed)):std::vector<std::string>{};
             if(base.size()!=chunk.count||(alternative&&changed.size()!=chunk.count))throw std::runtime_error("chunk cardinality");
             for(std::size_t i=0;i<chunk.count;++i){const auto v=fields(routing.routed[i]?changed[i]:base[i]);if(v.size()!=8||std::stoull(v[0])!=i)throw std::runtime_error("chunk order");
                 const auto& pair=lib.family.pairs.at(start+i);const auto add=[&](int j,std::string& text){if(id(v[j])!=pair.id)throw std::runtime_error("record identity");text+=v[j]+"\n"+v[j+1]+"\n+\n"+v[j+2]+"\n";};
@@ -136,7 +136,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
     for(auto& group:files)for(auto& file:group){file.close();if(!file)throw std::runtime_error("write output");}
     if(timings||debug)std::cerr<<"MERGE_STAGE router seconds="<<router_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
-    for(std::size_t c=0;c<cuts.size();++c){if(shadow)std::cerr<<"REPAIR_SHADOW cutoff="<<labels[c]<<" skip_and_unchanged="<<counters[c].skip_and_unchanged.load()<<" skip_but_changed="<<counters[c].skip_but_changed.load()<<" noskip_unchanged="<<counters[c].noskip_unchanged.load()<<" noskip_changed="<<counters[c].noskip_changed.load()<<'\n';
+    for(std::size_t c=0;c<cuts.size();++c){if(shadow)std::cerr<<"REPAIR_SHADOW cutoff="<<labels[c]<<" skip_and_unchanged="<<counters[c].skip_and_unchanged.load()<<" skip_but_changed="<<counters[c].skip_but_changed.load()<<" noskip_unchanged="<<counters[c].noskip_unchanged.load()<<" noskip_changed="<<counters[c].noskip_changed.load()<<" clean_and_unchanged="<<counters[c].clean_and_unchanged.load()<<" clean_but_changed="<<counters[c].clean_but_changed.load()<<" notclean="<<counters[c].notclean.load()<<'\n';
         if(timings||debug)std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<labels[c]<<" seconds="<<seconds[c]<<" timing_basis=worker_elapsed_excluding_write"<<memory_status()<<'\n';}
 }
 }
