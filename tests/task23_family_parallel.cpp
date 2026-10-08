@@ -7,7 +7,7 @@ static void require(bool ok){if(!ok)throw std::runtime_error("family parallel mi
 static void check(const std::vector<std::string>& keys){
     std::vector<int> expected(keys.size());std::iota(expected.begin(),expected.end(),0);
     require(serial_neighbor_families(keys,expected));
-    const auto roots=[](std::vector<int> p){for(std::size_t i=0;i<p.size();++i){int r=i;while(p[r]!=r)r=p[r];p[i]=r;}return p;};
+    const auto roots=[](std::vector<int> p){std::map<int,int> first;for(std::size_t i=0;i<p.size();++i){int r=i;while(p[r]!=r)r=p[r];first.emplace(r,i);}std::vector<int> out(p.size());for(std::size_t i=0;i<p.size();++i){int r=i;while(p[r]!=r)r=p[r];out[i]=first.at(r);}return out;};
     for(int threads:{1,8})for(std::size_t limit:{0,1,64}){
         std::vector<int> actual(keys.size());std::iota(actual.begin(),actual.end(),0);
         require(neighbor_families(keys,actual,threads,limit));

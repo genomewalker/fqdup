@@ -2,6 +2,7 @@
 // Must be byte-identical to the JS reference on R1.fastq, R2.fastq, family-edits.tsv and families.tsv.
 // Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
 #include "family.hpp"
+#include "family_index.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -63,7 +64,7 @@ struct Group { std::vector<int> m; bool oversize = false; int diameter = 0; };
 struct Column { int n = 0; std::vector<std::pair<char, std::vector<int>>> votes; int top = -1; }; // votes in first-seen order
 
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
-// Enumerate exact neighborhoods (including the frozen N/N mismatch rule).
+// Pigeonhole candidates with the frozen N/N mismatch rule.
 // Union roots are not output: groups/members are emitted by ascending read id.
 bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64){
     const auto code=[](char c){switch(c){case 'A':return 0;case 'C':return 1;case 'G':return 2;case 'T':return 3;case 'N':return 4;default:return -1;}};
@@ -73,14 +74,12 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     const auto unite=[&](int i,int j){i=root(i);j=root(j);if(i!=j)parent[i]=j;};
     std::unordered_map<std::string,int> exact;std::vector<int> representative;
     for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){auto [it,new_key]=exact.emplace(keys[i],representative.size());if(new_key)representative.push_back(i);else unite(i,representative[it->second]);}
-    using Index=std::unordered_map<std::uint64_t,std::vector<int>>;
-    std::array<Index,3> index;const int bounds[]={0,13,26,40};
-    const auto packed=[&](const std::string& key,int part){std::uint64_t x=0;for(int p=bounds[part];p<bounds[part+1];++p)x|=std::uint64_t(code(key[p]))<<(3*(p-bounds[part]));return x;};
-    std::size_t cells=0,max_bucket=0;
-    for(int part=0;part<3;++part){for(std::size_t i=0;i<representative.size();++i)index[part][packed(keys[representative[i]],part)].push_back(i);cells+=index[part].size();for(const auto& entry:index[part])max_bucket=std::max(max_bucket,entry.second.size());}
+    std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
+    std::size_t cells=0,max_bucket=0,index_bytes=0;
+    for(int part=0;part<3;++part){index[part].build(keys,representative,bounds[part],bounds[part+1]);cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
     const auto generated=std::chrono::steady_clock::now();
     // A fixed global batch, independent of -p. No per-worker seen array or index.
-    // Workers never access parent; union order stays query/block/neighborhood order.
+    // Workers never access parent; components are independent of edge order.
     struct Slot {
         std::array<int,64> edges{};
         std::size_t size=0;
@@ -94,41 +93,23 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
         const auto& key=keys[representative[query]];
         for(int part=0;part<3;++part){
-            const int length=bounds[part+1]-bounds[part];
-            std::array<int,14> normal{},npos{};int normals=0,ns=0;
-            for(int p=0;p<length;++p){if(key[bounds[part]+p]=='N')npos[ns++]=p;else normal[normals++]=p;}
-            // keys_of admits at most two Ns; reject other callers before indexing.
-            std::array<std::uint64_t,25> bases{};bases[0]=packed(key,part);int count=1;
-            for(int ni=0;ni<ns;++ni){const int p=npos[ni],old=count;
-                for(int b=old-1;b>=0;--b){const auto base=bases[b];for(int c=0;c<5;++c)bases[5*b+c]=(base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p));}count*=5;}
-            const int budget=2-ns;
-            const auto lookup=[&](std::uint64_t value){
-                ++result.lookups;const auto it=shared_index[part].find(value);if(it==shared_index[part].end())return;
-                result.candidates+=it->second.size();
-                for(int other:it->second){
-                    if(std::size_t(other)>=query)continue;
-                    const auto& candidate=keys[representative[other]];
-                    // This candidate was visited in an earlier block iff that
-                    // block has <=2 mismatches, including N/N as a mismatch.
-                    bool earlier=false;
-                    for(int block=0;block<part&&!earlier;++block){int m=0;
-                        for(int p=bounds[block];p<bounds[block+1];++p)m+=key[p]=='N'||candidate[p]=='N'||key[p]!=candidate[p];
-                        earlier=m<=2;}
-                    if(earlier)continue;
-                    ++result.verified;
-                    if(serial&&root(representative[query])==root(representative[other]))continue;
-                    if(mismatches(key,candidate)>MAXMIS)continue;
-                    if(serial)unite(representative[query],representative[other]);
-                    else if(result.size<edge_limit)result.edges[result.size++]=other;
-                    else result.overflow=true;
+            const auto value=fqdup::r8qkeep::FamilyPartIndex::pack(key,bounds[part],bounds[part+1]);
+            shared_index[part].visit(value,[&](int other){
+                if(std::size_t(other)>=query)return true;
+                const auto& candidate=keys[representative[other]];
+                for(int block=0;block<part;++block){int m=0;
+                    for(int p=bounds[block];p<bounds[block+1];++p)m+=key[p]=='N'||candidate[p]=='N'||key[p]!=candidate[p];
+                    if(m<=2)return true;
                 }
-            };
-            for(int bi=0;bi<count;++bi){const auto base=bases[bi];lookup(base);if(result.overflow)return;if(budget<1)continue;
-                for(int a=0;a<normals;++a){const int p=normal[a],original=code(key[bounds[part]+p]);
-                    for(int c=0;c<5;++c)if(c!=original){const auto first=(base&~(std::uint64_t(7)<<(3*p)))|(std::uint64_t(c)<<(3*p));lookup(first);if(result.overflow)return;if(budget<2)continue;
-                        for(int b=a+1;b<normals;++b){const int q=normal[b],second=code(key[bounds[part]+q]);for(int d=0;d<5;++d)if(d!=second){lookup((first&~(std::uint64_t(7)<<(3*q)))|(std::uint64_t(d)<<(3*q)));if(result.overflow)return;}}}
-                }
-            }
+                ++result.verified;
+                if(serial&&root(representative[query])==root(representative[other]))return true;
+                if(mismatches(key,candidate)>MAXMIS)return true;
+                if(serial)unite(representative[query],representative[other]);
+                else if(result.size<edge_limit)result.edges[result.size++]=other;
+                else result.overflow=true;
+                return !result.overflow;
+            },result.lookups,result.candidates);
+            if(result.overflow)return;
         }
     };
     std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
@@ -144,7 +125,7 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
         }
     }
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))
-{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<sizeof(slots)<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
+{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<sizeof(slots)<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
     return true;
 }
 
