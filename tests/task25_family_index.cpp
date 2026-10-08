@@ -49,7 +49,16 @@ int main() {
             index.visit(FamilyPartIndex::pack(query, 0, length), [&](int i) { actual.push_back(i); return true; }, lookups, candidates);
             std::sort(actual.begin(), actual.end());
             for (int i = 0; i < int(keys.size()); ++i) if (expected_values.count(keys[i])) expected.push_back(i);
-            if (actual != expected || lookups > 3) throw std::runtime_error("candidate set mismatch");
+            if (actual != expected || lookups > 4) throw std::runtime_error("candidate set mismatch");
+            // The exhaustive oracle includes mutations in the same sub-block
+            // and separate sub-blocks, N/N differences, and duplicate members.
+            int visits=0;lookups=candidates=0;
+            index.visit(FamilyPartIndex::pack(query,0,length),[&](int){++visits;return false;},lookups,candidates);
+            if(visits!=1)throw std::runtime_error("visitor early termination");
+            std::string too_many_n(length,'A');too_many_n[0]=too_many_n[4]=too_many_n[length-1]='N';
+            visits=0;
+            index.visit(FamilyPartIndex::pack(too_many_n,0,length),[&](int){++visits;return true;},lookups,candidates);
+            if(visits)throw std::runtime_error("three query Ns accepted");
         }
         std::cout << "Task 25 candidate sets: 72 exhaustive-neighborhood comparisons passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

@@ -150,7 +150,9 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P) {
     return keys;
 }
 std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads) {
-    const int n = int(P.size()); keys = keys_of(P);
+    auto last=std::chrono::steady_clock::now();
+    const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
+    const int n = int(P.size()); keys = keys_of(P);phase("keys");
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
     if(!neighbor_families(keys,parent,threads)){
@@ -175,12 +177,14 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     }
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_CANDIDATES pairs="<<n<<" buckets="<<buckets.size()<<" candidates="<<candidates<<" unique="<<unique<<" rank_bytes="<<rank.capacity()*sizeof(rank[0])<<'\n';
     }
+    phase("graph");
     std::vector<int> order; std::map<int, int> slot; std::vector<Group> groups;
     for (int i = 0; i < n; ++i) if (!keys[i].empty()) { int r = find(i); auto it = slot.find(r); if (it == slot.end()) { slot[r] = int(groups.size()); groups.push_back({}); it = slot.find(r); } groups[it->second].m.push_back(i); }
     std::vector<Group> out;
     for (auto& g : groups) { if (g.m.size() < 2) continue; int diam = 0;
         if (int(g.m.size()) <= MAXCOMP) for (size_t x = 0; x < g.m.size(); ++x) for (size_t y = x + 1; y < g.m.size(); ++y) diam = std::max(diam, mismatches(keys[g.m[x]], keys[g.m[y]]));
         g.oversize = int(g.m.size()) > MAXCOMP || diam > MAXDIAM; g.diameter = diam; out.push_back(g); }
+    phase("groups");
     return out;
 }
 std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
@@ -215,13 +219,17 @@ bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) retu
 
 namespace fqdup::r8qkeep {
 FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads) {
+        auto last=std::chrono::steady_clock::now();
+        const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
         constexpr bool damage_safe = false;
         if (R1.size() != R2.size()) throw std::runtime_error("pair count");
         std::vector<Pair> P; P.reserve(R1.size());
         for (size_t i = 0; i < R1.size(); ++i) { if (R1[i].id != R2[i].id) throw std::runtime_error("pair order " + R1[i].id); P.push_back({R1[i].id, {std::move(R1[i]), std::move(R2[i])}}); }
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
-        std::vector<std::string> keys; auto groups = families(P, keys, threads);
+        phase("pair_storage");
+        std::vector<std::string> keys; auto groups = families(P, keys, threads);phase("families_total");
         std::vector<char> disband(groups.size()); for (size_t k = 0; k < groups.size(); ++k) disband[k] = groups[k].oversize || second_molecule(P, groups[k].m);
+        phase("disband");
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
@@ -243,12 +251,18 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
                     else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::vector<double> w(col.votes.size(), 1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto& v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto& w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
+        phase("correction");
         std::ostringstream f, stats;
         f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
               for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
-        return {std::move(P), "pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str(), f.str(), stats.str()};
+        FamilyResult result{std::move(P), "pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str(), f.str(), stats.str()};
+        phase("serialization");return result;
 }
-std::vector<FamilyRead> read_family_fastq(const std::string& path) { return read_fastq(path); }
+std::vector<FamilyRead> read_family_fastq(const std::string& path) {
+    const auto start=std::chrono::steady_clock::now();auto reads=read_fastq(path);
+    if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_READ path="<<path<<" seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<'\n';
+    return reads;
+}
 }
