@@ -10,6 +10,16 @@
 #include "merged_span_budget.hpp"
 #include "repair_correspondence.hpp"
 
+// Owned by one repair worker; assignment/clear retains capacity between rows.
+template<class Record>
+struct NativeQualityScratch {
+    Record raw1,raw2;
+    fqalign::PairRisk pair;
+    std::vector<double> risk,proposed,selected,original1,original2,short_risk;
+    std::vector<double> a,b,rawa,rawb;
+    std::vector<fqquality::JointColumn> columns;
+};
+
 // Runs before PairOutcomeGuard on scope exit, including all early continues.
 // Batches retain their native bounded queues and original input ordering.
 template<class Batch, class Record>
@@ -24,7 +34,10 @@ class NativeQualityGuard {
     bool merged_floor;
     const fqquality::PairMixture* full_mixture;
     size_t original_size;
-    Record raw1,raw2;
+    NativeQualityScratch<Record> owned_scratch;
+    NativeQualityScratch<Record>& scratch;
+    Record& raw1;
+    Record& raw2;
     static void trim(Record& r,fqalign::TrimInterval iv,const char* channel,int mate) {
         const size_t length=r.seq.size();
         if(iv.end<=iv.begin){r.seq.clear();r.qual.clear();return;}
@@ -56,8 +69,8 @@ class NativeQualityGuard {
     }
 public:
     NativeQualityGuard(Batch& out,const Record& r1,const Record& r2,
-                       fqalign::QualityProcessor& p,double c,bool raise=false,int selective=0,const fqquality::PairMixture* model=nullptr,int mode=1,const fqquality::PairMixture* full_model=nullptr,bool floor=false)
-        :batch(out),processor(p),cutoff(c),raise_disagreements(raise),selective_mode(selective),mixture(model),mixture_mode(mode),full_mixture(full_model),merged_floor(floor),original_size(out.records.size()) {
+                       fqalign::QualityProcessor& p,double c,bool raise=false,int selective=0,const fqquality::PairMixture* model=nullptr,int mode=1,const fqquality::PairMixture* full_model=nullptr,bool floor=false,NativeQualityScratch<Record>* reuse=nullptr)
+        :batch(out),processor(p),cutoff(c),raise_disagreements(raise),selective_mode(selective),mixture(model),mixture_mode(mode),full_mixture(full_model),merged_floor(floor),original_size(out.records.size()),scratch(reuse?*reuse:owned_scratch),raw1(scratch.raw1),raw2(scratch.raw2) {
         if(cutoff>=0){raw1=r1;raw2=r2;}
     }
     ~NativeQualityGuard() {
@@ -65,14 +78,14 @@ public:
         if(batch.records.size()!=original_size+1)std::abort();
         auto& r=batch.records.back();
         if(r.is_merged) {
-            std::vector<double> risk; risk.reserve(r.merged.qual.size());
+            auto& risk=scratch.risk; risk.clear(); risk.reserve(r.merged.qual.size());
             for(char q:r.merged.qual)risk.push_back(fqalign::phred_error(q));
             if(mixture && mixture_mode>=6) {
                 const auto geom=fqalign::quality_independent_geometry(raw1.seq,raw2.seq);
-                auto pr=processor.risks(raw1.seq,raw1.qual,raw2.seq,raw2.qual,geom.eligible?geom.insert:-1);
+                auto& pr=scratch.pair;processor.risks_into(pr,raw1.seq,raw1.qual,raw2.seq,raw2.qual,geom.eligible?geom.insert:-1);
                 fqquality::PairMixture::Audit audit;
                 if(mixture->apply(pr,raw1.seq,raw1.qual,raw2.seq,raw2.qual,1,&audit)) {
-                    const auto rc=fqalign::reverse_complement(raw2.seq);auto proposed=risk;bool valid=true;
+                    const auto rc=fqalign::reverse_complement(raw2.seq);auto& proposed=scratch.proposed;proposed=risk;bool valid=true;
                     for(auto [i,j]:pr.correspondence.invariant) {
                         if(raw1.seq.at(i)=='N'||rc.at(j)=='N')continue;
                         const int k=int(raw2.seq.size())-1-j;
@@ -84,20 +97,20 @@ public:
                         for(int z=0;z<fqquality::PairMixture::K;++z){double e=fqquality::PairMixture::component(z);auto cp=fqquality::PairMixture::conditional(z==0?e1:e,z==0?e2:e,raw1.seq.at(i)==rc.at(j));value+=audit.posterior[z]*(mate==1?cp.first:cp.second);}
                         proposed[i]=value;
                     }
-                    if(valid)risk=std::move(proposed);
+                    if(valid)risk.swap(proposed);
                 }
             }
             auto iv=mixture_mode==9?fqquality::merged_span_budget(risk,cutoff):fqalign::mott_segment(risk,risk.size(),cutoff);
-            if(merged_floor && iv.end>iv.begin){std::vector<double> selected(risk.begin()+iv.begin,risk.begin()+iv.end);const auto cb=fqalign::reverse_complement(raw2.seq);for(size_t i=0;i<selected.size();++i){const int c=int(iv.begin+i),k=int(r.merged.seq.size())-1-c;if(c>=int(raw1.seq.size())||k<0||k>=int(raw2.seq.size()))continue;char x=raw1.seq[c],y=cb[raw2.seq.size()-1-k];if(x!='N'&&y!='N'&&x!=y)selected[i]=std::max(selected[i],.5);}auto local=fqalign::mott_segment(selected,selected.size(),cutoff);if(local.end>local.begin)iv={iv.begin+local.begin,iv.begin+local.end};else iv={};}
+            if(merged_floor && iv.end>iv.begin){auto& selected=scratch.selected;selected.assign(risk.begin()+iv.begin,risk.begin()+iv.end);const auto cb=fqalign::reverse_complement(raw2.seq);for(size_t i=0;i<selected.size();++i){const int c=int(iv.begin+i),k=int(r.merged.seq.size())-1-c;if(c>=int(raw1.seq.size())||k<0||k>=int(raw2.seq.size()))continue;char x=raw1.seq[c],y=cb[raw2.seq.size()-1-k];if(x!='N'&&y!='N'&&x!=y)selected[i]=std::max(selected[i],.5);}auto local=fqalign::mott_segment(selected,selected.size(),cutoff);if(local.end>local.begin)iv={iv.begin+local.begin,iv.begin+local.end};else iv={};}
             trim(r.merged,iv,"merged",0);
             if(r.merged.seq.empty()){--batch.n_merged;++batch.n_dropped;batch.records.pop_back();}
             return;
         }
         const auto g=fqalign::quality_independent_geometry(raw1.seq,raw2.seq);
-        auto p=processor.risks(raw1.seq,raw1.qual,raw2.seq,raw2.qual,g.eligible?g.insert:-1);
+        auto& p=scratch.pair;processor.risks_into(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual,g.eligible?g.insert:-1);
         bool mixture_applied=false;
         if(mixture && (!(mixture_mode==3||mixture_mode==4)||!r.is_orphan)) {
-            const auto original1=p.r1,original2=p.r2;
+            auto& original1=scratch.original1;auto& original2=scratch.original2;original1=p.r1;original2=p.r2;
             mixture_applied=mixture->apply(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual,mixture_mode);
             if(mixture_applied && (mixture_mode==3||mixture_mode==4))
                 fqquality::guard_pair_mixture(p,original1,original2,r.merged.seq.size(),r.unmerged2.seq.size(),cutoff);
@@ -112,7 +125,7 @@ public:
             mixture->prior_floor(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual);
         if(raise_disagreements)fqquality::raise_anchored_disagreements(p,raw1.seq,raw2.seq);
         if(selective_mode>0 && (selective_mode!=2 || !r.is_orphan)) {
-            const auto original1=p.r1,original2=p.r2;
+            auto& original1=scratch.original1;auto& original2=scratch.original2;original1=p.r1;original2=p.r2;
             fqquality::raise_weaker_disagreements(p,raw1.seq,raw2.seq,cutoff);
             if(selective_mode==2)fqquality::protect_unique_coverage(p,original1,original2,r.merged.seq.size(),r.unmerged2.seq.size(),cutoff);
         }
@@ -121,7 +134,7 @@ public:
             const auto& raw=mate==1?raw1:raw2;
             const auto& risk=mate==1?p.r1:p.r2;
             prefix(r.merged,raw);
-            auto short_risk=std::vector<double>(risk.begin(),risk.begin()+r.merged.seq.size());const auto rawcut=(mixture_mode==7||mixture_mode==9)&&!mixture_applied?fqquality::retained_median_cutoff(short_risk,raw.qual.substr(0,r.merged.seq.size()),cutoff):cutoff;
+            auto& short_risk=scratch.short_risk;short_risk.assign(risk.begin(),risk.begin()+r.merged.seq.size());const auto rawcut=(mixture_mode==7||mixture_mode==9)&&!mixture_applied?fqquality::retained_median_cutoff(short_risk,raw.qual.substr(0,r.merged.seq.size()),cutoff):cutoff;
             trim(r.merged,fqalign::mott_segment(short_risk,short_risk.size(),rawcut),"orphan",mate);
             if(r.merged.seq.empty()) {
                 --batch.n_orphan;
@@ -135,11 +148,11 @@ public:
         fqalign::Correspondence repair_corr;
         if(mixture_mode==9)repair_corr=fqrepair::full_trusted_correspondence(r.merged.seq,fqalign::reverse_complement(r.unmerged2.seq));
         std::array<fqalign::TrimInterval,2> intervals{fqalign::mott_segment(p.r1,r.merged.seq.size(),cutoff),fqalign::mott_segment(p.r2,r.unmerged2.seq.size(),cutoff)};
-        if(mixture_mode==7&&!mixture_applied){auto a=std::vector<double>(p.r1.begin(),p.r1.begin()+r.merged.seq.size()),b=std::vector<double>(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());intervals={fqalign::mott_segment(a,a.size(),fqquality::retained_median_cutoff(a,raw1.qual.substr(0,a.size()),cutoff)),fqalign::mott_segment(b,b.size(),fqquality::retained_median_cutoff(b,raw2.qual.substr(0,b.size()),cutoff))};}
+        if(mixture_mode==7&&!mixture_applied){auto& a=scratch.a;auto& b=scratch.b;a.assign(p.r1.begin(),p.r1.begin()+r.merged.seq.size());b.assign(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());intervals={fqalign::mott_segment(a,a.size(),fqquality::retained_median_cutoff(a,raw1.qual.substr(0,a.size()),cutoff)),fqalign::mott_segment(b,b.size(),fqquality::retained_median_cutoff(b,raw2.qual.substr(0,b.size()),cutoff))};}
         if(mixture_applied && (mixture_mode==5||mixture_mode>=6)) {
-            const auto rc=fqalign::reverse_complement(raw2.seq);std::vector<fqquality::JointColumn> columns;
+            const auto rc=fqalign::reverse_complement(raw2.seq);auto& columns=scratch.columns;columns.clear();
             for(auto [i,j]:p.correspondence.invariant)if(raw1.seq.at(i)!='N'&&rc.at(j)!='N')columns.push_back({i,int(raw2.seq.size())-1-j,raw1.seq.at(i)==rc.at(j)});
-            {size_t hqd=0;for(auto& c:columns)hqd+=!c.agree&&raw1.qual.at(c.i)>=63&&raw2.qual.at(c.k)>=63;if(mixture_mode==9&&hqd>=2){std::vector<double> a(r.merged.seq.size()),b(r.unmerged2.seq.size());for(size_t i=0;i<a.size();++i)a[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)b[i]=fqalign::phred_error(raw2.qual[i]);intervals={fqalign::mott_segment(a,a.size(),cutoff),fqalign::mott_segment(b,b.size(),cutoff)};columns.clear();}}bool exclusive=false;if(full_applied){auto a=std::vector<double>(p.r1.begin(),p.r1.begin()+r.merged.seq.size()),b=std::vector<double>(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size()),rawa=a,rawb=b;for(size_t i=0;i<a.size();++i)rawa[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)rawb[i]=fqalign::phred_error(raw2.qual[i]);exclusive=fqquality::exclusive_core_intervals(a,b,rawa,rawb,columns,cutoff,fqquality::PairMixture::fold(raw1.seq,raw2.seq),intervals);}
+            {size_t hqd=0;for(auto& c:columns)hqd+=!c.agree&&raw1.qual.at(c.i)>=63&&raw2.qual.at(c.k)>=63;if(mixture_mode==9&&hqd>=2){auto& a=scratch.a;auto& b=scratch.b;a.resize(r.merged.seq.size());b.resize(r.unmerged2.seq.size());for(size_t i=0;i<a.size();++i)a[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)b[i]=fqalign::phred_error(raw2.qual[i]);intervals={fqalign::mott_segment(a,a.size(),cutoff),fqalign::mott_segment(b,b.size(),cutoff)};columns.clear();}}bool exclusive=false;if(full_applied){auto& a=scratch.a;auto& b=scratch.b;a.assign(p.r1.begin(),p.r1.begin()+r.merged.seq.size());b.assign(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());auto& rawa=scratch.rawa;auto& rawb=scratch.rawb;rawa=a;rawb=b;for(size_t i=0;i<a.size();++i)rawa[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)rawb[i]=fqalign::phred_error(raw2.qual[i]);exclusive=fqquality::exclusive_core_intervals(a,b,rawa,rawb,columns,cutoff,fqquality::PairMixture::fold(raw1.seq,raw2.seq),intervals);}
             if(!exclusive)fqquality::joint_intervals(p.r1,p.r2,r.merged.seq.size(),r.unmerged2.seq.size(),columns,cutoff,intervals);
         }
         trim(r.merged,intervals[0],"r1",1);

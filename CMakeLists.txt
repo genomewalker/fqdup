@@ -264,3 +264,8 @@ add_executable(test_task24_alignment_cache tests/task24_alignment_cache.cpp)
 target_compile_options(test_task24_alignment_cache PRIVATE -ffp-contract=off)
 target_link_libraries(test_task24_alignment_cache PRIVATE Threads::Threads)
 add_test(NAME task24_alignment_cache COMMAND test_task24_alignment_cache)
+
+add_executable(test_task24_guard_scratch tests/task24_guard_scratch.cpp)
+target_compile_options(test_task24_guard_scratch PRIVATE -ffp-contract=off)
+target_link_libraries(test_task24_guard_scratch PRIVATE Threads::Threads)
+add_test(NAME task24_guard_scratch COMMAND test_task24_guard_scratch)

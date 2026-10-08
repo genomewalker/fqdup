@@ -75,13 +75,14 @@ std::string RepairPipeline::repair(const std::string& input_tsv,int mode,double 
     if((mode!=7&&mode!=9)||!std::isfinite(cut)||cut<0||cut>1)throw std::runtime_error("invalid repair arguments");
     if(threads>1){std::string result;ordered_text_chunks(input_tsv,threads,start,[&](const std::string& chunk,std::size_t offset){return repair(chunk,mode,cut,offset,1,shadow,excluded,repair_bounds,cache);},[&](std::string part){result+=part;},mode==9?"repair9":"repair7");return result;}
     const auto& model=impl_->nominal;const auto& full_model=impl_->full;fqalign::QualityProcessor processor;StringInputBuffer buffer(input_tsv);std::istream input(&buffer);std::ostringstream output;std::string line;std::size_t index=start;
+    NativeQualityScratch<Record> guard_scratch;
     while(std::getline(input,line)){alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(index-cache->impl_->start):nullptr);const auto v=split(line);if(v.size()!=13)throw std::runtime_error("repair columns");Record a{v[0],v[1],v[2]},b{v[3],v[4],v[5]};if(a.seq.size()!=a.qual.size()||b.seq.size()!=b.qual.size())throw std::runtime_error("raw lengths");Batch batch;
     const bool candidate=mode==9&&(!excluded||!excluded->at(index));
     const bool skip=candidate&&impl_->bound.unchanged(v,model,cut,repair_bounds?repair_bounds->at(index):-1);
     const std::string predicted=(skip||(candidate&&shadow))?native_full_span(v,index):std::string();
     if(skip&&!shadow){output<<predicted;++index;continue;}
     {
-        NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false);
+        NativeQualityGuard<Batch,Record> guard(batch,a,b,processor,cut,false,0,&model,mode,&full_model,false,&guard_scratch);
         MergeRecord r;r.merged={v[7],v[8],v[9]};r.unmerged2={v[10],v[11],v[12]};
         if(v[6]=="merged"){r.is_merged=true;batch.n_merged=1;}else if(v[6]=="unmerged")batch.n_unmerged=1;else if(v[6]=="orphan_r1"||v[6]=="orphan_r2"){r.is_orphan=true;r.orphan_r1=v[6]=="orphan_r1";batch.n_orphan=1;if(r.orphan_r1)batch.n_orphan_r1=1;else batch.n_orphan_r2=1;}else if(v[6]!="dropped")throw std::runtime_error("native outcome");
         if(v[6]!="dropped")batch.records.push_back(std::move(r));
