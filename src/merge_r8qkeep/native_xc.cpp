@@ -2774,6 +2774,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #undef fqrepair
 #include "native.hpp"
 #include "memory_status.hpp"
+#include "ordered_chunks.hpp"
 namespace fqdup::r8qkeep {
 NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t begin,std::size_t count,const NativeSettings& settings,bool trace,bool audit) {
     static_assert(native_batch_size==PAIR_BATCH_SZ);
@@ -2852,15 +2853,23 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
     memory("serialized");
     return result;
 }
-NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit){
+NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit,int threads){
     NativeResult result;result.records.reserve(pairs.size());if(audit)result.native_outcomes_json="[";
     bool first=true;
-    for(std::size_t begin=0;begin<pairs.size();begin+=PAIR_BATCH_SZ){const auto end=std::min(pairs.size(),begin+PAIR_BATCH_SZ);
-        auto part=merge_native_range(pairs,begin,end-begin,settings,trace&&begin==0,audit);
+    const auto consume=[&](NativeResult part){
         if(audit)result.native_tsv+=part.native_tsv;
-        for(std::size_t i=0;i<part.records.size();++i){part.records[i].raw=&pairs[begin+i];result.records.push_back(std::move(part.records[i]));}
+        for(auto& record:part.records)result.records.push_back(std::move(record));
         if(audit){result.merged_fq+=part.merged_fq;result.r1_fq+=part.r1_fq;result.r2_fq+=part.r2_fq;result.orphan_fq+=part.orphan_fq;result.outcomes_jsonl+=part.outcomes_jsonl;
             if(!first)result.native_outcomes_json+=',';result.native_outcomes_json+=part.native_outcomes_json.substr(1,part.native_outcomes_json.size()-3);first=false;}
+    };
+    if(threads>1&&pairs.size()>native_batch_size){
+        // Batch-local learning must see the original 2048-pair boundaries.
+        // Jobs borrow pairs; ordered consumption retains every serialized view.
+        ordered_index_chunks(pairs.size(),threads,0,[&](std::size_t begin,std::size_t n){
+            return merge_native_range(pairs,begin,n,settings,trace&&begin==0,audit);
+        },consume,"native_prepare",native_batch_size);
+    }else for(std::size_t begin=0;begin<pairs.size();begin+=native_batch_size){
+        consume(merge_native_range(pairs,begin,std::min(native_batch_size,pairs.size()-begin),settings,trace&&begin==0,audit));
     }
     if(audit)result.native_outcomes_json+="]\n";
     if(trace)std::cerr<<"MERGE_MEMORY native_chunks_done"<<memory_status()<<'\n';

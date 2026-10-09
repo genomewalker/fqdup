@@ -12,9 +12,9 @@ namespace fqdup::r8qkeep {
 // Index ranges borrow records directly; jobs finish out of order, consumption
 // remains ordered. At most workers futures (and outputs) are retained.
 template<class Work,class Consume>
-void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
+void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0) {
     const int workers=std::max(1,std::min(threads,8));
-    const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
+    const std::size_t chunk_rows=rows_per_chunk?rows_per_chunk:std::max<std::size_t>(1,1024/workers);
     using Result=decltype(work(row_offset,std::size_t{}));
     const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
     const auto start=std::chrono::steady_clock::now();std::size_t chunks=0,pos=0;
@@ -39,9 +39,9 @@ void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::si
     if(profile)std::fprintf(stderr,"CHUNK_PROFILE stage=%s workers=%d chunk_rows=%zu max_inflight=%d rows=%zu chunks=%zu wall=%.6f\n",label,workers,chunk_rows,workers,count,chunks,std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
 }
 template<class Work,class Consume>
-void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records") {
+void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0) {
     WorkerPool pool(std::max(1,std::min(threads,8)));
-    ordered_index_chunks(pool,count,threads,row_offset,std::move(work),std::move(consume),label);
+    ordered_index_chunks(pool,count,threads,row_offset,std::move(work),std::move(consume),label,rows_per_chunk);
 }
 
 // Bound outstanding row chunks and consume results in original input order.
