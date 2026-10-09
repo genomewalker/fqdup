@@ -24,6 +24,26 @@ int main(){
     }
 
     std::mt19937 rng(2503);std::size_t positives=0,negatives=0;
+    // Compare the native-only sufficient condition with the actual path set,
+    // especially repeats, contained inserts and the best-minus-two boundary.
+    std::size_t early_accepted=0,early_rejected=0;
+    const auto nominal=model(prior(0));NativeCleanBound native_bound(nominal);
+    for(int trial=0;trial<900;++trial){
+        const int insert=30+trial%55,n=insert-10+trial%21,m=insert-10+(trial/21)%21;
+        std::string a(n,'A'),rc(m,'A'),merged(insert,'A');
+        for(char& c:a)c="ACGT"[rng()%4];for(char& c:rc)c="ACGT"[rng()%4];
+        for(char& c:merged)c="ACGT"[rng()%4];
+        if(trial%5==0){a.assign(n,'A');rc.assign(m,'A');merged.assign(insert,'A');}
+        for(int i=std::max(0,insert-m);i<std::min(n,insert);++i)rc[i-insert+m]=merged[i]=a[i];
+        std::vector<std::string> v{"@a",a,std::string(n,'I'),"@b",fqalign::reverse_complement(rc),std::string(m,'I'),"merged","@a",merged,std::string(insert,'I'),"","",""};
+        const auto bound=native_bound(v);
+        if(bound<0){++early_rejected;continue;}++early_accepted;
+        fqalign::QualityProcessor processor;auto p=processor.risks(v[1],v[2],v[4],v[5],insert);
+        if(p.correspondence.eligible)for(auto [i,j]:p.correspondence.invariant)
+            require(j-i==m-insert&&a[i]==rc[j]&&a[i]==merged[i]);
+        require(bound>=clean_pair_bound(v,nominal,processor));
+    }
+    require(early_accepted>0&&early_rejected>0);
     for(int component:{-1,0,40,65}){
         RepairPipeline pipeline(prior(component),prior(component));
         for(int trial=0;trial<60;++trial){

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -98,6 +99,8 @@ struct OutputChunk {
     double router_seconds=0,native_seconds=0;
     std::string routed,audit,native;
     std::size_t count=0;
+    std::size_t native_clean=0;
+    std::vector<std::size_t> native_clean_pass;
 };
 template<class Consume>
 void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,Consume consume){
@@ -116,6 +119,11 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
         RepairAlignmentCache cache(start,n);const auto route_begin=Clock::now();
         const auto routing=lib.repair->route_records(native,debug,start,&cache,counters!=nullptr);
+        chunk.native_clean=routing.native_clean;chunk.native_clean_pass.resize(cuts.size());
+        for(std::size_t c=0;c<cuts.size();++c)for(std::size_t i=0;i<n;++i){
+            const auto bound=routing.native_clean_bounds[i];
+            if(bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()))++chunk.native_clean_pass[c];
+        }
         chunk.router_seconds=elapsed(route_begin);
         const bool alternative=std::find(routing.routed.begin(),routing.routed.end(),true)!=routing.routed.end();
         if(debug){chunk.routed=routing.routed_tsv;chunk.audit=routing.audit_tsv;}
@@ -201,9 +209,12 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     std::vector<OutputFiles> files(cuts.size());for(std::size_t c=0;c<cuts.size();++c)open_files(files[c],directories[c]);
     double output_seconds=measure?elapsed(stream_begin):0;
     std::vector<RepairShadow> counters(cuts.size());std::vector<double> seconds(cuts.size());
-    double router_seconds=0,native_seconds=0;std::size_t count=0;
+    double router_seconds=0,native_seconds=0;std::size_t count=0,native_clean=0;
+    std::vector<std::size_t> native_clean_pass(cuts.size());
     process_records(lib,cuts,threads,debug,shadow?counters.data():nullptr,[&](OutputChunk chunk){
         count+=chunk.count;router_seconds+=chunk.router_seconds;native_seconds+=chunk.native_seconds;
+        native_clean+=chunk.native_clean;
+        for(std::size_t c=0;c<cuts.size();++c)native_clean_pass[c]+=chunk.native_clean_pass[c];
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];write_files(files[c],chunk.outputs[c]);}
@@ -220,6 +231,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     if(timings||debug)std::cerr<<"MERGE_STAGE streaming_native seconds="<<native_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
     if(timings||debug)std::cerr<<"MERGE_STAGE router seconds="<<router_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
     for(std::size_t c=0;c<cuts.size();++c){
+        if(timings||debug)std::cerr<<"CLEAN_FIRST cutoff="<<labels[c]<<" native_certified="<<native_clean<<" bound_pass="<<native_clean_pass[c]<<" pairs="<<count<<" reference_checks="<<(debug||shadow)<<'\n';
         if(shadow)std::cerr<<"REPAIR_SHADOW cutoff="<<labels[c]<<" skip_and_unchanged="<<counters[c].skip_and_unchanged.load()<<" skip_but_changed="<<counters[c].skip_but_changed.load()<<" noskip_unchanged="<<counters[c].noskip_unchanged.load()<<" noskip_changed="<<counters[c].noskip_changed.load()<<" clean_and_unchanged="<<counters[c].clean_and_unchanged.load()<<" clean_but_changed="<<counters[c].clean_but_changed.load()<<" notclean="<<counters[c].notclean.load()<<'\n';
         if(timings||debug)std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<labels[c]<<" seconds="<<seconds[c]<<" timing_basis=worker_elapsed_excluding_write"<<memory_status()<<'\n';
     }

@@ -13,6 +13,8 @@ struct RepairShadow {
 struct RoutingResult { std::string routed_tsv,audit_tsv;std::vector<bool> routed;std::vector<std::string> replacements;
     // One bound per native row, from this pipeline's router; -1 means full repair.
     std::vector<int64_t> repair_bounds,clean_bounds;
+    std::vector<int64_t> native_clean_bounds;
+    std::size_t native_clean=0;
     std::vector<NativeRecord> record_replacements; };
 class RepairAlignmentCache {
     struct Impl;
