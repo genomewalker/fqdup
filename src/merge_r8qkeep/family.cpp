@@ -4,6 +4,7 @@
 #include "family.hpp"
 #include "family_index.hpp"
 #include "ordered_chunks.hpp"
+#include "memory_status.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -178,6 +179,11 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     // Cache both twenty-base halves once; part boundaries are exact slices.
     std::vector<PackedFamilyKey> packed_keys;packed_keys.reserve(representative.size());
     for(int i:representative)packed_keys.emplace_back(keys[i]);
+    if(fqdup::r8qkeep::memory_enabled()){
+        fqdup::r8qkeep::MemoryUsage m;
+        m.family=index_bytes+fqdup::r8qkeep::vector_bytes(representative)+fqdup::r8qkeep::vector_bytes(packed_keys)+fqdup::r8qkeep::vector_bytes(parent)+fqdup::r8qkeep::strings_bytes(keys);
+        m.report("family_index",keys.size(),"index_only_excludes_raw");
+    }
     const auto generated=std::chrono::steady_clock::now();
     // Workers enumerate immutable indexes; only the ordered consumer touches
     // parent, including overflow recomputation. No per-worker seen arrays.
@@ -283,6 +289,9 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
     const int n = int(P.size()); keys = keys_of(P,pool,threads);phase("keys");
+    if(fqdup::r8qkeep::memory_enabled()){
+        fqdup::r8qkeep::MemoryUsage m;m.pairs(P);m.family=fqdup::r8qkeep::strings_bytes(keys);m.report("family_keys",P.size());
+    }
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
     if(!neighbor_families(keys,parent,threads,64,pool)){
@@ -406,7 +415,13 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         for (size_t i = 0; i < R1.size(); ++i) { if (R1[i].id != R2[i].id) throw std::runtime_error("pair order " + R1[i].id); P.push_back({R1[i].id, {std::move(R1[i]), std::move(R2[i])}}); }
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
         phase("pair_storage");
+        if(memory_enabled()){MemoryUsage m;m.pairs(P);m.report("pair_storage",P.size());}
         std::vector<std::string> keys; auto groups = families(P, keys, threads,shared_pool);phase("families_total");
+        if(memory_enabled()){
+            MemoryUsage m;m.pairs(P);m.family=strings_bytes(keys)+vector_bytes(groups);
+            for(const auto& group:groups)m.family+=vector_bytes(group.m);
+            m.report("family_groups",P.size());
+        }
         std::vector<std::string>().swap(keys);
         std::vector<char> disband(groups.size());
         const auto quality_errors=family_quality_errors();

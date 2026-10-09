@@ -19,15 +19,39 @@
 #include <filesystem>
 namespace fqdup::r8qkeep {
 namespace {
+std::size_t stage_read_bytes(const StageRead& r){return string_heap(r.header)+string_heap(r.seq)+string_heap(r.qual);}
+template<class Record> std::size_t record_bytes(const std::vector<Record>& rows){
+    std::size_t bytes=vector_bytes(rows);for(const auto& r:rows)bytes+=string_heap(r.outcome)+stage_read_bytes(r.first)+stage_read_bytes(r.second);return bytes;
+}
+std::size_t native_bytes(const NativeResult& n){
+    return record_bytes(n.records)+string_heap(n.merged_fq)+string_heap(n.r1_fq)+string_heap(n.r2_fq)+string_heap(n.orphan_fq)+string_heap(n.outcomes_jsonl)+string_heap(n.native_tsv)+string_heap(n.native_outcomes_json);
+}
+std::size_t likelihood_bytes(const std::vector<PairLikelihood>& rows){
+    std::size_t bytes=vector_bytes(rows);for(const auto& p:rows)bytes+=string_heap(p.id);return bytes;
+}
+std::size_t routing_bytes(const RoutingResult& r){
+    return string_heap(r.routed_tsv)+string_heap(r.audit_tsv)+vector_bytes(r.routed)+strings_bytes(r.replacements)+vector_bytes(r.repair_bounds)+vector_bytes(r.clean_bounds)+vector_bytes(r.native_clean_bounds)+record_bytes(r.record_replacements);
+}
+MemoryUsage library_memory(const LibraryPipeline& lib){
+    MemoryUsage m;m.pairs(lib.family.pairs);m.native=native_bytes(lib.native);
+    m.census=likelihood_bytes(lib.observations.nominal_pairs)+likelihood_bytes(lib.observations.full_pairs);
+    m.routing=routing_bytes(lib.routing);
+    m.diagnostics=string_heap(lib.family.edits_tsv)+string_heap(lib.family.families_tsv)+string_heap(lib.family.stats_json)+string_heap(lib.observations.nominal_tsv)+string_heap(lib.observations.full_tsv)+string_heap(lib.observations.proposed_edits_tsv)+string_heap(lib.nominal_prior)+string_heap(lib.full_prior);
+    return m;
+}
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;
+    const bool memory=memory_enabled();
+    const auto memory_stage=[&](const char* name){if(memory)library_memory(out).report(name,out.family.pairs.size());};
+    if(memory){MemoryUsage m;m.reads(r1);m.reads(r2);m.report("input",r1.size());}
     const int workers=std::max(1,std::min(threads,8));out.pool=std::make_shared<WorkerPool>(workers);
     if(counts){canonicalize_family_input(r1,r2,out.pool.get(),workers);stage("canonical_input");}
     out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
+    memory_stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
         const auto selected=prior_sample_indices(out.family.pairs,requested);
@@ -35,14 +59,18 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
         for(auto i:selected)sample.push_back(std::move(out.family.pairs[i]));
         if(timings||debug)std::cerr<<"PRIOR_SAMPLE requested="<<requested<<" selected="<<sample.size()<<" total="<<out.family.pairs.size()<<" seed="<<prior_sample_seed<<'\n';
         const auto native=merge_native(sample,settings,timings||debug,debug,threads,out.pool.get());stage("sample_native");
+        if(memory){auto m=library_memory(out);m.pairs(sample);m.native+=native_bytes(native);m.census+=vector_bytes(selected);m.report("sample_native",out.family.pairs.size());}
         out.observations=census(sample,native,debug,threads,0,true,out.pool.get());
+        if(memory){auto m=library_memory(out);m.pairs(sample);m.native+=native_bytes(native);m.census+=vector_bytes(selected);m.report("sample_census",out.family.pairs.size());}
         // Both kernels have joined; observations own their IDs and statistics.
         // Restore the selected slots before fitting or streaming the library.
         for(std::size_t i=0;i<selected.size();++i)out.family.pairs[selected[i]]=std::move(sample[i]);
         stage("sample_census");
     }else{
         out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads,out.pool.get());stage("native");
+        memory_stage("native");
         out.observations=census(out.family.pairs,out.native,debug,threads,0,false,out.pool.get());stage("census");
+        memory_stage("census");
     }
 
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
@@ -70,12 +98,13 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
       }
     }
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
+    if(memory){auto m=library_memory(out);for(const auto& rows:pairs)m.census+=likelihood_bytes(rows);m.report("prior_fit",out.family.pairs.size());}
     if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" kkt_gap="<<fit.kkt_gap<<" newton_reentries="<<fit.newton_reentries<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
     if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads,out.pool.get());stage("native");}
     if(defer_routing){NativeResult empty;empty.native_tsv=std::move(out.native.native_tsv);out.native=std::move(empty);}
     if(!debug){std::string().swap(out.family.edits_tsv);std::string().swap(out.family.families_tsv);std::string().swap(out.observations.proposed_edits_tsv);}
-    out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);if(!defer_routing){out.routing=out.repair->route_records(out.native.records,debug);stage("router");}return out;
+    out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);if(!defer_routing){out.routing=out.repair->route_records(out.native.records,debug);stage("router");}memory_stage("prepared");return out;
 }
 namespace {
 std::string_view read_id(const std::string& h){
@@ -125,6 +154,9 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     // Deeper single-cut queues hide uneven pair work and output stalls. Multi-
     // cutoff jobs retain at most 4096 output rows, independent of input size.
     const std::size_t window=workers*(cuts.size()==1?16:4);
+    const bool memory=memory_enabled();
+    std::atomic<std::size_t> max_native{0},max_routing{0},max_output{0};
+    const auto maximum=[](std::atomic<std::size_t>& dst,std::size_t value){auto old=dst.load();while(old<value&&!dst.compare_exchange_weak(old,value)){};};
     std::unique_ptr<WorkerPool> owned_pool;
     if(!lib.pool)owned_pool=std::make_unique<WorkerPool>(workers);
     auto& pool=lib.pool?*lib.pool:*owned_pool;const auto pipeline_begin=Clock::now();
@@ -147,9 +179,15 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto begin=Clock::now();
             const auto base=lib.repair->repair_records(native,9,cuts[c],start,counters?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache,&routing.clean_bounds);
             const auto changed=alternative?lib.repair->repair_records(native,7,cuts[c],start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
+            if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed));
             if(base.size()!=n||(alternative&&changed.size()!=n))throw std::runtime_error("chunk cardinality");
             for(std::size_t i=0;i<n;++i)append_record(chunk.outputs[c],routing.routed[i]?changed[i]:base[i],lib.family.pairs.at(start+i));
             chunk.seconds[c]=elapsed(begin);
+        }
+        if(memory){
+            std::size_t bytes=vector_bytes(chunk.outputs)+vector_bytes(chunk.seconds)+vector_bytes(chunk.native_clean_pass)+string_heap(chunk.routed)+string_heap(chunk.audit)+string_heap(chunk.native);
+            for(const auto& out:chunk.outputs)bytes+=string_heap(out.merged)+string_heap(out.r1)+string_heap(out.r2)+string_heap(out.orphan)+string_heap(out.outcomes);
+            maximum(max_output,bytes);
         }
         return chunk;
     };
@@ -181,11 +219,21 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
                 auto chunk=pending.front().get();pending.pop_front();
                 if(next<lib.family.pairs.size())launch();
                 auto owner=std::make_shared<NativeResult>(std::move(chunk.result));
+                if(memory)maximum(max_native,native_bytes(*owner));
                 dispatch(owner->records,owner,chunk.start,chunk.seconds);
             }
         }
         writer.finish();
     }catch(...){pool.stop();throw;}
+    if(memory){
+        MemoryUsage m;m.native=max_native.load();m.routing=max_routing.load();m.output=max_output.load();
+        m.report("streaming_chunk_max",lib.family.pairs.size(),"independent_chunk_maxima_excludes_cache_and_dp_scratch");
+        // Native batches may be referenced by queued outputs after the producer
+        // advances. This is a conservative capacity bound, not simultaneous use.
+        m.native*=workers+window+1;m.routing*=workers;m.output*=window+workers+1;
+        m.report("streaming_buffer_bound",lib.family.pairs.size(),"capacity_bound_excludes_cache_and_dp_scratch");
+        library_memory(lib).report("streaming_finished",lib.family.pairs.size());
+    }
     if(std::getenv("FQDUP_CHUNK_PROFILE"))std::fprintf(stderr,
         "CHUNK_PROFILE stage=streaming_pipeline workers=%d chunk_rows=%zu max_inflight=%zu rows=%zu chunks=%zu wall=%.6f timing_basis=wall_including_native_and_consume\n",
         workers,chunk_rows,window,output_rows,output_chunks,elapsed(pipeline_begin));
