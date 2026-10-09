@@ -2,6 +2,7 @@
 #include <random>
 namespace fqdup_r8qkeep_repair_internal {
 #include "task25_full_correction_ref.hpp"
+#include "task25_full_scan_ref.hpp"
 #include "task25_geometry_ref.hpp"
 #include "task25_native_correspondence_ref.hpp"
 #include "task25_self_correspondence_ref.hpp"
@@ -41,6 +42,18 @@ int main(){
         try{internal::fqalign::quality_independent_geometry_uncached(a,b);}catch(const std::invalid_argument&){actual=true;}
         require(expected==actual);
     }
+    // Degenerate first-row/column scans, rectangular inputs, caps and maximum size.
+    for(int n:{0,1,2,7,31,100,512,513})for(int m:{0,1,2,7,31,100,512,513})
+        for(int variant=0;variant<3;++variant){
+            std::string a(n,variant==2?'N':'A'),b(m,variant==0?'A':variant==1?'C':'N');
+            internal::fqalign::FullCorrespondence nominal;
+            internal::frozen_full_scan::FullCorrespondence old_nominal;
+            const auto actual=nominal.align_uncached(a,b);const auto expected=old_nominal.align_uncached(a,b);
+            same_full(actual,expected);require(actual.summary_complete==expected.summary_complete);
+            internal::fqrepair::FullCorrespondence correction;
+            internal::frozen_full_correction::FullCorrespondence old_correction;
+            same_full(correction.align_uncached(a,b),old_correction.align_uncached(a,b));
+        }
     std::mt19937 policy_rng(2511);bool relaxed_length=false,stricter_error=false;
     std::vector<int> lengths;for(int length=20;length<=100;length+=5)lengths.push_back(length);
     lengths.insert(lengths.end(),{512,31,511,20}); // grow, shrink, reuse across engines
@@ -62,6 +75,8 @@ int main(){
             same(banded.align_uncached(a,b,insert),old_banded.align_uncached(a,b,insert));
         const auto expected=oracle.align_uncached(a,b);
         const auto normal=nominal.align_uncached(a,b);
+        internal::frozen_full_scan::FullCorrespondence old_nominal;
+        same_full(normal,old_nominal.align_uncached(a,b));
         relaxed_length|=expected.corr.eligible&&!normal.corr.eligible;
         stricter_error|=!expected.corr.eligible&&normal.corr.eligible;
         internal::alignment_cache::Pair cache;internal::alignment_cache::Scope scope(&cache);

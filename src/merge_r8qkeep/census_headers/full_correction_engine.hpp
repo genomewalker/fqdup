@@ -41,8 +41,9 @@ class FullCorrespondence {
     if(inside(i+1,j))c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
     if(inside(i,j+1))c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
   }
-  for(int i=1;i<=n;++i)for(int j=1;j<=m;++j)
-   if(i==1||j==1)out.best=std::max(out.best,sub(a[i-1],b[j-1])+at(i,j).suffix[0]);
+  // Original row-major boundary order: entire first row, then first column.
+  for(int j=1;j<=m;++j)out.best=std::max(out.best,sub(a[0],b[j-1])+at(1,j).suffix[0]);
+  for(int i=2;i<=n;++i)out.best=std::max(out.best,sub(a[i-1],b[0])+at(i,1).suffix[0]);
   if(out.best<=neg/2)return result;
   int threshold=out.best-2;
   int max_counted_score=neg;
@@ -63,8 +64,8 @@ class FullCorrespondence {
    }
    if(state==0)path.pop_back();else --gaps;informative-=info;mismatches-=mm;
   };
-  for(int i=1;i<=n&&out.paths<=256;++i)for(int j=1;j<=m&&out.paths<=256;++j)
-   if(i==1||j==1)visit(visit,i,j,0,sub(a[i-1],b[j-1]));
+  for(int j=1;j<=m&&out.paths<=256;++j)visit(visit,1,j,0,sub(a[0],b[j-1]));
+  for(int i=2;i<=n&&out.paths<=256;++i)visit(visit,i,1,0,sub(a[i-1],b[0]));
   if(out.paths>256){out.reason="cap_exceeded";return result;}
   if(out.paths<1||max_counted_score!=out.best){out.reason="internal_inconsistency";return result;}
   for(int i=1;i<=n;++i)for(int j=1;j<=m;++j)
