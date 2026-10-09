@@ -29,6 +29,7 @@ struct MixtureFit {
     int iterations = 0, polish_iterations = 0;
     double kkt_gap = 0, log_likelihood = 0;
     double em_seconds=0,polish_seconds=0;
+    std::uint64_t last_em_zero_cells=0,last_em_subnormal_cells=0;
     std::uint64_t exp_calls=0,exp_cache_hits=0;
     std::size_t unique_likelihoods=0;
 };

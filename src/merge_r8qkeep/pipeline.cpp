@@ -38,14 +38,15 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
 
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
-    const int concurrent=std::max(1,std::min(4,threads)),per_fit=std::max(1,threads/concurrent);
+    // Counts measurements favor parallel independent fits over inner term jobs.
+    const int concurrent=std::max(1,std::min(4,threads)),per_fit=counts?1:std::max(1,threads/concurrent);
     for(int begin=0;begin<4;begin+=concurrent){std::array<std::future<std::optional<MixtureFit>>,4> futures;
         for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<const PairLikelihood*> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(&p);
             if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit,counts](){return counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);});else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
         if(concurrent>1)for(int k=begin;k<std::min(4,begin+concurrent);++k)fits[k/2][k%2]=futures[k].get();
     }
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
-    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<'\n';}
+    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
     if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");}
     if(defer_routing){NativeResult empty;empty.native_tsv=std::move(out.native.native_tsv);out.native=std::move(empty);}

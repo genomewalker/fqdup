@@ -196,6 +196,11 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     });
     for(auto index:group){if constexpr(Counts)result.log_likelihood+=multiplicity[index]*terms[index].log_sum;else result.log_likelihood+=terms[index].log_sum;}
     for(const auto& cache:exp){result.exp_calls+=cache.calls();result.exp_cache_hits+=cache.hits();}
+    // Observe the final E-step cells without changing any value or FP setting.
+    for(const auto& term:terms)for(double value:term.responsibility){
+        result.last_em_zero_cells+=value==0;
+        result.last_em_subnormal_cells+=std::fpclassify(value)==FP_SUBNORMAL;
+    }
     return result;
 }
 std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<false>(pairs,threads);}
