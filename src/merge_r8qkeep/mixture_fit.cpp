@@ -20,11 +20,12 @@ struct BitsHash {std::size_t operator()(const Values* p)const {std::uint64_t has
 struct BitsEqual {bool operator()(const Values* a,const Values* b)const{return std::memcmp(a->data(),b->data(),sizeof(double)*mixture_components)==0;}};
 class FitWorkers {
     int threads_;
-    std::unique_ptr<WorkerPool> pool_;
+    std::unique_ptr<WorkerPool> owned_pool_;
+    WorkerPool* pool_;
     std::vector<std::future<void>> jobs_;
 public:
-    explicit FitWorkers(int threads):threads_(threads){
-        if(threads>1)pool_=std::make_unique<WorkerPool>(threads-1);
+    explicit FitWorkers(int threads,WorkerPool* shared_pool):threads_(threads),pool_(shared_pool){
+        if(threads>1&&!pool_){owned_pool_=std::make_unique<WorkerPool>(threads-1);pool_=owned_pool_.get();}
         jobs_.reserve(threads);
     }
     template<class Function> void run(std::size_t count,Function function){
@@ -97,7 +98,7 @@ std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,i
     return fit_mixture_views(view,threads);
 }
 template<bool Counts>
-static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLikelihood*>& pairs,int threads) {
+static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLikelihood*>& pairs,int threads,WorkerPool* shared_pool=nullptr) {
     if(pairs.empty())return std::nullopt;
     threads=std::max(1,threads);
     std::unordered_map<const Values*,std::size_t,BitsHash,BitsEqual> slots;
@@ -122,7 +123,7 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     }
     // Tiny fits stay serial; term arithmetic and ordered reductions are identical.
     if(keys.size()<64)threads=1;
-    FitWorkers workers(threads);
+    FitWorkers workers(threads,shared_pool);
     std::vector<ExactExpCache> exp(threads);
     struct Terms {Values responsibility;double log_sum=0;};
     std::vector<Terms> terms(keys.size());
@@ -216,7 +217,7 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     return result;
 }
 std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<false>(pairs,threads);}
-std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<true>(pairs,threads);}
+std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads,WorkerPool* shared_pool){return fit_mixture_impl<true>(pairs,threads,shared_pool);}
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits) {
     std::string out="FQDUP_PAIR_MIXTURE_V1 64\n";
     for(int f=0;f<2;++f){const auto& fit=fits[f];if(fit&&!fit->converged)throw std::runtime_error("unconverged mixture");out+=std::to_string(f)+" "+std::to_string(fit?fit->training_pairs:0);for(int j=0;j<mixture_components;++j)out+=" "+shortest_double(fit?fit->weights[j]:0);out+='\n';}

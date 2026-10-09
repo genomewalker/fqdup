@@ -37,7 +37,10 @@ struct MixtureFit {
 std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,int threads=1);
 std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads=1);
 // One mode and training fold per call. Exact-bit cells reduce in sorted order.
-std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads=1);
+// A borrowed pool must have live workers with the caller's FP environment,
+// and outlive every concurrent fit call.
+class WorkerPool;
+std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads=1,WorkerPool* shared_pool=nullptr);
 std::vector<PairLikelihood> read_census_likelihood(std::istream& census);
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits);
 }

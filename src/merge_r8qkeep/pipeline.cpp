@@ -8,6 +8,7 @@
 #include <string_view>
 #include <array>
 #include <future>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
@@ -41,12 +42,18 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     // Run the two folds of one mode at once, sharing the whole thread budget.
     // This keeps nominal workers busy even when the full fits are tiny.
     const int concurrent=std::max(1,std::min(2,threads));
-    const int per_fit=std::max(1,threads/concurrent);
+    // Counts callers share auxiliary workers, so a completed fold leaves
+    // capacity for the other fold. Callers plus auxiliaries stay within threads.
+    const int auxiliary=counts&&concurrent>1?std::max(0,threads-concurrent):0;
+    std::unique_ptr<WorkerPool> shared_pool;
+    if(auxiliary)shared_pool=std::make_unique<WorkerPool>(auxiliary);
+    const int per_fit=shared_pool?auxiliary+1:std::max(1,threads/concurrent);
     for(int begin=0;begin<4;begin+=concurrent){std::array<std::future<std::optional<MixtureFit>>,4> futures;
         for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<const PairLikelihood*> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(&p);
-            if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit,counts](){return counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);});else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
+            if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit,counts,pool=shared_pool.get()](){return counts?fit_mixture_counts(training,per_fit,pool):fit_mixture_views(training,per_fit);});else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
         if(concurrent>1)for(int k=begin;k<std::min(4,begin+concurrent);++k)fits[k/2][k%2]=futures[k].get();
     }
+    shared_pool.reset();
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
     if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);

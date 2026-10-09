@@ -1,4 +1,5 @@
 #include "../src/merge_r8qkeep/mixture_fit.hpp"
+#include "../src/merge_r8qkeep/worker_pool.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -62,6 +63,22 @@ static int benchmark_workers(const char* census_path){
                  <<" iterations="<<fits[0]->iterations<<","<<fits[1]->iterations
                  <<" exact=1"<<std::endl;
     }
+    for(int repeat=0;repeat<2;++repeat){
+        const auto begin=std::chrono::steady_clock::now();
+        std::array<std::optional<MixtureFit>,2> fits;
+        {
+            WorkerPool pool(6);
+            std::array<std::future<std::optional<MixtureFit>>,2> jobs;
+            for(int fold=0;fold<2;++fold)jobs[fold]=std::async(std::launch::async,[&,fold]{
+                return fit_mixture_counts(training[fold],7,&pool);
+            });
+            for(int fold=0;fold<2;++fold)fits[fold]=jobs[fold].get();
+        }
+        const double wall=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+        for(int fold=0;fold<2;++fold){require(bool(fits[fold]),"empty shared fit");identical(*baseline[fold],*fits[fold]);}
+        require(prior_text(baseline)==prior_text(fits),"shared worker prior differs");
+        std::cout<<"FIT_SHARED total_workers=8 logical_workers_per_fit=7 wall="<<wall<<" exact=1"<<std::endl;
+    }
     return 0;
 }
 int main(int argc,char** argv){
@@ -88,6 +105,18 @@ int main(int argc,char** argv){
         require(worker_error,"caller or worker exception was lost");
     }
     identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
+    // One caller can fail while another continues using the borrowed pool.
+    {
+        WorkerPool pool(2);
+        auto good=std::async(std::launch::async,[&]{return fit_mixture_counts(parallel_view,3,&pool);});
+        auto bad=std::async(std::launch::async,[&]{
+            auto poison=parallel;poison.back().log_likelihood.fill(-std::numeric_limits<double>::infinity());
+            return fit_mixture_counts(view(poison),3,&pool);
+        });
+        bool threw=false;try{bad.get();}catch(const std::runtime_error&){threw=true;}
+        require(threw,"shared fit exception was lost");identical(*serial_counts,*good.get());
+        identical(*serial_counts,*fit_mixture_counts(parallel_view,3,&pool));
+    }
     require(!fit_mixture_counts({}),"empty counts fit");
     std::vector<PairLikelihood> one(19);
     const auto single=fit_mixture_counts(view(one));
