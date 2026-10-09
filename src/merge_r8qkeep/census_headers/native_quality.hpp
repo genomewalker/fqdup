@@ -61,23 +61,17 @@ inline Geometry quality_independent_geometry(const std::string& a,const std::str
             b.data()+(begin-insert+int(b.size())),end-begin);
     };
     const int last=int(a.size()+b.size())-11;
-    // At most 1013 offsets; exact integer counts are reused for runner-up.
-    struct OffsetCount {int informative,mismatches;};
-    std::array<OffsetCount,1024> counts;
+    ::fqdup::r8qkeep::GeometryRanking ranking;
     for(int insert=11;insert<=last;++insert) {
         auto [n,mm]=count(insert);
-        counts[insert]={n,mm};
-        if(n<11)continue;
-        const double frac=double(mm)/n;
-        if(out.insert<0||frac<out.fraction)
-            {out.insert=insert;out.informative=n;out.mismatches=mm;out.fraction=frac;}
+        ranking.observe(insert,n,mm);
     }
-    if(out.insert<0)return out;
-    for(int insert=11;insert<=last;++insert) {
-        if(insert==out.insert)continue;
-        auto [n,mm]=counts[insert];
-        if(n>=30)out.second=std::min(out.second,double(mm)/n);
-    }
+    const auto& best=ranking.best;
+    if(best.insert<0)return out;
+    out.insert=best.insert;out.informative=best.informative;
+    out.mismatches=best.mismatches;out.fraction=double(best.mismatches)/best.informative;
+    const auto& second=ranking.runner_up();
+    if(second.insert>=0)out.second=double(second.mismatches)/second.informative;
     out.eligible=out.informative>=30&&out.fraction<=0.30&&out.second>=0.45;
     return out;
 }

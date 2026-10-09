@@ -189,6 +189,16 @@ int main(){
             require(geometry_counts(a,b,n)==std::make_pair(known,mismatch));
         }
     }
+    // Exhaust the bounded fraction domain: integer order and ties must agree
+    // with the frozen binary64 divisions, including adjacent closest ratios.
+    std::vector<GeometryCandidate> fractions;
+    for(int n=11;n<=512;++n)for(int mm=0;mm<=n;++mm)fractions.push_back({0,n,mm});
+    std::sort(fractions.begin(),fractions.end(),[](const auto& a,const auto& b){return a.precedes(b);});
+    for(std::size_t i=1;i<fractions.size();++i){
+        const auto& a=fractions[i-1];const auto& b=fractions[i];
+        const double x=double(a.mismatches)/a.informative,y=double(b.mismatches)/b.informative;
+        require(x<=y&&a.precedes(b)==(x<y));
+    }
     std::mt19937 geometry_rng(2512);
     for(int n:{0,1,10,11,12,29,30,31,32,33,63,64,65,100,151,511,512,513})
         for(int m:{0,1,10,11,12,29,30,31,32,33,63,64,65,100,151,511,512,513})
