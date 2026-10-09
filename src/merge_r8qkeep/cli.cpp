@@ -51,7 +51,7 @@ int merge_r8qkeep_main(int argc,char** argv){
         auto library=prepare_library(std::move(mate1),std::move(mate2),settings,threads,debug,timings,true,counts);
         std::vector<double> values;std::vector<std::string> directories;
         for(const auto& cut:cuts){values.push_back(number(cut));directories.push_back((multiple?out/cut:out).string());}
-        write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow);
+        write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow,true);
         if(debug){std::filesystem::create_directory(out/"debug");write(out/"debug"/"family-edits.tsv",library.family.edits_tsv);write(out/"debug"/"families.tsv",library.family.families_tsv);write(out/"debug"/"stats.json",library.family.stats_json);write(out/"debug"/"native.tsv",library.native.native_tsv);write(out/"debug"/"nominal.tsv",library.observations.nominal_tsv);write(out/"debug"/"full.tsv",library.observations.full_tsv);write(out/"debug"/"proposed-edits.tsv",library.observations.proposed_edits_tsv);write(out/"debug"/"nominal.txt",library.nominal_prior);write(out/"debug"/"full.txt",library.full_prior);write(out/"debug"/"routed.tsv",library.routing.routed_tsv);write(out/"debug"/"route-audit.tsv",library.routing.audit_tsv);}
         return 0;
     }catch(const std::exception& e){std::cerr<<"fqdup merge: "<<e.what()<<'\n';return 1;}

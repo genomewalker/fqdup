@@ -16,7 +16,7 @@ struct LibraryPipeline {
 };
 struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; };
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false,bool defer_routing=false,bool counts=false);
-void write_library_cutoffs(LibraryPipeline& library,const std::vector<double>& cutoffs,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow);
+void write_library_cutoffs(LibraryPipeline& library,const std::vector<double>& cutoffs,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records=false);
 FinalOutput emit_library(const LibraryPipeline& library,double cutoff);
 void write_library_outputs(const LibraryPipeline& library,double cutoff,const std::string& directory,int threads=1,RepairShadow* shadow=nullptr);
 }

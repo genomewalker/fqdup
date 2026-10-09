@@ -219,7 +219,7 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
     if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
     close_files(files);
 }
-void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow){
+void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records){
     if(cuts.size()!=directories.size()||cuts.size()!=labels.size())throw std::runtime_error("cutoff cardinality");
     using Clock=std::chrono::steady_clock;
     const bool measure=timings||debug;const auto stream_begin=Clock::now();
@@ -247,10 +247,28 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         if(measure)write_seconds+=elapsed(write_begin);
     });
     if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    std::future<double> reclaimed;double release_seconds=0;
+    if(consume_records){
+        // process_records joined every reader and writer. The task owns all
+        // released storage, including on output-close failure. Debug text stays.
+        auto release=[pairs=std::move(lib.family.pairs),native=std::move(lib.native.records),
+                      replacements=std::move(lib.routing.record_replacements),measure]() mutable {
+            const auto begin=measure?Clock::now():Clock::time_point{};
+            std::vector<NativeRecord>().swap(replacements);
+            std::vector<NativeRecord>().swap(native);
+            std::vector<FamilyPair>().swap(pairs);
+            return measure?std::chrono::duration<double>(Clock::now()-begin).count():0;
+        };
+        if(threads>1&&lib.pool)reclaimed=lib.pool->submit(std::move(release));
+        else release_seconds=release();
+    }
     const auto close_begin=measure?Clock::now():Clock::time_point{};
     each_file([&](std::size_t c,std::size_t f){files[c][f].close();if(!files[c][f])throw std::runtime_error("write output");},"output_close");
+    const double close_seconds=measure?elapsed(close_begin):0;
+    if(reclaimed.valid())release_seconds=reclaimed.get();
     if(measure){
-        const double close_seconds=elapsed(close_begin),output_seconds=open_seconds+write_seconds+close_seconds;
+        if(consume_records)std::cerr<<"MERGE_STAGE release_input seconds="<<release_seconds<<" timing_basis=worker_elapsed_overlaps_output_close\n";
+        const double output_seconds=open_seconds+write_seconds+close_seconds;
         const double stream_seconds=elapsed(stream_begin);
         std::cerr<<"MERGE_STAGE output_open seconds="<<open_seconds<<" timing_basis=wall\n";
         std::cerr<<"MERGE_STAGE output_write seconds="<<write_seconds<<" timing_basis=writer_elapsed\n";
