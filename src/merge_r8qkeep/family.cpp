@@ -113,20 +113,29 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     std::unordered_map<std::string,int> exact;std::vector<int> representative;
     for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){auto [it,new_key]=exact.emplace(keys[i],representative.size());if(new_key)representative.push_back(i);else unite(i,representative[it->second]);}
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
+    const int workers=std::max(1,std::min(threads,8));
+    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
+    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
+    const auto build_part=[&](int part){index[part].build(keys,representative,bounds[part],bounds[part+1]);};
+    if(pool){
+        std::array<std::future<void>,3> builds;
+        try{for(int part=0;part<3;++part)builds[part]=pool->submit([&,part]{build_part(part);});for(auto& build:builds)build.get();}
+        catch(...){pool->stop();throw;}
+    }else for(int part=0;part<3;++part)build_part(part);
     std::size_t cells=0,max_bucket=0,index_bytes=0;
-    for(int part=0;part<3;++part){index[part].build(keys,representative,bounds[part],bounds[part+1]);cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
+    for(int part=0;part<3;++part){cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
     const auto generated=std::chrono::steady_clock::now();
-    // A fixed global batch, independent of -p. No per-worker seen array or index.
-    // Workers never access parent; components are independent of edge order.
+    // Workers enumerate immutable indexes; only the ordered consumer touches
+    // parent, including overflow recomputation. No per-worker seen arrays.
     struct Slot {
         std::array<int,64> edges{};
         std::size_t size=0;
         bool overflow=false;
         std::uint64_t lookups=0,candidates=0,verified=0;
     };
-    std::array<Slot,256> slots{};
-    edge_limit=std::min(edge_limit,slots[0].edges.size());
-    const int workers=std::max(1,std::min(threads,8));
+    constexpr std::size_t batch_rows=32;
+    edge_limit=std::min(edge_limit,Slot{}.edges.size());
+    const std::size_t scratch_bytes=sizeof(Slot)*(workers==1?1:workers*batch_rows);
     const auto& shared_index=index;
     const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
         const auto& key=keys[representative[query]];
@@ -150,23 +159,38 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
             if(result.overflow)return;
         }
     };
-    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
-    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
-    std::array<std::future<void>,8> jobs;
     std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
-    for(std::size_t begin=0;begin<representative.size();begin+=slots.size()){
-        const auto count=std::min(slots.size(),representative.size()-begin);
-        const auto work=[&](int worker){for(std::size_t s=worker;s<count;s+=workers){slots[s]=Slot{};enumerate(begin+s,slots[s],false);}};
-        if(workers==1)work(0);
-        else {try{for(int w=0;w<workers;++w)jobs[w]=pool->submit([work,w]{work(w);});for(int w=0;w<workers;++w)jobs[w].get();}catch(...){pool->stop();throw;}}
-        for(std::size_t s=0;s<count;++s){auto& result=slots[s];
-            if(result.overflow){++overflows;result=Slot{};enumerate(begin+s,result,true);}
-            else for(std::size_t e=0;e<result.size;++e)unite(representative[begin+s],representative[result.edges[e]]);
-            lookups+=result.lookups;candidates+=result.candidates;verified+=result.verified;
-        }
+    const auto consume=[&](std::size_t query,Slot& result){
+        if(result.overflow){++overflows;result=Slot{};enumerate(query,result,true);}
+        else for(std::size_t e=0;e<result.size;++e)unite(representative[query],representative[result.edges[e]]);
+        lookups+=result.lookups;candidates+=result.candidates;verified+=result.verified;
+    };
+    if(!pool){
+        for(std::size_t query=0;query<representative.size();++query){Slot result;enumerate(query,result,false);consume(query,result);}
+    }else{
+        struct QueryBatch {std::size_t begin;std::vector<Slot> slots;};
+        std::deque<std::future<QueryBatch>> pending;std::size_t next=0;
+        const auto launch=[&]{
+            const auto begin=next,count=std::min(batch_rows,representative.size()-next);next+=count;
+            pending.push_back(pool->submit([&,begin,count]{
+                QueryBatch batch{begin,std::vector<Slot>(count)};
+                for(std::size_t s=0;s<count;++s)enumerate(begin+s,batch.slots[s],false);
+                return batch;
+            }));
+        };
+        try{
+            while(next<representative.size()&&pending.size()<std::size_t(workers))launch();
+            while(!pending.empty()){
+                // Destroy the consumed buffer before replenishing the queue:
+                // at most workers*32 slots, including the consumer, are live.
+                {auto batch=pending.front().get();pending.pop_front();
+                 for(std::size_t s=0;s<batch.slots.size();++s)consume(batch.begin+s,batch.slots[s]);}
+                if(next<representative.size())launch();
+            }
+        }catch(...){pool->stop();throw;}
     }
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))
-{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<sizeof(slots)<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
+{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<scratch_bytes<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
     return true;
 }
 
