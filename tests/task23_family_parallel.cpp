@@ -1,6 +1,7 @@
 #include "../src/merge_r8qkeep/family.cpp"
 // Frozen B1 oracle from 456fc55: original seen-array and root-shortcut traversal.
 #include "task23_family_serial.hpp"
+#include "task25_columns_ref.hpp"
 #include <random>
 #include <stdexcept>
 static void require(bool ok){if(!ok)throw std::runtime_error("family parallel mismatch");}
@@ -14,7 +15,43 @@ static void check(const std::vector<std::string>& keys){
         require(roots(actual)==roots(expected));
     }
 }
+static void column_parity(){
+    std::mt19937 rng(2516);
+    for(int size=0;size<=MAXCOMP;++size)for(int trial=0;trial<32;++trial){
+        std::vector<Pair> pairs(24);
+        for(std::size_t id=0;id<pairs.size();++id)for(int side=0;side<2;++side){
+            auto& read=pairs[id].r[side];read.s.resize(1+rng()%30);
+            for(auto& base:read.s)base="ACGTN"[rng()%5];
+            read.q.assign(read.s.size(),'I');
+        }
+        std::vector<int> group(24);std::iota(group.begin(),group.end(),0);
+        std::shuffle(group.begin(),group.end(),rng);group.resize(size);
+        // Exercise all bounded base slots, not only the usual four DNA bases.
+        if(trial==0)for(int member=0;member<size;++member)
+            for(int side=0;side<2;++side)pairs[group[member]].r[side].s[0]=char('A'+member);
+        for(int side=0;side<2;++side){
+            const auto expected=frozen_columns::columns(pairs,group,side);
+            const auto actual=columns(pairs,group,side);
+            require(expected.size()==actual.size());
+            for(std::size_t c=0;c<actual.size();++c){
+                require(expected[c].n==actual[c].n&&expected[c].top==actual[c].top&&
+                        expected[c].votes.size()==actual[c].votes.size());
+                for(std::size_t v=0;v<actual[c].votes.size();++v){
+                    const auto vote=actual[c].votes[v];
+                    require(vote.first==expected[c].votes[v].first);
+                    std::vector<int> ids;for(int id:vote.second)ids.push_back(id);
+                    require(ids==expected[c].votes[v].second&&ids.size()==vote.second.size());
+                    for(std::size_t i=0;i<ids.size();++i)require(ids[i]==vote.second[i]);
+                }
+            }
+        }
+    }
+    std::cout<<"FAMILY_COLUMN_BYTES compact="<<sizeof(Column)
+             <<" old_object="<<sizeof(frozen_columns::Column)
+             <<" old_nested_allocations=excluded"<<std::endl;
+}
 int main(){try{
+    column_parity();
     std::mt19937 rng(2302);const std::string alphabet="ACGT";
     std::vector<std::string> keys;
     for(int family=0;family<32;++family){std::string key(40,'A');for(char& c:key)c=alphabet[rng()%4];

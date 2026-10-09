@@ -62,7 +62,44 @@ bool low_complexity(const std::string& seq) {
 int mismatches(const std::string& a, const std::string& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
 
 struct Group { std::vector<int> m; bool oversize = false; int diameter = 0; };
-struct Column { int n = 0; std::vector<std::pair<char, std::vector<int>>> votes; int top = -1; }; // votes in first-seen order
+// Masks index the original group order; views never own or reorder read IDs.
+struct MemberMask {
+    const std::vector<int>* group;
+    std::uint16_t bits;
+    struct Iterator {
+        const std::vector<int>* group;
+        std::uint16_t bits;
+        int operator*() const {return (*group)[__builtin_ctz(unsigned(bits))];}
+        Iterator& operator++(){bits&=bits-1;return *this;}
+        bool operator!=(const Iterator& other) const {return bits!=other.bits;}
+    };
+    Iterator begin() const {return {group,bits};}
+    Iterator end() const {return {group,0};}
+    std::size_t size() const {return __builtin_popcount(unsigned(bits));}
+    int operator[](std::size_t index) const {
+        auto remaining=bits;while(index--)remaining&=remaining-1;
+        return (*group)[__builtin_ctz(unsigned(remaining))];
+    }
+};
+struct ColumnVotes {
+    const std::vector<int>* group=nullptr;
+    std::array<char,MAXCOMP> bases{};
+    std::array<std::uint16_t,MAXCOMP> masks{};
+    std::size_t count=0;
+    struct Vote {char first;MemberMask second;};
+    Vote operator[](std::size_t index) const {return {bases[index],{group,masks[index]}};}
+    std::size_t size() const {return count;}
+    struct Iterator {
+        const ColumnVotes* votes;
+        std::size_t index;
+        Vote operator*() const {return (*votes)[index];}
+        Iterator& operator++(){++index;return *this;}
+        bool operator!=(const Iterator& other) const {return index!=other.index;}
+    };
+    Iterator begin() const {return {this,0};}
+    Iterator end() const {return {this,count};}
+};
+struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
 
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Pigeonhole candidates with the frozen N/N mismatch rule.
@@ -199,12 +236,18 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     return out;
 }
 std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
+    if(g.size()>MAXCOMP)throw std::logic_error("unbounded family column group");
     size_t L = 0; for (int i : g) L = std::max(L, P[i].r[side].s.size());
     std::vector<Column> cols(L);
-    for (size_t c = 0; c < L; ++c) { auto& col = cols[c];
-        for (int i : g) { const auto& s = P[i].r[side].s; if (c >= s.size() || s[c] == 'N') continue; ++col.n; char b = s[c];
-            auto it = std::find_if(col.votes.begin(), col.votes.end(), [&](auto& v) { return v.first == b; });
-            if (it == col.votes.end()) col.votes.push_back({b, {i}}); else it->second.push_back(i); }
+    for (size_t c = 0; c < L; ++c) { auto& col = cols[c];col.votes.group=&g;
+        for(std::size_t member=0;member<g.size();++member){
+            const auto& s=P[g[member]].r[side].s;
+            if(c>=s.size()||s[c]=='N')continue;
+            ++col.n;const char base=s[c];std::size_t slot=0;
+            while(slot<col.votes.count&&col.votes.bases[slot]!=base)++slot;
+            if(slot==col.votes.count)col.votes.bases[col.votes.count++]=base;
+            col.votes.masks[slot]|=std::uint16_t(1U<<member);
+        }
         int top = -1; for (size_t v = 0; v < col.votes.size(); ++v) if (top < 0 || col.votes[v].second.size() > col.votes[top].second.size()) top = int(v);
         bool tie = false; if (top >= 0) for (size_t v = 0; v < col.votes.size(); ++v) if (int(v) != top && col.votes[v].second.size() == col.votes[top].second.size()) tie = true;
         col.top = tie ? -1 : top; }
@@ -270,9 +313,9 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
                     if (col.n >= 3 && col.votes.size() == 1) { ++confirmed; for (int i : col.votes[0].second) set(i, col.votes[0].first, std::max(qv(P[i].r[side], c), 30)); }
                     else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
                         ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
-                        for (auto& v : col.votes) for (int i : v.second) { if (damage_safe && v.first != top && transition(v.first, top) && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, top, q); } }
-                    else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::vector<double> w(col.votes.size(), 1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
-                        for (size_t a = 0; a < col.votes.size(); ++a) { auto& v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto& w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
+                        for (auto v : col.votes) for (int i : v.second) { if (damage_safe && v.first != top && transition(v.first, top) && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, top, q); } }
+                    else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
+                        for (size_t a = 0; a < col.votes.size(); ++a) { auto v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
         return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded}};
         },[&](CorrectedChunk part){
