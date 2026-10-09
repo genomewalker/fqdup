@@ -187,9 +187,13 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         workers,chunk_rows,window,output_rows,output_chunks,elapsed(pipeline_begin));
 }
 using OutputFiles=std::array<std::ofstream,5>;
+void open_file(std::ofstream& file,const std::string& directory,std::size_t index){
+    static const char* names[]={"merged.fq","r1.fq","r2.fq","orphan.fq","outcomes.jsonl"};
+    file.open(std::filesystem::path(directory)/names[index],std::ios::binary);
+    if(!file)throw std::runtime_error("open output");
+}
 void open_files(OutputFiles& files,const std::string& directory){
-    const char* names[]={"merged.fq","r1.fq","r2.fq","orphan.fq","outcomes.jsonl"};
-    for(int i=0;i<5;++i){files[i].open(std::filesystem::path(directory)/names[i],std::ios::binary);if(!files[i])throw std::runtime_error("open output");}
+    for(std::size_t i=0;i<files.size();++i)open_file(files[i],directory,i);
 }
 void write_files(OutputFiles& files,const FinalOutput& out){
     files[0]<<out.merged;files[1]<<out.r1;files[2]<<out.r2;files[3]<<out.orphan;files[4]<<out.outcomes;
@@ -216,8 +220,16 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     using Clock=std::chrono::steady_clock;
     const bool measure=timings||debug;const auto stream_begin=Clock::now();
     const auto elapsed=[](auto begin){return std::chrono::duration<double>(Clock::now()-begin).count();};
-    std::vector<OutputFiles> files(cuts.size());for(std::size_t c=0;c<cuts.size();++c)open_files(files[c],directories[c]);
-    double output_seconds=measure?elapsed(stream_begin):0;
+    std::vector<OutputFiles> files(cuts.size());
+    const auto each_file=[&](auto work,const char* label){
+        if(threads>1&&lib.pool){
+            ordered_index_chunks(*lib.pool,files.size()*5,threads,0,
+                [&](std::size_t begin,std::size_t n){for(std::size_t i=begin;i<begin+n;++i)work(i/5,i%5);return 0;},
+                [](int){},label,1);
+        }else for(std::size_t c=0;c<files.size();++c)for(std::size_t f=0;f<5;++f)work(c,f);
+    };
+    each_file([&](std::size_t c,std::size_t f){open_file(files[c][f],directories[c],f);},"output_open");
+    const double open_seconds=measure?elapsed(stream_begin):0;double write_seconds=0;
     std::vector<RepairShadow> counters(cuts.size());std::vector<double> seconds(cuts.size());
     double router_seconds=0,native_seconds=0;std::size_t count=0,native_clean=0;
     std::vector<std::size_t> native_clean_pass(cuts.size());
@@ -228,14 +240,18 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];write_files(files[c],chunk.outputs[c]);}
-        if(measure)output_seconds+=elapsed(write_begin);
+        if(measure)write_seconds+=elapsed(write_begin);
     });
     if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
     const auto close_begin=measure?Clock::now():Clock::time_point{};
-    for(auto& group:files)close_files(group);
+    each_file([&](std::size_t c,std::size_t f){files[c][f].close();if(!files[c][f])throw std::runtime_error("write output");},"output_close");
     if(measure){
-        output_seconds+=elapsed(close_begin);const double stream_seconds=elapsed(stream_begin);
-        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=writer_elapsed_plus_main_open_close"<<memory_status()<<'\n';
+        const double close_seconds=elapsed(close_begin),output_seconds=open_seconds+write_seconds+close_seconds;
+        const double stream_seconds=elapsed(stream_begin);
+        std::cerr<<"MERGE_STAGE output_open seconds="<<open_seconds<<" timing_basis=wall\n";
+        std::cerr<<"MERGE_STAGE output_write seconds="<<write_seconds<<" timing_basis=writer_elapsed\n";
+        std::cerr<<"MERGE_STAGE output_close seconds="<<close_seconds<<" timing_basis=wall\n";
+        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=writer_elapsed_plus_open_close_wall"<<memory_status()<<'\n';
         std::cerr<<"MERGE_STAGE streaming_wall seconds="<<stream_seconds<<" timing_basis=wall_including_output"<<memory_status()<<'\n';
     }
     if(timings||debug)std::cerr<<"MERGE_STAGE streaming_native seconds="<<native_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
