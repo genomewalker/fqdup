@@ -1,6 +1,7 @@
 #pragma once
 #include "fast_dp16.hpp"
 #include <cstddef>
+#include <array>
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -10,8 +11,20 @@
 #include <immintrin.h>
 #endif
 namespace fqdup_fast_dp {
-inline void intersect_path(std::vector<std::pair<int,int>>& common,const std::vector<std::pair<int,int>>& path,int paths){
- if(paths==1){common=path;return;}
+struct TracePath {
+ std::array<std::pair<int,int>,512> cells;
+ std::size_t used=0;
+ void clear(){used=0;}
+ void emplace_back(int i,int j){if(used==cells.size())throw std::logic_error("alignment path bound");cells[used++]={i,j};}
+ void pop_back(){--used;}
+ std::size_t size()const{return used;}
+ const std::pair<int,int>& operator[](std::size_t i)const{return cells[i];}
+ const std::pair<int,int>* begin()const{return cells.data();}
+ const std::pair<int,int>* end()const{return cells.data()+used;}
+};
+template<class Path>
+inline void intersect_path(std::vector<std::pair<int,int>>& common,const Path& path,int paths){
+ if(paths==1){common.assign(path.begin(),path.end());return;}
  std::size_t kept=0,pos=0;
  for(const auto cell:common){
   while(pos<path.size()&&path[pos]<cell)++pos;

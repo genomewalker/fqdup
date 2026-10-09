@@ -77,7 +77,7 @@ class BandedCorrespondence {
   if(out.best<=neg/2)return out;
   int threshold=out.best-2;
   int max_counted_score=neg;
-  std::vector<std::pair<int,int>> path;
+  static thread_local ::fqdup_fast_dp::TracePath path;path.clear();
   auto visit=[&](auto&& recurse,int i,int j,int state,int score)->void{
    if(out.paths>256||score+at(i,j).suffix[state]<threshold)return;
    if(state==0)path.emplace_back(i,j);

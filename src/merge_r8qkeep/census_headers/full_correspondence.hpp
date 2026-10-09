@@ -65,7 +65,7 @@ class FullCorrespondence {
   if(out.best<=neg/2)return result;
   int threshold=out.best-2;
   int max_counted_score=neg;
-  std::vector<std::pair<int,int>> path;int informative=0,mismatches=0,gaps=0;
+  static thread_local ::fqdup_fast_dp::TracePath path;path.clear();int informative=0,mismatches=0,gaps=0;
   auto visit=[&](auto&& recurse,int i,int j,int state,int score)->void{
    if(out.paths>256||score+at(i,j).suffix[state]<threshold)return;
    bool info=state==0&&a[i-1]!='N'&&b[j-1]!='N';bool mm=info&&a[i-1]!=b[j-1];
