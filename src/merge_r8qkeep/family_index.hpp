@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -26,6 +27,45 @@ class FamilyPartIndex {
     bool has_n(std::uint64_t value, int b) const {
         for (int p = bounds_[b]; p < bounds_[b+1]; ++p) if (((value >> (3*p)) & 7) == 4) return true;
         return false;
+    }
+    static constexpr std::array<int,6> first_block{0,0,0,1,1,2};
+    static constexpr std::array<int,6> second_block{1,2,3,2,3,3};
+    std::uint32_t pair_key(std::uint64_t value,int stream) const {
+        return (block(value,first_block[stream])<<12)|block(value,second_block[stream]);
+    }
+    int posting(int stream,std::size_t position) const {
+        return (std::uint32_t(blocks_[stream/2][position])>>(16*(stream%2)))&65535;
+    }
+    template<class Visitor>
+    void visit_pairs(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
+        std::array<std::size_t,6> at{},end{};
+        for(int b=0;b<6;++b){
+            if(has_n(query,first_block[b])||has_n(query,second_block[b]))continue;
+            ++lookups;const auto target=pair_key(query,b);
+            const auto key_at=[&](std::size_t pos){return pair_key(parts_[posting(b,pos)].value,b);};
+            std::size_t lo=0,hi=parts_.size();
+            while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<target)lo=mid+1;else hi=mid;}
+            at[b]=end[b]=lo;
+            if(lo==parts_.size()||key_at(lo)!=target)continue;
+            // Upper-bound ties are usually nearby; bracket before binary search.
+            const auto begin=lo,remaining=parts_.size()-begin;std::size_t span=1;
+            while(span<remaining&&key_at(begin+span)==target)span*=2;
+            lo=begin+(span==1?1:span/2+1);hi=begin+std::min(span+1,remaining);
+            while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<=target)lo=mid+1;else hi=mid;}
+            end[b]=lo;
+        }
+        for(;;){
+            int minimum=-1;
+            for(int b=0;b<6;++b)if(at[b]<end[b]){
+                const int id=posting(b,at[b]);if(minimum<0||id<minimum)minimum=id;
+            }
+            if(minimum<0)return;
+            ++candidates;const auto& part=parts_[minimum];const auto x=query^part.value;
+            const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
+            auto remaining=different&(different-1);remaining&=remaining-1;
+            if(remaining==0)for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;
+            for(int b=0;b<6;++b)if(at[b]<end[b]&&posting(b,at[b])==minimum)++at[b];
+        }
     }
 public:
     static std::uint64_t pack(const std::string& key, int begin, int end) {
@@ -55,6 +95,29 @@ public:
             parts_.push_back({v, first, int(i)});
         }
         std::vector<std::uint64_t>().swap(packed);
+        if(parts_.size()<=65536){
+            // Six 16-bit ID streams occupy three existing 32-bit vectors.
+            // Pair keys are reconstructed from parts_, so no key arrays persist.
+            static_assert(sizeof(int)==sizeof(std::uint32_t));
+            for(auto& offsets:offsets_)std::vector<std::uint32_t>().swap(offsets);
+            std::vector<int>().swap(blocks_[3]);
+            for(int b=0;b<3;++b)blocks_[b].resize(parts_.size());
+            std::vector<std::uint16_t> ids(parts_.size());
+            for(int b=0;b<6;++b){
+                std::iota(ids.begin(),ids.end(),std::uint16_t(0));
+                std::sort(ids.begin(),ids.end(),[&](int a,int c){
+                    const auto x=pair_key(parts_[a].value,b),y=pair_key(parts_[c].value,b);
+                    return x<y||(x==y&&a<c);
+                });
+                const int shift=16*(b%2);
+                for(std::size_t i=0;i<ids.size();++i){
+                    auto& entry=blocks_[b/2][i];
+                    const std::uint32_t word=(std::uint32_t(entry)&~(std::uint32_t(65535)<<shift))|(std::uint32_t(ids[i])<<shift);
+                    std::memcpy(&entry,&word,sizeof(word));
+                }
+            }
+            return;
+        }
         for (int b = 0; b < 4; ++b) {
             const std::size_t domain=std::size_t(1) << (3*(bounds_[b+1]-bounds_[b]));
             auto& offsets=offsets_[b];offsets.assign(domain+1,0);
@@ -71,6 +134,7 @@ public:
     // ID can jump to the next range's minimum because no earlier ID can recur.
     template<class Visitor>
     void visit(std::uint64_t query, Visitor visitor, std::uint64_t& lookups, std::uint64_t& candidates) const {
+        if(offsets_[0].empty()){visit_pairs(query,visitor,lookups,candidates);return;}
         std::array<std::size_t,4> at{},end{};
         for(int b=0;b<4;++b){
             if(has_n(query,b))continue;

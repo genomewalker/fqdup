@@ -30,8 +30,41 @@ static std::set<std::string> old_candidates(const std::string& query) {
     }
     return out;
 }
+static std::uint64_t expected_lookups(const std::string& query,std::size_t cells){
+    const int length=query.size();const std::array<int,5> bounds{0,4,length==13?7:8,length==13?10:11,length};
+    std::uint64_t clean=0;
+    for(int b=0;b<4;++b)if(query.substr(bounds[b],bounds[b+1]-bounds[b]).find('N')==std::string::npos)++clean;
+    return cells<=65536?clean*(clean-1)/2:clean;
+}
+static void boundary_and_rebuilds(){
+    FamilyPartIndex index;fqdup::r8qkeep::FrozenFamilyPartIndex frozen;
+    for(std::size_t count:{65535,65536,65537,0,65536,1,65537}){
+        std::vector<std::string> keys;keys.reserve(count);
+        for(std::size_t i=0;i<count;++i){
+            std::uint64_t word=(i*2654435761ULL)&((1ULL<<28)-1);std::string key(14,'A');
+            for(char& c:key){c="ACGT"[word&3];word>>=2;}keys.push_back(key);
+        }
+        std::vector<int> representatives(count);std::iota(representatives.begin(),representatives.end(),0);
+        index.build(keys,representatives,0,14);frozen.build(keys,representatives,0,14);
+        if(index.cells()!=count||index.bytes()>frozen.bytes())throw std::runtime_error("boundary retained storage");
+        std::vector<std::string> queries{std::string(14,'A'),std::string(14,'T')};
+        if(count){queries.push_back(keys.back());queries.push_back(keys[count/2]);}
+        for(auto query:queries)for(int ns=0;ns<=3;++ns){
+            if(ns)query[4*(ns-1)]='N';
+            for(std::size_t stop:{std::size_t(1),std::size_t(3),count+1}){
+                std::vector<int> actual,expected;std::uint64_t lookups=0,candidates=0,old_lookups=0,old_candidates=0;
+                const auto packed=FamilyPartIndex::pack(query,0,14);
+                index.visit(packed,[&](int i){actual.push_back(i);return actual.size()<stop;},lookups,candidates);
+                frozen.visit(packed,[&](int i){expected.push_back(i);return expected.size()<stop;},old_lookups,old_candidates);
+                if(actual!=expected||candidates!=old_candidates||lookups!=expected_lookups(query,count))
+                    throw std::runtime_error("boundary/rebuild/prefix oracle mismatch");
+            }
+        }
+    }
+}
 int main() {
     try {
+        boundary_and_rebuilds();
         std::mt19937 rng(2501); const std::string bases = "ACGT";
         for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) {
             std::string query(length, 'A'); for (char& c : query) c = bases[rng()%4];
@@ -51,18 +84,18 @@ int main() {
             index.visit(FamilyPartIndex::pack(query, 0, length), [&](int i) { actual.push_back(i); return true; }, lookups, candidates);
             std::vector<int> frozen_order;std::uint64_t frozen_lookups=0,frozen_candidates=0;
             frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){frozen_order.push_back(i);return true;},frozen_lookups,frozen_candidates);
-            if(actual!=frozen_order||lookups!=frozen_lookups||candidates!=frozen_candidates||index.bytes()!=frozen.bytes())
+            if(actual!=frozen_order||lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates||index.bytes()>frozen.bytes())
                 throw std::runtime_error("frozen traversal/counter/storage mismatch");
             for(std::size_t stop:{std::size_t(1),std::size_t(3),frozen_order.size()}){
                 if(!stop)continue;
                 std::vector<int> prefix,old_prefix;lookups=candidates=frozen_lookups=frozen_candidates=0;
                 index.visit(FamilyPartIndex::pack(query,0,length),[&](int i){prefix.push_back(i);return prefix.size()<stop;},lookups,candidates);
                 frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){old_prefix.push_back(i);return old_prefix.size()<stop;},frozen_lookups,frozen_candidates);
-                if(prefix!=old_prefix||lookups!=frozen_lookups||candidates!=frozen_candidates)throw std::runtime_error("frozen early-exit mismatch");
+                if(prefix!=old_prefix||lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates)throw std::runtime_error("frozen early-exit mismatch");
             }
             std::sort(actual.begin(), actual.end());
             for (int i = 0; i < int(keys.size()); ++i) if (expected_values.count(keys[i])) expected.push_back(i);
-            if (actual != expected || lookups > 4) throw std::runtime_error("candidate set mismatch");
+            if (actual != expected || lookups > 6) throw std::runtime_error("candidate set mismatch");
             // The exhaustive oracle includes mutations in the same sub-block
             // and separate sub-blocks, N/N differences, and duplicate members.
             int visits=0;lookups=candidates=0;
