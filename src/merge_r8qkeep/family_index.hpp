@@ -148,10 +148,6 @@ class FamilyPartIndex {
     std::uint32_t block(std::uint64_t value, int b) const {
         return (value >> (3 * bounds_[b])) & ((std::uint64_t(1) << (3 * (bounds_[b+1] - bounds_[b]))) - 1);
     }
-    bool has_n(std::uint64_t value, int b) const {
-        for (int p = bounds_[b]; p < bounds_[b+1]; ++p) if (((value >> (3*p)) & 7) == 4) return true;
-        return false;
-    }
     static constexpr std::array<int,6> first_block{0,0,0,1,1,2};
     static constexpr std::array<int,6> second_block{1,2,3,2,3,3};
     std::uint32_t pair_key(std::uint64_t value,int stream) const {
@@ -180,7 +176,7 @@ class FamilyPartIndex {
         std::array<int,6> heads;heads.fill(exhausted);
         std::array<std::uint32_t,4> query_blocks;
         std::array<bool,4> n_free;
-        for(int b=0;b<4;++b){query_blocks[b]=block(query,b);n_free[b]=!has_n(query,b);}
+        for(int b=0;b<4;++b){query_blocks[b]=block(query,b);n_free[b]=(query_blocks[b]&0x924U)==0;}
         for(int b=0;b<6;++b){
             if(!n_free[first_block[b]]||!n_free[second_block[b]])continue;
             ++lookups;const auto target=query_blocks[second_block[b]];
@@ -189,6 +185,11 @@ class FamilyPartIndex {
             const auto prefix=compact_pairs_?(compact_pair_key(query,b)>>pair_shift_[b]):query_blocks[first_block[b]];
             std::size_t lo=directory.empty()?0:directory[prefix];
             const std::size_t limit=directory.empty()?parts_.size():directory[prefix+1];
+            // A complete compact key already gives the exact equal range.
+            if(compact_pairs_&&pair_shift_[b]==0){
+                at[b]=lo;end[b]=limit;if(lo<limit)heads[b]=posting(b,lo);
+                continue;
+            }
             std::size_t hi=limit;
             while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<target)lo=mid+1;else hi=mid;}
             at[b]=end[b]=lo;
