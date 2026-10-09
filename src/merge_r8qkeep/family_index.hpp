@@ -91,7 +91,7 @@ class FamilyPartIndex {
         for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
         (void)suffix_masks();(void)prefix_deltas();
     }
-    template<class Visitor>
+    template<bool Ordered=true,class Visitor>
     void visit_dense(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
         // Radius two over fourteen five-letter positions has at most
         // 1+14*4+C(14,2)*16=1513 values, independent of library size.
@@ -133,7 +133,7 @@ class FamilyPartIndex {
         }
         // Compact ACGT codes have the same order as packed part values.
         // Separate dependent table loads from the enumeration hot loop.
-        std::sort(hits.begin(),hits.begin()+count);
+        if constexpr(Ordered)std::sort(hits.begin(),hits.begin()+count);
         for(std::size_t i=0;i<count;++i){const auto code=std::uint32_t(hits[i]);
             const auto row=code>>6;const auto bit=std::uint64_t(1)<<(code&63);
             hits[i]=dense_ranks_[row]+__builtin_popcountll(dense_words_[row]&(bit-1));}
@@ -147,7 +147,7 @@ class FamilyPartIndex {
                     if(next>=0&&cost<=remaining){++lookups;self(self,next,p-1,remaining-cost);}}
             };
             walk(walk,0,length_-1,2);
-            std::sort(hits.begin(),hits.begin()+count);
+            if constexpr(Ordered)std::sort(hits.begin(),hits.begin()+count);
         }
         for(std::size_t i=0;i<count;++i){++candidates;const auto& part=parts_[hits[i]];
             for(int j=part.begin;j<part.end;++j)if(!visitor(members_[j]))return;}
@@ -340,6 +340,13 @@ public:
     void visit(std::uint64_t query, Visitor visitor, std::uint64_t& lookups, std::uint64_t& candidates) const {
         if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
         visit_dense(query,visitor,lookups,candidates);
+    }
+    // Identical unique candidates in unspecified order, for commutative
+    // component unions. The ordered API above retains its existing contract.
+    template<class Visitor>
+    void visit_unordered(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates)const {
+        if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
+        visit_dense<false>(query,visitor,lookups,candidates);
     }
     std::size_t cells() const { return parts_.size(); }
     std::size_t max_bucket() const {

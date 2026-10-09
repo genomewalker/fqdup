@@ -24,8 +24,11 @@ public:
 };
 std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::string>& first,const std::vector<std::string>& second,int threads){
     constexpr std::size_t batch=4096;
-    struct Reader {std::unique_ptr<FastqReaderBase> input;FastqRecord record;};
-    std::array<Reader,2> reader{{{make_chained_fastq_reader(first,1),{}},{make_chained_fastq_reader(second,1),{}}}};
+    struct Reader {std::unique_ptr<FastqReaderBase> input;FastqRecord record;std::unique_ptr<BufferedPlainInput> plain;};
+    const auto source=[](const std::vector<std::string>& paths){Reader out;
+        if(paths.size()==1)out.plain=BufferedPlainInput::open(paths[0]);
+        if(!out.plain)out.input=make_chained_fastq_reader(paths,1);return out;};
+    std::array<Reader,2> reader{{source(first),source(second)}};
     auto raw_pool=std::make_shared<CompactRawPool>();
     WorkerPool readers(2),encoders(std::max(1,std::min(threads,8)-2));
     auto result=std::make_shared<CompactPairStore>();
@@ -34,7 +37,8 @@ std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::
         std::array<std::future<std::shared_ptr<CompactRawBatch>>,2> next;
         for(unsigned side=0;side<2;++side)next[side]=readers.submit([&,side]{
             auto raw=raw_pool->acquire();auto& source=reader[side];
-            while(raw->rows.size()<batch&&source.input->read(source.record))raw->append(source.record);
+            if(source.plain)source.plain->read(*raw,batch);
+            else while(raw->rows.size()<batch&&source.input->read(source.record))raw->append(source.record);
             return raw;
         });return next;
     };

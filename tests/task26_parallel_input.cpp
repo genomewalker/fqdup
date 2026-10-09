@@ -1,7 +1,9 @@
+#include "../src/merge_r8qkeep/buffered_plain_input.hpp"
 #include "../src/merge_r8qkeep/compact_store.hpp"
 #include "fqdup/fastq_types.hpp"
 #include <atomic>
 #include <iostream>
+#include <fstream>
 using namespace fqdup::r8qkeep;
 class MockReader:public FastqReaderBase {
     std::size_t at_=0,count_;unsigned mate_;bool fail_;std::atomic<bool> reading_{false};
@@ -37,5 +39,17 @@ int main(){
         else parallel_compact_input({"12303","1"},{"12304","2"},8);
     }catch(const std::runtime_error& e){caught=std::string(e.what())==(fail?"injected reader failure":"pair count");}if(!caught)throw std::runtime_error("reader failure missing");}
     auto empty=parallel_compact_input({"0","1"},{"0","2"},8);if(!empty->empty())throw std::runtime_error("empty input");
+    char directory[]="/tmp/task26-plain-pipeline-XXXXXX";if(!::mkdtemp(directory))throw std::runtime_error("plain fixture directory");
+    const auto first=std::string(directory)+"/first.fq",second=std::string(directory)+"/second.fq";
+    {
+        std::ofstream a(first),b(second);MockReader one(12303,1,false),two(12303,2,false);FastqRecord x,y;
+        while(one.read(x)){two.read(y);for(auto output:{std::make_pair(&a,&x),std::make_pair(&b,&y)}){auto& file=*output.first;const auto& r=*output.second;file<<r.header<<'\n'<<r.seq<<"\n+\n"<<r.qual<<'\n';}}
+    }
+    for(int threads:{2,8}){
+        auto store=parallel_compact_input({first},{second},threads);if(store->size()!=12303)throw std::runtime_error("plain pipeline cardinality");
+        MockReader a(12303,1,false),b(12303,2,false);FastqRecord x,y;FamilyPair observed;CompactPairStore::Decoder cursor;
+        for(std::size_t i=0;i<store->size();++i){a.read(x);b.read(y);store->read(i,observed,cursor);
+            if(observed.r[0].h!=x.header||observed.r[0].s!=x.seq||observed.r[0].q!=x.qual||observed.r[1].h!=y.header||observed.r[1].s!=y.seq||observed.r[1].q!=y.qual)throw std::runtime_error("plain pipeline parity");}
+    }
     std::cout<<"parallel input parity, cardinality, empty input and failure drain PASS\n";
 }

@@ -84,6 +84,12 @@ int main() {
             std::vector<int> actual, expected;
             std::uint64_t lookups = 0, candidates = 0;
             index.visit(FamilyPartIndex::pack(query, 0, length), [&](int i) { actual.push_back(i); return true; }, lookups, candidates);
+            std::vector<int> unordered;std::uint64_t unordered_lookups=0,unordered_candidates=0;
+            index.visit_unordered(FamilyPartIndex::pack(query,0,length),[&](int i){unordered.push_back(i);return true;},unordered_lookups,unordered_candidates);
+            auto ordered_set=actual;std::sort(ordered_set.begin(),ordered_set.end());std::sort(unordered.begin(),unordered.end());
+            if(unordered!=ordered_set||unordered_lookups!=lookups||unordered_candidates!=candidates)throw std::runtime_error("unordered candidate parity");
+            int stopped=0;index.visit_unordered(FamilyPartIndex::pack(query,0,length),[&](int){++stopped;return false;},unordered_lookups,unordered_candidates);
+            if(stopped!=1)throw std::runtime_error("unordered early stop");
             std::vector<int> frozen_order;std::uint64_t frozen_lookups=0,frozen_candidates=0;
             frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){frozen_order.push_back(i);return true;},frozen_lookups,frozen_candidates);
             if(actual!=frozen_order||(!dense&&(lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates||index.bytes()>frozen.bytes())))

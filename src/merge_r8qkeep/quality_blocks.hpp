@@ -34,13 +34,17 @@ private:
         for(unsigned char c:text)if(codes[c]<0){codes[c]=count;if(count<16)alphabet[count]=c;if(++count==17)break;}
         unsigned width=0;while((1U<<width)<count)++width;if(width>4)width=8;
         std::array<unsigned char,2*block_size+16> runs{};std::size_t run_bytes=0;
+        std::array<std::uint16_t,16> seek_position{},seek_offset{};std::size_t seek_count=0;
         if(width)for(std::size_t i=0;i<text.size();){auto end=i+1;while(end<text.size()&&text[end]==text[i])++end;
+            while(seek_count*256<end){seek_position[seek_count]=i;seek_offset[seek_count++]=run_bytes;}
             auto token=std::uint32_t((end-i-1)<<width)|(width==8?static_cast<unsigned char>(text[i]):unsigned(codes[static_cast<unsigned char>(text[i])]));
             do{runs[run_bytes++]=static_cast<unsigned char>((token&127)|(token>=128?128:0));token>>=7;}while(token);i=end;
         }
         const auto raw_bytes=(text.size()*width+7)/8;const bool rle=width&&run_bytes<raw_bytes;
-        output.push_back(static_cast<unsigned char>(width|(rle?128:0)));
+        const bool seek=rle&&run_bytes>64;
+        output.push_back(static_cast<unsigned char>(width|(rle?128:0)|(seek?64:0)));
         if(width<8){output.push_back(static_cast<unsigned char>(count));output.insert(output.end(),alphabet.begin(),alphabet.begin()+count);}
+        if(seek)for(std::size_t i=0;i<seek_count;++i){output.push_back(seek_position[i]&255);output.push_back(seek_position[i]>>8);output.push_back(seek_offset[i]&255);output.push_back(seek_offset[i]>>8);}
         if(rle){output.insert(output.end(),runs.begin(),runs.begin()+run_bytes);return;}
         if(width==8){output.insert(output.end(),text.begin(),text.end());return;}
         const auto start=output.size();output.resize(start+raw_bytes,0);
@@ -61,6 +65,7 @@ private:
         const auto* at=data_.data()+block.offset;const auto* end=at+block.bytes;const unsigned mode=*at++,width=mode&15;
         std::array<unsigned char,16> alphabet{};unsigned count=256;
         if(width<8){count=*at++;if(!count||count>16||std::size_t(end-at)<count)throw std::logic_error("quality alphabet");std::copy_n(at,count,alphabet.begin());at+=count;}
+        if(mode&64){const auto bytes=4*((n+255)/256);if(std::size_t(end-at)<bytes)throw std::logic_error("quality seek index");at+=bytes;}
         cursor.text.resize(n);
         if(!width)std::fill(cursor.text.begin(),cursor.text.end(),char(alphabet[0]));
         else if(mode&128){
@@ -79,6 +84,29 @@ private:
                 if(code>=count)throw std::logic_error("quality code");cursor.text[i]=char(alphabet[code]);}
         }
         cursor.owner=this;cursor.generation=generation_;cursor.block=index;cursor.decoded=true;
+    }
+    // Seek to a 256-symbol checkpoint, then replay only runs overlapping the
+    // requested slice. Checkpoints can point into an earlier long run.
+    void slice_runs(std::size_t index,std::size_t begin,std::size_t count,char* output)const{
+        const auto& block=blocks_[index];const auto length=block.end-(index?blocks_[index-1].end:0);
+        const auto* at=data_.data()+block.offset;const auto* end=at+block.bytes;
+        const unsigned mode=*at++,width=mode&15,mask=(1U<<width)-1;
+        const unsigned char* alphabet=nullptr;unsigned symbols=256;
+        if(width<8){symbols=*at++;alphabet=at;at+=symbols;}
+        std::size_t position=0;
+        if(mode&64){
+            const auto* seek=at+4*(begin/256);const auto offset=unsigned(seek[2])|(unsigned(seek[3])<<8);
+            position=unsigned(seek[0])|(unsigned(seek[1])<<8);at+=4*((length+255)/256)+offset;
+        }
+        while(position<begin+count){
+            std::uint32_t token=0;unsigned shift=0,byte;
+            do{if(at==end||shift>28)throw std::logic_error("quality seek run");byte=*at++;token|=(byte&127)<<shift;shift+=7;}while(byte&128);
+            const auto run=std::size_t(token>>width)+1;const auto code=token&mask;
+            if(run>length-position||code>=symbols)throw std::logic_error("quality seek range");
+            const auto finish=position+run;
+            if(finish>begin){const auto lo=std::max(position,begin),hi=std::min(finish,begin+count);std::fill_n(output+(lo-begin),hi-lo,char(width==8?code:alphabet[code]));}
+            position=finish;
+        }
     }
     void compact(){
         std::vector<unsigned char> next;next.reserve(live_bytes_);
@@ -112,8 +140,8 @@ public:
             const auto start=index?blocks_[index-1].end:0;const auto count=std::min<std::size_t>(n-written,blocks_[index].end-at);
             const auto* bytes=data_.data()+blocks_[index].offset;const unsigned mode=*bytes++,width=mode&15;
             if(mode&128){
-                if(!cached||!cursor.decoded)decode(index,cursor);
-                std::memcpy(out.data()+written,cursor.text.data()+at-start,count);
+                slice_runs(index,at-start,count,out.data()+written);
+                cursor.owner=this;cursor.generation=generation_;cursor.block=index;cursor.decoded=false;
             }else{
                 // Raw blocks support direct slices; random record order must
                 // never force 4096 decoded bytes for a short quality string.

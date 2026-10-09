@@ -7,7 +7,7 @@ struct QueryStats {std::uint64_t lookups=0,candidates=0,verified=0;};
 fqdup::r8qkeep::AtomicFamilyUnion components(parent);
 const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
     const auto& key=packed_keys[query];
-    index[part].visit(key.part(part),[&](int other){
+    index[part].visit_unordered(key.part(part),[&](int other){
         if(std::size_t(other)>=query)return true;
         const auto& candidate=packed_keys[other];
         const auto d0=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.lo,candidate.lo);
