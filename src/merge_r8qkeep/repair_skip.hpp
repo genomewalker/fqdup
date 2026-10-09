@@ -25,17 +25,17 @@ struct RepairSkipBound {
         for(size_t i=0;i<v[8].size();++i){const size_t k=v[8].size()-1-i;
             if(i<v[1].size()&&k<v[4].size()&&v[1][i]!='N'&&v[4][k]!='N'&&v[8][i]=='N')return -1;
         }
-        const auto rc=fqalign::reverse_complement(v[4]);
         fqquality::PairMixture::ConditionalProducts products(audit.posterior);
         for(auto [i,j]:pr.correspondence.invariant){
-            if(v[1].at(i)=='N'||rc.at(j)=='N')continue;
             const int k=int(v[4].size())-1-j;
+            const char other=fqalign::complement(v[4].at(k));
+            if(v[1].at(i)=='N'||other=='N')continue;
             if(i+k!=int(v[8].size())-1)return -1;
             if(size_t(i)>=v[8].size())continue;
             const char chosen=v[8][i];
-            const int mate=chosen==v[1][i]?1:chosen==rc[j]?2:0;
+            const int mate=chosen==v[1][i]?1:chosen==other?2:0;
             if(!mate)return -1;
-            const auto cp=products.get(v[2].at(i),v[5].at(k),v[1][i]==rc[j]);
+            const auto cp=products.get(v[2].at(i),v[5].at(k),v[1][i]==other);
             const double value=mate==1?cp.first:cp.second;
             // Identical normalization and ordered dot product; SKIP.md proves
             // the extra allowance conservatively covers positive arithmetic.

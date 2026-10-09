@@ -18,6 +18,7 @@ class FamilyPartIndex {
     std::array<std::vector<std::uint32_t>, 4> offsets_;
     std::array<int, 5> bounds_{};
     int length_ = 0;
+    bool paired_=true;
     template<class Id,class Key>
     static void radix_ids(std::vector<Id>& ids,Key key,int bits) {
         // Stable digits preserve the ascending-ID tie break from initial iota.
@@ -56,14 +57,18 @@ class FamilyPartIndex {
         std::array<std::size_t,6> at{},end{};
         for(int b=0;b<6;++b){
             if(has_n(query,first_block[b])||has_n(query,second_block[b]))continue;
-            ++lookups;const auto target=pair_key(query,b);
-            const auto key_at=[&](std::size_t pos){return pair_key(parts_[posting(b,pos)].value,b);};
-            std::size_t lo=0,hi=parts_.size();
+            ++lookups;const auto target=block(query,second_block[b]);
+            const auto key_at=[&](std::size_t pos){return block(parts_[posting(b,pos)].value,second_block[b]);};
+            const auto& directory=offsets_[first_block[b]];
+            const auto prefix=block(query,first_block[b]);
+            std::size_t lo=directory.empty()?0:directory[prefix];
+            const std::size_t limit=directory.empty()?parts_.size():directory[prefix+1];
+            std::size_t hi=limit;
             while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<target)lo=mid+1;else hi=mid;}
             at[b]=end[b]=lo;
-            if(lo==parts_.size()||key_at(lo)!=target)continue;
+            if(lo==limit||key_at(lo)!=target)continue;
             // Upper-bound ties are usually nearby; bracket before binary search.
-            const auto begin=lo,remaining=parts_.size()-begin;std::size_t span=1;
+            const auto begin=lo,remaining=limit-begin;std::size_t span=1;
             while(span<remaining&&key_at(begin+span)==target)span*=2;
             lo=begin+(span==1?1:span/2+1);hi=begin+std::min(span+1,remaining);
             while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<=target)lo=mid+1;else hi=mid;}
@@ -111,11 +116,20 @@ public:
             parts_.push_back({v, first, int(i)});
         }
         std::vector<std::uint64_t>().swap(packed);
-        if(parts_.size()<=65536){
+        paired_=parts_.size()<=65536;
+        if(paired_){
             // Six 16-bit ID streams occupy three existing 32-bit vectors.
             // Pair keys are reconstructed from parts_, so no key arrays persist.
             static_assert(sizeof(int)==sizeof(std::uint32_t));
             for(auto& offsets:offsets_)std::vector<std::uint32_t>().swap(offsets);
+            // Streams sharing their first block have identical prefix bounds.
+            // Restrict second-block searches without changing sorted part IDs.
+            for(int b=0;b<3;++b){
+                const std::size_t domain=std::size_t(1)<<(3*(bounds_[b+1]-bounds_[b]));
+                auto& directory=offsets_[b];directory.assign(domain+1,0);
+                for(const auto& part:parts_)++directory[block(part.value,b)+1];
+                std::partial_sum(directory.begin(),directory.end(),directory.begin());
+            }
             std::vector<int>().swap(blocks_[3]);
             for(int b=0;b<3;++b)blocks_[b].resize(parts_.size());
             std::vector<std::uint16_t> ids(parts_.size());
@@ -151,7 +165,7 @@ public:
     // ID can jump to the next range's minimum because no earlier ID can recur.
     template<class Visitor>
     void visit(std::uint64_t query, Visitor visitor, std::uint64_t& lookups, std::uint64_t& candidates) const {
-        if(offsets_[0].empty()){visit_pairs(query,visitor,lookups,candidates);return;}
+        if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
         std::array<std::size_t,4> at{},end{};
         for(int b=0;b<4;++b){
             if(has_n(query,b))continue;

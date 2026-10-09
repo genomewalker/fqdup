@@ -138,7 +138,11 @@ public:
     risk.r1=entry.r1;risk.r2=entry.r2;*audit=entry.audit;return true;
    }
   }
-  const auto rc=fqalign::reverse_complement(s2);std::vector<std::pair<int,int>> cols;for(auto c:risk.correspondence.invariant)if(s1.at(c.first)!='N'&&rc.at(c.second)!='N')cols.push_back(c);
+  // apply does not recurse; no scratch references escape the call or cache.
+  struct Scratch {std::string rc;std::vector<std::pair<int,int>> cols;};
+  static thread_local Scratch scratch;auto& rc=scratch.rc;auto& cols=scratch.cols;
+  fqalign::reverse_complement_into(s2,rc);cols.clear();
+  for(auto c:risk.correspondence.invariant)if(s1.at(c.first)!='N'&&rc.at(c.second)!='N')cols.push_back(c);
   auto logpost=initial_log_weights(training);std::array<double,K> post{};
   std::array<int,K> active{};int active_size=0;
   for(int t=1;t<K;++t)if(weights[training][t]>0)active[active_size++]=t;
@@ -196,4 +200,3 @@ inline void guard_pair_mixture(fqalign::PairRisk& risk,const std::vector<double>
  if(!keep[0])risk.r1=base1;if(!keep[1])risk.r2=base2;
 }
 }
-

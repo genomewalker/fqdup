@@ -54,6 +54,7 @@ RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std:
     const auto& model=impl_->nominal;fqalign::QualityProcessor processor;std::ostringstream out,audit;RoutingResult result;std::size_t row=start;
     result.routed.reserve(native.size());result.repair_bounds.reserve(native.size());result.clean_bounds.reserve(native.size());result.record_replacements.reserve(native.size());
     result.native_clean_bounds.reserve(native.size());
+    std::string rc;
     for(const auto& v:native) {
         NativeRecord replacement;
         alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(row-cache->impl_->start):nullptr);
@@ -68,7 +69,7 @@ RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std:
             insert=v[8].size();reason="geometry_abstain";const auto g=fqalign::quality_independent_geometry(v[1],v[4]);
             if(g.eligible&&g.insert==insert){auto p=processor.risks(v[1],v[2],v[4],v[5],insert);if(p.correspondence.eligible){
                 fqquality::PairMixture::Audit post;const bool fitted=model.apply(p,v[1],v[2],v[4],v[5],1,&post);
-                if(fitted)repair_bound=RepairSkipBound::weighted_sum(v,p,post);bool valid=true;const auto rc=fqalign::reverse_complement(v[4]);
+                if(fitted)repair_bound=RepairSkipBound::weighted_sum(v,p,post);bool valid=true;fqalign::reverse_complement_into(v[4],rc);
                 for(auto [i,j]:p.correspondence.invariant){const int k=int(v[4].size())-1-j;if(i+k!=insert-1){valid=false;break;}if(v[1][i]=='N'||rc[j]=='N'||v[1][i]==rc[j])continue;
                     const char chosen=v[8].at(i);double risk=1;
                     if(chosen==v[1][i]||chosen==rc[j]){const double e1=fqalign::phred_error(v[2][i]),e2=fqalign::phred_error(v[5][k]);auto cp=fqquality::PairMixture::conditional(e1,e2,false);double a=cp.first,b=cp.second;

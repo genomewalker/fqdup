@@ -10,6 +10,13 @@ static void require(bool ok){if(!ok)throw std::runtime_error("Task 24 lookup par
 static void bits(double a,double b){require(std::memcmp(&a,&b,sizeof(a))==0);}
 static void vector_bits(const std::vector<double>& a,const std::vector<double>& b){require(a.size()==b.size());for(size_t i=0;i<a.size();++i)bits(a[i],b[i]);}
 int main(){
+ std::string reverse_buffer;reverse_buffer.reserve(1024);
+ for(int length:{0,1,30,512,7,150,0}){
+  std::string input;for(int i=0;i<length;++i)input+="ACGTN"[i%5];
+  std::string expected;for(auto i=input.rbegin();i!=input.rend();++i)expected+="TGCAN"[std::string_view("ACGTN").find(*i)];
+  fqalign::reverse_complement_into(input,reverse_buffer);
+  if(reverse_buffer!=expected||reverse_buffer.capacity()<1024)throw std::runtime_error("reverse buffer mismatch");
+ }
  for(int t=-1;t<=Model::K;++t)bits(Model::component(t),Direct::component(t));
  for(int t=1;t<Model::K;++t)for(bool agree:{false,true}){
   double e=Direct::component(t),d=2*e-4*e*e/3;

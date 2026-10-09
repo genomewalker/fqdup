@@ -18,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <sys/stat.h>
@@ -46,17 +47,19 @@ std::vector<Read> read_fastq(const std::string& path) {
     return out;
 }
 // native full_complexity::overlap_is_low_complexity (window 64)
-bool low_complexity(const std::string& seq) {
+bool low_complexity(std::string_view seq) {
     const int len = int(seq.size()); if (len < 5) return false;
     auto b2 = [](char c) { switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; } return -1; };
     const int nt = len - 2, wt = std::min(62, nt); if (wt < 2) return false;
-    std::vector<int> tri(nt); for (int i = 0; i < nt; ++i) { int a = b2(seq[i]), b = b2(seq[i + 1]), c = b2(seq[i + 2]); tri[i] = (a < 0 || b < 0 || c < 0) ? -1 : a * 16 + b * 4 + c; }
+    std::array<int,62> tri{};
+    const auto triplet=[&](int i){int a=b2(seq[i]),b=b2(seq[i+1]),c=b2(seq[i+2]);return a<0||b<0||c<0?-1:a*16+b*4+c;};
     int cnt[64] = {}; long valid = 0, score = 0;
     auto add = [&](int t) { if (t >= 0) { score += cnt[t]; ++cnt[t]; ++valid; } };
     auto del = [&](int t) { if (t >= 0) { --cnt[t]; score -= cnt[t]; --valid; } };
     auto exceeds = [&]() { return valid >= 2 && double(score) / (double(valid) * (valid - 1) / 2) > DUST_MAX; };
-    for (int i = 0; i < wt; ++i) add(tri[i]); if (exceeds()) return true;
-    for (int i = wt; i < nt; ++i) { del(tri[i - wt]); add(tri[i]); if (exceeds()) return true; }
+    for (int i = 0; i < wt; ++i) add(tri[i]=triplet(i)); if (exceeds()) return true;
+    int cursor=0;
+    for (int i = wt; i < nt; ++i) {auto& slot=tri[cursor];del(slot);add(slot=triplet(i));if(exceeds())return true;if(++cursor==wt)cursor=0;}
     return false;
 }
 int mismatches(const std::string& a, const std::string& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
@@ -200,7 +203,7 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::Work
     const auto collect=[&](std::size_t begin,std::size_t count){
     for (size_t i = begin; i < begin+count; ++i) {
         const auto &a = P[i].r[0].s, &b = P[i].r[1].s; if (int(a.size()) < KEYLEN || int(b.size()) < KEYLEN) continue;
-        std::string k = a.substr(0, KEYLEN) + b.substr(0, KEYLEN);
+        std::string k;k.reserve(2*KEYLEN);k.append(a.data(),KEYLEN);k.append(b.data(),KEYLEN);
         if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
         if (!g_rev8) {
             if (low_complexity(a) || low_complexity(b)) continue;
@@ -210,8 +213,8 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::Work
             bool ok = true;
             for (int s = 0; s < 2 && ok; ++s) { const auto& r = P[i].r[s].s; auto at = r.find(ADAPTERS[s].substr(0, ADSEED)); if (at != std::string::npos && int(at) < KEYLEN) { ok = false; break; }
                 size_t e = r.size(); if (at != std::string::npos) e = std::min(e, at); size_t g = r.size(); while (g > 0 && r[g - 1] == 'G') --g; if (r.size() - g >= 10) e = std::min(e, g);
-                if (low_complexity(r.substr(0, e))) ok = false; }
-            if (ok) keys[i] = k;
+                if (low_complexity(std::string_view(r).substr(0, e))) ok = false; }
+            if (ok) keys[i] = std::move(k);
         }
     }
     };
@@ -270,10 +273,11 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     phase("groups");
     return out;
 }
-std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
+const std::vector<Column>& columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
     if(g.size()>MAXCOMP)throw std::logic_error("unbounded family column group");
     size_t L = 0; for (int i : g) L = std::max(L, P[i].r[side].s.size());
-    std::vector<Column> cols(L);
+    static thread_local std::array<std::vector<Column>,2> scratch;
+    auto& cols=scratch.at(side);cols.assign(L,Column{});
     for (size_t c = 0; c < L; ++c) { auto& col = cols[c];col.votes.group=&g;
         for(std::size_t member=0;member<g.size();++member){
             const auto& s=P[g[member]].r[side].s;
@@ -289,11 +293,12 @@ std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& 
     return cols;
 }
 bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
-    const std::array<std::vector<Column>,2> all_columns{columns(P,g,0),columns(P,g,1)};
+    if(g.size()<2)return false;
+    const std::array<const std::vector<Column>*,2> all_columns{&columns(P,g,0),&columns(P,g,1)};
     std::array<std::array<int,MAXCOMP>,MAXCOMP> shared{}; long multi = 0, cover = 0;
-    for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
+    for (int side = 0; side < 2; ++side) for (const auto& col : *all_columns[side]) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
     if (cover && double(multi) / cover > MAXDIS) return true;
-    for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) { if (col.top < 0) continue;
+    for (int side = 0; side < 2; ++side) for (const auto& col : *all_columns[side]) { if (col.top < 0) continue;
         for (size_t v = 0; v < col.votes.size(); ++v) { if (int(v) == col.top || col.votes[v].second.size() < 2) continue;
             const auto mask=col.votes[v].second.bits;
             for(auto x=mask;x;x&=x-1)for(auto y=std::uint16_t(x&(x-1));y;y&=y-1)
@@ -305,7 +310,8 @@ bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
 int qv(const Read& r, size_t c) { return r.q[c] - 33; }
 std::array<int,MAXCOMP> high_quality_counts(const std::vector<Pair>& P,const std::vector<int>& g) {
     std::array<int,MAXCOMP> hiq{};
-    for(int side=0;side<2;++side){const auto cols=columns(P,g,side);
+    if(g.size()<2)return hiq;
+    for(int side=0;side<2;++side){const auto& cols=columns(P,g,side);
         for(size_t c=0;c<cols.size();++c){const auto& col=cols[c];if(col.top<0)continue;
             int topq=-1;for(int i:col.votes[col.top].second)topq=std::max(topq,qv(P[i].r[side],c));
             if(topq<30)continue;
@@ -365,7 +371,7 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
             std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
             ++fam; members += long(g.size());
-            for (int side = 0; side < 2; ++side) { auto cols = columns(P, g, side);
+            for (int side = 0; side < 2; ++side) { const auto& cols = columns(P, g, side);
                 for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
                     auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
                         r.s[c] = base; r.q[c] = char(q + 33); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };

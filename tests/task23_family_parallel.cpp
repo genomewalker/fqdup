@@ -101,6 +101,24 @@ static void key_parity(){
 }
 
 int main(){try{
+    // Independent complete-window oracle for allocation-free rolling DUST.
+    std::mt19937 dust_rng(2547);
+    for(int trial=0;trial<200;++trial){
+        std::string seq(trial*7%513,'A');
+        if(trial%4)for(char& c:seq)c="ACGTN?"[dust_rng()%(trial%4==1?4:6)];
+        bool expected=false;
+        if(seq.size()>=5){const int nt=int(seq.size())-2,wt=std::min(62,nt);
+            for(int start=0;start+wt<=nt;++start){std::array<int,64> counts{};long valid=0,score=0;
+                for(int i=start;i<start+wt;++i){int word=0;bool good=true;
+                    for(int k=0;k<3;++k){const auto p=std::string_view("ACGT").find(seq[i+k]);if(p==std::string_view::npos){good=false;break;}word=word*4+int(p);}
+                    if(good){++counts[word];++valid;}
+                }
+                for(int n:counts)score+=n*(n-1)/2;
+                expected|=valid>=2&&double(score)/(double(valid)*(valid-1)/2)>DUST_MAX;
+            }
+        }
+        require(low_complexity(seq)==expected);
+    }
     key_parity();
     const int rounding=std::fegetround();
     for(int mode:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){

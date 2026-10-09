@@ -14,6 +14,7 @@
 template<class Record>
 struct NativeQualityScratch {
     Record raw1,raw2;
+    std::string reverse;
     fqalign::PairRisk pair;
     std::vector<double> risk,proposed,selected,original1,original2,short_risk;
     std::vector<double> a,b,rawa,rawb;
@@ -85,7 +86,7 @@ public:
                 auto& pr=scratch.pair;processor.risks_into(pr,raw1.seq,raw1.qual,raw2.seq,raw2.qual,geom.eligible?geom.insert:-1);
                 fqquality::PairMixture::Audit audit;
                 if(mixture->apply(pr,raw1.seq,raw1.qual,raw2.seq,raw2.qual,1,&audit)) {
-                    const auto rc=fqalign::reverse_complement(raw2.seq);auto& proposed=scratch.proposed;proposed=risk;bool valid=true;
+                    auto& rc=scratch.reverse;fqalign::reverse_complement_into(raw2.seq,rc);auto& proposed=scratch.proposed;proposed=risk;bool valid=true;
                     for(auto [i,j]:pr.correspondence.invariant) {
                         if(raw1.seq.at(i)=='N'||rc.at(j)=='N')continue;
                         const int k=int(raw2.seq.size())-1-j;
@@ -119,7 +120,7 @@ public:
         if(mixture_mode>=7 && !mixture_applied){
             for(size_t i=0;i<raw1.qual.size();++i)p.r1[i]=fqalign::phred_error(raw1.qual[i]);
             for(size_t i=0;i<raw2.qual.size();++i)p.r2[i]=fqalign::phred_error(raw2.qual[i]);
-            if(full_mixture && !r.is_orphan){auto corr=fqalign::full_trusted_correspondence(r.merged.seq,fqalign::reverse_complement(r.unmerged2.seq));if(corr.eligible){const int shift=int(raw2.seq.size()-r.unmerged2.seq.size());for(auto& c:corr.invariant)c.second+=shift;for(auto& c:corr.certified)c.second+=shift;p.correspondence=std::move(corr);full_applied=full_mixture->apply(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual,6,nullptr,true);mixture_applied=full_applied;}}
+            if(full_mixture && !r.is_orphan){fqalign::reverse_complement_into(r.unmerged2.seq,scratch.reverse);auto corr=fqalign::full_trusted_correspondence(r.merged.seq,scratch.reverse);if(corr.eligible){const int shift=int(raw2.seq.size()-r.unmerged2.seq.size());for(auto& c:corr.invariant)c.second+=shift;for(auto& c:corr.certified)c.second+=shift;p.correspondence=std::move(corr);full_applied=full_mixture->apply(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual,6,nullptr,true);mixture_applied=full_applied;}}
         }
         if(mixture && mixture_mode>=6 && !mixture_applied)
             mixture->prior_floor(p,raw1.seq,raw1.qual,raw2.seq,raw2.qual);
@@ -146,11 +147,11 @@ public:
         prefix(r.merged,raw1);prefix(r.unmerged2,raw2);
         const size_t parent2_length=r.unmerged2.seq.size();
         fqalign::Correspondence repair_corr;
-        if(mixture_mode==9)repair_corr=fqrepair::full_trusted_correspondence(r.merged.seq,fqalign::reverse_complement(r.unmerged2.seq));
+        if(mixture_mode==9){fqalign::reverse_complement_into(r.unmerged2.seq,scratch.reverse);repair_corr=fqrepair::full_trusted_correspondence(r.merged.seq,scratch.reverse);}
         std::array<fqalign::TrimInterval,2> intervals{fqalign::mott_segment(p.r1,r.merged.seq.size(),cutoff),fqalign::mott_segment(p.r2,r.unmerged2.seq.size(),cutoff)};
         if(mixture_mode==7&&!mixture_applied){auto& a=scratch.a;auto& b=scratch.b;a.assign(p.r1.begin(),p.r1.begin()+r.merged.seq.size());b.assign(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());intervals={fqalign::mott_segment(a,a.size(),fqquality::retained_median_cutoff(a,raw1.qual.substr(0,a.size()),cutoff)),fqalign::mott_segment(b,b.size(),fqquality::retained_median_cutoff(b,raw2.qual.substr(0,b.size()),cutoff))};}
         if(mixture_applied && (mixture_mode==5||mixture_mode>=6)) {
-            const auto rc=fqalign::reverse_complement(raw2.seq);auto& columns=scratch.columns;columns.clear();
+            auto& rc=scratch.reverse;fqalign::reverse_complement_into(raw2.seq,rc);auto& columns=scratch.columns;columns.clear();
             for(auto [i,j]:p.correspondence.invariant)if(raw1.seq.at(i)!='N'&&rc.at(j)!='N')columns.push_back({i,int(raw2.seq.size())-1-j,raw1.seq.at(i)==rc.at(j)});
             {size_t hqd=0;for(auto& c:columns)hqd+=!c.agree&&raw1.qual.at(c.i)>=63&&raw2.qual.at(c.k)>=63;if(mixture_mode==9&&hqd>=2){auto& a=scratch.a;auto& b=scratch.b;a.resize(r.merged.seq.size());b.resize(r.unmerged2.seq.size());for(size_t i=0;i<a.size();++i)a[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)b[i]=fqalign::phred_error(raw2.qual[i]);intervals={fqalign::mott_segment(a,a.size(),cutoff),fqalign::mott_segment(b,b.size(),cutoff)};columns.clear();}}bool exclusive=false;if(full_applied){auto& a=scratch.a;auto& b=scratch.b;a.assign(p.r1.begin(),p.r1.begin()+r.merged.seq.size());b.assign(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());auto& rawa=scratch.rawa;auto& rawb=scratch.rawb;rawa=a;rawb=b;for(size_t i=0;i<a.size();++i)rawa[i]=fqalign::phred_error(raw1.qual[i]);for(size_t i=0;i<b.size();++i)rawb[i]=fqalign::phred_error(raw2.qual[i]);exclusive=fqquality::exclusive_core_intervals(a,b,rawa,rawb,columns,cutoff,fqquality::PairMixture::fold(raw1.seq,raw2.seq),intervals);}
             if(!exclusive)fqquality::joint_intervals(p.r1,p.r2,r.merged.seq.size(),r.unmerged2.seq.size(),columns,cutoff,intervals);
@@ -169,4 +170,3 @@ public:
         if(first)++batch.n_orphan_r1;else ++batch.n_orphan_r2;
     }
 };
-

@@ -84,10 +84,11 @@ CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,
     nominal<<"id\tfold\ti\tk\tq1_bin\tq2_bin\te1\te2\tbase1\trc_base2\tcertified\n";
     full<<"id\tfold\ti\tk\tb1\tb2\te1\te2\ta\tb\tcert\n";
     fqalign::BandedCorrespondence banded;fqalign::FullCorrespondence full_engine;
+    std::string rc;
     for(const auto& p:pairs) {
         const auto& a=p.r[0];const auto& b=p.r[1];if(a.s.size()>512||b.s.size()>512)continue;
         const auto g=fqalign::quality_independent_geometry(a.s,b.s);if(!g.eligible)continue;
-        const auto rc=fqalign::reverse_complement(b.s);const auto c=banded.align(a.s,rc,g.insert);if(!c.eligible)continue;
+        fqalign::reverse_complement_into(b.s,rc);const auto c=banded.align(a.s,rc,g.insert);if(!c.eligible)continue;
         const int f=fold(p);
         for(auto [i,j]:c.invariant){if(a.s[i]=='N'||rc[j]=='N')continue;const int k=int(b.s.size())-1-j;const auto e1=fqalign::phred_error(a.q[i]),e2=fqalign::phred_error(b.q[k]);nominal_pairs.add(p.id,f,e1,e2,a.s[i]==rc[j]);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();nominal<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<bin(a.q[i])<<'\t'<<bin(b.q[k])<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<cert<<'\n';}}
     }
@@ -96,7 +97,7 @@ CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,
         if(row>=pairs.size())throw std::runtime_error("extra native row");const auto& p=pairs[row];const auto index=start+row++;
         if(v[0]!=p.r[0].h||v[3]!=p.r[1].h||v[1]!=p.r[0].s||v[4]!=p.r[1].s)throw std::runtime_error("native census input registry");
         if(v[6]!="unmerged")continue;
-        const auto rc=fqalign::reverse_complement(v[11]);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;
+        fqalign::reverse_complement_into(v[11],rc);auto r=full_columns(full_engine,v[8],rc);const auto& c=r.corr;
         if(c.eligible){const int f=fold(p),length=int(v[11].size());for(auto [i,j]:c.invariant){const int k=length-1-j,q1=int(static_cast<unsigned char>(p.r[0].q[i]))-33,q2=int(static_cast<unsigned char>(p.r[1].q[k]))-33;const double e1=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q1/10.0))),e2=std::max(1e-10,std::min(1.0,fqdup::fdlibm::pow(10.0,-q2/10.0)));const char b=fqalign::reverse_complement(std::string(1,p.r[1].s[k]))[0];full_pairs.add(p.id,f,e1,e2,p.r[0].s[i]==b);if(debug){const bool cert=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();full<<p.id<<'\t'<<f<<'\t'<<i<<'\t'<<k<<'\t'<<q1/5<<'\t'<<q2/5<<'\t'<<shortest_double(e1)<<'\t'<<shortest_double(e2)<<'\t'<<p.r[0].s[i]<<'\t'<<b<<'\t'<<cert<<'\n';}}}
         // Proposed edits are a debug view; repair computes its own corrections.
         // Training observations above retain the same geometry and accumulation.

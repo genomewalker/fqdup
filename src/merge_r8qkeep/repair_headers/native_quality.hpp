@@ -23,16 +23,17 @@ inline double agreement_error(double a,double b) {
     const double num=a*b/3.0, den=(1.0-a)*(1.0-b)+num;
     return den>0.0?num/den:1.0;
 }
+inline char complement(char c) {
+    switch(c){case 'A':return 'T';case 'C':return 'G';case 'G':return 'C';
+        case 'T':return 'A';case 'N':return 'N';default:throw std::invalid_argument("unsupported base");}
+}
+// Callers supply distinct input and output storage; capacity survives rows.
+inline void reverse_complement_into(std::string_view s,std::string& out) {
+    out.resize(s.size());
+    for(size_t i=0;i<s.size();++i)out[s.size()-1-i]=complement(s[i]);
+}
 inline std::string reverse_complement(std::string_view s) {
-    std::string out(s.size(),'N');
-    for (size_t i=0;i<s.size();++i) {
-        char c=s[i];
-        switch(c){case 'A':c='T';break;case 'C':c='G';break;
-          case 'G':c='C';break;case 'T':c='A';break;case 'N':break;
-          default:throw std::invalid_argument("unsupported base");}
-        out[s.size()-1-i]=c;
-    }
-    return out;
+    std::string out;reverse_complement_into(s,out);return out;
 }
 struct PairRisk {
     std::vector<double> r1,r2;
@@ -49,7 +50,7 @@ struct Geometry {
 inline Geometry quality_independent_geometry_uncached(const std::string& a,const std::string& raw_b) {
     Geometry out;
     if(a.empty()||raw_b.empty()||a.size()>512||raw_b.size()>512)return out;
-    const auto b=reverse_complement(raw_b);
+    static thread_local std::string b;reverse_complement_into(raw_b,b);
     if(!::fqdup_fast_bases::valid(a))
         throw std::invalid_argument("unsupported base");
     auto count=[&](int insert) {
@@ -85,6 +86,7 @@ inline Geometry quality_independent_geometry(const std::string& a,const std::str
 }
 class QualityProcessor {
     BandedCorrespondence verifier;
+    std::string reverse_buffer;
 public:
     // Raw R2 orientation. Caller supplies quality-independent geometry, or -1.
     PairRisk risks(const std::string& s1,const std::string& q1,
@@ -106,7 +108,8 @@ public:
         for(char c:q1)out.r1.push_back(phred_error(c));
         for(char c:q2)out.r2.push_back(phred_error(c));
         if(!enabled||insert<0){out.correspondence.reason=enabled?"no_geometry":"disabled";return;}
-        const auto corr=verifier.align(s1,reverse_complement(s2),insert);
+        reverse_complement_into(s2,reverse_buffer);
+        const auto corr=verifier.align(s1,reverse_buffer,insert);
         out.correspondence=corr;
         for(auto [i,j]:out.correspondence.certified) {
             const int k=int(s2.size())-1-j;
@@ -137,4 +140,3 @@ inline TrimInterval mott_segment(const std::vector<double>& risk,size_t prefix,d
     return best>0?TrimInterval{bstart,bend}:TrimInterval{};
 }
 }
-
