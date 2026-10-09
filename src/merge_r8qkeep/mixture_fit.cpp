@@ -1,4 +1,5 @@
 #include "mixture_fit.hpp"
+#include "counts_row.hpp"
 #include "shortest_double.hpp"
 #include "fdlibm.hpp"
 #include "exact_exp_cache.hpp"
@@ -153,11 +154,10 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         workers.run(keys.size(),[&](std::size_t i,int worker){
             auto& t=terms[i];
             if constexpr(Counts){
-                double s=0;
-                for(int j=0;j<mixture_components;++j){t.responsibility[j]=w[j]*densities[i][j];s+=t.responsibility[j];}
+                const double s=detail::counts_products(w,densities[i],t.responsibility);
                 if(s>0){
                     t.log_sum=row_max[i]+fqdup::fdlibm::log(s);
-                    for(double& r:t.responsibility)r/=s;
+                    detail::counts_normalize(t.responsibility,s);
                     return;
                 }
                 // A zero scaled denominator must use the original log path.

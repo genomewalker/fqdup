@@ -261,7 +261,7 @@ target_link_libraries(test_task24_lookup_tables PRIVATE Threads::Threads)
 add_test(NAME task24_lookup_tables COMMAND test_task24_lookup_tables)
 
 add_executable(test_task24_alignment_cache tests/task24_alignment_cache.cpp)
-target_compile_options(test_task24_alignment_cache PRIVATE -ffp-contract=off)
+target_compile_options(test_task24_alignment_cache PRIVATE -O2 -march=${FQDUP_MARCH} -ffp-contract=off)
 target_link_libraries(test_task24_alignment_cache PRIVATE Threads::Threads)
 add_test(NAME task24_alignment_cache COMMAND test_task24_alignment_cache)
 
@@ -271,6 +271,7 @@ target_link_libraries(test_task24_guard_scratch PRIVATE Threads::Threads)
 add_test(NAME task24_guard_scratch COMMAND test_task24_guard_scratch)
 
 add_executable(test_task25_family_index tests/task25_family_index.cpp)
+target_compile_options(test_task25_family_index PRIVATE -O2 -march=${FQDUP_MARCH})
 add_test(NAME task25_family_index COMMAND test_task25_family_index)
 add_executable(test_task25_counts tests/task25_counts.cpp src/merge_r8qkeep/mixture_fit.cpp src/merge_r8qkeep/fdlibm.cpp src/merge_r8qkeep/shortest_double.cpp)
 # This target also times worker schedules; match the production fitter flags.

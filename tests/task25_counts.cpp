@@ -1,5 +1,8 @@
 #include "../src/merge_r8qkeep/mixture_fit.hpp"
 #include "../src/merge_r8qkeep/worker_pool.hpp"
+#include "../src/merge_r8qkeep/counts_row.hpp"
+#include <cfenv>
+#include <random>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -85,9 +88,49 @@ static int benchmark_workers(const char* census_path){
     }
     return 0;
 }
+static void row_terms_parity(){
+    const int original_round=std::fegetround();
+    std::mt19937_64 rng(2530);
+    for(int mode:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
+        require(std::fesetround(mode)==0,"set row-oracle rounding mode");
+        for(int trial=0;trial<256;++trial){
+            detail::CountsRow weights,density,expected,actual;
+            for(int j=0;j<mixture_components;++j){
+                weights[j]=double(1+rng()%1000)/1001.0;
+                if(trial%3==0)weights[j]=std::ldexp(weights[j],-int(rng()%1000));
+                switch((j+trial)%8){
+                    case 0:density[j]=0;break;
+                    case 1:density[j]=std::numeric_limits<double>::denorm_min()*double(1+rng()%1000);break;
+                    case 2:density[j]=std::numeric_limits<double>::min();break;
+                    case 3:density[j]=1;break;
+                    case 4:density[j]=std::ldexp(double(1+rng()%1000)/1001.0,-int(rng()%1000));break;
+                    case 5:density[j]=std::nextafter(1.0,0.0);break;
+                    case 6:density[j]=std::nextafter(std::numeric_limits<double>::min(),0.0);break;
+                    default:density[j]=.5;
+                }
+                if(trial==0)density[j]=0;
+            }
+            // Literal previous interleaved loop, including every ordered add.
+            double expected_sum=0;
+            for(int j=0;j<mixture_components;++j){
+                expected[j]=weights[j]*density[j];expected_sum+=expected[j];
+            }
+            const double actual_sum=detail::counts_products(weights,density,actual);
+            require(std::memcmp(expected.data(),actual.data(),sizeof(expected))==0 &&
+                    std::memcmp(&expected_sum,&actual_sum,sizeof(double))==0,"counts products/sum bits");
+            if(expected_sum>0){
+                for(double& value:expected)value/=expected_sum;
+                detail::counts_normalize(actual,actual_sum);
+                require(std::memcmp(expected.data(),actual.data(),sizeof(expected))==0,"counts division bits");
+            }
+        }
+    }
+    require(std::fesetround(original_round)==0,"restore row-oracle rounding mode");
+}
 int main(int argc,char** argv){
     if(argc==2)return benchmark_workers(argv[1]);
     require(argc==1,"unexpected counts test arguments");
+    row_terms_parity();
     // A partial final 64-row chunk exercises bounded dynamic scheduling and unwind.
     std::vector<PairLikelihood> parallel(513);
     for(std::size_t i=0;i<parallel.size();++i){
