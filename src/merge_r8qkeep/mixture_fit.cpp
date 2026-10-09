@@ -28,12 +28,12 @@ public:
         if(threads>1&&!pool_){owned_pool_=std::make_unique<WorkerPool>(threads-1);pool_=owned_pool_.get();}
         jobs_.reserve(threads);
     }
-    template<class Function> void run(std::size_t count,Function function){
+    template<class Function> void run(std::size_t count,Function function,std::size_t max_chunk=64){
         const int workers=std::max(1,std::min<int>(threads_,count));
         if(workers==1){for(std::size_t i=0;i<count;++i)function(i,0);return;}
         jobs_.clear();
         alignas(64) std::atomic<std::size_t> next{0};
-        const std::size_t chunk_rows=std::min<std::size_t>(64,(count+workers-1)/workers);
+        const std::size_t chunk_rows=std::max<std::size_t>(1,std::min(max_chunk,(count+workers-1)/workers));
         const auto consume=[&](int worker){
             for(;;){
                 const auto begin=next.fetch_add(chunk_rows,std::memory_order_relaxed);
@@ -165,8 +165,28 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
             t.log_sum=logsum(a,exp[worker]);
             for(int j=0;j<mixture_components;++j)t.responsibility[j]=exp[worker](a[j]-t.log_sum);
         });
-        // Every floating-point reduction still visits every original pair in order.
-        for(std::size_t index:group){const auto& t=terms[index];if constexpr(Counts){const double n=multiplicity[index];ll+=n*t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=n*t.responsibility[j];}else{ll+=t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=t.responsibility[j];}}
+        // Each scalar accumulator retains the original group order. Different
+        // accumulators can run independently; no partial sums are combined.
+        const auto reduce_serial=[&]{
+            for(std::size_t index:group){const auto& t=terms[index];if constexpr(Counts){const double n=multiplicity[index];ll+=n*t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=n*t.responsibility[j];}else{ll+=t.log_sum;for(int j=0;j<mixture_components;++j)count[j]+=t.responsibility[j];}}
+        };
+        if constexpr(Counts){
+            if(threads>1){
+                constexpr int width=4,blocks=(mixture_components+width-1)/width;
+                workers.run(blocks+1,[&](std::size_t block,int){
+                    if(block==blocks){
+                        for(std::size_t index:group){const double n=multiplicity[index];ll+=n*terms[index].log_sum;}
+                        return;
+                    }
+                    const int begin=int(block)*width,end=std::min(begin+width,mixture_components);
+                    std::array<double,width> partial{};
+                    for(std::size_t index:group){const double n=multiplicity[index];const auto& t=terms[index];
+                        for(int j=begin;j<end;++j)partial[j-begin]+=n*t.responsibility[j];
+                    }
+                    for(int j=begin;j<end;++j)count[j]=partial[j-begin];
+                },1);
+            }else reduce_serial();
+        }else reduce_serial();
         Values next;for(int j=0;j<mixture_components;++j)next[j]=std::max(count[j]/pairs.size(),1e-300);
         const double mass=sum(next);for(double& x:next)x/=mass;
         if(ll+1e-7<old)throw std::runtime_error("EM likelihood decreased");

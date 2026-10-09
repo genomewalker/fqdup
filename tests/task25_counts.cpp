@@ -2,6 +2,7 @@
 #include "../src/merge_r8qkeep/worker_pool.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <fstream>
@@ -19,6 +20,9 @@ static void identical(const MixtureFit& a,const MixtureFit& b){
         a.unique_likelihoods==b.unique_likelihoods && a.converged==b.converged &&
         a.iterations==b.iterations && a.polish_iterations==b.polish_iterations &&
         a.kkt_gap==b.kkt_gap && a.log_likelihood==b.log_likelihood,"counts order/thread dependence");
+    require(std::memcmp(a.weights.data(),b.weights.data(),sizeof(a.weights))==0 &&
+        std::memcmp(&a.kkt_gap,&b.kkt_gap,sizeof(double))==0 &&
+        std::memcmp(&a.log_likelihood,&b.log_likelihood,sizeof(double))==0,"fit bit-pattern dependence");
 }
 static void repeated_objective(const std::vector<PairLikelihood>& pairs,const MixtureFit& fit){
     double ll=0;
@@ -116,6 +120,22 @@ int main(int argc,char** argv){
         bool threw=false;try{bad.get();}catch(const std::runtime_error&){threw=true;}
         require(threw,"shared fit exception was lost");identical(*serial_counts,*good.get());
         identical(*serial_counts,*fit_mixture_counts(parallel_view,3,&pool));
+    }
+    // Normal, subnormal and zero densities exercise the reordered independent
+    // accumulator schedule against the literal serial reduction path.
+    std::vector<PairLikelihood> deep(257);
+    for(std::size_t i=0;i<deep.size();++i){deep[i].id=std::to_string(i);
+        for(int j=0;j<mixture_components;++j)
+            deep[i].log_likelihood[j]=(j==int(i%4)?0.0:-20.0-100.0*(j%9))-.001*i;
+    }
+    const auto deep_view=view(deep);
+    const auto deep_serial=fit_mixture_counts(deep_view,1);
+    for(int threads:{2,4,8})identical(*deep_serial,*fit_mixture_counts(deep_view,threads));
+    {
+        WorkerPool pool(6);
+        auto first=std::async(std::launch::async,[&]{return fit_mixture_counts(deep_view,7,&pool);});
+        auto second=std::async(std::launch::async,[&]{return fit_mixture_counts(deep_view,7,&pool);});
+        identical(*deep_serial,*first.get());identical(*deep_serial,*second.get());
     }
     require(!fit_mixture_counts({}),"empty counts fit");
     std::vector<PairLikelihood> one(19);
