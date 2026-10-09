@@ -11,9 +11,10 @@
 namespace fqdup::r8qkeep {
 // Compact postings over distinct 13/14-base parts, not over all reads.
 class FamilyPartIndex {
-    struct Part { std::uint64_t value; int begin, end; };
+    struct Part { int begin, end; };
     std::vector<int> members_;
     std::vector<Part> parts_;
+    std::vector<std::uint64_t> values_;
     std::array<std::vector<int>, 4> blocks_;
     std::array<std::vector<std::uint32_t>, 4> offsets_;
     std::array<std::vector<std::uint32_t>,6> pair_offsets_;
@@ -49,7 +50,7 @@ class FamilyPartIndex {
         dense_words_.assign(rows,0);dense_ranks_.assign(rows,0);
         dense_ids_.clear();n_nodes_.clear();
         for(std::size_t id=0;id<parts_.size();++id){
-            const auto value=parts_[id].value;
+            const auto value=values_[id];
             if(value&0x24924924924ULL){
                 if(n_nodes_.empty())n_nodes_.emplace_back();
                 int node=0;
@@ -176,7 +177,7 @@ class FamilyPartIndex {
         for(int b=0;b<6;++b){
             if(!n_free[first_block[b]]||!n_free[second_block[b]])continue;
             ++lookups;const auto target=query_blocks[second_block[b]];
-            const auto key_at=[&](std::size_t pos){return block(parts_[posting(b,pos)].value,second_block[b]);};
+            const auto key_at=[&](std::size_t pos){return block(values_[posting(b,pos)],second_block[b]);};
             const auto& directory=compact_pairs_?pair_offsets_[b]:offsets_[first_block[b]];
             const auto prefix=compact_pairs_?(compact_pair_key(query,b)>>pair_shift_[b]):query_blocks[first_block[b]];
             std::size_t lo=directory.empty()?0:directory[prefix];
@@ -197,10 +198,11 @@ class FamilyPartIndex {
             const int minimum=std::min(std::min(heads[0],heads[1]),
                 std::min(std::min(heads[2],heads[3]),std::min(heads[4],heads[5])));
             if(minimum==exhausted)return;
-            ++candidates;const auto& part=parts_[minimum];const auto x=query^part.value;
+            ++candidates;const auto x=query^values_[minimum];
             const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
             auto remaining=different&(different-1);remaining&=remaining-1;
-            if(remaining==0)for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;
+            if(remaining==0){const auto& part=parts_[minimum];
+                for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;}
             for(int b=0;b<6;++b)if(heads[b]==minimum){
                 ++at[b];heads[b]=at[b]<end[b]?posting(b,at[b]):exhausted;
             }
@@ -221,18 +223,18 @@ public:
         std::vector<std::uint64_t> packed;packed.reserve(representatives.size());
         for(int i:representatives)packed.push_back(pack(keys[i],begin,end));
         const auto value = [&](int i) { return packed[i]; };
-        parts_.clear();
+        parts_.clear();values_.clear();
         if(members_.size()>=1024)radix_ids(members_,value,3*length_);
         else std::sort(members_.begin(), members_.end(), [&](int a, int b) {
             const auto x = value(a), y = value(b); return x < y || (x == y && a < b);
         });
         std::size_t count = 0;
         for (std::size_t i = 0; i < members_.size(); ++i) if (!i || value(members_[i]) != value(members_[i-1])) ++count;
-        parts_.reserve(count);
+        parts_.reserve(count);values_.reserve(count);
         for (std::size_t i = 0; i < members_.size();) {
             const auto v = value(members_[i]); const int first = i++;
             while (i < members_.size() && value(members_[i]) == v) ++i;
-            parts_.push_back({v, first, int(i)});
+            parts_.push_back({first, int(i)});values_.push_back(v);
         }
         std::vector<std::uint64_t>().swap(packed);
         paired_=!force_dense&&parts_.size()<=65536;
@@ -256,7 +258,7 @@ public:
                     pair_shift_[b]=bits-prefix;
                     const std::size_t domain=std::size_t(1)<<prefix;
                     auto& directory=pair_offsets_[b];directory.assign(domain+1,0);
-                    for(const auto& part:parts_){const auto key=compact_pair_key(part.value,b);
+                    for(const auto value:values_){const auto key=compact_pair_key(value,b);
                         if(key<(std::uint32_t(1)<<bits))++directory[(key>>pair_shift_[b])+1];}
                     std::partial_sum(directory.begin(),directory.end(),directory.begin());
                 }
@@ -265,7 +267,7 @@ public:
                 for(int b=0;b<3;++b){
                     const std::size_t domain=std::size_t(1)<<(3*(bounds_[b+1]-bounds_[b]));
                     auto& directory=offsets_[b];directory.assign(domain+1,0);
-                    for(const auto& part:parts_)++directory[block(part.value,b)+1];
+                    for(const auto value:values_)++directory[block(value,b)+1];
                     std::partial_sum(directory.begin(),directory.end(),directory.begin());
                 }
             }
@@ -274,7 +276,7 @@ public:
             std::vector<std::uint16_t> ids(parts_.size());
             for(int b=0;b<6;++b){
                 std::iota(ids.begin(),ids.end(),std::uint16_t(0));
-                const auto key=[&](int id){return compact_pairs_?compact_pair_key(parts_[id].value,b):pair_key(parts_[id].value,b);};
+                const auto key=[&](int id){return compact_pairs_?compact_pair_key(values_[id],b):pair_key(values_[id],b);};
                 if(ids.size()>=1024)radix_ids(ids,key,24);
                 else std::sort(ids.begin(),ids.end(),[&](int a,int c){
                     const auto x=key(a),y=key(c);
@@ -301,7 +303,7 @@ public:
         std::size_t n = 0; for (const auto& p : parts_) n = std::max(n, std::size_t(p.end-p.begin)); return n;
     }
     std::size_t bytes() const {
-        std::size_t n = members_.capacity()*sizeof(int) + parts_.capacity()*sizeof(Part);
+        std::size_t n = members_.capacity()*sizeof(int) + parts_.capacity()*sizeof(Part) + values_.capacity()*sizeof(std::uint64_t);
         for (const auto& b : blocks_) n += b.capacity()*sizeof(int);
         for (const auto& offsets : offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
         for (const auto& offsets : pair_offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
