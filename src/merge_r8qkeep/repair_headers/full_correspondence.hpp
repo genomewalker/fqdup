@@ -13,7 +13,7 @@ namespace fqalign {
 // Experimental unbanded boundary overlap. Score +1/-1, gap 3+g, delta2, cap256.
 // Gates frozen before labels: all paths n>=30, invariant ACGT>=30, worst error fraction<=.30, certified anchor.
 // Enumeration stops at cap+1: rejected counts are lower bounds, never exact claims.
-struct FullResult {Correspondence corr;int min_informative=1000000000,max_gap=0;double max_fraction=0;};
+struct FullResult {Correspondence corr;int min_informative=1000000000,max_gap=0;double max_fraction=0;bool summary_complete=false;};
 class FullCorrespondence {
  static constexpr int neg=-1000000000;
  struct Cell {std::array<int,3> suffix{neg,neg,neg}; int through=0;};
@@ -84,6 +84,7 @@ class FullCorrespondence {
    }begin=end;
   }
   int invariant_n=0;for(auto [i,j]:out.invariant)invariant_n+=a[i]!='N'&&b[j]!='N';
+  result.summary_complete=true;
   if(result.min_informative<30||invariant_n<30){out.reason="insufficient_columns";return result;}
   if(result.max_fraction>.30){out.reason="excess_error_fraction";return result;}
   if(out.certified.empty()){out.reason="no_certified_anchor";return result;}

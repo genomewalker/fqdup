@@ -1,11 +1,39 @@
 #include "../src/merge_r8qkeep/repair.cpp"
 #include <random>
+namespace fqdup_r8qkeep_repair_internal {
+#include "task25_full_correction_ref.hpp"
+}
 using namespace fqdup::r8qkeep;
 namespace internal=fqdup_r8qkeep_repair_internal;
 static void require(bool value){if(!value)throw std::runtime_error("alignment cache differential failure");}
 static std::string prior(int component){std::ostringstream out;out<<"FQDUP_PAIR_MIXTURE_V1 64\n";for(int f=0;f<2;++f){out<<f<<' '<<(component>=0);for(int z=0;z<66;++z)out<<' '<<(z==component?1:0);out<<'\n';}return out.str();}
 static void same(const internal::fqalign::Correspondence& a,const internal::fqalign::Correspondence& b){require(a.best==b.best&&a.paths==b.paths&&a.eligible==b.eligible&&a.reason==b.reason&&a.invariant==b.invariant&&a.certified==b.certified);}
+template<class A,class B> static void same_full(const A& a,const B& b){
+    same(a.corr,b.corr);require(a.min_informative==b.min_informative&&a.max_gap==b.max_gap&&a.max_fraction==b.max_fraction);
+}
 int main(){
+    std::mt19937 policy_rng(2511);bool relaxed_length=false,stricter_error=false;
+    for(int length=20;length<=100;length+=5)for(int variant=0;variant<8;++variant){
+        std::string a(length,'A');for(auto& base:a)base="ACGT"[policy_rng()%4];auto b=a;
+        if(variant)for(int i=7;i<length;i+=std::max(5,20-variant*2))b[i]=b[i]=='A'?'C':'A';
+        if(variant==6)b.insert(b.begin()+length/2,'G');
+        if(variant==7){a[3]='N';b[length/2]='N';}
+        internal::fqalign::FullCorrespondence nominal;
+        internal::fqrepair::FullCorrespondence correction;
+        internal::frozen_full_correction::FullCorrespondence oracle;
+        const auto expected=oracle.align_uncached(a,b);
+        const auto normal=nominal.align_uncached(a,b);
+        relaxed_length|=expected.corr.eligible&&!normal.corr.eligible;
+        stricter_error|=!expected.corr.eligible&&normal.corr.eligible;
+        internal::alignment_cache::Pair cache;internal::alignment_cache::Scope scope(&cache);
+        if(variant%2)same_full(correction.align(a,b),expected);
+        same_full(nominal.align(a,b),normal);
+        same_full(correction.align(a,b),expected);
+        same_full(correction.align_uncached(a,b),expected);
+        require(cache.misses==1);
+    }
+    require(relaxed_length&&stricter_error);
+
     std::mt19937 rng(24);std::string input;
     for(int row=0;row<12;++row){std::string a(60,'A'),q(60,'I');for(char& c:a)c="ACGT"[rng()%4];auto b=internal::fqalign::reverse_complement(a);if(row%3==0)b[20]=b[20]=='A'?'C':'A';
         const auto raw="@same\t"+a+"\t"+q+"\t@same\t"+b+"\t"+q+"\t";
@@ -16,10 +44,10 @@ int main(){
         internal::alignment_cache::Pair cache;internal::alignment_cache::Scope scope(&cache);
         internal::fqalign::FullCorrespondence full;internal::fqrepair::FullCorrespondence repair;internal::fqalign::SelfCorrespondence self;internal::fqalign::BandedCorrespondence banded;
         same(full.align(a,a).corr,full.align_uncached(a,a).corr);same(repair.align(a,a).corr,repair.align_uncached(a,a).corr);same(self.align(a,a).corr,self.align_uncached(a,a).corr);same(banded.align(a,a,60),banded.align_uncached(a,a,60));
-        require(cache.misses==4);auto modified=full.align(a,a);modified.corr.invariant.clear();same(full.align(a,a).corr,full.align_uncached(a,a).corr);self.align(a,a);repair.align(a,a);banded.align(a,a,60);require(cache.misses==4);
-        full.align(a.substr(0,49),a);banded.align(a,a,59);require(cache.misses==6);
+        require(cache.misses==3);auto modified=full.align(a,a);modified.corr.invariant.clear();same(full.align(a,a).corr,full.align_uncached(a,a).corr);self.align(a,a);repair.align(a,a);banded.align(a,a,60);require(cache.misses==3);
+        full.align(a.substr(0,49),a);banded.align(a,a,59);require(cache.misses==5);
         const auto g=internal::fqalign::quality_independent_geometry(a,b);const auto direct=internal::fqalign::quality_independent_geometry_uncached(a,b);require(g.insert==direct.insert&&g.informative==direct.informative&&g.mismatches==direct.mismatches&&g.fraction==direct.fraction&&g.second==direct.second&&g.eligible==direct.eligible);
-        internal::fqalign::quality_independent_geometry(a,b);require(cache.misses==7);
+        internal::fqalign::quality_independent_geometry(a,b);require(cache.misses==6);
     }
     const std::size_t count=48,start=17;
     for(int component:{-1,0,65}){const auto p=prior(component);RepairPipeline pipeline(p,p);RepairAlignmentCache cache(start,count);
