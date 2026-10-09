@@ -103,13 +103,16 @@ template<class Consume>
 void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,Consume consume){
     using Clock=std::chrono::steady_clock;
     const auto elapsed=[](auto start){return std::chrono::duration<double>(Clock::now()-start).count();};
-    WorkerPool pool(std::max(1,std::min(threads,8)));
+    const int workers=std::max(1,std::min(threads,8));
+    const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
+    // Deeper single-cut queues hide uneven pair work and output stalls. Multi-
+    // cutoff jobs retain at most 4096 output rows, independent of input size.
+    const std::size_t window=workers*(cuts.size()==1?16:4);
+    WorkerPool pool(workers);const auto pipeline_begin=Clock::now();
     const bool native_debug=debug&&lib.native.native_tsv.empty();
-    const auto process=[&](NativeRecords records,std::size_t offset,double native_seconds){
-    bool first=true;
-    ordered_index_chunks(pool,records.size(),threads,offset,[&](std::size_t start,std::size_t n){
-        OutputChunk chunk;chunk.count=n;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
-        const auto native=records.slice(start-offset,n);
+    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds){
+        const std::size_t n=native.size();
+        OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
         RepairAlignmentCache cache(start,n);const auto route_begin=Clock::now();
         const auto routing=lib.repair->route_records(native,debug,start,&cache,counters!=nullptr);
@@ -125,22 +128,45 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             chunk.seconds[c]=elapsed(begin);
         }
         return chunk;
-    },[&](OutputChunk chunk){if(first){chunk.native_seconds=native_seconds;first=false;}consume(std::move(chunk));},"all_cutoffs");
     };
-    if(!lib.native.records.empty()){process(lib.native.records,0,0);return;}
-    struct NativeChunk {NativeResult result;std::size_t start;double seconds;};
-    std::deque<std::future<NativeChunk>> pending;
-    std::size_t next=0;
-    const auto launch=[&]{
-        const auto start=next,n=std::min(native_batch_size,lib.family.pairs.size()-next);next+=n;
-        pending.push_back(pool.submit([&,start,n]{const auto begin=Clock::now();auto result=merge_native_range(lib.family.pairs,start,n,lib.native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
+    std::deque<std::future<OutputChunk>> output;
+    std::size_t output_rows=0,output_chunks=0;
+    const auto consume_next=[&]{auto chunk=output.front().get();output.pop_front();consume(std::move(chunk));};
+    const auto dispatch=[&](NativeRecords records,std::shared_ptr<const NativeResult> owner,std::size_t offset,double native_seconds){
+        for(std::size_t pos=0;pos<records.size();pos+=chunk_rows){
+            if(output.size()>=window)consume_next();
+            const auto n=std::min(chunk_rows,records.size()-pos),start=offset+pos;
+            const auto native=records.slice(pos,n);const double seconds=pos==0?native_seconds:0;
+            // Native views stay valid even after the coordinator advances to
+            // another batch. Results own their emitted strings before returning.
+            output.push_back(pool.submit([&,native,start,seconds,keep_alive=owner]{
+                (void)keep_alive;return process(native,start,seconds);
+            }));
+            output_rows+=n;++output_chunks;
+        }
     };
-    while(next<lib.family.pairs.size()&&pending.size()<std::size_t(std::max(1,std::min(threads,8))))launch();
-    while(!pending.empty()){
-        auto chunk=pending.front().get();pending.pop_front();
-        if(next<lib.family.pairs.size())launch();
-        process(chunk.result.records,chunk.start,chunk.seconds);
-    }
+    try{
+        if(!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
+        else{
+            struct NativeChunk {NativeResult result;std::size_t start;double seconds;};
+            std::deque<std::future<NativeChunk>> pending;std::size_t next=0;
+            const auto launch=[&]{
+                const auto start=next,n=std::min(native_batch_size,lib.family.pairs.size()-next);next+=n;
+                pending.push_back(pool.submit([&,start,n]{const auto begin=Clock::now();auto result=merge_native_range(lib.family.pairs,start,n,lib.native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
+            };
+            while(next<lib.family.pairs.size()&&pending.size()<std::size_t(workers))launch();
+            while(!pending.empty()){
+                auto chunk=pending.front().get();pending.pop_front();
+                if(next<lib.family.pairs.size())launch();
+                auto owner=std::make_shared<NativeResult>(std::move(chunk.result));
+                dispatch(owner->records,owner,chunk.start,chunk.seconds);
+            }
+        }
+        while(!output.empty())consume_next();
+    }catch(...){pool.stop();throw;}
+    if(std::getenv("FQDUP_CHUNK_PROFILE"))std::fprintf(stderr,
+        "CHUNK_PROFILE stage=streaming_pipeline workers=%d chunk_rows=%zu max_inflight=%zu rows=%zu chunks=%zu wall=%.6f timing_basis=wall_including_native_and_consume\n",
+        workers,chunk_rows,window,output_rows,output_chunks,elapsed(pipeline_begin));
 }
 using OutputFiles=std::array<std::ofstream,5>;
 void open_files(OutputFiles& files,const std::string& directory){
@@ -169,16 +195,28 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
 }
 void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow){
     if(cuts.size()!=directories.size()||cuts.size()!=labels.size())throw std::runtime_error("cutoff cardinality");
+    using Clock=std::chrono::steady_clock;
+    const bool measure=timings||debug;const auto stream_begin=Clock::now();
+    const auto elapsed=[](auto begin){return std::chrono::duration<double>(Clock::now()-begin).count();};
     std::vector<OutputFiles> files(cuts.size());for(std::size_t c=0;c<cuts.size();++c)open_files(files[c],directories[c]);
+    double output_seconds=measure?elapsed(stream_begin):0;
     std::vector<RepairShadow> counters(cuts.size());std::vector<double> seconds(cuts.size());
     double router_seconds=0,native_seconds=0;std::size_t count=0;
     process_records(lib,cuts,threads,debug,shadow?counters.data():nullptr,[&](OutputChunk chunk){
         count+=chunk.count;router_seconds+=chunk.router_seconds;native_seconds+=chunk.native_seconds;
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
+        const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];write_files(files[c],chunk.outputs[c]);}
+        if(measure)output_seconds+=elapsed(write_begin);
     });
     if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    const auto close_begin=measure?Clock::now():Clock::time_point{};
     for(auto& group:files)close_files(group);
+    if(measure){
+        output_seconds+=elapsed(close_begin);const double stream_seconds=elapsed(stream_begin);
+        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=main_thread_elapsed_including_open_close"<<memory_status()<<'\n';
+        std::cerr<<"MERGE_STAGE streaming_wall seconds="<<stream_seconds<<" timing_basis=wall_including_output"<<memory_status()<<'\n';
+    }
     if(timings||debug)std::cerr<<"MERGE_STAGE streaming_native seconds="<<native_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
     if(timings||debug)std::cerr<<"MERGE_STAGE router seconds="<<router_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
     for(std::size_t c=0;c<cuts.size();++c){
