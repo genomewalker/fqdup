@@ -138,8 +138,9 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
         std::uint64_t lookups=0,candidates=0,verified=0;
     };
     constexpr std::size_t batch_rows=32;
+    const std::size_t query_window=4*workers;
     edge_limit=std::min(edge_limit,Slot{}.edges.size());
-    const std::size_t scratch_bytes=sizeof(Slot)*(workers==1?1:workers*batch_rows);
+    const std::size_t scratch_bytes=sizeof(Slot)*(workers==1?1:query_window*batch_rows);
     const auto& shared_index=index;
     const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
         const auto& key=keys[representative[query]];
@@ -183,10 +184,10 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
             }));
         };
         try{
-            while(next<representative.size()&&pending.size()<std::size_t(workers))launch();
+            while(next<representative.size()&&pending.size()<query_window)launch();
             while(!pending.empty()){
                 // Destroy the consumed buffer before replenishing the queue:
-                // at most workers*32 slots, including the consumer, are live.
+                // at most query_window*32 slots, including consumer, are live.
                 {auto batch=pending.front().get();pending.pop_front();
                  for(std::size_t s=0;s<batch.slots.size();++s)consume(batch.begin+s,batch.slots[s]);}
                 if(next<representative.size())launch();

@@ -17,6 +17,17 @@ static void compare(const CensusResult& a,const CensusResult& b){
     compare_pairs(a.nominal_pairs,b.nominal_pairs);compare_pairs(a.full_pairs,b.full_pairs);
 }
 int main(){
+    // A slow first chunk must not prevent later independent work from running.
+    // The bounded timeout makes a shallow-queue regression fail without hanging.
+    {
+        WorkerPool pool(2);std::promise<void> later;auto ready=later.get_future().share();
+        std::vector<std::size_t> order;
+        ordered_index_chunks(pool,9,2,0,[&](std::size_t begin,std::size_t){
+            if(begin==0)require(ready.wait_for(std::chrono::seconds(5))==std::future_status::ready);
+            if(begin==4)later.set_value();return begin;
+        },[&](auto begin){order.push_back(begin);},"lookahead_test",1);
+        require(order.size()==9);for(std::size_t i=0;i<order.size();++i)require(order[i]==i);
+    }
     // Native preparation requires fixed batch boundaries at every worker count.
     for(int workers:{1,3,8}){
         std::vector<std::pair<std::size_t,std::size_t>> ranges;
