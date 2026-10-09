@@ -58,8 +58,50 @@ static void suffix_cells(){
  std::cout<<"TASK25_SUFFIX_CELLS_PASS cases=1024\n";
 #endif
 }
+static void band_suffix_cells(){
+#if defined(__AVX2__)
+ using Cell=internal::fqalign::AlignmentCell;
+ constexpr int neg=-1000000000;
+ std::mt19937 rng(2536);std::vector<Cell> expected,actual;int cases=0;
+ for(int n:{1,2,7,8,9,15,16,17,30,31,32,33,100,150,511,512})
+  for(int m:{1,2,7,8,9,15,16,17,30,31,32,33,100,150,511,512})
+   for(int d:{-n-4,-n,-n+4,m-n,-8,-3,-1,0,1,3,8,m-4,m,m+4})
+    for(int pattern=0;pattern<4;++pattern){
+     std::string a(n,'A'),b(m,'A');
+     if(pattern==1){a.assign(n,'N');b.assign(m,'N');}
+     if(pattern>=2){for(char& c:a)c="ACGTN"[rng()%5];for(char& c:b)c="ACGTN"[rng()%5];}
+     if(pattern==3){b=a;b.resize(m,'A');}
+     auto inside=[&](int i,int j){return i>=1&&i<=n&&j>=1&&j<=m&&std::abs(j-i-d)<=3;};
+     auto scalar=[&](std::vector<Cell>& cells,int i,int j){
+      auto at=[&](int r,int c)->Cell&{return cells[r*7+c-r-d+3];};
+      auto& c=at(i,j);c.through=0;int diag=neg;
+      if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+(a[i]==b[j]&&a[i]!='N'?1:-1);
+      c.suffix[0]=std::max(i==n||j==m?0:neg,diag);
+      if(inside(i+1,j))c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
+      if(inside(i,j+1))c.suffix[0]=std::max(c.suffix[0],at(i,j+1).suffix[2]-4);
+      c.suffix[1]=diag;c.suffix[2]=diag;
+      if(inside(i+1,j))c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
+      if(inside(i,j+1))c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+     };
+     expected.assign((n+1)*7,Cell{});for(auto& c:expected)c.through=157;actual=expected;
+     for(int i=n;i>=1;--i)for(int j=std::min(m,i+d+3);j>=std::max(1,i+d-3);--j)scalar(expected,i,j);
+     for(int i=n;i>=1;--i){
+      int lo=std::max(1,i+d-3),hi=std::min(m,i+d+3);
+      if(i<n&&hi<m&&hi-lo==6)fqdup_fast_dp::suffix_seven(&actual[i*7],&actual[(i+1)*7],a[i],b.data()+lo);
+      else for(int j=hi;j>=lo;--j)scalar(actual,i,j);
+     }
+     if(std::memcmp(expected.data(),actual.data(),expected.size()*sizeof(Cell))!=0){
+      std::cerr<<"band suffix mismatch n="<<n<<" m="<<m<<" d="<<d<<" pattern="<<pattern<<'\n';require(false);
+     }
+     ++cases;
+    }
+ std::cout<<"TASK25_BAND_SUFFIX_CELLS_PASS cases="<<cases<<'\n';
+#endif
+}
+
 int main(){
     suffix_cells();
+    band_suffix_cells();
     // All tail lengths and unaligned starts, including arbitrary byte equality.
     std::mt19937 count_rng(2528);
     std::array<char,576> left{},right{};

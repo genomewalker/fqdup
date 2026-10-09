@@ -1,4 +1,5 @@
 #pragma once
+#include "../fast_dp.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -61,7 +62,15 @@ class BandedCorrespondence {
   if(!any){out.reason="empty_band";return out;}
   cells=fqalign::alignment_scratch((n+1)*7);
   // Suffix after the current state. Terminal states must be aligned columns.
-  for(int i=n;i>=1;--i) for(int j=std::min(m,i+d0+3);j>=std::max(1,i+d0-3);--j) {
+  for(int i=n;i>=1;--i){
+   const int lo=std::max(1,i+d0-3),hi=std::min(m,i+d0+3);
+#if defined(__AVX2__)
+   if(i<n&&hi<m&&hi-lo==6){
+    fqdup_fast_dp::suffix_seven(&at(i,lo),&at(i+1,lo+1),a[i],b.data()+lo);
+    continue;
+   }
+#endif
+   for(int j=hi;j>=lo;--j) {
     auto& c=at(i,j);c.through=0;int diag=neg;
     if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((i==n||j==m)?0:neg,diag);
@@ -70,6 +79,7 @@ class BandedCorrespondence {
     c.suffix[1]=diag;c.suffix[2]=diag;
     if(inside(i+1,j))c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
     if(inside(i,j+1))c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+   }
   }
   for(int i=1;i<=n;++i)for(int j=std::max(1,i+d0-3);j<=std::min(m,i+d0+3);++j)
    if(i==1||j==1)out.best=std::max(out.best,sub(a[i-1],b[j-1])+at(i,j).suffix[0]);
