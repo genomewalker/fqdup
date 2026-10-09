@@ -312,3 +312,6 @@ target_link_libraries(test_task26_compact_family PRIVATE Threads::Threads)
 add_test(NAME task26_compact_family COMMAND test_task26_compact_family)
 add_executable(test_task26_packed_kernels tests/task26_packed_kernels.cpp)
 add_test(NAME task26_packed_kernels COMMAND test_task26_packed_kernels)
+
+add_executable(test_task26_content_memo tests/task26_content_memo.cpp)
+add_test(NAME task26_content_memo COMMAND test_task26_content_memo)

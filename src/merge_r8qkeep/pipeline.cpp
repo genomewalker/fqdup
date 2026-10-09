@@ -1,3 +1,4 @@
+#include "content_memo.hpp"
 #include "pipeline.hpp"
 #include "canonical_pairs.hpp"
 #include "prior_sample.hpp"
@@ -164,8 +165,8 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     if(!lib.pool)owned_pool=std::make_unique<WorkerPool>(workers);
     auto& pool=lib.pool?*lib.pool:*owned_pool;const auto pipeline_begin=Clock::now();
     const bool native_debug=debug&&lib.native.native_tsv.empty();
-    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds){
-        const std::size_t n=native.size();
+    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr){
+        const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
         RepairAlignmentCache cache(start,n);const auto route_begin=Clock::now();
@@ -184,7 +185,12 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto changed=alternative?lib.repair->repair_records(native,7,cuts[c],start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
             if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed));
             if(base.size()!=n||(alternative&&changed.size()!=n))throw std::runtime_error("chunk cardinality");
-            for(std::size_t i=0;i<n;++i)append_record(chunk.outputs[c],routing.routed[i]?changed[i]:base[i],*native[i].raw);
+            for(std::size_t i=0;i<n;++i){
+                const auto& record=routing.routed[i]?changed[i]:base[i];
+                if(collected){const auto bound=routing.native_clean_bounds[i];
+                    (*collected)[i]=memo_owned(record,bound>=0,bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()));}
+                else append_record(chunk.outputs[c],record,*native[i].raw);
+            }
             chunk.seconds[c]=elapsed(begin);
         }
         if(memory){
@@ -194,6 +200,9 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
         return chunk;
     };
+    #include "memo_pipeline.inc"
+    const auto memo_switch=std::getenv("FQDUP_MEMO");
+    const bool use_memo=lib.compact&&cuts.size()==1&&!debug&&!counters&&(!memo_switch||std::string_view(memo_switch)!="0");
     OrderedWriter<OutputChunk> writer(window,std::move(consume));
     std::size_t output_rows=0,output_chunks=0;
     const auto dispatch=[&](NativeRecords records,std::shared_ptr<const NativeResult> owner,std::size_t offset,double native_seconds){
@@ -209,7 +218,10 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
     };
     try{
-        if(!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
+        if(use_memo){
+            for(std::size_t start=0;start<lib.pair_count();start+=512){const auto n=std::min<std::size_t>(512,lib.pair_count()-start);
+                writer.submit(pool.submit([&,start,n]{return memo_process(start,n);}));output_rows+=n;++output_chunks;}
+        }else if(!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
         else{
             struct NativeChunk {NativeResult result;std::size_t start;double seconds;};
             auto raw_pool=std::make_shared<DecodedPairPool>(native_batch_size);
@@ -233,13 +245,14 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             }
         }
         writer.finish();
+        std::cerr<<"MERGE_MEMO enabled="<<use_memo<<" rows="<<memo_rows.load()<<" hits="<<memo_hits.load()<<" bypassed="<<memo_bypassed.load()<<" hit_rate="<<(memo_rows.load()?double(memo_hits.load())/memo_rows.load():0)<<" cache_capacity_bound_per_worker="<<ContentMemo::capacity_bound()<<'\n';
     }catch(...){pool.stop();throw;}
     if(memory){
         MemoryUsage m;m.native=max_native.load();m.routing=max_routing.load();m.output=max_output.load();
         m.report("streaming_chunk_max",lib.pair_count(),"independent_chunk_maxima_excludes_cache_and_dp_scratch");
         // Native batches may be referenced by queued outputs after the producer
         // advances. This is a conservative capacity bound, not simultaneous use.
-        m.native*=workers+window+1;m.routing*=workers;m.output*=window+workers+1;
+        m.native*=use_memo?workers:workers+window+1;m.routing*=workers;m.output*=window+workers+1;
         m.report("streaming_buffer_bound",lib.pair_count(),"capacity_bound_excludes_cache_and_dp_scratch");
         library_memory(lib).report("streaming_finished",lib.pair_count());
     }
