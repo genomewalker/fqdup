@@ -4,6 +4,7 @@
 #include "exact_exp_cache.hpp"
 #include "worker_pool.hpp"
 #include <chrono>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -30,13 +31,21 @@ public:
         const int workers=std::max(1,std::min<int>(threads_,count));
         if(workers==1){for(std::size_t i=0;i<count;++i)function(i,0);return;}
         jobs_.clear();
+        alignas(64) std::atomic<std::size_t> next{0};
+        const std::size_t chunk_rows=std::min<std::size_t>(64,(count+workers-1)/workers);
+        const auto consume=[&](int worker){
+            for(;;){
+                const auto begin=next.fetch_add(chunk_rows,std::memory_order_relaxed);
+                if(begin>=count)return;
+                const auto end=std::min(count,begin+chunk_rows);
+                for(auto i=begin;i<end;++i)function(i,worker);
+            }
+        };
         try {
-            for(int w=1;w<workers;++w)jobs_.push_back(pool_->submit([&,w]{
-                for(std::size_t i=count*w/workers;i<count*(w+1)/workers;++i)function(i,w);
-            }));
-            // Keep the coordinator on useful work instead of immediately
-            // sleeping on a future. All original partition IDs are preserved.
-            for(std::size_t i=0;i<count/workers;++i)function(i,0);
+            for(int w=1;w<workers;++w)jobs_.push_back(pool_->submit([&,w]{consume(w);}));
+            // Independent rows can have different costs. Keep caches private
+            // to logical workers and leave all reductions after the join.
+            consume(0);
             for(auto& job:jobs_)job.get();
         }catch(...){
             for(auto& job:jobs_)if(job.valid())job.wait();

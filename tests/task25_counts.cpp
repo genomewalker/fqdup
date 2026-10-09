@@ -67,16 +67,19 @@ static int benchmark_workers(const char* census_path){
 int main(int argc,char** argv){
     if(argc==2)return benchmark_workers(argv[1]);
     require(argc==1,"unexpected counts test arguments");
-    // More than 64 distinct cells exercises persistent workers, including unwind.
-    std::vector<PairLikelihood> parallel(96);
+    // A partial final 64-row chunk exercises bounded dynamic scheduling and unwind.
+    std::vector<PairLikelihood> parallel(513);
     for(std::size_t i=0;i<parallel.size();++i){
         parallel[i].id=std::to_string(i);
         for(int j=0;j<mixture_components;++j)
             parallel[i].log_likelihood[j]=(j==int(i%3)?0.0:-20.0)-.001*i;
     }
     const auto parallel_view=view(parallel);
-    identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
-    identical(*fit_mixture_views(parallel_view,1),*fit_mixture_views(parallel_view,8));
+    const auto serial_counts=fit_mixture_counts(parallel_view,1),serial_full=fit_mixture_views(parallel_view,1);
+    for(int threads:{2,4,8}){
+        identical(*serial_counts,*fit_mixture_counts(parallel_view,threads));
+        identical(*serial_full,*fit_mixture_views(parallel_view,threads));
+    }
     for(bool counts:{false,true})for(std::size_t bad:{std::size_t(0),parallel.size()-1}){
         auto poison=parallel;poison[bad].log_likelihood.fill(-std::numeric_limits<double>::infinity());
         bool worker_error=false;
