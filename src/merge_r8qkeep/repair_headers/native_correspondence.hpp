@@ -1,6 +1,7 @@
 #pragma once
 #include "../base_validation.hpp"
 #include "../fast_dp.hpp"
+#include "../diagonal_certificate.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -58,6 +59,9 @@ class BandedCorrespondence {
   n=a.size();m=b.size();
   if(insert<0){out.reason="no_geometry";return out;}
   d0=m-insert;
+  if(::fqdup_fast_diagonal::unique(a,b,d0,3)){
+   ::fqdup_fast_diagonal::fill(out,n,m,d0);return out;
+  }
   bool any=false;
   for(int i=1;i<=n;++i)if(std::max(1,i+d0-3)<=std::min(m,i+d0+3)){any=true;break;}
   if(!any){out.reason="empty_band";return out;}
@@ -123,4 +127,3 @@ class BandedCorrespondence {
  }
 };
 }
-

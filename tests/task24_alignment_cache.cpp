@@ -116,6 +116,27 @@ static void base_validation(){
 }
 
 int main(){
+    std::mt19937 diagonal_rng(2545);int shortcuts=0,fallbacks=0;
+    for(int trial=0;trial<600;++trial){
+        const int insert=30+trial%63,n=insert-8+trial%17,m=insert-8+(trial/17)%17;
+        std::string a(n,'A'),b(m,'A');
+        if(trial%5){for(char& c:a)c="ACGT"[diagonal_rng()%4];for(char& c:b)c="ACGT"[diagonal_rng()%4];}
+        for(int i=std::max(0,insert-m);i<std::min(n,insert);++i)b[i-insert+m]=a[i];
+        if(trial%7==0)b[m/2]='N';
+        if(trial%11==0)b[m/2]=b[m/2]=='A'?'C':'A';
+        if(::fqdup_fast_diagonal::unique(a,b,m-insert,3))++shortcuts;else ++fallbacks;
+        internal::fqalign::BandedCorrespondence banded;
+        internal::frozen_traceback::BandedCorrespondence old_banded;
+        same(banded.align_uncached(a,b,insert),old_banded.align_uncached(a,b,insert));
+        internal::fqalign::FullCorrespondence full;
+        internal::frozen_full_scan::FullCorrespondence old_full;
+        same_full(full.align_uncached(a,b),old_full.align_uncached(a,b));
+        // Full containment shortcut, including equal strings and edge ties.
+        const auto contained=trial%2?a:a+"ACG";
+        same_full(full.align_uncached(a,contained),old_full.align_uncached(a,contained));
+        same_full(full.align_uncached(contained,a),old_full.align_uncached(contained,a));
+    }
+    require(shortcuts>0&&fallbacks>0);
     base_validation();
     suffix_cells();
     band_suffix_cells();

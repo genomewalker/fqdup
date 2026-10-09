@@ -44,6 +44,11 @@ class FullCorrespondence {
   if(a.empty()||b.empty()){out.reason="empty_read";return result;}
   if(!::fqdup_fast_bases::valid(a)||!::fqdup_fast_bases::valid(b)){out.reason="unsupported_base";return result;}
   n=a.size();m=b.size();
+  int diagonal=0;
+  if(::fqdup_fast_diagonal::full_offset(a,b,diagonal)){
+   ::fqdup_fast_diagonal::fill(out,n,m,diagonal);
+   result.min_informative=out.best;result.summary_complete=true;return result;
+  }
   cells=fqalign::alignment_scratch((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.
   // Preserve descending row-major updates; specialize only boundary predicates.
@@ -106,4 +111,3 @@ class FullCorrespondence {
  }
 };
 }
-

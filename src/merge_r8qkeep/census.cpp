@@ -2,6 +2,7 @@
 #include "ordered_chunks.hpp"
 #include "geometry_counts.hpp"
 #include "base_validation.hpp"
+#include "diagonal_certificate.hpp"
 #include <string_view>
 #include "string_input.hpp"
 #include "fdlibm.hpp"
