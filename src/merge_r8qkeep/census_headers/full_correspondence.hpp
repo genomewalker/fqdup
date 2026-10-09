@@ -16,9 +16,9 @@ namespace fqalign {
 // Enumeration stops at cap+1: rejected counts are lower bounds, never exact claims.
 struct FullResult {Correspondence corr;int min_informative=1000000000,max_gap=0;double max_fraction=0;};
 class FullCorrespondence {
- static constexpr int neg=-1000000000;
- using Cell=::fqdup_fast_dp::PlanarCells::Cell;
- ::fqdup_fast_dp::PlanarCells cells;
+ static constexpr int neg=::fqdup_fast_dp::ShortPlanarCells::neg;
+ using Cell=::fqdup_fast_dp::ShortPlanarCells::Cell;
+ ::fqdup_fast_dp::ShortPlanarCells cells;
  int n=0,m=0;
  bool inside(int i,int j) const {return i>=1&&i<=n&&j>=1&&j<=m;}
  Cell at(int i,int j) {return cells.at(i*(m+1)+j);}
@@ -28,11 +28,11 @@ class FullCorrespondence {
     auto c=at(i,j);int diag=neg;
     if constexpr(next_i&&next_j)diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((!next_i||!next_j)?0:neg,diag);
-    if constexpr(next_i)c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
-    if constexpr(next_j)c.suffix[0]=std::max(c.suffix[0],at(i,j+1).suffix[2]-4);
+    if constexpr(next_i)c.suffix[0]=std::max<int>(c.suffix[0],at(i+1,j).suffix[1]-4);
+    if constexpr(next_j)c.suffix[0]=std::max<int>(c.suffix[0],at(i,j+1).suffix[2]-4);
     c.suffix[1]=diag;c.suffix[2]=diag;
-    if constexpr(next_i)c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
-    if constexpr(next_j)c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+    if constexpr(next_i)c.suffix[1]=std::max<int>(c.suffix[1],at(i+1,j).suffix[1]-1);
+    if constexpr(next_j)c.suffix[2]=std::max<int>(c.suffix[2],at(i,j+1).suffix[2]-1);
  }
  public:
  FullResult align(const std::string&a,const std::string&b) {
@@ -55,7 +55,7 @@ class FullCorrespondence {
     fill_suffix<true,false>(i,m,a,b);
     int j=m-1;
 #if defined(__AVX2__)
-    for(;j>=8;j-=8)::fqdup_fast_dp::suffix_eight_planar<false>(cells,i*(m+1)+j-7,(i+1)*(m+1)+j-7,a[i],b.data()+j-7);
+    for(;j>=16;j-=16)::fqdup_fast_dp::suffix_sixteen_planar(cells,i*(m+1)+j-15,(i+1)*(m+1)+j-15,a[i],b.data()+j-15);
 #endif
     for(;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }

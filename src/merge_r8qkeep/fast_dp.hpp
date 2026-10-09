@@ -1,4 +1,5 @@
 #pragma once
+#include "fast_dp16.hpp"
 #include <cstddef>
 #include <algorithm>
 #include <memory>
