@@ -36,7 +36,19 @@ int merge_r8qkeep_main(int argc,char** argv){
         for(const auto& text:cuts){const double cut=number(text);if(cut<0||cut>1||text.find_first_of("/\\")!=std::string::npos)throw std::runtime_error("invalid cutoff");}
         if(!std::filesystem::create_directory(outdir))throw std::runtime_error("output directory exists");const std::filesystem::path out=outdir;
         if(multiple)for(const auto& text:cuts)if(!std::filesystem::create_directory(out/text))throw std::runtime_error("duplicate cutoff directory");
-        auto library=prepare_library(input(r1),input(r2),settings,threads,debug,timings,true,counts);
+        const auto input_start=std::chrono::steady_clock::now();
+        std::vector<FamilyRead> mate1,mate2;
+        if(threads>1){
+            // Independent readers preserve each mate's lane and record order.
+            // An async future joins even if the other reader throws, before
+            // its referenced paths leave scope.
+            auto first=std::async(std::launch::async,[&]{return input(r1);});
+            mate2=input(r2);mate1=first.get();
+        }else{mate2=input(r2);mate1=input(r1);}
+        if(timings||debug)std::cerr<<"MERGE_STAGE input_wall seconds="
+            <<std::chrono::duration<double>(std::chrono::steady_clock::now()-input_start).count()
+            <<memory_status()<<'\n';
+        auto library=prepare_library(std::move(mate1),std::move(mate2),settings,threads,debug,timings,true,counts);
         std::vector<double> values;std::vector<std::string> directories;
         for(const auto& cut:cuts){values.push_back(number(cut));directories.push_back((multiple?out/cut:out).string());}
         write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow);
