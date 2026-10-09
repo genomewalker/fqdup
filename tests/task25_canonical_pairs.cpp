@@ -16,7 +16,7 @@ static std::vector<Row> rows(const std::vector<FamilyRead>& r1,
                        r2[i].h, r2[i].s, r2[i].q, r2[i].id});
     return out;
 }
-static void check(const std::vector<Row>& input) {
+static void check(const std::vector<Row>& input,WorkerPool* pool=nullptr,int workers=1) {
     std::vector<FamilyRead> r1, r2;
     for (const auto& r : input) {
         r1.push_back({r[1], r[0], r[2], r[3]});
@@ -24,9 +24,9 @@ static void check(const std::vector<Row>& input) {
     }
     auto expected = input;
     std::sort(expected.begin(), expected.end());
-    canonicalize_family_input(r1, r2);
+    canonicalize_family_input(r1, r2,pool,workers);
     require(rows(r1, r2) == expected, "canonical output differs from row oracle");
-    canonicalize_family_input(r1, r2);
+    canonicalize_family_input(r1, r2,pool,workers);
     require(rows(r1, r2) == expected, "canonicalization is not idempotent");
 }
 int main() {
@@ -48,6 +48,15 @@ int main() {
     variants.push_back(other);
     std::mt19937 rng(25000);
     for (int i = 0; i < 300; ++i) { std::shuffle(variants.begin(), variants.end(), rng); check(variants); }
+
+    // Uneven merge ranges, tied IDs with different mate fields, exact duplicate
+    // rows and already-sorted input exercise the parallel path and idempotence.
+    std::vector<Row> large;
+    for(int i=0;i<8193;++i){
+        auto row=variants[rng()%variants.size()];
+        row[0]=row[7]="id"+std::to_string(rng()%1024);large.push_back(std::move(row));
+    }
+    for(int workers:{2,3,8}){WorkerPool pool(workers);check(large,&pool,workers);}
 
     std::vector<FamilyRead> r1{{"@a/1", "a", "AC", "II"}, {"@b/1", "b", "GT", "II"}};
     std::vector<FamilyRead> r2{{"@b/2", "b", "TG", "II"}, {"@a/2", "a", "CA", "II"}};

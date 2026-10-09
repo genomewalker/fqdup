@@ -24,9 +24,9 @@ void json_string(std::string& out,const std::string& s){static const char hex[]=
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
-    if(counts){canonicalize_family_input(r1,r2);stage("canonical_input");}
     LibraryPipeline out;out.native_settings=settings;
     const int workers=std::max(1,std::min(threads,8));out.pool=std::make_shared<WorkerPool>(workers);
+    if(counts){canonicalize_family_input(r1,r2,out.pool.get(),workers);stage("canonical_input");}
     out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
