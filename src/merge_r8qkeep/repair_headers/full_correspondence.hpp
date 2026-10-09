@@ -50,7 +50,7 @@ class FullCorrespondence {
   int threshold=out.best-2;
   int max_counted_score=neg;
   std::vector<std::pair<int,int>> path;int informative=0,mismatches=0,gaps=0;
-  std::function<void(int,int,int,int)> visit=[&](int i,int j,int state,int score){
+  auto visit=[&](auto&& recurse,int i,int j,int state,int score)->void{
    if(out.paths>256||score+at(i,j).suffix[state]<threshold)return;
    bool info=state==0&&a[i-1]!='N'&&b[j-1]!='N';bool mm=info&&a[i-1]!=b[j-1];
    if(state==0)path.emplace_back(i,j);else ++gaps;informative+=info;mismatches+=mm;
@@ -60,14 +60,14 @@ class FullCorrespondence {
     if(out.paths<=256)for(auto c:path)++at(c.first,c.second).through;
    }
    if(out.paths<=256){
-    if(inside(i+1,j+1))visit(i+1,j+1,0,score+sub(a[i],b[j]));
-    if(state!=2&&inside(i+1,j))visit(i+1,j,1,score-(state==1?1:4));
-    if(state!=1&&inside(i,j+1))visit(i,j+1,2,score-(state==2?1:4));
+    if(inside(i+1,j+1))recurse(recurse,i+1,j+1,0,score+sub(a[i],b[j]));
+    if(state!=2&&inside(i+1,j))recurse(recurse,i+1,j,1,score-(state==1?1:4));
+    if(state!=1&&inside(i,j+1))recurse(recurse,i,j+1,2,score-(state==2?1:4));
    }
    if(state==0)path.pop_back();else --gaps;informative-=info;mismatches-=mm;
   };
   for(int i=1;i<=n&&out.paths<=256;++i)for(int j=1;j<=m&&out.paths<=256;++j)
-   if(i==1||j==1)visit(i,j,0,sub(a[i-1],b[j-1]));
+   if(i==1||j==1)visit(visit,i,j,0,sub(a[i-1],b[j-1]));
   if(out.paths>256){out.reason="cap_exceeded";return result;}
   if(out.paths<1||max_counted_score!=out.best){out.reason="internal_inconsistency";return result;}
   for(int i=1;i<=n;++i)for(int j=1;j<=m;++j)

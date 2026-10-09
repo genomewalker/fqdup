@@ -57,7 +57,7 @@ class BandedCorrespondence {
   int threshold=out.best-2;
   int max_counted_score=neg;
   std::vector<std::pair<int,int>> path;
-  std::function<void(int,int,int,int)> visit=[&](int i,int j,int state,int score){
+  auto visit=[&](auto&& recurse,int i,int j,int state,int score)->void{
    if(out.paths>256||score+at(i,j).suffix[state]<threshold)return;
    if(state==0)path.emplace_back(i,j);
    if(state==0&&(i==n||j==m)&&score>=threshold){
@@ -65,14 +65,14 @@ class BandedCorrespondence {
     if(out.paths<=256)for(auto c:path)++at(c.first,c.second).through;
    }
    if(out.paths<=256){
-    if(inside(i+1,j+1))visit(i+1,j+1,0,score+sub(a[i],b[j]));
-    if(state!=2&&inside(i+1,j))visit(i+1,j,1,score-(state==1?1:4));
-    if(state!=1&&inside(i,j+1))visit(i,j+1,2,score-(state==2?1:4));
+    if(inside(i+1,j+1))recurse(recurse,i+1,j+1,0,score+sub(a[i],b[j]));
+    if(state!=2&&inside(i+1,j))recurse(recurse,i+1,j,1,score-(state==1?1:4));
+    if(state!=1&&inside(i,j+1))recurse(recurse,i,j+1,2,score-(state==2?1:4));
    }
    if(state==0)path.pop_back();
   };
   for(int i=1;i<=n&&out.paths<=256;++i)for(int j=std::max(1,i+d0-3);j<=std::min(m,i+d0+3)&&out.paths<=256;++j)
-   if(i==1||j==1)visit(i,j,0,sub(a[i-1],b[j-1]));
+   if(i==1||j==1)visit(visit,i,j,0,sub(a[i-1],b[j-1]));
   if(out.paths>256){out.reason="cap_exceeded";return out;}
   if(out.paths<1||max_counted_score!=out.best){out.reason="internal_inconsistency";return out;}
   for(int i=1;i<=n;++i)for(int j=std::max(1,i+d0-3);j<=std::min(m,i+d0+3);++j)

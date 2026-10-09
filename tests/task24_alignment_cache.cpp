@@ -3,6 +3,8 @@
 namespace fqdup_r8qkeep_repair_internal {
 #include "task25_full_correction_ref.hpp"
 #include "task25_geometry_ref.hpp"
+#include "task25_native_correspondence_ref.hpp"
+#include "task25_self_correspondence_ref.hpp"
 }
 using namespace fqdup::r8qkeep;
 namespace internal=fqdup_r8qkeep_repair_internal;
@@ -48,6 +50,14 @@ int main(){
         internal::fqalign::FullCorrespondence nominal;
         internal::fqrepair::FullCorrespondence correction;
         internal::frozen_full_correction::FullCorrespondence oracle;
+        internal::fqalign::SelfCorrespondence self;
+        internal::frozen_traceback::SelfCorrespondence old_self;
+        same_full(self.align_uncached(a,a),old_self.align_uncached(a,a));
+        same_full(self.align_uncached(a,b),old_self.align_uncached(a,b));
+        internal::fqalign::BandedCorrespondence banded;
+        internal::frozen_traceback::BandedCorrespondence old_banded;
+        for(int insert:{length/2,length,length+5})
+            same(banded.align_uncached(a,b,insert),old_banded.align_uncached(a,b,insert));
         const auto expected=oracle.align_uncached(a,b);
         const auto normal=nominal.align_uncached(a,b);
         relaxed_length|=expected.corr.eligible&&!normal.corr.eligible;
