@@ -2,6 +2,7 @@
 #include <random>
 namespace fqdup_r8qkeep_repair_internal {
 #include "task25_full_correction_ref.hpp"
+#include "task25_geometry_ref.hpp"
 }
 using namespace fqdup::r8qkeep;
 namespace internal=fqdup_r8qkeep_repair_internal;
@@ -11,7 +12,33 @@ static void same(const internal::fqalign::Correspondence& a,const internal::fqal
 template<class A,class B> static void same_full(const A& a,const B& b){
     same(a.corr,b.corr);require(a.min_informative==b.min_informative&&a.max_gap==b.max_gap&&a.max_fraction==b.max_fraction);
 }
+static void geometry_parity(const std::string& a,const std::string& b){
+    const auto expected=internal::frozen_geometry::geometry(a,b);
+    const auto actual=internal::fqalign::quality_independent_geometry_uncached(a,b);
+    require(expected.insert==actual.insert&&expected.informative==actual.informative&&
+            expected.mismatches==actual.mismatches&&expected.fraction==actual.fraction&&
+            expected.second==actual.second&&expected.eligible==actual.eligible);
+}
 int main(){
+    std::mt19937 geometry_rng(2512);
+    for(int n:{0,1,10,11,12,29,30,31,59,100,151,511,512,513})
+        for(int m:{0,1,10,11,12,29,30,31,59,100,151,511,512,513})
+            for(int variant=0;variant<4;++variant){
+                std::string a(n,'A'),b(m,'T');
+                if(variant==1){a.assign(n,'N');b.assign(m,'N');}
+                if(variant>=2){
+                    for(auto& c:a)c="ACGTN"[geometry_rng()%(variant==2?4:5)];
+                    for(auto& c:b)c="ACGTN"[geometry_rng()%(variant==2?4:5)];
+                }
+                geometry_parity(a,b);
+            }
+    for(auto [a,b]:std::vector<std::pair<std::string,std::string>>{
+            {"X","A"},{"A","X"},{"","X"},{std::string(513,'A'),"X"}}){
+        bool expected=false,actual=false;
+        try{internal::frozen_geometry::geometry(a,b);}catch(const std::invalid_argument&){expected=true;}
+        try{internal::fqalign::quality_independent_geometry_uncached(a,b);}catch(const std::invalid_argument&){actual=true;}
+        require(expected==actual);
+    }
     std::mt19937 policy_rng(2511);bool relaxed_length=false,stricter_error=false;
     for(int length=20;length<=100;length+=5)for(int variant=0;variant<8;++variant){
         std::string a(length,'A');for(auto& base:a)base="ACGT"[policy_rng()%4];auto b=a;

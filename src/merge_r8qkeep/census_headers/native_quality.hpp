@@ -56,13 +56,19 @@ inline Geometry quality_independent_geometry(const std::string& a,const std::str
         int informative=0,mismatches=0;
         for(int i=std::max(0,insert-int(b.size()));i<std::min(int(a.size()),insert);++i) {
             int j=i-insert+int(b.size());
-            if(a[i]!='N'&&b[j]!='N'){++informative;mismatches+=a[i]!=b[j];}
+            const int known=(a[i]!='N') & (b[j]!='N');
+            informative+=known;
+            mismatches+=known & (a[i]!=b[j]);
         }
         return std::pair<int,int>{informative,mismatches};
     };
     const int last=int(a.size()+b.size())-11;
+    // At most 1013 offsets; exact integer counts are reused for runner-up.
+    struct OffsetCount {int informative,mismatches;};
+    std::array<OffsetCount,1024> counts;
     for(int insert=11;insert<=last;++insert) {
         auto [n,mm]=count(insert);
+        counts[insert]={n,mm};
         if(n<11)continue;
         const double frac=double(mm)/n;
         if(out.insert<0||frac<out.fraction)
@@ -71,7 +77,7 @@ inline Geometry quality_independent_geometry(const std::string& a,const std::str
     if(out.insert<0)return out;
     for(int insert=11;insert<=last;++insert) {
         if(insert==out.insert)continue;
-        auto [n,mm]=count(insert);
+        auto [n,mm]=counts[insert];
         if(n>=30)out.second=std::min(out.second,double(mm)/n);
     }
     out.eligible=out.informative>=30&&out.fraction<=0.30&&out.second>=0.45;
