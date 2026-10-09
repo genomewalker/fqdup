@@ -2,6 +2,7 @@
 #include "family.hpp"
 #include "worker_pool.hpp"
 #include "packed_kernels.hpp"
+#include "quality_blocks.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -13,8 +14,8 @@
 #include <tuple>
 
 namespace fqdup::r8qkeep {
-// Columnar input storage. Sequence offsets also address the library-wide quality
-// code stream. Only exceptional (non-ACGT) symbols carry a position and byte.
+// Columnar input storage. Sequence offsets also address independently compressed quality
+// blocks. Only exceptional (non-ACGT) symbols carry a position and byte.
 // Header checkpoints bound random access; sequential decoders reuse their prefix.
 class CompactPairStore {
 public:
@@ -22,9 +23,11 @@ public:
     struct Decoder {
         std::size_t next=std::numeric_limits<std::size_t>::max(),offset=0;
         std::string header;
+        QualityBlocks::Cursor quality;
     };
 private:
-    std::vector<std::uint8_t> bases_,qualities_,headers_;
+    std::vector<std::uint8_t> bases_,headers_;
+    QualityBlocks qualities_;
     std::vector<std::uint64_t> starts_{0},checkpoints_,exception_positions_;
     std::vector<unsigned char> exception_values_;
     std::array<unsigned char,256> alphabet_{};
@@ -63,19 +66,13 @@ private:
         std::size_t value=0;unsigned shift=0;
         for(;;){const auto byte=headers_.at(offset++);value|=std::size_t(byte&127)<<shift;if(!(byte&128))return value;shift+=7;}
     }
-    #include "parallel_quality.inc"
-    void add_alphabet(std::string_view text,WorkerPool* pool=nullptr,int workers=1) {
-        const unsigned old_width=width_;bool changed=false;
+    void add_alphabet(std::string_view text,WorkerPool* =nullptr,int =1) {
+        bool changed=false;
         for(unsigned char c:text)if(codes_[c]<0){codes_[c]=int(alphabet_size_);alphabet_[alphabet_size_++]=c;changed=true;}
         if(!changed)return;
         width_=0;
         while((1U<<width_)<alphabet_size_)++width_;
         if(width_>4)width_=8;
-        if(width_==old_width)return;
-        const auto n=starts_.back();
-        qualities_.resize((n*width_+7)/8);
-        // Widen backwards: destination bits cannot overwrite an unread code.
-        widen_qualities(old_width,pool,workers);
     }
     template<class Read> void append_read(const Read& read) {
         if(read.s.size()!=read.q.size())throw std::runtime_error("FASTQ lengths");
@@ -87,7 +84,7 @@ private:
         headers_.insert(headers_.end(),read.h.begin()+prefix,read.h.end());previous_header_=read.h;
         add_alphabet(read.q);
         const auto start=starts_.back(),end=start+read.s.size();
-        bases_.resize((end*2+7)/8);qualities_.resize((end*width_+7)/8);
+        bases_.resize((end*2+7)/8);
         std::size_t i=0;
         for(;i+32<=read.s.size();i+=32){
             const auto block=packed::block(read.s.data()+i);
@@ -100,31 +97,38 @@ private:
             const unsigned code=base_code(read.s[i]);put(bases_,start+i,2,code&3);
             if(code==4){exception_positions_.push_back(start+i);exception_values_.push_back(read.s[i]);}
         }
-        if(width_==8){if(!read.q.empty())std::memcpy(qualities_.data()+start,read.q.data(),read.q.size());}
-        else if(width_)for(std::size_t i=0;i<read.q.size();++i)put(qualities_,start+i,width_,codes_[static_cast<unsigned char>(read.q[i])]);
+        qualities_.append(read.q);
         starts_.push_back(end);
     }
     std::size_t physical(std::size_t index)const {return order_.empty()?index:order_.at(index);}
+    void decode_sequence(std::size_t row,std::string& sequence)const {
+        const auto start=starts_.at(row),end=starts_.at(row+1),length=end-start;
+        sequence.resize(length);
+        std::size_t i=0;
+        for(;i+32<=length;i+=32)packed::decode32(bases_.data()+(start+i)/4,2*((start+i)%4),sequence.data()+i);
+        for(;i<length;++i)sequence[i]="ACGT"[get(bases_,start+i,2)];
+        auto e=std::lower_bound(exception_positions_.begin(),exception_positions_.end(),start);
+        for(;e!=exception_positions_.end()&&*e<end;++e)sequence[*e-start]=char(exception_values_[e-exception_positions_.begin()]);
+    }
     void decode_read(std::size_t row,FamilyRead& read,Decoder& decoder)const {
         header(row,read.h,decoder);const auto id=id_view(read.h);read.id.assign(id.data(),id.size());
-        const auto start=starts_.at(row),end=starts_.at(row+1),length=end-start;
-        read.s.resize(length);read.q.resize(length);
-        std::size_t i=0;
-        for(;i+32<=length;i+=32)packed::decode32(bases_.data()+(start+i)/4,2*((start+i)%4),read.s.data()+i);
-        for(;i<length;++i)read.s[i]="ACGT"[get(bases_,start+i,2)];
-        if(width_==8){if(length)std::memcpy(read.q.data(),qualities_.data()+start,length);}
-        else if(!width_)std::fill(read.q.begin(),read.q.end(),char(alphabet_[0]));
-        else for(std::size_t i=0;i<length;++i)read.q[i]=char(alphabet_[get(qualities_,start+i,width_)]);
-        auto e=std::lower_bound(exception_positions_.begin(),exception_positions_.end(),start);
-        for(;e!=exception_positions_.end()&&*e<end;++e)read.s[*e-start]=char(exception_values_[e-exception_positions_.begin()]);
+        decode_sequence(row,read.s);qualities_.read(starts_[row],starts_[row+1]-starts_[row],read.q,decoder.quality);
+    }
+    void set_base(std::uint64_t at,char base) {
+        const auto code=base_code(base);put(bases_,at,2,code&3);
+        const auto found=std::lower_bound(exception_positions_.begin(),exception_positions_.end(),at);
+        const auto slot=found-exception_positions_.begin();
+        if(found!=exception_positions_.end()&&*found==at)exception_values_[slot]=base;
+        else if(code==4){exception_positions_.insert(found,at);exception_values_.insert(exception_values_.begin()+slot,base);}
     }
 public:
     #include "compact_join.inc"
+    #include "parallel_quality.inc"
     CompactPairStore(){codes_.fill(-1);}
     std::size_t size()const{return (starts_.size()-1)/2;}
     bool empty()const{return size()==0;}
     void prepare_qualities(std::string_view symbols,WorkerPool* pool=nullptr,int workers=1){add_alphabet(symbols,pool,workers);}
-    std::array<std::size_t,5> capacity_bytes()const{return {bases_.capacity(),qualities_.capacity(),headers_.capacity()+8*checkpoints_.capacity(),8*starts_.capacity()+4*order_.capacity(),8*exception_positions_.capacity()+exception_values_.capacity()};}
+    std::array<std::size_t,5> capacity_bytes()const{return {bases_.capacity(),qualities_.owned_bytes(),headers_.capacity()+8*checkpoints_.capacity(),8*starts_.capacity()+4*order_.capacity(),8*exception_positions_.capacity()+exception_values_.capacity()};}
     unsigned quality_width()const{return width_;}
     unsigned quality_alphabet_size()const{return alphabet_size_;}
     std::uint64_t symbols()const{return starts_.back();}
@@ -154,6 +158,13 @@ public:
     void read(std::size_t index,FamilyPair& pair,Decoder& decoder)const {
         const auto row=2*physical(index);decode_read(row,pair.r[0],decoder);decode_read(row+1,pair.r[1],decoder);pair.id=pair.r[0].id;
     }
+    void sequences(std::size_t index,FamilyPair& pair)const {
+        const auto row=2*physical(index);decode_sequence(row,pair.r[0].s);decode_sequence(row+1,pair.r[1].s);
+    }
+    void content(std::size_t index,FamilyPair& pair,Decoder& decoder)const {
+        sequences(index,pair);const auto row=2*physical(index);
+        for(unsigned m=0;m<2;++m)qualities_.read(starts_[row+m],starts_[row+m+1]-starts_[row+m],pair.r[m].q,decoder.quality);
+    }
     void read(std::size_t index,FamilyPair& pair)const {Decoder decoder;read(index,pair,decoder);}
     // All workers finish reading before these sparse corrections are applied.
     // This keeps quality alphabet expansion and cross-word writes race-free.
@@ -162,12 +173,7 @@ public:
         const auto row=2*physical(index)+mate,start=starts_.at(row);
         if(position>=starts_.at(row+1)-start)throw std::out_of_range("compact edit");
         add_alphabet(std::string_view(&quality,1));const auto at=start+position;
-        put(qualities_,at,width_,width_==8?static_cast<unsigned char>(quality):codes_[static_cast<unsigned char>(quality)]);
-        const auto code=base_code(base);put(bases_,at,2,code&3);
-        const auto found=std::lower_bound(exception_positions_.begin(),exception_positions_.end(),at);
-        const auto slot=found-exception_positions_.begin();
-        if(found!=exception_positions_.end()&&*found==at)exception_values_[slot]=base;
-        else if(code==4){exception_positions_.insert(found,at);exception_values_.insert(exception_values_.begin()+slot,base);}
+        qualities_.edit(at,static_cast<unsigned char>(quality));set_base(at,base);
     }
     bool canonicalize() {
         if(!order_.empty())throw std::logic_error("already canonical");
@@ -204,7 +210,7 @@ public:
     }
     void input_order(){std::vector<std::uint32_t>().swap(order_);}
     std::size_t owned_bytes()const {
-        return bases_.capacity()+qualities_.capacity()+headers_.capacity()+exception_values_.capacity()
+        return bases_.capacity()+qualities_.owned_bytes()+headers_.capacity()+exception_values_.capacity()
             +8*(starts_.capacity()+checkpoints_.capacity()+exception_positions_.capacity())+4*order_.capacity();
     }
 };

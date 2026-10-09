@@ -18,5 +18,25 @@ int main(){
                 if(output.r[m].q[i]!=char(33+(row+m+i)%alphabet))throw std::runtime_error("parallel quality widening");}
         }
     }
-    std::cout<<"parallel in-place quality widening all widths PASS\n";
+    // Bulk corrections must preserve logical-to-physical mapping and the last
+    // value at duplicate positions, including edits to existing exceptions.
+    struct Edit {unsigned pair,position,mate;char base,quality;};
+    for(bool canonical:{false,true})for(int workers:{1,8}){
+        CompactPairStore bulk,scalar;
+        for(unsigned row=0;row<4096;++row){
+            const auto id=std::to_string(4096-row);std::string seq(137,'A'),q(137,'I');seq[7]='N';
+            bulk.append("@"+id+"/1 comment",seq,q,"@"+id+"/2 comment",seq,q);
+            scalar.append("@"+id+"/1 comment",seq,q,"@"+id+"/2 comment",seq,q);
+        }
+        if(canonical){bulk.canonicalize();scalar.canonicalize();}
+        std::vector<Edit> edits;
+        for(unsigned i=0;i<1200;++i){const auto row=(i*239)%4096;edits.push_back({row,7,i%2,'T',char(33+i%70)});edits.push_back({row,7,i%2,'C',char(33+(i+1)%70)});edits.push_back({row,136,(i+1)%2,'N','!'});}
+        for(const auto& e:edits)scalar.edit(e.pair,e.mate,e.position,e.base,e.quality);
+        bulk.apply_edits(std::move(edits),&pool,workers);
+        FamilyPair a,b;CompactPairStore::Decoder da,db;
+        for(unsigned row=0;row<4096;++row){bulk.read(row,a,da);scalar.read(row,b,db);if(a.id!=b.id)throw std::runtime_error("bulk ID");
+            for(unsigned m=0;m<2;++m)if(a.r[m].h!=b.r[m].h||a.r[m].s!=b.r[m].s||a.r[m].q!=b.r[m].q)throw std::runtime_error("bulk corrected content");
+            bulk.content(row,b,db);for(unsigned m=0;m<2;++m)if(a.r[m].s!=b.r[m].s||a.r[m].q!=b.r[m].q)throw std::runtime_error("content-only decoder");}
+    }
+    std::cout<<"parallel block quality edits and alphabet changes PASS\n";
 }

@@ -22,13 +22,13 @@ int main(){
             }
         }
     }
-    for(int threads:{1,8})for(bool canonical:{false,true}){
+    for(int threads:{1,8})for(bool canonical:{false,true})for(bool debug:{false,true}){
         auto a=first,b=second;CompactPairStore store;
         for(std::size_t i=0;i<a.size();++i)store.append(a[i],b[i]);
         if(canonical){canonicalize_family_input(a,b);require(store.canonicalize());}
-        const auto ref=correct_family(std::move(a),std::move(b),threads,true);
-        const auto compact=correct_compact_family(store,threads,true,nullptr);
-        require(ref.edits_tsv==compact.edits_tsv);require(ref.families_tsv==compact.families_tsv);require(ref.stats_json==compact.stats_json);
+        const auto ref=correct_family(std::move(a),std::move(b),threads,debug);
+        const auto compact=correct_compact_family(store,threads,debug,nullptr);
+        if(debug){require(ref.edits_tsv==compact.edits_tsv);require(ref.families_tsv==compact.families_tsv);}require(ref.stats_json==compact.stats_json);
         FamilyPair pair;CompactPairStore::Decoder decoder;
         for(std::size_t i=0;i<store.size();++i){store.read(i,pair,decoder);require(pair.id==ref.pairs[i].id);
             for(int mate=0;mate<2;++mate){const auto& x=pair.r[mate];const auto& y=ref.pairs[i].r[mate];require(x.h==y.h&&x.id==y.id&&x.s==y.s&&x.q==y.q);}}

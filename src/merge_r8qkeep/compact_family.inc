@@ -28,7 +28,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
     std::vector<FamilyKey> keys(store.size());
     ordered_index_chunks(pool,store.size(),threads,0,[&](std::size_t begin,std::size_t n){
         FamilyPair pair;CompactPairStore::Decoder decoder;
-        for(std::size_t i=begin;i<begin+n;++i){store.read(i,pair,decoder);keys[i]=compact_family_key(pair);}
+        for(std::size_t i=begin;i<begin+n;++i){store.sequences(i,pair);keys[i]=compact_family_key(pair);}
         return 0;
     },[](int){},"compact_family_keys");
     auto plan=discover_family_keys(std::move(keys),threads,shared_pool);
@@ -51,7 +51,10 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             if(groups[gi].oversize){disband[gi]=1;++dis;continue;}
             const auto& original=groups[gi].m;std::vector<int> g0(original.size());
             std::iota(g0.begin(),g0.end(),0);
-            for(std::size_t member=0;member<original.size();++member)store.read(original[member],P[member],decoder);
+            for(std::size_t member=0;member<original.size();++member){
+                if(debug)store.read(original[member],P[member],decoder);
+                else store.content(original[member],P[member],decoder);
+            }
             std::array<const std::vector<Column>*,2> prepared{};
             disband[gi]=groups[gi].oversize||second_molecule(P,g0,&prepared);
             if(disband[gi]){++dis;continue;}
@@ -80,11 +83,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             corrected+=c[5];confirmed+=c[6];unresolved+=c[7];excluded+=c[8];
         },"family_correct");
         phase("correction");
-        std::array<bool,256> observed{};std::string alphabet;
-        for(const auto& edit:all_edits){const auto q=static_cast<unsigned char>(edit.quality);if(!observed[q]){observed[q]=true;alphabet+=edit.quality;}}
-        store.prepare_qualities(alphabet,&pool,std::max(1,std::min(threads,8)));
-        for(const auto& edit:all_edits)store.edit(edit.pair,edit.mate,edit.position,edit.base,edit.quality);
-        std::vector<CompactEdit>().swap(all_edits);
+        store.apply_edits(std::move(all_edits),&pool,std::max(1,std::min(threads,8)));
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;
         if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';

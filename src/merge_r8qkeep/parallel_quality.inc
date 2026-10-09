@@ -1,21 +1,19 @@
-// Included in CompactPairStore's private section. A wave writes only above all
-// still-unread source bits. Barriers between waves make in-place widening safe.
-void widen_qualities(unsigned old_width,WorkerPool* pool,int workers){
-    const auto convert=[&](std::uint64_t begin,std::uint64_t end){
-        for(auto i=end;i>begin;){--i;const auto old=get(qualities_,i,old_width);const auto c=old_width==8?old:alphabet_[old];put(qualities_,i,width_,width_==8?c:codes_[c]);}
-    };
-    auto remaining=starts_.back();
-    if(pool&&workers>1){
-        while(remaining>65536){
-            const auto begin=((remaining*old_width+width_-1)/width_+7)/8*8;
-            if(begin>=remaining)break;
-            const auto stride=((remaining-begin+workers-1)/workers+7)/8*8;
-            std::vector<std::future<void>> jobs;jobs.reserve(workers);
-            try{for(auto lo=begin;lo<remaining;lo+=stride){const auto hi=std::min(remaining,lo+stride);jobs.push_back(pool->submit([&,lo,hi]{convert(lo,hi);}));}
-                for(auto& job:jobs)job.get();
-            }catch(...){for(auto& job:jobs)if(job.valid())job.wait();throw;}
-            remaining=begin;
-        }
+// Included in CompactPairStore's public section. Family reads finish before
+// edits: base bytes are changed in journal order, then independent quality
+// blocks are rebuilt in bounded parallel chunks. Duplicate positions retain
+// the last journal value, including after canonical ordering of pairs.
+template<class Edits> void apply_edits(Edits edits,WorkerPool* pool=nullptr,int workers=1){
+    std::vector<QualityBlocks::Edit> qualities;qualities.reserve(edits.size());
+    std::array<bool,256> observed{};std::string alphabet;
+    for(const auto& edit:edits){
+        if(edit.mate>1)throw std::out_of_range("compact mate");
+        const auto row=2*physical(edit.pair)+edit.mate,start=starts_.at(row);
+        if(edit.position>=starts_.at(row+1)-start)throw std::out_of_range("compact edit");
+        const auto at=start+edit.position;set_base(at,edit.base);
+        const auto q=static_cast<unsigned char>(edit.quality);
+        if(!observed[q]){observed[q]=true;alphabet+=edit.quality;}
+        qualities.push_back({at,q});
     }
-    convert(0,remaining);
+    add_alphabet(alphabet);Edits().swap(edits);
+    qualities_.rewrite(std::move(qualities),pool,workers);
 }
