@@ -4,6 +4,8 @@
 // a subset of that native path. See CLEAN.md; this performs no alignment.
 struct NativeCleanBound {
     std::array<int,2> component{{-2,-2}};
+    std::array<double,2> fixed_max{};
+    std::array<bool,2> has_nominal{};
     explicit NativeCleanBound(const fqquality::PairMixture& model) {
         for(int f=0;f<2;++f){
             if(!model.supported[f]){component[f]=-1;continue;}
@@ -12,17 +14,20 @@ struct NativeCleanBound {
                 if(found>=0){found=-2;break;}found=z;
             }
             component[f]=found;
+            has_nominal[f]=model.weights[f][0]>0;
+            for(int z=1;z<fqquality::PairMixture::K;++z)if(model.weights[f][z]>0)
+                fixed_max[f]=std::max(fixed_max[f],fqquality::PairMixture::lookup(z,'I','I',true).risk.first);
         }
     }
     static char complement(char c) {
         switch(c){case 'A':return 'T';case 'C':return 'G';case 'G':return 'C';case 'T':return 'A';default:return 'N';}
     }
-    template<class Row> int64_t operator()(const Row& v) const {
+    template<class Row> int64_t operator()(const Row& v,double cutoff=0) const {
         if(v.size()!=13)return -1;
         if(v[6]=="dropped")return 0;
         if(!RepairSkipBound::supported(v)||v[1].size()>512||v[4].size()>512)return -1;
-        const int z=component[1-fqquality::PairMixture::fold(v[1],v[4])];
-        if(z==-2)return -1; // Mixed priors retain the existing exact check.
+        const int training=1-fqquality::PairMixture::fold(v[1],v[4]);
+        const int z=component[training];
         const int insert=v[8].size(),n=v[1].size(),m=v[4].size();
         const int begin=std::max(0,insert-m),end=std::min(n,insert),length=end-begin;
         if(length<30)return -1;
@@ -40,12 +45,22 @@ struct NativeCleanBound {
         int64_t sum=0;
         for(int i=0;i<insert;++i){
             double upper=fqalign::phred_error(v[9][i]);
-            if(z>=0&&i>=begin&&i<end){
-                const double risk=fqquality::PairMixture::lookup(z,v[2][i],v[5][insert-1-i],true).risk.first;
+            if(z!=-1&&i>=begin&&i<end){
+                double risk;
+                if(z>=0)risk=fqquality::PairMixture::lookup(z,v[2][i],v[5][insert-1-i],true).risk.first;
+                else{
+                    risk=fixed_max[training];
+                    if(has_nominal[training])risk=std::max(risk,
+                        fqquality::PairMixture::lookup(0,v[2][i],v[5][insert-1-i],true).risk.first);
+                }
+                if(z==-2&&risk+1e-12>1)return -1;
                 upper=std::max(upper,risk+1e-12);
             }
             sum+=int64_t(std::floor(upper*RepairSkipBound::scale+.5));
         }
+        // Preserve the tighter posterior bound when this envelope cannot
+        // certify every requested cutoff. Point-mass behavior is unchanged.
+        if(z==-2&&sum>int64_t(std::floor(cutoff*RepairSkipBound::scale+.5))*insert)return -1;
         return sum;
     }
 };

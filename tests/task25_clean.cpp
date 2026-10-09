@@ -3,8 +3,15 @@
 using namespace fqdup::r8qkeep;
 static void require(bool ok){if(!ok)throw std::runtime_error("clean differential failure");}
 static std::string prior(int component){
-    std::ostringstream out;out<<"FQDUP_PAIR_MIXTURE_V1 64\n";
-    for(int f=0;f<2;++f){out<<f<<' '<<(component>=0);for(int j=0;j<66;++j)out<<' '<<(j==component?1:0);out<<'\n';}
+    std::ostringstream out;out.precision(17);out<<"FQDUP_PAIR_MIXTURE_V1 64\n";
+    for(int f=0;f<2;++f){out<<f<<' '<<(component!=-1);for(int j=0;j<66;++j){
+        double w=j==component?1:0;
+        if(component==-2)w=1.0/66;
+        if(component==-3)w=j==0?.9999:j==65?.0001:0;
+        if(component==-4)w=j==0?1e-300:j==40?.75:j==65?.25:0;
+        if(component==-5)w=j==0?.7:j==5?.3:0;
+        out<<' '<<w;
+    }out<<'\n';}
     return out.str();
 }
 int main(){
@@ -44,7 +51,7 @@ int main(){
         require(bound>=clean_pair_bound(v,nominal,processor));
     }
     require(early_accepted>0&&early_rejected>0);
-    for(int component:{-1,0,40,65}){
+    for(int component:{-5,-4,-3,-2,-1,0,40,65}){
         RepairPipeline pipeline(prior(component),prior(component));
         for(int trial=0;trial<60;++trial){
             const int insert=35+trial,n=trial%2?insert-4:insert+7,m=trial%2?insert-5:insert+9;
@@ -68,6 +75,11 @@ int main(){
                 const auto expected=pipeline.repair(text,9,cut,0,1,&shadow,&reference.routed,&reference.repair_bounds,nullptr,&fast.clean_bounds);
                 const auto actual=pipeline.repair(text,9,cut,0,1,nullptr,&fast.routed,&fast.repair_bounds,&cache,&fast.clean_bounds);
                 require(expected==actual&&shadow.clean_but_changed==0&&shadow.skip_but_changed==0);
+                auto parsed=parse_native_records(text);
+                RepairAlignmentCache typed_cache(0,1);
+                const auto certified=pipeline.route_records(parsed.records,false,0,&typed_cache,false,cut);
+                const auto typed=pipeline.repair(text,9,cut,0,1,nullptr,&certified.routed,&certified.repair_bounds,&typed_cache,&certified.clean_bounds);
+                require(expected==typed);
                 positives+=shadow.clean_and_unchanged;negatives+=shadow.notclean;
                 require(shadow.clean_and_unchanged+shadow.notclean==1);
                 const auto selected=pipeline.repair(text,7,cut,0,1,nullptr,nullptr,nullptr,&cache,nullptr,&fast.routed);

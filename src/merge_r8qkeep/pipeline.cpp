@@ -130,7 +130,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
         RepairAlignmentCache cache(start,n);const auto route_begin=Clock::now();
-        const auto routing=lib.repair->route_records(native,debug,start,&cache,counters!=nullptr);
+        const auto routing=lib.repair->route_records(native,debug,start,&cache,counters!=nullptr,*std::min_element(cuts.begin(),cuts.end()));
         chunk.native_clean=routing.native_clean;chunk.native_clean_pass.resize(cuts.size());
         for(std::size_t c=0;c<cuts.size();++c)for(std::size_t i=0;i<n;++i){
             const auto bound=routing.native_clean_bounds[i];
