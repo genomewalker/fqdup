@@ -34,10 +34,11 @@ static void column_parity(){
         if(trial==0)for(int member=0;member<size;++member)
             for(int side=0;side<2;++side)pairs[group[member]].r[side].s[0]=char('A'+member);
         require(second_molecule(pairs,group)==frozen_family_counters::second_molecule(pairs,group));
-        require(high_quality_counts(pairs,group)==frozen_family_counters::high_quality_counts(pairs,group));
+        std::array<const std::vector<Column>*,2> prepared{};
+        require(high_quality_counts(pairs,group,prepared)==frozen_family_counters::high_quality_counts(pairs,group));
         for(int side=0;side<2;++side){
             const auto expected=frozen_columns::columns(pairs,group,side);
-            const auto actual=columns(pairs,group,side);
+            const auto& actual=size>=2?*prepared[side]:columns(pairs,group,side);
             require(expected.size()==actual.size());
             for(std::size_t c=0;c<actual.size();++c){
                 require(expected[c].n==actual[c].n&&expected[c].top==actual[c].top&&
@@ -61,7 +62,8 @@ static void column_parity(){
         if(pattern)for(int member:{1,pattern==1?4:5})pairs[group[member]].r[1].s[8]='C';
         require(second_molecule(pairs,group)==(pattern==1));
         require(second_molecule(pairs,group)==frozen_family_counters::second_molecule(pairs,group));
-        require(high_quality_counts(pairs,group)==frozen_family_counters::high_quality_counts(pairs,group));
+        std::array<const std::vector<Column>*,2> prepared{};
+        require(high_quality_counts(pairs,group,prepared)==frozen_family_counters::high_quality_counts(pairs,group));
     }
     std::cout<<"FAMILY_COLUMN_BYTES compact="<<sizeof(Column)
              <<" old_object="<<sizeof(frozen_columns::Column)

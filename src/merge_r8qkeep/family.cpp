@@ -308,10 +308,11 @@ bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
     return false;
 }
 int qv(const Read& r, size_t c) { return r.q[c] - 33; }
-std::array<int,MAXCOMP> high_quality_counts(const std::vector<Pair>& P,const std::vector<int>& g) {
+std::array<int,MAXCOMP> high_quality_counts(const std::vector<Pair>& P,const std::vector<int>& g,
+                                         std::array<const std::vector<Column>*,2>& prepared) {
     std::array<int,MAXCOMP> hiq{};
     if(g.size()<2)return hiq;
-    for(int side=0;side<2;++side){const auto& cols=columns(P,g,side);
+    for(int side=0;side<2;++side){const auto& cols=columns(P,g,side);prepared[side]=&cols;
         for(size_t c=0;c<cols.size();++c){const auto& col=cols[c];if(col.top<0)continue;
             int topq=-1;for(int i:col.votes[col.top].second)topq=std::max(topq,qv(P[i].r[side],c));
             if(topq<30)continue;
@@ -367,11 +368,14 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = begin; gi < begin+n; ++gi) {
             const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
-            const auto hiq=high_quality_counts(P,g0);
+            std::array<const std::vector<Column>*,2> prepared{};
+            const auto hiq=high_quality_counts(P,g0,prepared);
             std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
             ++fam; members += long(g.size());
-            for (int side = 0; side < 2; ++side) { const auto& cols = columns(P, g, side);
+            // With no exclusions, masks still refer to the identical ordered
+            // g0 members. Other-side edits cannot invalidate these columns.
+            for (int side = 0; side < 2; ++side) { const auto& cols = g.size()==g0.size()?*prepared[side]:columns(P, g, side);
                 for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
                     auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
                         r.s[c] = base; r.q[c] = char(q + 33); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };

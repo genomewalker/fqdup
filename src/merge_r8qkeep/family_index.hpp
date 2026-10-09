@@ -55,12 +55,17 @@ class FamilyPartIndex {
     template<class Visitor>
     void visit_pairs(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
         std::array<std::size_t,6> at{},end{};
+        constexpr int exhausted=65536; // one past every possible 16-bit ID
+        std::array<int,6> heads;heads.fill(exhausted);
+        std::array<std::uint32_t,4> query_blocks;
+        std::array<bool,4> n_free;
+        for(int b=0;b<4;++b){query_blocks[b]=block(query,b);n_free[b]=!has_n(query,b);}
         for(int b=0;b<6;++b){
-            if(has_n(query,first_block[b])||has_n(query,second_block[b]))continue;
-            ++lookups;const auto target=block(query,second_block[b]);
+            if(!n_free[first_block[b]]||!n_free[second_block[b]])continue;
+            ++lookups;const auto target=query_blocks[second_block[b]];
             const auto key_at=[&](std::size_t pos){return block(parts_[posting(b,pos)].value,second_block[b]);};
             const auto& directory=offsets_[first_block[b]];
-            const auto prefix=block(query,first_block[b]);
+            const auto prefix=query_blocks[first_block[b]];
             std::size_t lo=directory.empty()?0:directory[prefix];
             const std::size_t limit=directory.empty()?parts_.size():directory[prefix+1];
             std::size_t hi=limit;
@@ -73,18 +78,19 @@ class FamilyPartIndex {
             lo=begin+(span==1?1:span/2+1);hi=begin+std::min(span+1,remaining);
             while(lo<hi){const auto mid=lo+(hi-lo)/2;if(key_at(mid)<=target)lo=mid+1;else hi=mid;}
             end[b]=lo;
+            heads[b]=posting(b,at[b]);
         }
         for(;;){
-            int minimum=-1;
-            for(int b=0;b<6;++b)if(at[b]<end[b]){
-                const int id=posting(b,at[b]);if(minimum<0||id<minimum)minimum=id;
-            }
-            if(minimum<0)return;
+            const int minimum=std::min(std::min(heads[0],heads[1]),
+                std::min(std::min(heads[2],heads[3]),std::min(heads[4],heads[5])));
+            if(minimum==exhausted)return;
             ++candidates;const auto& part=parts_[minimum];const auto x=query^part.value;
             const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
             auto remaining=different&(different-1);remaining&=remaining-1;
             if(remaining==0)for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;
-            for(int b=0;b<6;++b)if(at[b]<end[b]&&posting(b,at[b])==minimum)++at[b];
+            for(int b=0;b<6;++b)if(heads[b]==minimum){
+                ++at[b];heads[b]=at[b]<end[b]?posting(b,at[b]):exhausted;
+            }
         }
     }
 public:
