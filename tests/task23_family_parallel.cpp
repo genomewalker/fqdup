@@ -9,6 +9,16 @@
 #include <random>
 #include <stdexcept>
 static void require(bool ok){if(!ok)throw std::runtime_error("family parallel mismatch");}
+static void exact_key_collisions(){
+    std::vector<std::string> keys;
+    for(int i=0;i<80;++i){keys.push_back("key"+std::to_string(i));keys.push_back(keys[i/2]);}
+    keys.push_back("");keys.push_back("");
+    for(std::size_t hash:{std::size_t(0),~std::size_t(0)}){
+        ExactFamilyKeys actual(keys,keys.size());std::map<std::string,int> expected;
+        for(std::size_t i=0;i<keys.size();++i){const auto inserted=expected.emplace(keys[i],i);
+            require(actual.insert(i,hash)==inserted.first->second);}
+    }
+}
 static void packed_key_parity(){
     std::mt19937 rng(2560);const int bounds[]{0,13,26,40};
     for(int trial=0;trial<10000;++trial){
@@ -116,7 +126,7 @@ static void key_parity(){
 }
 
 int main(){
-    packed_key_parity();try{
+    exact_key_collisions();packed_key_parity();try{
     // Independent complete-window oracle for allocation-free rolling DUST.
     std::mt19937 dust_rng(2547);
     for(int trial=0;trial<200;++trial){

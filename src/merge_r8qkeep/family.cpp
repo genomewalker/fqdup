@@ -123,6 +123,27 @@ struct PackedFamilyKey {
 };
 static_assert(sizeof(PackedFamilyKey)==16);
 
+// Integer slots reference immutable full keys; hash collisions never imply equality.
+class ExactFamilyKeys {
+    const std::vector<std::string>& keys_;
+    std::vector<int> slots_;
+public:
+    ExactFamilyKeys(const std::vector<std::string>& keys,std::size_t eligible):keys_(keys){
+        std::size_t capacity=1;
+        if(eligible>slots_.max_size()/2)throw std::length_error("family key table size");
+        while(capacity<2*eligible)capacity*=2;
+        slots_.assign(capacity,-1);
+    }
+    int insert(int id,std::size_t hash){
+        const auto mask=slots_.size()-1;auto pos=hash&mask;
+        while(slots_[pos]>=0){const int old=slots_[pos];
+            if(keys_[old]==keys_[id])return old;
+            pos=(pos+1)&mask;
+        }
+        slots_[pos]=id;return id;
+    }
+};
+
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Pigeonhole candidates with the frozen N/N mismatch rule.
 // Union roots are not output: groups/members are emitted by ascending read id.
@@ -133,10 +154,14 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     const auto started=std::chrono::steady_clock::now();
     const auto root=[&](int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
     const auto unite=[&](int i,int j){i=root(i);j=root(j);if(i!=j)parent[i]=j;};
-    // Views remain valid: keys is immutable and outlives this local index.
-    std::unordered_map<std::string_view,int> exact;exact.reserve(eligible_keys);
     std::vector<int> representative;
-    for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){auto [it,new_key]=exact.emplace(keys[i],representative.size());if(new_key)representative.push_back(i);else unite(i,representative[it->second]);}
+    {
+        ExactFamilyKeys exact(keys,eligible_keys);
+        for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){
+            const int first=exact.insert(i,std::hash<std::string_view>{}(keys[i]));
+            if(first==int(i))representative.push_back(i);else unite(i,first);
+        }
+    } // Release duplicate lookup storage before constructing part indexes.
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
     const int workers=std::max(1,std::min(threads,8));
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
