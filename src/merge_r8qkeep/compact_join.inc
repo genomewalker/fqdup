@@ -4,6 +4,7 @@ void append_store(const CompactPairStore& part){
     if(part.empty())return;
     if(!order_.empty()||!part.order_.empty()||(starts_.size()-1)%header_interval)throw std::logic_error("compact join boundary");
     if(size()+part.size()>std::numeric_limits<std::uint32_t>::max())throw std::length_error("compact pair count");
+    common_id(part.id_common_);
     const auto start=starts_.back(),count=part.symbols();
     add_alphabet(std::string_view(reinterpret_cast<const char*>(part.alphabet_.data()),part.alphabet_size_));
     const auto append_bits=[](std::vector<std::uint8_t>& dst,std::uint64_t at,const std::vector<std::uint8_t>& src,std::uint64_t bits){

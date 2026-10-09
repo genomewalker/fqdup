@@ -33,7 +33,7 @@ private:
     std::array<unsigned char,256> alphabet_{};
     std::array<int,256> codes_{};
     unsigned alphabet_size_=0,width_=0;
-    std::string previous_header_;
+    std::string previous_header_,id_common_;
     std::vector<std::uint32_t> order_;
 
     static unsigned get(const std::vector<std::uint8_t>& bytes,std::uint64_t at,unsigned width) {
@@ -57,6 +57,10 @@ private:
         header.remove_prefix(1);header=header.substr(0,header.find_first_of(" \t"));
         if(header.size()>2&&header[header.size()-2]=='/'&&(header.back()=='1'||header.back()=='2'))header.remove_suffix(2);
         return header;
+    }
+    void common_id(std::string_view id){
+        if(empty())id_common_.assign(id.data(),id.size());
+        else{std::size_t n=0;while(n<std::min(id_common_.size(),id.size())&&id_common_[n]==id[n])++n;id_common_.resize(n);}
     }
     void varint(std::size_t value) {
         while(value>=128){headers_.push_back(std::uint8_t(value)|128);value>>=7;}
@@ -128,7 +132,7 @@ public:
     std::size_t size()const{return (starts_.size()-1)/2;}
     bool empty()const{return size()==0;}
     void prepare_qualities(std::string_view symbols,WorkerPool* pool=nullptr,int workers=1){add_alphabet(symbols,pool,workers);}
-    std::array<std::size_t,5> capacity_bytes()const{return {bases_.capacity(),qualities_.owned_bytes(),headers_.capacity()+8*checkpoints_.capacity(),8*starts_.capacity()+4*order_.capacity(),8*exception_positions_.capacity()+exception_values_.capacity()};}
+    std::array<std::size_t,5> capacity_bytes()const{return {bases_.capacity(),qualities_.owned_bytes(),headers_.capacity()+id_common_.capacity()+8*checkpoints_.capacity(),8*starts_.capacity()+4*order_.capacity(),8*exception_positions_.capacity()+exception_values_.capacity()};}
     unsigned quality_width()const{return width_;}
     unsigned quality_alphabet_size()const{return alphabet_size_;}
     std::uint64_t symbols()const{return starts_.back();}
@@ -138,6 +142,7 @@ public:
         if(size()>=std::numeric_limits<std::uint32_t>::max())throw std::length_error("compact pair count");
         if(s1.size()!=q1.size()||s2.size()!=q2.size())throw std::runtime_error("FASTQ lengths");
         if(id_view(h1)!=id_view(h2))throw std::runtime_error("pair order "+std::string(id_view(h1)));
+        common_id(id_view(h1));
         struct View {std::string_view h,s,q;};
         append_read(View{h1,s1,q1});append_read(View{h2,s2,q2});
     }
@@ -175,34 +180,64 @@ public:
         add_alphabet(std::string_view(&quality,1));const auto at=start+position;
         qualities_.edit(at,static_cast<unsigned char>(quality));set_base(at,base);
     }
-    bool canonicalize() {
+    bool canonicalize(WorkerPool* pool=nullptr,int workers=1) {
         if(!order_.empty())throw std::logic_error("already canonical");
         // A library often shares a long instrument/run prefix. It contributes
         // nothing to lexicographic order; index the first varying bytes.
-        Decoder decoder;std::string h,common;
-        for(std::size_t i=0;i<size();++i){
-            header(2*i,h,decoder);const auto id=id_view(h);
-            if(!i)common.assign(id.data(),id.size());
-            else{std::size_t n=0;while(n<std::min(common.size(),id.size())&&common[n]==id[n])++n;common.resize(n);}
-            if(common.empty())break;
-        }
-        const auto skip=common.size();decoder={};
+        workers=pool?std::max(1,std::min(workers,8)):1;
+        const auto skip=id_common_.size();
         std::vector<std::uint64_t> prefix(size());
-        for(std::size_t i=0;i<size();++i){
-            header(2*i,h,decoder);const auto id=id_view(h);
-            for(std::size_t j=0;j<8;++j)prefix[i]=(prefix[i]<<8)|(skip+j<id.size()?static_cast<unsigned char>(id[skip+j]):0);
-        }
+        const auto collect=[&](std::size_t begin,std::size_t end){
+            Decoder decoder;std::string h;
+            for(auto i=begin;i<end;++i){header(2*i,h,decoder);const auto id=id_view(h);
+                for(std::size_t j=0;j<8;++j)prefix[i]=(prefix[i]<<8)|(skip+j<id.size()?static_cast<unsigned char>(id[skip+j]):0);}
+        };
+        if(pool&&workers>1&&size()>=4096){
+            std::vector<std::future<void>> pending;pending.reserve(workers);
+            const auto span=((size()+workers*16-1)/(workers*16))*16;
+            try{for(std::size_t begin=0;begin<size();begin+=span){const auto end=std::min(size(),begin+span);pending.push_back(pool->submit([&,begin,end]{collect(begin,end);}));}
+                for(auto& task:pending)task.get();
+            }catch(...){for(auto& task:pending)if(task.valid())task.wait();throw;}
+        }else collect(0,size());
         std::vector<std::uint32_t> order(size());std::iota(order.begin(),order.end(),std::uint32_t{0});
         FamilyPair a,b;Decoder da,db;std::string ha,hb;
         const auto compare_ids=[&](auto i,auto j){header(2*i,ha,da);header(2*j,hb,db);return id_view(ha).compare(id_view(hb));};
         const auto key=[](const FamilyPair& p){return std::tie(p.id,p.r[0].h,p.r[0].s,p.r[0].q,p.r[1].h,p.r[1].s,p.r[1].q);};
-        std::sort(order.begin(),order.end(),[&](auto i,auto j){
+        const auto less=[&](auto i,auto j){
             if(prefix[i]!=prefix[j])return prefix[i]<prefix[j];
             const auto ids=compare_ids(i,j);if(ids)return ids<0;
-            // Only genuinely repeated normalized IDs need sequence/quality
-            // tie-breaks. Decoding ordinary reads during sort is unnecessary.
             read(i,a,da);read(j,b,db);return key(a)<key(b);
-        });
+        };
+        if(size()<4096)std::sort(order.begin(),order.end(),less);
+        else{
+            // Stable radix passes order only the fixed-size prefix. Full IDs
+            // and the frozen seven-field tuple still resolve every collision.
+            constexpr unsigned digit_bits=11,buckets=1U<<digit_bits;
+            std::uint64_t varying=0;for(auto value:prefix)varying|=value^prefix[0];
+            std::vector<std::uint32_t> scratch(order.size());
+            std::vector<std::array<std::size_t,buckets>> positions(workers);
+            const auto ranges=[&](auto work){
+                if(workers==1){work(0,0,order.size());return;}
+                std::vector<std::future<void>> pending;pending.reserve(workers);
+                try{for(int worker=0;worker<workers;++worker){const auto begin=order.size()*worker/workers,end=order.size()*(worker+1)/workers;
+                    pending.push_back(pool->submit([&,worker,begin,end]{work(worker,begin,end);}));}
+                    for(auto& task:pending)task.get();
+                }catch(...){for(auto& task:pending)if(task.valid())task.wait();throw;}
+            };
+            for(unsigned shift=0;shift<64;shift+=digit_bits){
+                if(!((varying>>shift)&(buckets-1)))continue;
+                ranges([&](int worker,std::size_t begin,std::size_t end){auto& counts=positions[worker];counts.fill(0);
+                    for(auto i=begin;i<end;++i)++counts[(prefix[order[i]]>>shift)&(buckets-1)];});
+                std::size_t offset=0;
+                for(unsigned bucket=0;bucket<buckets;++bucket)for(auto& counts:positions){const auto next=offset+counts[bucket];counts[bucket]=offset;offset=next;}
+                ranges([&](int worker,std::size_t begin,std::size_t end){auto& at=positions[worker];
+                    for(auto i=begin;i<end;++i){const auto id=order[i];scratch[at[(prefix[id]>>shift)&(buckets-1)]++]=id;}});
+                order.swap(scratch);
+            }
+            for(std::size_t begin=0;begin<order.size();){auto end=begin+1;while(end<order.size()&&prefix[order[begin]]==prefix[order[end]])++end;
+                if(end-begin>1)std::sort(order.begin()+begin,order.begin()+end,less);begin=end;}
+        }
+
         bool unique=true;
         for(std::size_t i=1;i<order.size();++i)
             if(prefix[order[i-1]]==prefix[order[i]]&&!compare_ids(order[i-1],order[i]))unique=false;
@@ -210,7 +245,7 @@ public:
     }
     void input_order(){std::vector<std::uint32_t>().swap(order_);}
     std::size_t owned_bytes()const {
-        return bases_.capacity()+qualities_.owned_bytes()+headers_.capacity()+exception_values_.capacity()
+        return bases_.capacity()+qualities_.owned_bytes()+headers_.capacity()+id_common_.capacity()+exception_values_.capacity()
             +8*(starts_.capacity()+checkpoints_.capacity()+exception_positions_.capacity())+4*order_.capacity();
     }
 };

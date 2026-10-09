@@ -8,7 +8,7 @@ LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,
     const bool memory=memory_enabled();
     const auto memory_stage=[&](const char* name){if(memory){library_memory(out).report(name,store->size());const auto bytes=store->capacity_bytes();std::cerr<<"MERGE_COMPACT stage="<<name<<" pairs="<<store->size()<<" bases_bytes="<<bytes[0]<<" quality_bytes="<<bytes[1]<<" header_bytes="<<bytes[2]<<" offset_bytes="<<bytes[3]<<" exception_bytes="<<bytes[4]<<" quality_width="<<store->quality_width()<<" alphabet="<<store->quality_alphabet_size()<<'\n';}};
     memory_stage("compact_input");
-    const bool unique=store->canonicalize();
+    const bool unique=store->canonicalize(out.pool.get(),workers);
     if(!counts)store->input_order();
     stage("canonical_input");
     // Full census merges repeated IDs in one scalar accumulator. Preserve that
