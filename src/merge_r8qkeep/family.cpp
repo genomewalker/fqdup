@@ -128,6 +128,15 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     }else for(int part=0;part<3;++part)build_part(part);
     std::size_t cells=0,max_bucket=0,index_bytes=0;
     for(int part=0;part<3;++part){cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
+    // Cache exact three-bit parts once. Candidate verification then reads a
+    // compact fixed record instead of chasing forty-base strings.
+    std::vector<std::array<std::uint64_t,3>> packed_keys(representative.size());
+    for(std::size_t i=0;i<representative.size();++i)for(int p=0;p<3;++p)
+        packed_keys[i][p]=fqdup::r8qkeep::FamilyPartIndex::pack(keys[representative[i]],bounds[p],bounds[p+1]);
+    const auto distance=[](std::uint64_t a,std::uint64_t b){
+        const auto x=a^b;
+        return __builtin_popcountll(((x|(x>>1)|(x>>2))|(a>>2))&0x9249249249ULL);
+    };
     const auto generated=std::chrono::steady_clock::now();
     // Workers enumerate immutable indexes; only the ordered consumer touches
     // parent, including overflow recomputation. No per-worker seen arrays.
@@ -143,19 +152,19 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     const std::size_t scratch_bytes=sizeof(Slot)*(workers==1?1:query_window*batch_rows);
     const auto& shared_index=index;
     const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
-        const auto& key=keys[representative[query]];
+        const auto& key=packed_keys[query];
         for(int part=0;part<3;++part){
-            const auto value=fqdup::r8qkeep::FamilyPartIndex::pack(key,bounds[part],bounds[part+1]);
+            const auto value=key[part];
             shared_index[part].visit(value,[&](int other){
                 if(std::size_t(other)>=query)return true;
-                const auto& candidate=keys[representative[other]];
-                for(int block=0;block<part;++block){int m=0;
-                    for(int p=bounds[block];p<bounds[block+1];++p)m+=key[p]=='N'||candidate[p]=='N'||key[p]!=candidate[p];
-                    if(m<=2)return true;
-                }
+                const auto& candidate=packed_keys[other];
+                const int d0=distance(key[0],candidate[0]);
+                if(part>0&&d0<=2)return true;
+                const int d1=distance(key[1],candidate[1]);
+                if(part>1&&d1<=2)return true;
                 ++result.verified;
                 if(serial&&root(representative[query])==root(representative[other]))return true;
-                if(mismatches(key,candidate)>MAXMIS)return true;
+                if(d0+d1+distance(key[2],candidate[2])>MAXMIS)return true;
                 if(serial)unite(representative[query],representative[other]);
                 else if(result.size<edge_limit)result.edges[result.size++]=other;
                 else result.overflow=true;
