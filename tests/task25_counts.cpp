@@ -77,10 +77,13 @@ int main(int argc,char** argv){
     const auto parallel_view=view(parallel);
     identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
     identical(*fit_mixture_views(parallel_view,1),*fit_mixture_views(parallel_view,8));
-    auto poison=parallel;poison.back().log_likelihood.fill(-std::numeric_limits<double>::infinity());
-    bool worker_error=false;
-    try{fit_mixture_counts(view(poison),8);}catch(const std::runtime_error&){worker_error=true;}
-    require(worker_error,"worker exception was lost");
+    for(bool counts:{false,true})for(std::size_t bad:{std::size_t(0),parallel.size()-1}){
+        auto poison=parallel;poison[bad].log_likelihood.fill(-std::numeric_limits<double>::infinity());
+        bool worker_error=false;
+        try{if(counts)fit_mixture_counts(view(poison),8);else fit_mixture_views(view(poison),8);}
+        catch(const std::runtime_error&){worker_error=true;}
+        require(worker_error,"caller or worker exception was lost");
+    }
     identical(*fit_mixture_counts(parallel_view,1),*fit_mixture_counts(parallel_view,8));
     require(!fit_mixture_counts({}),"empty counts fit");
     std::vector<PairLikelihood> one(19);

@@ -23,7 +23,7 @@ class FitWorkers {
     std::vector<std::future<void>> jobs_;
 public:
     explicit FitWorkers(int threads):threads_(threads){
-        if(threads>1)pool_=std::make_unique<WorkerPool>(threads);
+        if(threads>1)pool_=std::make_unique<WorkerPool>(threads-1);
         jobs_.reserve(threads);
     }
     template<class Function> void run(std::size_t count,Function function){
@@ -31,9 +31,12 @@ public:
         if(workers==1){for(std::size_t i=0;i<count;++i)function(i,0);return;}
         jobs_.clear();
         try {
-            for(int w=0;w<workers;++w)jobs_.push_back(pool_->submit([&,w]{
+            for(int w=1;w<workers;++w)jobs_.push_back(pool_->submit([&,w]{
                 for(std::size_t i=count*w/workers;i<count*(w+1)/workers;++i)function(i,w);
             }));
+            // Keep the coordinator on useful work instead of immediately
+            // sleeping on a future. All original partition IDs are preserved.
+            for(std::size_t i=0;i<count/workers;++i)function(i,0);
             for(auto& job:jobs_)job.get();
         }catch(...){
             for(auto& job:jobs_)if(job.valid())job.wait();
