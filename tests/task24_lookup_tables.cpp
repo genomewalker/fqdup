@@ -55,6 +55,24 @@ int main(){
    vector_bits(x.r1,y.r1);vector_bits(x.r2,y.r2);require(ax.fold==ay.fold&&ax.n==ay.n&&ax.supported==ay.supported);
    bits(ax.nominal,ay.nominal);bits(ax.flat,ay.flat);for(int t=0;t<66;++t)bits(ax.posterior[t],ay.posterior[t]);
   }
+  // Router mode 1 and repair mode 9 share arithmetic; 2/4 form a distinct
+  // early-return class. Compare real cache hits against the uncached oracle.
+  for(bool trusted:{false,true}){
+   std::vector<Model::CachedApply> cache;Model::CacheScope scope(&cache);
+   bool first_applied=false;
+   for(int mode:{1,9,2,4,7,1}){
+    const auto before=cache.size();auto x=seed,y=seed;Model::Audit ax;Direct::Audit ay;
+    const bool applied=model.apply(x,s1,q1,s2,q2,mode,&ax,trusted);
+    require(applied==direct.apply(y,s1,q1,s2,q2,mode,&ay,trusted));
+    vector_bits(x.r1,y.r1);vector_bits(x.r2,y.r2);
+    require(ax.fold==ay.fold&&ax.n==ay.n&&ax.supported==ay.supported);
+    bits(ax.nominal,ay.nominal);bits(ax.flat,ay.flat);for(int t=0;t<66;++t)bits(ax.posterior[t],ay.posterior[t]);
+    if(mode==1)first_applied=applied;
+    if((mode==9||mode==7)&&first_applied)require(cache.size()==before);
+    if(!applied)require(cache.size()==before);
+   }
+   require(cache.size()<=2);
+  }
   auto x=seed,y=seed;require(model.prior_floor(x,s1,q1,s2,q2)==direct.prior_floor(y,s1,q1,s2,q2));vector_bits(x.r1,y.r1);vector_bits(x.r2,y.r2);
  }
  std::cout<<"TASK24_LOOKUP_TABLES_PASS\n";

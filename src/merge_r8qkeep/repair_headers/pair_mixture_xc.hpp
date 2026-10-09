@@ -122,8 +122,11 @@ public:
   if(!risk.correspondence.eligible)return false;
 
   int training=1-fold(s1,s2);if(!supported[training])return false;
+  // Only 2/4 have the nominal-posterior early return. All other modes
+  // execute identical arithmetic, including router 1 and repair 9.
+  const int cache_mode=(mode==2||mode==4)?2:1;
   if(active_cache)for(const auto& entry:*active_cache){
-   if(entry.model==this&&entry.mode==mode&&entry.full_trusted==full_trusted&&
+   if(entry.model==this&&entry.mode==cache_mode&&entry.full_trusted==full_trusted&&
       entry.s1==s1&&entry.q1==q1&&entry.s2==s2&&entry.q2==q2&&
       entry.invariant==risk.correspondence.invariant&&entry.certified==risk.correspondence.certified&&
       entry.r1.size()==risk.r1.size()&&entry.r2.size()==risk.r2.size()){
@@ -159,7 +162,7 @@ public:
     risk.r1.at(i)=conditional.first;risk.r2.at(k)=conditional.second;
    }begin=end;
   }
-  if(active_cache)active_cache->push_back({this,mode,full_trusted,s1,q1,s2,q2,
+  if(active_cache)active_cache->push_back({this,cache_mode,full_trusted,s1,q1,s2,q2,
       risk.correspondence.invariant,risk.correspondence.certified,risk.r1,risk.r2,*audit});
   return true;
  }
