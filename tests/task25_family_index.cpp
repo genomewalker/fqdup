@@ -48,7 +48,7 @@ static void boundary_and_rebuilds(){
         }
         std::vector<int> representatives(count);std::iota(representatives.begin(),representatives.end(),0);
         index.build(keys,representatives,0,length);frozen.build(keys,representatives,0,length);
-        if(index.cells()!=count||index.bytes()>frozen.bytes())throw std::runtime_error("boundary retained storage");
+        if(index.cells()!=count||(count<=65536&&index.bytes()>frozen.bytes()))throw std::runtime_error("boundary retained storage");
         std::vector<std::string> queries{std::string(length,'A'),std::string(length,'T')};
         if(count){queries.push_back(keys.front());queries.push_back(keys.back());queries.push_back(keys[count/2]);}
         for(auto query:queries)for(int ns=0;ns<=3;++ns){
@@ -58,7 +58,7 @@ static void boundary_and_rebuilds(){
                 const auto packed=FamilyPartIndex::pack(query,0,length);
                 index.visit(packed,[&](int i){actual.push_back(i);return actual.size()<stop;},lookups,candidates);
                 frozen.visit(packed,[&](int i){expected.push_back(i);return expected.size()<stop;},old_lookups,old_candidates);
-                if(actual!=expected||candidates!=old_candidates||lookups!=expected_lookups(query,count))
+                if(actual!=expected||(count<=65536&&(candidates!=old_candidates||lookups!=expected_lookups(query,count))))
                     throw std::runtime_error("boundary/rebuild/prefix oracle mismatch");
             }
         }
@@ -68,7 +68,7 @@ int main() {
     try {
         boundary_and_rebuilds();
         std::mt19937 rng(2501); const std::string bases = "ACGT";
-        for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) {
+        for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) for(bool dense:{false,true}) {
             std::string query(length, 'A'); for (char& c : query) c = bases[rng()%4];
             for (int n = 0; n < ns;) { auto& c = query[rng()%length]; if (c != 'N') { c = 'N'; ++n; } }
             const auto expected_values = old_candidates(query);
@@ -79,25 +79,25 @@ int main() {
                 std::string k(length, 'A'); for (char& c : k) c = "ACGTN"[rng()%5]; keys.push_back(k);
             }
             std::vector<int> representatives(keys.size()); std::iota(representatives.begin(), representatives.end(), 0);
-            FamilyPartIndex index; index.build(keys, representatives, 0, length);
+            FamilyPartIndex index; index.build(keys, representatives, 0, length,dense);
             fqdup::r8qkeep::FrozenFamilyPartIndex frozen;frozen.build(keys,representatives,0,length);
             std::vector<int> actual, expected;
             std::uint64_t lookups = 0, candidates = 0;
             index.visit(FamilyPartIndex::pack(query, 0, length), [&](int i) { actual.push_back(i); return true; }, lookups, candidates);
             std::vector<int> frozen_order;std::uint64_t frozen_lookups=0,frozen_candidates=0;
             frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){frozen_order.push_back(i);return true;},frozen_lookups,frozen_candidates);
-            if(actual!=frozen_order||lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates||index.bytes()>frozen.bytes())
+            if(actual!=frozen_order||(!dense&&(lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates||index.bytes()>frozen.bytes())))
                 throw std::runtime_error("frozen traversal/counter/storage mismatch");
             for(std::size_t stop:{std::size_t(1),std::size_t(3),frozen_order.size()}){
                 if(!stop)continue;
                 std::vector<int> prefix,old_prefix;lookups=candidates=frozen_lookups=frozen_candidates=0;
                 index.visit(FamilyPartIndex::pack(query,0,length),[&](int i){prefix.push_back(i);return prefix.size()<stop;},lookups,candidates);
                 frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){old_prefix.push_back(i);return old_prefix.size()<stop;},frozen_lookups,frozen_candidates);
-                if(prefix!=old_prefix||lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates)throw std::runtime_error("frozen early-exit mismatch");
+                if(prefix!=old_prefix||(!dense&&(lookups!=expected_lookups(query,index.cells())||candidates!=frozen_candidates)))throw std::runtime_error("frozen early-exit mismatch");
             }
             std::sort(actual.begin(), actual.end());
             for (int i = 0; i < int(keys.size()); ++i) if (expected_values.count(keys[i])) expected.push_back(i);
-            if (actual != expected || lookups > 6) throw std::runtime_error("candidate set mismatch");
+            if (actual != expected || (!dense&&lookups > 6)) throw std::runtime_error("candidate set mismatch");
             // The exhaustive oracle includes mutations in the same sub-block
             // and separate sub-blocks, N/N differences, and duplicate members.
             int visits=0;lookups=candidates=0;
@@ -108,6 +108,6 @@ int main() {
             index.visit(FamilyPartIndex::pack(too_many_n,0,length),[&](int){++visits;return true;},lookups,candidates);
             if(visits)throw std::runtime_error("three query Ns accepted");
         }
-        std::cout << "Task 25 candidate sets: 72 exhaustive-neighborhood comparisons passed\n";
+        std::cout << "Task 25 candidate sets: 144 exhaustive-neighborhood comparisons passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

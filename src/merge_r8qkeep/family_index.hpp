@@ -22,6 +22,103 @@ class FamilyPartIndex {
     int length_ = 0;
     bool paired_=true;
     bool compact_pairs_=false;
+    // Full ACGT domain: one word covers the low three bases. Ranks map
+    // matching bits back to the original sorted part IDs.
+    std::vector<std::uint64_t> dense_words_;
+    std::vector<std::uint32_t> dense_ranks_;
+    std::vector<int> dense_ids_;
+    struct NNode { std::array<int,5> child{{-1,-1,-1,-1,-1}}; int id=-1; };
+    std::vector<NNode> n_nodes_;
+    static const auto& suffix_masks() {
+        static const auto table=[] {
+            std::array<std::array<std::uint64_t,3>,512> result{};
+            for(int q=0;q<512;++q)for(int s=0;s<64;++s){
+                int distance=0;
+                for(int p=0;p<3;++p){const int c=(q>>(3*p))&7;
+                    distance+=c>=4||c!=((s>>(2*p))&3);}
+                for(int budget=distance;budget<=2;++budget)result[q][budget]|=1ULL<<s;
+            }
+            return result;
+        }();
+        return table;
+    }
+    void build_dense() {
+        for(auto& v:blocks_)std::vector<int>().swap(v);
+        for(auto& v:offsets_)std::vector<std::uint32_t>().swap(v);
+        const std::size_t rows=std::size_t(1)<<(2*(length_-3));
+        dense_words_.assign(rows,0);dense_ranks_.assign(rows,0);
+        dense_ids_.clear();n_nodes_.clear();
+        for(std::size_t id=0;id<parts_.size();++id){
+            const auto value=parts_[id].value;
+            if(value&0x24924924924ULL){
+                if(n_nodes_.empty())n_nodes_.emplace_back();
+                int node=0;
+                for(int p=length_-1;p>=0;--p){
+                    const int c=(value>>(3*p))&7;
+                    int next=n_nodes_[node].child[c];
+                    if(next<0){next=n_nodes_.size();n_nodes_[node].child[c]=next;n_nodes_.emplace_back();}
+                    node=next;
+                }
+                n_nodes_[node].id=id;
+            }else{
+                std::uint32_t word=0;
+                for(int p=0;p<length_;++p)word|=((value>>(3*p))&3)<<(2*p);
+                dense_words_[word>>6]|=1ULL<<(word&63);
+                dense_ids_.push_back(id);
+            }
+        }
+        std::uint32_t rank=0;
+        for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
+        (void)suffix_masks();
+    }
+    template<class Visitor>
+    void visit_dense(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
+        // Radius two over fourteen five-letter positions has at most
+        // 1+14*4+C(14,2)*16=1513 values, independent of library size.
+        std::array<int,1513> hits;std::size_t count=0;
+        int ns=0;for(int p=0;p<length_;++p)ns+=((query>>(3*p))&7)==4;
+        if(ns>2)return;
+        std::uint32_t prefix=0;
+        std::array<int,11> normal{};int normals=0;
+        std::array<int,2> unknown{};int unknowns=0;
+        for(int p=3;p<length_;++p){
+            const int c=(query>>(3*p))&7,shift=2*(p-3);
+            if(c==4)unknown[unknowns++]=shift;
+            else{prefix|=std::uint32_t(c)<<shift;normal[normals++]=shift;}
+        }
+        const auto& masks=suffix_masks()[query&511];
+        const auto collect=[&](std::uint32_t row,int budget){
+            ++lookups;const auto present=dense_words_[row];auto matches=present&masks[budget];
+            while(matches){const auto bit=matches&-matches;
+                hits[count++]=dense_ids_[dense_ranks_[row]+__builtin_popcountll(present&(bit-1))];
+                matches&=matches-1;}
+        };
+        const int budget=2-unknowns;
+        for(int expansion=0;expansion<(1<<(2*unknowns));++expansion){
+            auto base=prefix;
+            for(int i=0;i<unknowns;++i)base|=((expansion>>(2*i))&3)<<unknown[i];
+            collect(base,budget);
+            if(budget<1)continue;
+            for(int a=0;a<normals;++a)for(std::uint32_t x=1;x<=3;++x){
+                const auto first=base^(x<<normal[a]);collect(first,budget-1);
+                if(budget<2)continue;
+                for(int b=0;b<a;++b)for(std::uint32_t y=1;y<=3;++y)collect(first^(y<<normal[b]),0);
+            }
+        }
+        if(!n_nodes_.empty()){
+            const auto walk=[&](auto&& self,int node,int p,int remaining)->void {
+                if(p<0){hits[count++]=n_nodes_[node].id;return;}
+                const int q=(query>>(3*p))&7;
+                for(int c=0;c<5;++c){const int next=n_nodes_[node].child[c];
+                    const int cost=q==4||q!=c;
+                    if(next>=0&&cost<=remaining){++lookups;self(self,next,p-1,remaining-cost);}}
+            };
+            walk(walk,0,length_-1,2);
+        }
+        std::sort(hits.begin(),hits.begin()+count);
+        for(std::size_t i=0;i<count;++i){++candidates;const auto& part=parts_[hits[i]];
+            for(int j=part.begin;j<part.end;++j)if(!visitor(members_[j]))return;}
+    }
     template<class Id,class Key>
     static void radix_ids(std::vector<Id>& ids,Key key,int bits) {
         // Stable digits preserve the ascending-ID tie break from initial iota.
@@ -115,7 +212,7 @@ public:
         for (int p = begin; p < end; ++p) value |= std::uint64_t(code(key[p])) << (3 * (p-begin));
         return value;
     }
-    void build(const std::vector<std::string>& keys, const std::vector<int>& representatives, int begin, int end) {
+    void build(const std::vector<std::string>& keys, const std::vector<int>& representatives, int begin, int end, bool force_dense=false) {
         length_ = end - begin;
         bounds_ = {0, 4, length_ == 13 ? 7 : 8, length_ == 13 ? 10 : 11, length_};
         members_.resize(representatives.size());
@@ -138,9 +235,13 @@ public:
             parts_.push_back({v, first, int(i)});
         }
         std::vector<std::uint64_t>().swap(packed);
-        paired_=parts_.size()<=65536;
+        paired_=!force_dense&&parts_.size()<=65536;
         compact_pairs_=paired_&&parts_.size()>=4096;
         for(auto& directory:pair_offsets_)std::vector<std::uint32_t>().swap(directory);
+        if(!paired_){build_dense();return;}
+        std::vector<std::uint64_t>().swap(dense_words_);
+        std::vector<std::uint32_t>().swap(dense_ranks_);
+        std::vector<int>().swap(dense_ids_);std::vector<NNode>().swap(n_nodes_);
         if(paired_){
             // Six 16-bit ID streams occupy three existing 32-bit vectors.
             // Pair keys are reconstructed from parts_, so no key arrays persist.
@@ -188,67 +289,12 @@ public:
             }
             return;
         }
-        for (int b = 0; b < 4; ++b) {
-            const std::size_t domain=std::size_t(1) << (3*(bounds_[b+1]-bounds_[b]));
-            auto& offsets=offsets_[b];offsets.assign(domain+1,0);
-            for(const auto& part:parts_)++offsets[block(part.value,b)+1];
-            std::partial_sum(offsets.begin(),offsets.end(),offsets.begin());
-            blocks_[b].resize(parts_.size());
-            auto cursor=offsets;
-            // Ascending part IDs give sorted postings within each block value.
-            for(std::size_t i=0;i<parts_.size();++i)blocks_[b][cursor[block(parts_[i].value,b)]++]=i;
-        }
     }
-    // Two differences (including query N/N) leave two exact N-free blocks.
-    // Merge four sorted posting ranges with fixed query scratch. A singleton
-    // ID can jump to the next range's minimum because no earlier ID can recur.
+    // Both representations return sorted part IDs and sorted member IDs.
     template<class Visitor>
     void visit(std::uint64_t query, Visitor visitor, std::uint64_t& lookups, std::uint64_t& candidates) const {
         if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
-        std::array<std::size_t,4> at{},end{};
-        for(int b=0;b<4;++b){
-            if(has_n(query,b))continue;
-            const auto target=block(query,b);++lookups;
-            at[b]=offsets_[b][target];end[b]=offsets_[b][target+1];
-        }
-        for(;;){
-            int minimum=-1,second=-1,first=-1,hits=0,active=0;
-            for(int b=0;b<4;++b)if(at[b]<end[b]){
-                ++active;const int id=blocks_[b][at[b]];
-                if(minimum<0||id<minimum){second=minimum;minimum=id;first=b;hits=1;}
-                else if(id==minimum)++hits;
-                else if(second<0||id<second)second=id;
-            }
-            if(active<2)return;
-            if(hits==1){
-                const auto& entries=blocks_[first];
-                const auto begin=at[first]+1,limit=end[first];
-                if(begin==limit||entries[begin]>=second)at[first]=begin;
-                else {
-                    // The destination is often nearby. Exponentially bracket
-                    // the same lower_bound without scanning the whole tail.
-                    std::size_t span=1;const auto remaining=limit-begin;
-                    while(span<remaining&&entries[begin+span]<second)span*=2;
-                    const auto low=begin+span/2+1;
-                    const auto high=begin+std::min(span+1,remaining);
-                    at[first]=std::lower_bound(entries.begin()+low,entries.begin()+high,second)-entries.begin();
-                }
-                continue;
-            }
-            ++candidates;
-            const auto& part=parts_[minimum];
-            const auto x=query^part.value;
-            // Collapse each 3-bit code to one difference bit; query code 4
-            // adds its N bit even when the stored code is also N.
-            const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
-            // Unsigned zero stays zero; clearing twice leaves zero iff <=2
-            // difference bits were set. Candidate order and N rules are intact.
-            auto remaining=different&(different-1);
-            remaining&=remaining-1;
-            if(remaining==0)
-                for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;
-            for(int b=0;b<4;++b)if(at[b]<end[b]&&blocks_[b][at[b]]==minimum)++at[b];
-        }
+        visit_dense(query,visitor,lookups,candidates);
     }
     std::size_t cells() const { return parts_.size(); }
     std::size_t max_bucket() const {
@@ -259,6 +305,8 @@ public:
         for (const auto& b : blocks_) n += b.capacity()*sizeof(int);
         for (const auto& offsets : offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
         for (const auto& offsets : pair_offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
+        n+=dense_words_.capacity()*sizeof(std::uint64_t)+dense_ranks_.capacity()*sizeof(std::uint32_t);
+        n+=dense_ids_.capacity()*sizeof(int)+n_nodes_.capacity()*sizeof(NNode);
         return n;
     }
 };
