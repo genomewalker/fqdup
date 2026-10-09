@@ -50,7 +50,7 @@ inline Geometry quality_independent_geometry_uncached(const std::string& a,const
     Geometry out;
     if(a.empty()||raw_b.empty()||a.size()>512||raw_b.size()>512)return out;
     const auto b=reverse_complement(raw_b);
-    for(char c:a)if(std::string_view("ACGTN").find(c)==std::string_view::npos)
+    if(!::fqdup_fast_bases::valid(a))
         throw std::invalid_argument("unsupported base");
     auto count=[&](int insert) {
         const int begin=std::max(0,insert-int(b.size()));

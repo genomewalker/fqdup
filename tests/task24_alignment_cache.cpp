@@ -99,7 +99,24 @@ static void band_suffix_cells(){
 #endif
 }
 
+static void base_validation(){
+ const auto scalar=[](std::string_view s){for(char c:s)if(std::string_view("ACGTN").find(c)==std::string_view::npos)return false;return true;};
+ std::array<char,576> bytes{};std::mt19937 rng(2537);std::size_t cases=0;
+ for(int offset=0;offset<32;++offset)for(int length=0;length<=512;++length){
+  for(char& c:bytes)c="ACGTN"[rng()%5];
+  std::string_view view(bytes.data()+offset,length);
+  require(fqdup_fast_bases::valid(view)==scalar(view));++cases;
+  if(length){bytes[offset+rng()%length]=char(rng()%256);require(fqdup_fast_bases::valid(view)==scalar(view));++cases;}
+ }
+ for(int length:{1,31,32,33,63,64,65,96})for(int value=0;value<256;++value)for(int position=0;position<length;++position){
+  bytes.fill('A');bytes[position]=char(value);std::string_view view(bytes.data(),length);
+  require(fqdup_fast_bases::valid(view)==scalar(view));++cases;
+ }
+ std::cout<<"TASK25_BASE_VALIDATION_PASS cases="<<cases<<'\n';
+}
+
 int main(){
+    base_validation();
     suffix_cells();
     band_suffix_cells();
     // All tail lengths and unaligned starts, including arbitrary byte equality.

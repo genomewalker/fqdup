@@ -17,7 +17,7 @@ class SelfCorrespondence {
   FullResult result;auto& out=result.corr;
   if(a.size()>512||b.size()>512){out.reason="unsupported_read_length";return result;}
   if(a.empty()||b.empty()){out.reason="empty_read";return result;}
-  for(char c:a+b)if(std::string("ACGTN").find(c)==std::string::npos){out.reason="unsupported_base";return result;}
+  if(!::fqdup_fast_bases::valid(a)||!::fqdup_fast_bases::valid(b)){out.reason="unsupported_base";return result;}
   n=a.size();m=b.size();
   cells=fqalign::alignment_scratch((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.

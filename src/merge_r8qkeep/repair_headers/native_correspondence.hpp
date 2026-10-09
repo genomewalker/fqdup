@@ -1,4 +1,5 @@
 #pragma once
+#include "../base_validation.hpp"
 #include "../fast_dp.hpp"
 #include <algorithm>
 #include <array>
@@ -53,7 +54,7 @@ class BandedCorrespondence {
   Correspondence out;
   if(a.size()>512||b.size()>512){out.reason="unsupported_read_length";return out;}
   if(a.empty()||b.empty()){out.reason="empty_read";return out;}
-  for(char c:a+b)if(std::string("ACGTN").find(c)==std::string::npos){out.reason="unsupported_base";return out;}
+  if(!::fqdup_fast_bases::valid(a)||!::fqdup_fast_bases::valid(b)){out.reason="unsupported_base";return out;}
   n=a.size();m=b.size();
   if(insert<0){out.reason="no_geometry";return out;}
   d0=m-insert;

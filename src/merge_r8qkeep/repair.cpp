@@ -1,6 +1,7 @@
 #include "repair.hpp"
 #include "ordered_chunks.hpp"
 #include "geometry_counts.hpp"
+#include "base_validation.hpp"
 #include "fast_dp.hpp"
 #include "string_input.hpp"
 #include <algorithm>

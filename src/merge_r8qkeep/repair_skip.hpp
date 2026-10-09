@@ -7,7 +7,7 @@ struct RepairSkipBound {
         if(v.size()!=13||v[6]!="merged"||v[8].empty()||v[8].size()>512||v[8].size()!=v[9].size())return false;
         if(v[1].size()!=v[2].size()||v[4].size()!=v[5].size())return false;
         if(!std::numeric_limits<double>::is_iec559||std::fegetround()!=FE_TONEAREST)return false;
-        for(int j:{1,4,8})for(char c:v[j])if(std::string_view("ACGTN").find(c)==std::string_view::npos)return false;
+        for(int j:{1,4,8})if(!::fqdup_fast_bases::valid(v[j]))return false;
         for(int j:{2,5,9})for(unsigned char c:v[j])if(c<33||c>126)return false;
         return true;
     }
