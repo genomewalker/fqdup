@@ -1,5 +1,6 @@
 #include "mixture_fit.hpp"
 #include "counts_row.hpp"
+#include "counts_solver.hpp"
 #include "shortest_double.hpp"
 #include "fdlibm.hpp"
 #include "exact_exp_cache.hpp"
@@ -64,7 +65,7 @@ double logsum(const Values& values, ExactExpCache& exp) {
     return m+fqdup::fdlibm::log(s);
 }
 }
-std::vector<PairLikelihood> read_census_likelihood(std::istream& census) {
+std::vector<PairLikelihood> read_census_likelihood(std::istream& census,bool counts) {
     const auto likelihood=[](double d,bool agree){return fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,agree?1-d:d)));};
     std::array<std::array<double,2>,mixture_components> flat{};
     for(int j=1;j<mixture_components;++j){const double r=double(j-1)/64,e=.75*(r*r),d=2*e-4*e*e/3;flat[j]={likelihood(d,true),likelihood(d,false)};}
@@ -79,12 +80,13 @@ std::vector<PairLikelihood> read_census_likelihood(std::istream& census) {
         auto& p=pairs[it->second];if(p.fold!=fold)throw std::runtime_error("fold mismatch");
         const double e1=std::stod(fields[6]),e2=std::stod(fields[7]);const bool agree=fields[8]==fields[9];
         p.log_likelihood[0]+=likelihood(e1+e2-4*e1*e2/3,agree);
-        for(int j=1;j<mixture_components;++j)p.log_likelihood[j]+=flat[j][agree?0:1];
+        if(counts){p.sufficient_statistics=true;if(agree)++p.agreements;else ++p.disagreements;}
+        else for(int j=1;j<mixture_components;++j)p.log_likelihood[j]+=flat[j][agree?0:1];
     }
     if(census.bad())throw std::runtime_error("census read failure");
     return pairs;
 }
-LikelihoodAccumulator::LikelihoodAccumulator(){
+LikelihoodAccumulator::LikelihoodAccumulator(bool counts):counts_(counts){
     const auto likelihood=[](double d,bool agree){return fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,agree?1-d:d)));};
     for(int j=1;j<mixture_components;++j){const double r=double(j-1)/64,e=.75*(r*r),d=2*e-4*e*e/3;flat_[j]={likelihood(d,true),likelihood(d,false)};}
 }
@@ -93,7 +95,8 @@ void LikelihoodAccumulator::add(const std::string& id,int fold,double e1,double 
     auto& p=pairs_[it->second];if(p.fold!=fold)throw std::runtime_error("fold mismatch");
     const double d=e1+e2-4*e1*e2/3;
     p.log_likelihood[0]+=fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,agree?1-d:d)));
-    for(int j=1;j<mixture_components;++j)p.log_likelihood[j]+=flat_[j][agree?0:1];
+    if(counts_){p.sufficient_statistics=true;if(agree)++p.agreements;else ++p.disagreements;}
+    else for(int j=1;j<mixture_components;++j)p.log_likelihood[j]+=flat_[j][agree?0:1];
 }
 std::optional<MixtureFit> fit_mixture(const std::vector<PairLikelihood>& pairs,int threads) {
     std::vector<const PairLikelihood*> view;view.reserve(pairs.size());for(const auto& pair:pairs)view.push_back(&pair);
@@ -145,6 +148,11 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
             row_max[i]=m;
             for(int j=0;j<mixture_components;++j)densities[i][j]=exp[worker](p[j]-m);
         });
+    }
+    if constexpr(Counts){
+        auto fitted=detail::solve_counts(densities,row_max,multiplicity,pairs.size(),workers);
+        for(const auto& cache:exp){fitted.exp_calls+=cache.calls();fitted.exp_cache_hits+=cache.hits();}
+        return fitted;
     }
     const auto em_begin=std::chrono::steady_clock::now();
     double old=-std::numeric_limits<double>::infinity();
@@ -245,7 +253,25 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
     return result;
 }
 std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikelihood*>& pairs,int threads){return fit_mixture_impl<false>(pairs,threads);}
-std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads,WorkerPool* shared_pool){return fit_mixture_impl<true>(pairs,threads,shared_pool);}
+std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads,WorkerPool* shared_pool){
+    std::array<std::array<double,2>,mixture_components> flat{};
+    for(int j=1;j<mixture_components;++j){
+        const double r=double(j-1)/64,e=.75*(r*r),d=2*e-4*e*e/3;
+        flat[j]={fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,1-d))),
+                 fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,d)))};
+    }
+    std::vector<PairLikelihood> expanded;expanded.reserve(pairs.size());
+    std::vector<const PairLikelihood*> rows;rows.reserve(pairs.size());
+    for(const auto* p:pairs){
+        if(!p->sufficient_statistics){rows.push_back(p);continue;}
+        expanded.emplace_back();auto& row=expanded.back();row.fold=p->fold;
+        row.log_likelihood[0]=p->log_likelihood[0];
+        for(int j=1;j<mixture_components;++j)row.log_likelihood[j]=
+            double(p->agreements)*flat[j][0]+double(p->disagreements)*flat[j][1];
+        rows.push_back(&row);
+    }
+    return fit_mixture_impl<true>(rows,threads,shared_pool);
+}
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits) {
     std::string out="FQDUP_PAIR_MIXTURE_V1 64\n";
     for(int f=0;f<2;++f){const auto& fit=fits[f];if(fit&&!fit->converged)throw std::runtime_error("unconverged mixture");out+=std::to_string(f)+" "+std::to_string(fit?fit->training_pairs:0);for(int j=0;j<mixture_components;++j)out+=" "+shortest_double(fit?fit->weights[j]:0);out+='\n';}

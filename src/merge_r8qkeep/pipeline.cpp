@@ -31,7 +31,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
         for(auto i:selected)sample.push_back(out.family.pairs[i]);
         if(timings||debug)std::cerr<<"PRIOR_SAMPLE requested="<<requested<<" selected="<<sample.size()<<" total="<<out.family.pairs.size()<<" seed="<<prior_sample_seed<<'\n';
         const auto native=merge_native(sample,settings,timings||debug,debug);stage("sample_native");
-        out.observations=census(sample,native,debug,threads);stage("sample_census");
+        out.observations=census(sample,native,debug,threads,0,true);stage("sample_census");
     }else{
         out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");
         out.observations=census(out.family.pairs,out.native,debug,threads);stage("census");
@@ -55,7 +55,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     }
     shared_pool.reset();
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
-    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
+    if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" kkt_gap="<<fit.kkt_gap<<" newton_reentries="<<fit.newton_reentries<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
     if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug);stage("native");}
     if(defer_routing){NativeResult empty;empty.native_tsv=std::move(out.native.native_tsv);out.native=std::move(empty);}

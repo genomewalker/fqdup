@@ -1,6 +1,7 @@
 #include "../src/merge_r8qkeep/mixture_fit.hpp"
 #include "../src/merge_r8qkeep/worker_pool.hpp"
 #include "../src/merge_r8qkeep/counts_row.hpp"
+#include "../src/merge_r8qkeep/fdlibm.hpp"
 #include <cfenv>
 #include <random>
 #include <algorithm>
@@ -45,7 +46,7 @@ static void repeated_objective(const std::vector<PairLikelihood>& pairs,const Mi
 static int benchmark_workers(const char* census_path){
     std::ifstream input(census_path);
     require(bool(input),"cannot open worker benchmark census");
-    const auto pairs=read_census_likelihood(input);
+    const auto pairs=read_census_likelihood(input,true);
     std::array<std::vector<const PairLikelihood*>,2> training;
     for(const auto& p:pairs)training[p.fold].push_back(&p);
     std::array<std::optional<MixtureFit>,2> baseline;
@@ -229,5 +230,46 @@ int main(int argc,char** argv){
     const auto a=separated.take(),b=mixed.take();
     require(a[0].log_likelihood!=a[1].log_likelihood && b[0].log_likelihood==b[1].log_likelihood,"whole-pair grouping fixture");
     require(fit_mixture_counts(view(a))->unique_likelihoods==2 && fit_mixture_counts(view(b))->unique_likelihoods==1,"base observations were pooled");
+    // Components outside the four-component initial support must re-enter.
+    std::vector<PairLikelihood> reentry;
+    for(int kind=0;kind<6;++kind)for(int copy=0;copy<10*(kind+1);++copy){
+        PairLikelihood p;p.id=std::to_string(reentry.size());p.log_likelihood.fill(-40);
+        for(int j=0;j<6;++j)p.log_likelihood[j]=-3;
+        p.log_likelihood[kind]=0;reentry.push_back(p);
+    }
+    const auto entered=fit_mixture_counts(view(reentry));
+    require(entered->newton_reentries>0,"inactive components never re-entered");
+    repeated_objective(reentry,*entered);
+    for(int j=0;j<6;++j){const double a=std::exp(-3.0),expected=(double(j+1)/21*(1+5*a)-a)/(1-a);
+        require(std::abs(entered->weights[j]-expected)<1e-6,"re-entry optimum");}
+    std::reverse(reentry.begin(),reentry.end());
+    identical(*entered,*fit_mixture_counts(view(reentry),8));
+
+    // Per-pair statistics preserve duplicate IDs/folds and nominal addition order;
+    // flat components use A*log(1-d)+D*log(d), not pooled base counts.
+    LikelihoodAccumulator stats(true),expanded_stats;
+    for(int k=0;k<120;++k)for(int id=0;id<6;++id){
+        const bool agree=k%(id+3)!=0;
+        const std::string name=std::to_string(id);
+        stats.add(name,1,.01,.02,agree);expanded_stats.add(name,1,.01,.02,agree);
+    }
+    const auto counted=stats.take();auto manual=expanded_stats.take();
+    require(counted.size()==6,"duplicate ID statistics split");
+    for(std::size_t i=0;i<counted.size();++i){
+        const auto& p=counted[i];
+        require(p.sufficient_statistics&&p.agreements+p.disagreements==120,"pair A/D counts");
+        require(p.log_likelihood[0]==manual[i].log_likelihood[0],"nominal accumulation changed");
+        for(int j=1;j<mixture_components;++j){
+            const double r=double(j-1)/64,e=.75*(r*r),d=2*e-4*e*e/3;
+            manual[i].log_likelihood[j]=double(p.agreements)*fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,1-d)))+
+                double(p.disagreements)*fqdup::fdlibm::log(std::max(1e-15,std::min(1-1e-15,d)));
+        }
+    }
+    const auto stat_fit=fit_mixture_counts(view(counted));
+    identical(*stat_fit,*fit_mixture_counts(view(manual),8));
+    repeated_objective(manual,*stat_fit);
+    LikelihoodAccumulator wrong_fold(true);wrong_fold.add("duplicate",0,.01,.02,true);
+    bool fold_error=false;try{wrong_fold.add("duplicate",1,.01,.02,false);}catch(const std::runtime_error&){fold_error=true;}
+    require(fold_error,"statistics accepted duplicate ID fold mismatch");
     std::cout<<"TASK25_COUNTS_PASS\n";
 }

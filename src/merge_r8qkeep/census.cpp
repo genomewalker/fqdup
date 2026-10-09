@@ -41,7 +41,7 @@ fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::
     return r;
 }
 }
-CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start) {
+CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start,bool counts) {
     ParsedNativeRecords parsed;
     if(native.records.empty()&&!native.native_tsv.empty())parsed=parse_native_records(native.native_tsv);
     const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
@@ -57,7 +57,7 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
             CensusResult result;result.nominal_pairs.reserve(pairs.size());bool first=true;
             ordered_index_chunks(native_rows.size(),std::min(threads,4),start,[&](std::size_t offset,std::size_t n){
                 std::vector<FamilyPair> block(pairs.begin()+offset-start,pairs.begin()+offset-start+n);
-                NativeResult part;const auto range=native_rows.slice(offset-start,n);part.records.assign(range.begin(),range.end());return census(block,part,debug,1,offset);
+                NativeResult part;const auto range=native_rows.slice(offset-start,n);part.records.assign(range.begin(),range.end());return census(block,part,debug,1,offset,counts);
             },[&](CensusResult part){
                 const auto append=[&](std::string& target,const std::string& text){target+=first?text:text.substr(text.find('\n')+1);};
                 if(debug){append(result.nominal_tsv,part.nominal_tsv);append(result.full_tsv,part.full_tsv);}
@@ -68,7 +68,7 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
             if(!pairs.empty())return result;
         }
     }
-    LikelihoodAccumulator nominal_pairs,full_pairs;
+    LikelihoodAccumulator nominal_pairs(counts),full_pairs(counts);
     std::ostringstream nominal,full,edits;nominal.precision(17);
     nominal<<"id\tfold\ti\tk\tq1_bin\tq2_bin\te1\te2\tbase1\trc_base2\tcertified\n";
     full<<"id\tfold\ti\tk\tb1\tb2\te1\te2\ta\tb\tcert\n";

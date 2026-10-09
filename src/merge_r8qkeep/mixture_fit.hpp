@@ -12,13 +12,17 @@ struct PairLikelihood {
     std::string id;
     int fold = 0;
     std::array<double, mixture_components> log_likelihood{};
+    // Counts mode uses only log_likelihood[0] and these per-pair statistics.
+    std::uint64_t agreements=0, disagreements=0;
+    bool sufficient_statistics=false;
 };
 class LikelihoodAccumulator {
     std::array<std::array<double,2>,mixture_components> flat_{};
     std::unordered_map<std::string,std::size_t> slots_;
     std::vector<PairLikelihood> pairs_;
+    bool counts_;
 public:
-    LikelihoodAccumulator();
+    explicit LikelihoodAccumulator(bool counts=false);
     void add(const std::string& id,int fold,double e1,double e2,bool agree);
     std::vector<PairLikelihood> take(){return std::move(pairs_);}
 };
@@ -26,7 +30,7 @@ struct MixtureFit {
     std::array<double, mixture_components> weights{};
     std::size_t training_pairs = 0;
     bool converged = false;
-    int iterations = 0, polish_iterations = 0;
+    int iterations = 0, polish_iterations = 0, newton_reentries=0;
     double kkt_gap = 0, log_likelihood = 0;
     double em_seconds=0,polish_seconds=0;
     std::uint64_t last_em_zero_cells=0,last_em_subnormal_cells=0;
@@ -41,6 +45,6 @@ std::optional<MixtureFit> fit_mixture_views(const std::vector<const PairLikeliho
 // and outlive every concurrent fit call.
 class WorkerPool;
 std::optional<MixtureFit> fit_mixture_counts(const std::vector<const PairLikelihood*>& pairs,int threads=1,WorkerPool* shared_pool=nullptr);
-std::vector<PairLikelihood> read_census_likelihood(std::istream& census);
+std::vector<PairLikelihood> read_census_likelihood(std::istream& census,bool counts=false);
 std::string prior_text(const std::array<std::optional<MixtureFit>,2>& fits);
 }
