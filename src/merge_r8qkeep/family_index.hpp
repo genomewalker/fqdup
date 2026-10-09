@@ -88,7 +88,17 @@ public:
             if(active<2)return;
             if(hits==1){
                 const auto& entries=blocks_[first];
-                at[first]=std::lower_bound(entries.begin()+at[first]+1,entries.begin()+end[first],second)-entries.begin();
+                const auto begin=at[first]+1,limit=end[first];
+                if(begin==limit||entries[begin]>=second)at[first]=begin;
+                else {
+                    // The destination is often nearby. Exponentially bracket
+                    // the same lower_bound without scanning the whole tail.
+                    std::size_t span=1;const auto remaining=limit-begin;
+                    while(span<remaining&&entries[begin+span]<second)span*=2;
+                    const auto low=begin+span/2+1;
+                    const auto high=begin+std::min(span+1,remaining);
+                    at[first]=std::lower_bound(entries.begin()+low,entries.begin()+high,second)-entries.begin();
+                }
                 continue;
             }
             ++candidates;

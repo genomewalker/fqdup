@@ -1,4 +1,5 @@
 #include "../src/merge_r8qkeep/family_index.hpp"
+#include "task25_family_index_ref.hpp"
 #include <iostream>
 #include <random>
 #include <set>
@@ -44,9 +45,21 @@ int main() {
             }
             std::vector<int> representatives(keys.size()); std::iota(representatives.begin(), representatives.end(), 0);
             FamilyPartIndex index; index.build(keys, representatives, 0, length);
+            fqdup::r8qkeep::FrozenFamilyPartIndex frozen;frozen.build(keys,representatives,0,length);
             std::vector<int> actual, expected;
             std::uint64_t lookups = 0, candidates = 0;
             index.visit(FamilyPartIndex::pack(query, 0, length), [&](int i) { actual.push_back(i); return true; }, lookups, candidates);
+            std::vector<int> frozen_order;std::uint64_t frozen_lookups=0,frozen_candidates=0;
+            frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){frozen_order.push_back(i);return true;},frozen_lookups,frozen_candidates);
+            if(actual!=frozen_order||lookups!=frozen_lookups||candidates!=frozen_candidates||index.bytes()!=frozen.bytes())
+                throw std::runtime_error("frozen traversal/counter/storage mismatch");
+            for(std::size_t stop:{std::size_t(1),std::size_t(3),frozen_order.size()}){
+                if(!stop)continue;
+                std::vector<int> prefix,old_prefix;lookups=candidates=frozen_lookups=frozen_candidates=0;
+                index.visit(FamilyPartIndex::pack(query,0,length),[&](int i){prefix.push_back(i);return prefix.size()<stop;},lookups,candidates);
+                frozen.visit(FamilyPartIndex::pack(query,0,length),[&](int i){old_prefix.push_back(i);return old_prefix.size()<stop;},frozen_lookups,frozen_candidates);
+                if(prefix!=old_prefix||lookups!=frozen_lookups||candidates!=frozen_candidates)throw std::runtime_error("frozen early-exit mismatch");
+            }
             std::sort(actual.begin(), actual.end());
             for (int i = 0; i < int(keys.size()); ++i) if (expected_values.count(keys[i])) expected.push_back(i);
             if (actual != expected || lookups > 4) throw std::runtime_error("candidate set mismatch");
