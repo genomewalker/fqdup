@@ -22,6 +22,17 @@ class FullCorrespondence {
  bool inside(int i,int j) const {return i>=1&&i<=n&&j>=1&&j<=m;}
  Cell& at(int i,int j) {return cells[i*(m+1)+j];}
  static int sub(char a,char b) {return a==b&&a!='N'?1:-1;}
+ template<bool next_i,bool next_j>
+ void fill_suffix(int i,int j,const std::string& a,const std::string& b) {
+    auto& c=at(i,j);c.through=0;int diag=neg;
+    if constexpr(next_i&&next_j)diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
+    c.suffix[0]=std::max((!next_i||!next_j)?0:neg,diag);
+    if constexpr(next_i)c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
+    if constexpr(next_j)c.suffix[0]=std::max(c.suffix[0],at(i,j+1).suffix[2]-4);
+    c.suffix[1]=diag;c.suffix[2]=diag;
+    if constexpr(next_i)c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
+    if constexpr(next_j)c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+ }
  public:
  FullResult align(const std::string&a,const std::string&b) {
   FullResult result;auto& out=result.corr;
@@ -31,15 +42,12 @@ class FullCorrespondence {
   n=a.size();m=b.size();
   cells=fqalign::alignment_scratch((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.
-  for(int i=n;i>=1;--i) for(int j=m;j>=1;--j) {
-    auto& c=at(i,j);c.through=0;int diag=neg;
-    if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
-    c.suffix[0]=std::max((i==n||j==m)?0:neg,diag);
-    if(inside(i+1,j))c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
-    if(inside(i,j+1))c.suffix[0]=std::max(c.suffix[0],at(i,j+1).suffix[2]-4);
-    c.suffix[1]=diag;c.suffix[2]=diag;
-    if(inside(i+1,j))c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
-    if(inside(i,j+1))c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+  // Preserve descending row-major updates; specialize only boundary predicates.
+  fill_suffix<false,false>(n,m,a,b);
+  for(int j=m-1;j>=1;--j)fill_suffix<false,true>(n,j,a,b);
+  for(int i=n-1;i>=1;--i){
+    fill_suffix<true,false>(i,m,a,b);
+    for(int j=m-1;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }
   // Original row-major boundary order: entire first row, then first column.
   for(int j=1;j<=m;++j)out.best=std::max(out.best,sub(a[0],b[j-1])+at(1,j).suffix[0]);
