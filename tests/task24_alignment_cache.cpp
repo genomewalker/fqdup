@@ -1,5 +1,6 @@
 #include "../src/merge_r8qkeep/repair.cpp"
 #include <random>
+#include <cstring>
 namespace fqdup_r8qkeep_repair_internal {
 #include "task25_full_correction_ref.hpp"
 #include "task25_full_scan_ref.hpp"
@@ -22,7 +23,43 @@ static void geometry_parity(const std::string& a,const std::string& b){
             expected.mismatches==actual.mismatches&&expected.fraction==actual.fraction&&
             expected.second==actual.second&&expected.eligible==actual.eligible);
 }
+static void suffix_cells(){
+#if defined(__AVX2__)
+ using Cell=internal::fqalign::AlignmentCell;constexpr int neg=-1000000000;
+ const auto scalar=[](std::vector<Cell>& cells,int n,int m,int i,int j,const std::string& a,const std::string& b){
+  const auto at=[&](int x,int y)->Cell&{return cells[x*(m+1)+y];};
+  auto& c=at(i,j);c.through=0;int diag=neg;
+  if(i<n&&j<m)diag=at(i+1,j+1).suffix[0]+(a[i]==b[j]&&a[i]!='N'?1:-1);
+  c.suffix[0]=std::max(i==n||j==m?0:neg,diag);
+  if(i<n)c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
+  if(j<m)c.suffix[0]=std::max(c.suffix[0],at(i,j+1).suffix[2]-4);
+  c.suffix[1]=diag;c.suffix[2]=diag;
+  if(i<n)c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
+  if(j<m)c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+ };
+ std::mt19937 rng(2535);std::vector<Cell> expected,actual;
+ for(int n:{1,2,7,8,9,15,16,17,30,31,32,33,100,150,511,512})
+  for(int m:{1,2,7,8,9,15,16,17,30,31,32,33,100,150,511,512})
+   for(int pattern=0;pattern<4;++pattern){
+    std::string a(n,'A'),b(m,'A');
+    if(pattern==1){a.assign(n,'N');b.assign(m,'N');}
+    if(pattern>=2){for(char& c:a)c="ACGTN"[rng()%5];for(char& c:b)c="ACGTN"[rng()%5];}
+    if(pattern==3){b=a;b.resize(m,'A');}
+    expected.assign((n+1)*(m+1),Cell{});for(auto& c:expected)c.through=157;actual=expected;
+    for(int i=n;i>=1;--i)for(int j=m;j>=1;--j)scalar(expected,n,m,i,j,a,b);
+    for(int j=m;j>=1;--j)scalar(actual,n,m,n,j,a,b);
+    for(int i=n-1;i>=1;--i){
+     scalar(actual,n,m,i,m,a,b);int j=m-1;
+     for(;j>=8;j-=8)fqdup_fast_dp::suffix_eight(&actual[i*(m+1)+j-7],&actual[(i+1)*(m+1)+j-7],a[i],b.data()+j-7);
+     for(;j>=1;--j)scalar(actual,n,m,i,j,a,b);
+    }
+    require(std::memcmp(expected.data(),actual.data(),expected.size()*sizeof(Cell))==0);
+   }
+ std::cout<<"TASK25_SUFFIX_CELLS_PASS cases=1024\n";
+#endif
+}
 int main(){
+    suffix_cells();
     // All tail lengths and unaligned starts, including arbitrary byte equality.
     std::mt19937 count_rng(2528);
     std::array<char,576> left{},right{};

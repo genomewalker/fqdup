@@ -1,5 +1,6 @@
 #pragma once
 #include "native_correspondence.hpp"
+#include "../fast_dp.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -50,7 +51,11 @@ class FullCorrespondence {
   for(int j=m-1;j>=1;--j)fill_suffix<false,true>(n,j,a,b);
   for(int i=n-1;i>=1;--i){
     fill_suffix<true,false>(i,m,a,b);
-    for(int j=m-1;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
+    int j=m-1;
+#if defined(__AVX2__)
+    for(;j>=8;j-=8)fqdup_fast_dp::suffix_eight(&at(i,j-7),&at(i+1,j-7),a[i],b.data()+j-7);
+#endif
+    for(;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }
   // Original row-major boundary order: entire first row, then first column.
   for(int j=1;j<=m;++j)out.best=std::max(out.best,sub(a[0],b[j-1])+at(1,j).suffix[0]);
