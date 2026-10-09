@@ -310,3 +310,5 @@ add_executable(test_task26_compact_family tests/task26_compact_family.cpp src/me
 target_compile_options(test_task26_compact_family PRIVATE -ffp-contract=off)
 target_link_libraries(test_task26_compact_family PRIVATE Threads::Threads)
 add_test(NAME task26_compact_family COMMAND test_task26_compact_family)
+add_executable(test_task26_packed_kernels tests/task26_packed_kernels.cpp)
+add_test(NAME task26_packed_kernels COMMAND test_task26_packed_kernels)

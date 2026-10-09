@@ -1,3 +1,5 @@
+#include "packed_kernels.hpp"
+namespace packed26 = fqdup::r8qkeep::packed;
 #define fqdup fqdup_r8qkeep_native_headers
 #define fqalign fqdup_r8qkeep_native_alignment
 #define fqquality fqdup_r8qkeep_native_quality
@@ -453,6 +455,8 @@ static int find_tail_head_ov(const char* r1, int L1,
                              bool require_unique = false) {
     int best = -1;
     const int max_ov = std::min(L1, L2) - (require_unique ? 1 : 0);
+    const packed26::Bases packed_r1(std::string_view(r1,L1)),packed_r2(std::string_view(rc2,L2));
+    const bool packed_supported=packed_r1.supported()&&packed_r2.supported();
     for (int ov = min_ov; ov <= max_ov; ++ov) {
         const char* a = r1  + (L1 - ov);
         const char* b = rc2;
@@ -462,7 +466,8 @@ static int find_tail_head_ov(const char* r1, int L1,
         const int stop_after = (require_unique && std::isfinite(max_mm_rate) &&
                                 max_mm_rate >= 0.f && max_mm_rate <= 1.f) ?
             static_cast<int>(std::ceil(max_mm_rate * ov)) : ov;
-        const int mm = count_informative_mismatches(a, b, ov, stop_after);
+        const int mm = packed_supported ? packed26::Bases::mismatches(packed_r1,L1-ov,packed_r2,0,ov,packed26::NRule::ignore,stop_after) :
+            count_informative_mismatches(a, b, ov, stop_after);
         if ((float)mm / (float)ov <= max_mm_rate) {
             // A short homopolymer/repeat match is not molecule-identity evidence.
             // Accuracy-first mode retains the mates rather than constructing a longer
@@ -1593,8 +1598,11 @@ static int find_adapter_in(const std::string& seq, const std::string& adapter,
     if (adapter.empty()) return -1;
     int alen = (int)std::min(adapter.size(), (size_t)alen_req);
     int L    = (int)seq.size();
+    const packed26::Bases packed_seq(seq),packed_adapter(std::string_view(adapter).substr(0,alen));
+    const bool packed_supported=packed_seq.supported()&&packed_adapter.supported()&&min_pos>=0;
     for (int i = min_pos; i <= L - alen; ++i) {
-        const int mm = count_mismatches_limited(seq.data() + i, adapter.data(), alen, max_mm);
+        const int mm = packed_supported ? packed26::Bases::mismatches(packed_seq,i,packed_adapter,0,alen,packed26::NRule::equal,max_mm) :
+            count_mismatches_limited(seq.data() + i, adapter.data(), alen, max_mm);
         if (mm <= max_mm) return i;
     }
     return -1;

@@ -5,6 +5,7 @@
 #include "compact_family.hpp"
 #include "family_index.hpp"
 #include "family_key.hpp"
+#include "packed_kernels.hpp"
 #include "ordered_chunks.hpp"
 #include "memory_status.hpp"
 #include <algorithm>
@@ -194,7 +195,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
     std::size_t cells=0,max_bucket=0,index_bytes=0;
     for(int part=0;part<3;++part){cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
     // Cache both twenty-base halves once; part boundaries are exact slices.
-    std::vector<PackedFamilyKey> packed_keys;packed_keys.reserve(representative.size());
+    std::vector<fqdup::r8qkeep::TwoBitFamilyKey> packed_keys;packed_keys.reserve(representative.size());
     for(int i:representative)packed_keys.emplace_back(keys[i]);
     if(fqdup::r8qkeep::memory_enabled()){
         fqdup::r8qkeep::MemoryUsage m;
@@ -222,10 +223,10 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
             shared_index[part].visit(value,[&](int other){
                 if(std::size_t(other)>=query)return true;
                 const auto& candidate=packed_keys[other];
-                const auto d0=PackedFamilyKey::differences(key.lo,candidate.lo);
-                const auto d1=PackedFamilyKey::differences(key.hi,candidate.hi);
-                if(part>0&&__builtin_popcountll(d0&((1ULL<<39)-1))<=2)return true;
-                if(part>1&&__builtin_popcountll(d0>>39)+__builtin_popcountll(d1&((1ULL<<18)-1))<=2)return true;
+                const auto d0=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.lo,candidate.lo);
+                const auto d1=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.hi,candidate.hi);
+                if(part>0&&__builtin_popcountll(d0&((1ULL<<26)-1))<=2)return true;
+                if(part>1&&__builtin_popcountll(d0>>26)+__builtin_popcountll(d1&((1ULL<<12)-1))<=2)return true;
                 ++result.verified;
                 if(serial&&root(representative[query])==root(representative[other]))return true;
                 if(__builtin_popcountll(d0)+__builtin_popcountll(d1)>MAXMIS)return true;

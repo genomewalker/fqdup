@@ -1,5 +1,6 @@
 #pragma once
 #include "family.hpp"
+#include "packed_kernels.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -85,7 +86,15 @@ private:
         add_alphabet(read.q);
         const auto start=starts_.back(),end=start+read.s.size();
         bases_.resize((end*2+7)/8);qualities_.resize((end*width_+7)/8);
-        for(std::size_t i=0;i<read.s.size();++i){
+        std::size_t i=0;
+        for(;i+32<=read.s.size();i+=32){
+            const auto block=packed::block(read.s.data()+i);
+            packed::store32(bases_.data()+(start+i)/4,2*((start+i)%4),block.codes);
+            auto exceptions=block.exceptions;
+            while(exceptions){const auto bit=__builtin_ctz(exceptions);exceptions&=exceptions-1;
+                exception_positions_.push_back(start+i+bit);exception_values_.push_back(read.s[i+bit]);}
+        }
+        for(;i<read.s.size();++i){
             const unsigned code=base_code(read.s[i]);put(bases_,start+i,2,code&3);
             if(code==4){exception_positions_.push_back(start+i);exception_values_.push_back(read.s[i]);}
         }
@@ -98,7 +107,9 @@ private:
         header(row,read.h,decoder);const auto id=id_view(read.h);read.id.assign(id.data(),id.size());
         const auto start=starts_.at(row),end=starts_.at(row+1),length=end-start;
         read.s.resize(length);read.q.resize(length);
-        for(std::size_t i=0;i<length;++i)read.s[i]="ACGT"[get(bases_,start+i,2)];
+        std::size_t i=0;
+        for(;i+32<=length;i+=32)packed::decode32(bases_.data()+(start+i)/4,2*((start+i)%4),read.s.data()+i);
+        for(;i<length;++i)read.s[i]="ACGT"[get(bases_,start+i,2)];
         if(width_==8){if(length)std::memcpy(read.q.data(),qualities_.data()+start,length);}
         else if(!width_)std::fill(read.q.begin(),read.q.end(),char(alphabet_[0]));
         else for(std::size_t i=0;i<length;++i)read.q[i]=char(alphabet_[get(qualities_,start+i,width_)]);
