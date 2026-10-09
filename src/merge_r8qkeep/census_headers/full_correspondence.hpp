@@ -56,6 +56,8 @@ class FullCorrespondence {
     int j=m-1;
 #if defined(__AVX2__)
     for(;j>=16;j-=16)::fqdup_fast_dp::suffix_sixteen_planar(cells,i*(m+1)+j-15,(i+1)*(m+1)+j-15,a[i],b.data()+j-15);
+    if(j>=8){::fqdup_fast_dp::suffix_short_tail<8>(cells,i*(m+1)+j-7,(i+1)*(m+1)+j-7,a[i],b.data()+j-7);j-=8;}
+    if(j>=4){::fqdup_fast_dp::suffix_short_tail<4>(cells,i*(m+1)+j-3,(i+1)*(m+1)+j-3,a[i],b.data()+j-3);j-=4;}
 #endif
     for(;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }

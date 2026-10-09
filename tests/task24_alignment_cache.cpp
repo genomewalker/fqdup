@@ -174,20 +174,22 @@ int main(){
     // unreachable states, and cells just outside the written tile.
     {
         std::mt19937 rng(2555);::fqdup_fast_dp::ShortPlanarCells cells;cells.resize(80);
-        for(int trial=0;trial<3000;++trial){
+        for(int width:{4,8,16})for(int trial=0;trial<3000;++trial){
             std::array<std::array<int,80>,3> expected;
             for(int state=0;state<3;++state)for(int i=0;i<80;++i){
                 const int value=rng()%7?int(rng()%1025)-512:cells.neg;
                 *cells.score(state,i)=value;expected[state][i]=value;
             }
             std::array<char,16> b;for(auto& c:b)c="ACGTN"[rng()%5];const char a="ACGTN"[rng()%5];
-            for(int j=15;j>=0;--j){
+            for(int j=width-1;j>=0;--j){
                 const int diag=expected[0][41+j]+(a==b[j]&&a!='N'?1:-1);
                 expected[0][1+j]=std::max({cells.neg,diag,expected[1][40+j]-4,expected[2][2+j]-4});
                 expected[1][1+j]=std::max(diag,expected[1][40+j]-1);
                 expected[2][1+j]=std::max(diag,expected[2][2+j]-1);
             }
-            ::fqdup_fast_dp::suffix_sixteen_planar(cells,1,40,a,b.data());
+            if(width==16)::fqdup_fast_dp::suffix_sixteen_planar(cells,1,40,a,b.data());
+            else if(width==8)::fqdup_fast_dp::suffix_short_tail<8>(cells,1,40,a,b.data());
+            else ::fqdup_fast_dp::suffix_short_tail<4>(cells,1,40,a,b.data());
             for(int state=0;state<3;++state)for(int i=0;i<80;++i)require(*cells.score(state,i)==expected[state][i]);
         }
     }

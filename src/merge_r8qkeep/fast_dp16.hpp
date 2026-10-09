@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #if defined(__AVX2__)
@@ -31,6 +32,39 @@ struct ShortPlanarCells {
  Cell at(std::size_t index){return {{values+index,plane}};}
 };
 #if defined(__AVX2__)
+template<int width>
+inline void suffix_short_tail(ShortPlanarCells& cells,std::size_t out,std::size_t below,char a,const char* b){
+ static_assert(width==4||width==8);
+ const auto load=[](const std::int16_t* p){
+  if constexpr(width==8)return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+  else return _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+ };
+ __m128i letters;
+ if constexpr(width==8)letters=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b));
+ else{std::int32_t bytes;std::memcpy(&bytes,b,sizeof(bytes));letters=_mm_cvtsi32_si128(bytes);}
+ const auto equal=a=='N'?_mm_setzero_si128():_mm_cmpeq_epi8(_mm_set1_epi8(a),letters);
+ const auto substitution=_mm_sub_epi16(_mm_set1_epi16(-1),_mm_slli_epi16(_mm_cvtepi8_epi16(equal),1));
+ const auto diag=_mm_add_epi16(load(cells.score(0,below+1)),substitution),down=load(cells.score(1,below));
+ const auto one=_mm_set1_epi16(1),four=_mm_set1_epi16(4),absent=_mm_set1_epi16(-30000);
+ const auto vertical=_mm_max_epi16(diag,_mm_sub_epi16(down,one));
+ auto horizontal=diag;
+ if constexpr(width==4)horizontal=_mm_blend_epi16(horizontal,absent,0xf0);
+ horizontal=_mm_max_epi16(horizontal,_mm_sub_epi16(_mm_alignr_epi8(absent,horizontal,2),one));
+ horizontal=_mm_max_epi16(horizontal,_mm_sub_epi16(_mm_alignr_epi8(absent,horizontal,4),_mm_set1_epi16(2)));
+ if constexpr(width==8)horizontal=_mm_max_epi16(horizontal,_mm_sub_epi16(_mm_alignr_epi8(absent,horizontal,8),four));
+ const auto carry=_mm_set1_epi16(*cells.score(2,out+width));
+ horizontal=_mm_max_epi16(horizontal,_mm_sub_epi16(carry,_mm_setr_epi16(width,width-1,width-2,width-3,width-4,width-5,width-6,width-7)));
+ auto next=horizontal;if constexpr(width==4)next=_mm_blend_epi16(next,carry,0xf0);
+ const auto right=_mm_alignr_epi8(carry,next,2);
+ auto aligned=_mm_max_epi16(diag,_mm_set1_epi16(ShortPlanarCells::neg));
+ aligned=_mm_max_epi16(aligned,_mm_sub_epi16(down,four));
+ aligned=_mm_max_epi16(aligned,_mm_sub_epi16(right,four));
+ const auto store=[](std::int16_t* p,__m128i value){
+  if constexpr(width==8)_mm_storeu_si128(reinterpret_cast<__m128i*>(p),value);
+  else _mm_storel_epi64(reinterpret_cast<__m128i*>(p),value);
+ };
+ store(cells.score(0,out),aligned);store(cells.score(1,out),vertical);store(cells.score(2,out),horizontal);
+}
 template<int bytes>
 inline __m256i shift_right_short(__m256i value,__m256i padding){
  const auto next=_mm256_permute2x128_si256(value,padding,0x21);
