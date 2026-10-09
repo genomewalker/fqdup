@@ -90,8 +90,8 @@ class FamilyPartIndex {
         const auto& masks=suffix_masks()[query&511];
         const auto collect=[&](std::uint32_t row,int budget){
             ++lookups;const auto present=dense_words_[row];auto matches=present&masks[budget];
-            while(matches){const auto bit=matches&-matches;
-                hits[count++]=dense_ids_[dense_ranks_[row]+__builtin_popcountll(present&(bit-1))];
+            while(matches){
+                hits[count++]=(row<<6)|__builtin_ctzll(matches);
                 matches&=matches-1;}
         };
         const int budget=2-unknowns;
@@ -106,6 +106,13 @@ class FamilyPartIndex {
                 for(int b=0;b<a;++b)for(std::uint32_t y=1;y<=3;++y)collect(first^(y<<normal[b]),0);
             }
         }
+        // Compact ACGT codes have the same order as packed part values.
+        // Separate dependent table loads from the enumeration hot loop.
+        std::sort(hits.begin(),hits.begin()+count);
+        for(std::size_t i=0;i<count;++i){const auto code=std::uint32_t(hits[i]);
+            const auto row=code>>6;const auto bit=std::uint64_t(1)<<(code&63);
+            hits[i]=dense_ranks_[row]+__builtin_popcountll(dense_words_[row]&(bit-1));}
+        for(std::size_t i=0;i<count;++i)hits[i]=dense_ids_[hits[i]];
         if(!n_nodes_.empty()){
             const auto walk=[&](auto&& self,int node,int p,int remaining)->void {
                 if(p<0){hits[count++]=n_nodes_[node].id;return;}
@@ -115,8 +122,8 @@ class FamilyPartIndex {
                     if(next>=0&&cost<=remaining){++lookups;self(self,next,p-1,remaining-cost);}}
             };
             walk(walk,0,length_-1,2);
+            std::sort(hits.begin(),hits.begin()+count);
         }
-        std::sort(hits.begin(),hits.begin()+count);
         for(std::size_t i=0;i<count;++i){++candidates;const auto& part=parts_[hits[i]];
             for(int j=part.begin;j<part.end;++j)if(!visitor(members_[j]))return;}
     }
