@@ -157,6 +157,16 @@ int main(){
         same_full(full.align_uncached(contained,a),old_full.align_uncached(contained,a));
     }
     require(shortcuts>0&&fallbacks>0);
+    {internal::fqalign::FullCorrespondence engine;
+     internal::frozen_full_scan::FullCorrespondence oracle;
+     const std::string repeat(60,'A');
+     const auto ambiguous=engine.align_uncached(repeat,repeat);
+     same_full(ambiguous,oracle.align_uncached(repeat,repeat));
+     require(ambiguous.corr.invariant.empty()&&ambiguous.corr.paths>1);
+     const std::string a="C"+std::string(509,'A')+"G",b="C"+std::string(510,'A')+"G";
+     const auto capped=engine.align_uncached(a,b);
+     same_full(capped,oracle.align_uncached(a,b));
+     require(capped.corr.reason=="cap_exceeded"&&capped.corr.invariant.empty());}
     base_validation();
     suffix_cells();
     band_suffix_cells();

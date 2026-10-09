@@ -3,12 +3,25 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 namespace fqdup_fast_dp {
+inline void intersect_path(std::vector<std::pair<int,int>>& common,const std::vector<std::pair<int,int>>& path,int paths){
+ if(paths==1){common=path;return;}
+ std::size_t kept=0,pos=0;
+ for(const auto cell:common){
+  while(pos<path.size()&&path[pos]<cell)++pos;
+  if(pos==path.size())break;
+  if(path[pos]==cell)common[kept++]=cell;
+ }
+ common.resize(kept);
+}
 // Full engines share one nonrecursive scratch allocation per worker. Every
-// valid cell is initialized by the descending fill before any traceback.
+// score read by traceback is initialized by the descending fill. The optional
+// through plane remains available for the tile oracle; full engines omit it.
 struct PlanarCells {
  struct Scores {int* values;std::size_t stride;int& operator[](std::size_t s)const{return values[s*stride];}};
  struct Cell {Scores suffix;int& through;};
@@ -31,6 +44,7 @@ struct PlanarCells {
 #if defined(__AVX2__)
 // Same eight-cell recurrence as suffix_tile<false>; contiguous planes replace
 // gathers and AoS transposition with two loads and four stores.
+template<bool clear_through=true>
 inline void suffix_eight_planar(PlanarCells& cells,std::size_t out,std::size_t below,char a,const char* b){
  constexpr int neg=-1000000000;
  const auto absent=_mm256_set1_epi32(-2147482624);
@@ -56,7 +70,7 @@ inline void suffix_eight_planar(PlanarCells& cells,std::size_t out,std::size_t b
  _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(0,out)),aligned);
  _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(1,out)),vertical);
  _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(2,out)),horizontal);
- _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(3,out)),_mm256_setzero_si256());
+ if constexpr(clear_through)_mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(3,out)),_mm256_setzero_si256());
 }
 // Eight full-matrix or seven banded interior cells of the +1/-1,
 // gap-open 4 / gap-extend 1 suffix DP.

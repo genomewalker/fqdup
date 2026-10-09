@@ -26,7 +26,7 @@ class FullCorrespondence {
  static int sub(char a,char b) {return a==b&&a!='N'?1:-1;}
  template<bool next_i,bool next_j>
  void fill_suffix(int i,int j,const std::string& a,const std::string& b) {
-    auto c=at(i,j);c.through=0;int diag=neg;
+    auto c=at(i,j);int diag=neg;
     if constexpr(next_i&&next_j)diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((!next_i||!next_j)?0:neg,diag);
     if constexpr(next_i)c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
@@ -59,7 +59,7 @@ class FullCorrespondence {
     fill_suffix<true,false>(i,m,a,b);
     int j=m-1;
 #if defined(__AVX2__)
-    for(;j>=8;j-=8)::fqdup_fast_dp::suffix_eight_planar(cells,i*(m+1)+j-7,(i+1)*(m+1)+j-7,a[i],b.data()+j-7);
+    for(;j>=8;j-=8)::fqdup_fast_dp::suffix_eight_planar<false>(cells,i*(m+1)+j-7,(i+1)*(m+1)+j-7,a[i],b.data()+j-7);
 #endif
     for(;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }
@@ -77,7 +77,7 @@ class FullCorrespondence {
    if(state==0&&(i==n||j==m)&&score>=threshold){
     result.min_informative=std::min(result.min_informative,informative);result.max_gap=std::max(result.max_gap,gaps);result.max_fraction=std::max(result.max_fraction,double(mismatches+gaps)/std::max(1,informative+gaps));
     ++out.paths;max_counted_score=std::max(max_counted_score,score);
-    if(out.paths<=256)for(auto c:path)++at(c.first,c.second).through;
+    if(out.paths<=256)::fqdup_fast_dp::intersect_path(out.invariant,path,out.paths);
    }
    if(out.paths<=256){
     if(inside(i+1,j+1))recurse(recurse,i+1,j+1,0,score+sub(a[i],b[j]));
@@ -88,10 +88,9 @@ class FullCorrespondence {
   };
   for(int j=1;j<=m&&out.paths<=256;++j)visit(visit,1,j,0,sub(a[0],b[j-1]));
   for(int i=2;i<=n&&out.paths<=256;++i)visit(visit,i,1,0,sub(a[i-1],b[0]));
-  if(out.paths>256){out.reason="cap_exceeded";return result;}
-  if(out.paths<1||max_counted_score!=out.best){out.reason="internal_inconsistency";return result;}
-  for(int i=1;i<=n;++i)for(int j=1;j<=m;++j)
-   if(at(i,j).through==out.paths)out.invariant.emplace_back(i-1,j-1);
+  if(out.paths>256){out.invariant.clear();out.reason="cap_exceeded";return result;}
+  if(out.paths<1||max_counted_score!=out.best){out.invariant.clear();out.reason="internal_inconsistency";return result;}
+  for(auto& cell:out.invariant){--cell.first;--cell.second;}
   // Maximal consecutive diagonal blocks; flanks count agreeing columns.
   for(size_t begin=0;begin<out.invariant.size();){
    size_t end=begin+1;
