@@ -32,10 +32,14 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
         constexpr std::size_t requested=25000;
         const auto selected=prior_sample_indices(out.family.pairs,requested);
         std::vector<FamilyPair> sample;sample.reserve(selected.size());
-        for(auto i:selected)sample.push_back(out.family.pairs[i]);
+        for(auto i:selected)sample.push_back(std::move(out.family.pairs[i]));
         if(timings||debug)std::cerr<<"PRIOR_SAMPLE requested="<<requested<<" selected="<<sample.size()<<" total="<<out.family.pairs.size()<<" seed="<<prior_sample_seed<<'\n';
         const auto native=merge_native(sample,settings,timings||debug,debug,threads,out.pool.get());stage("sample_native");
-        out.observations=census(sample,native,debug,threads,0,true,out.pool.get());stage("sample_census");
+        out.observations=census(sample,native,debug,threads,0,true,out.pool.get());
+        // Both kernels have joined; observations own their IDs and statistics.
+        // Restore the selected slots before fitting or streaming the library.
+        for(std::size_t i=0;i<selected.size();++i)out.family.pairs[selected[i]]=std::move(sample[i]);
+        stage("sample_census");
     }else{
         out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads,out.pool.get());stage("native");
         out.observations=census(out.family.pairs,out.native,debug,threads,0,false,out.pool.get());stage("census");
