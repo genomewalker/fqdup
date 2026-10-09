@@ -9,6 +9,19 @@
 #include <random>
 #include <stdexcept>
 static void require(bool ok){if(!ok)throw std::runtime_error("family parallel mismatch");}
+static void packed_key_parity(){
+    std::mt19937 rng(2560);const int bounds[]{0,13,26,40};
+    for(int trial=0;trial<10000;++trial){
+        std::string a(40,'A'),b(40,'A');
+        for(char& c:a)c="ACGTN"[rng()%5];for(char& c:b)c="ACGTN"[rng()%5];
+        const PackedFamilyKey x(a),y(b);
+        for(int p=0;p<3;++p)require(x.part(p)==fqdup::r8qkeep::FamilyPartIndex::pack(a,bounds[p],bounds[p+1]));
+        const auto lo=PackedFamilyKey::differences(x.lo,y.lo),hi=PackedFamilyKey::differences(x.hi,y.hi);
+        require(__builtin_popcountll(lo)+__builtin_popcountll(hi)==mismatches(a,b));
+        require(__builtin_popcountll(lo&((1ULL<<39)-1))==mismatches(a.substr(0,13),b.substr(0,13)));
+        require(__builtin_popcountll(lo>>39)+__builtin_popcountll(hi&((1ULL<<18)-1))==mismatches(a.substr(13,13),b.substr(13,13)));
+    }
+}
 static void check(const std::vector<std::string>& keys){
     std::vector<int> expected(keys.size());std::iota(expected.begin(),expected.end(),0);
     require(serial_neighbor_families(keys,expected));
@@ -102,7 +115,8 @@ static void key_parity(){
     std::cout<<"TASK25_FAMILY_KEYS_PASS cases="<<cases<<'\n';
 }
 
-int main(){try{
+int main(){
+    packed_key_parity();try{
     // Independent complete-window oracle for allocation-free rolling DUST.
     std::mt19937 dust_rng(2547);
     for(int trial=0;trial<200;++trial){

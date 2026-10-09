@@ -104,6 +104,25 @@ struct ColumnVotes {
 };
 struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
 
+// Forty three-bit bases fit in two sixty-bit words. This avoids cache-line
+// straddles in candidate records while retaining N as an explicit code.
+struct PackedFamilyKey {
+    std::uint64_t lo,hi;
+    explicit PackedFamilyKey(const std::string& key):
+        lo(fqdup::r8qkeep::FamilyPartIndex::pack(key,0,20)),
+        hi(fqdup::r8qkeep::FamilyPartIndex::pack(key,20,40)){}
+    std::uint64_t part(int p) const {
+        if(p==0)return lo&((1ULL<<39)-1);
+        if(p==1)return (lo>>39)|((hi&((1ULL<<18)-1))<<21);
+        return hi>>18;
+    }
+    static std::uint64_t differences(std::uint64_t a,std::uint64_t b){
+        const auto x=a^b;
+        return ((x|(x>>1)|(x>>2))|(a>>2))&0x9249249249249249ULL;
+    }
+};
+static_assert(sizeof(PackedFamilyKey)==16);
+
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Pigeonhole candidates with the frozen N/N mismatch rule.
 // Union roots are not output: groups/members are emitted by ascending read id.
@@ -131,15 +150,9 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     }else for(int part=0;part<3;++part)build_part(part);
     std::size_t cells=0,max_bucket=0,index_bytes=0;
     for(int part=0;part<3;++part){cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
-    // Cache exact three-bit parts once. Candidate verification then reads a
-    // compact fixed record instead of chasing forty-base strings.
-    std::vector<std::array<std::uint64_t,3>> packed_keys(representative.size());
-    for(std::size_t i=0;i<representative.size();++i)for(int p=0;p<3;++p)
-        packed_keys[i][p]=fqdup::r8qkeep::FamilyPartIndex::pack(keys[representative[i]],bounds[p],bounds[p+1]);
-    const auto distance=[](std::uint64_t a,std::uint64_t b){
-        const auto x=a^b;
-        return __builtin_popcountll(((x|(x>>1)|(x>>2))|(a>>2))&0x9249249249ULL);
-    };
+    // Cache both twenty-base halves once; part boundaries are exact slices.
+    std::vector<PackedFamilyKey> packed_keys;packed_keys.reserve(representative.size());
+    for(int i:representative)packed_keys.emplace_back(keys[i]);
     const auto generated=std::chrono::steady_clock::now();
     // Workers enumerate immutable indexes; only the ordered consumer touches
     // parent, including overflow recomputation. No per-worker seen arrays.
@@ -157,17 +170,17 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
         const auto& key=packed_keys[query];
         for(int part=0;part<3;++part){
-            const auto value=key[part];
+            const auto value=key.part(part);
             shared_index[part].visit(value,[&](int other){
                 if(std::size_t(other)>=query)return true;
                 const auto& candidate=packed_keys[other];
-                const int d0=distance(key[0],candidate[0]);
-                if(part>0&&d0<=2)return true;
-                const int d1=distance(key[1],candidate[1]);
-                if(part>1&&d1<=2)return true;
+                const auto d0=PackedFamilyKey::differences(key.lo,candidate.lo);
+                const auto d1=PackedFamilyKey::differences(key.hi,candidate.hi);
+                if(part>0&&__builtin_popcountll(d0&((1ULL<<39)-1))<=2)return true;
+                if(part>1&&__builtin_popcountll(d0>>39)+__builtin_popcountll(d1&((1ULL<<18)-1))<=2)return true;
                 ++result.verified;
                 if(serial&&root(representative[query])==root(representative[other]))return true;
-                if(d0+d1+distance(key[2],candidate[2])>MAXMIS)return true;
+                if(__builtin_popcountll(d0)+__builtin_popcountll(d1)>MAXMIS)return true;
                 if(serial)unite(representative[query],representative[other]);
                 else if(result.size<edge_limit)result.edges[result.size++]=other;
                 else result.overflow=true;
