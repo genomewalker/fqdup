@@ -38,22 +38,24 @@ static std::uint64_t expected_lookups(const std::string& query,std::size_t cells
 }
 static void boundary_and_rebuilds(){
     FamilyPartIndex index;fqdup::r8qkeep::FrozenFamilyPartIndex frozen;
-    for(std::size_t count:{1023,1024,1025,65535,65536,65537,0,65536,1,65537}){
+    for(int length:{13,14})for(std::size_t count:{1023,1024,1025,4095,4096,4097,8193,65535,65536,65537,0,65536,1,65537}){
         std::vector<std::string> keys;keys.reserve(count);
         for(std::size_t i=0;i<count;++i){
-            std::uint64_t word=(i*2654435761ULL)&((1ULL<<28)-1);std::string key(14,'A');
-            for(char& c:key){c="ACGT"[word&3];word>>=2;}keys.push_back(key);
+            std::uint64_t word=(i*2654435761ULL)&((1ULL<<(2*length))-1);std::string key(length,'A');
+            for(char& c:key){c="ACGT"[word&3];word>>=2;}
+            if(count==8193){if(i%5==0)key[length-1]='N';if(i%17==0)key[length-2]='N';}
+            keys.push_back(key);
         }
         std::vector<int> representatives(count);std::iota(representatives.begin(),representatives.end(),0);
-        index.build(keys,representatives,0,14);frozen.build(keys,representatives,0,14);
+        index.build(keys,representatives,0,length);frozen.build(keys,representatives,0,length);
         if(index.cells()!=count||index.bytes()>frozen.bytes())throw std::runtime_error("boundary retained storage");
-        std::vector<std::string> queries{std::string(14,'A'),std::string(14,'T')};
-        if(count){queries.push_back(keys.back());queries.push_back(keys[count/2]);}
+        std::vector<std::string> queries{std::string(length,'A'),std::string(length,'T')};
+        if(count){queries.push_back(keys.front());queries.push_back(keys.back());queries.push_back(keys[count/2]);}
         for(auto query:queries)for(int ns=0;ns<=3;++ns){
             if(ns)query[4*(ns-1)]='N';
             for(std::size_t stop:{std::size_t(1),std::size_t(3),count+1}){
                 std::vector<int> actual,expected;std::uint64_t lookups=0,candidates=0,old_lookups=0,old_candidates=0;
-                const auto packed=FamilyPartIndex::pack(query,0,14);
+                const auto packed=FamilyPartIndex::pack(query,0,length);
                 index.visit(packed,[&](int i){actual.push_back(i);return actual.size()<stop;},lookups,candidates);
                 frozen.visit(packed,[&](int i){expected.push_back(i);return expected.size()<stop;},old_lookups,old_candidates);
                 if(actual!=expected||candidates!=old_candidates||lookups!=expected_lookups(query,count))
