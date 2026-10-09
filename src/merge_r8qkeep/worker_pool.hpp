@@ -9,7 +9,9 @@
 #include <thread>
 #include <vector>
 namespace fqdup::r8qkeep {
-// Callers bound outstanding futures. Workers never wait for other pool jobs.
+// Callers bound outstanding futures. Nested waits require reserved capacity:
+// counts fitting reserves at most two coordinators and uses the remaining
+// workers for their jobs; p1/p2 coordinators submit no nested work.
 class WorkerPool {
     std::mutex mutex_;
     std::condition_variable ready_;

@@ -55,7 +55,7 @@ struct CensusPairs {
     bool empty()const{return count==0;}
     const FamilyPair& operator[](std::size_t i)const{return all[offset+i];}
 };
-CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,int threads,std::size_t start,bool counts) {
+CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,int threads,std::size_t start,bool counts,WorkerPool* shared_pool=nullptr) {
     if(threads>1) {
         // Duplicate IDs share an accumulator in the frozen serial algorithm.
         // Keep that path unchanged; otherwise each pair's sums are independent.
@@ -75,7 +75,7 @@ CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,
                 result.proposed_edits_tsv+=part.proposed_edits_tsv;
                 for(auto& p:part.nominal_pairs)result.nominal_pairs.push_back(std::move(p));
                 for(auto& p:part.full_pairs)result.full_pairs.push_back(std::move(p));first=false;
-            },"census");
+            },"census",0,shared_pool);
             if(!pairs.empty())return result;
         }
     }
@@ -109,10 +109,10 @@ CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,
     return {debug?nominal.str():"",debug?full.str():"",edits.str(),nominal_pairs.take(),full_pairs.take()};
 }
 }
-CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start,bool counts) {
+CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start,bool counts,WorkerPool* shared_pool) {
     ParsedNativeRecords parsed;
     if(native.records.empty()&&!native.native_tsv.empty())parsed=parse_native_records(native.native_tsv);
     const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
-    return census_rows({pairs,0,pairs.size()},native_rows,debug,threads,start,counts);
+    return census_rows({pairs,0,pairs.size()},native_rows,debug,threads,start,counts,shared_pool);
 }
 }

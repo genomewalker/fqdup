@@ -39,7 +39,8 @@ void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::si
     if(profile)std::fprintf(stderr,"CHUNK_PROFILE stage=%s workers=%d chunk_rows=%zu max_inflight=%d rows=%zu chunks=%zu wall=%.6f\n",label,workers,chunk_rows,workers,count,chunks,std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
 }
 template<class Work,class Consume>
-void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0) {
+void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0,WorkerPool* shared_pool=nullptr) {
+    if(shared_pool){ordered_index_chunks(*shared_pool,count,threads,row_offset,std::move(work),std::move(consume),label,rows_per_chunk);return;}
     WorkerPool pool(std::max(1,std::min(threads,8)));
     ordered_index_chunks(pool,count,threads,row_offset,std::move(work),std::move(consume),label,rows_per_chunk);
 }

@@ -2853,7 +2853,7 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
     memory("serialized");
     return result;
 }
-NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit,int threads){
+NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSettings& settings,bool trace,bool audit,int threads,WorkerPool* shared_pool){
     NativeResult result;result.records.reserve(pairs.size());if(audit)result.native_outcomes_json="[";
     bool first=true;
     const auto consume=[&](NativeResult part){
@@ -2867,7 +2867,7 @@ NativeResult merge_native(const std::vector<FamilyPair>& pairs,const NativeSetti
         // Jobs borrow pairs; ordered consumption retains every serialized view.
         ordered_index_chunks(pairs.size(),threads,0,[&](std::size_t begin,std::size_t n){
             return merge_native_range(pairs,begin,n,settings,trace&&begin==0,audit);
-        },consume,"native_prepare",native_batch_size);
+        },consume,"native_prepare",native_batch_size,shared_pool);
     }else for(std::size_t begin=0;begin<pairs.size();begin+=native_batch_size){
         consume(merge_native_range(pairs,begin,std::min(native_batch_size,pairs.size()-begin),settings,trace&&begin==0,audit));
     }

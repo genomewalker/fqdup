@@ -221,16 +221,17 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::Work
     else collect(0,P.size());
     return keys;
 }
-std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads) {
+std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads,fqdup::r8qkeep::WorkerPool* shared_pool) {
     auto last=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
     const int workers=std::max(1,std::min(threads,8));
-    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
-    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
-    const int n = int(P.size()); keys = keys_of(P,pool.get(),threads);phase("keys");
+    std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
+    auto* pool=workers>1?shared_pool:nullptr;
+    if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
+    const int n = int(P.size()); keys = keys_of(P,pool,threads);phase("keys");
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-    if(!neighbor_families(keys,parent,threads,64,pool.get())){
+    if(!neighbor_families(keys,parent,threads,64,pool)){
     std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
     std::unordered_map<std::string, std::vector<int>> buckets;
     for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }
@@ -331,7 +332,10 @@ bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) retu
 } // namespace
 
 namespace fqdup::r8qkeep {
-FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug) {
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool) {
+        std::unique_ptr<WorkerPool> owned_pool;
+        if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(std::max(1,std::min(threads,8)));shared_pool=owned_pool.get();}
+        auto& pool=*shared_pool;
         auto last=std::chrono::steady_clock::now();
         const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
         constexpr bool damage_safe = false;
@@ -340,9 +344,8 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         for (size_t i = 0; i < R1.size(); ++i) { if (R1[i].id != R2[i].id) throw std::runtime_error("pair order " + R1[i].id); P.push_back({R1[i].id, {std::move(R1[i]), std::move(R2[i])}}); }
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
         phase("pair_storage");
-        std::vector<std::string> keys; auto groups = families(P, keys, threads);phase("families_total");
+        std::vector<std::string> keys; auto groups = families(P, keys, threads,shared_pool);phase("families_total");
         std::vector<std::string>().swap(keys);
-        WorkerPool pool(std::max(1,std::min(threads,8)));
         std::vector<char> disband(groups.size());
         ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
             for(std::size_t k=begin;k<begin+n;++k)disband[k]=groups[k].oversize||second_molecule(P,groups[k].m);

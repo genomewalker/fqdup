@@ -2,6 +2,7 @@
 #include "canonical_pairs.hpp"
 #include "prior_sample.hpp"
 #include "ordered_chunks.hpp"
+#include "ordered_writer.hpp"
 #include "memory_status.hpp"
 #include "string_input.hpp"
 #include <algorithm>
@@ -24,41 +25,50 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     if(counts){canonicalize_family_input(r1,r2);stage("canonical_input");}
-    LibraryPipeline out;out.native_settings=settings;out.family=correct_family(std::move(r1),std::move(r2),threads,debug);stage("family");
+    LibraryPipeline out;out.native_settings=settings;
+    const int workers=std::max(1,std::min(threads,8));out.pool=std::make_shared<WorkerPool>(workers);
+    out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
         const auto selected=prior_sample_indices(out.family.pairs,requested);
         std::vector<FamilyPair> sample;sample.reserve(selected.size());
         for(auto i:selected)sample.push_back(out.family.pairs[i]);
         if(timings||debug)std::cerr<<"PRIOR_SAMPLE requested="<<requested<<" selected="<<sample.size()<<" total="<<out.family.pairs.size()<<" seed="<<prior_sample_seed<<'\n';
-        const auto native=merge_native(sample,settings,timings||debug,debug,threads);stage("sample_native");
-        out.observations=census(sample,native,debug,threads,0,true);stage("sample_census");
+        const auto native=merge_native(sample,settings,timings||debug,debug,threads,out.pool.get());stage("sample_native");
+        out.observations=census(sample,native,debug,threads,0,true,out.pool.get());stage("sample_census");
     }else{
-        out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads);stage("native");
-        out.observations=census(out.family.pairs,out.native,debug,threads);stage("census");
+        out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads,out.pool.get());stage("native");
+        out.observations=census(out.family.pairs,out.native,debug,threads,0,false,out.pool.get());stage("census");
     }
 
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
     // Run the two folds of one mode at once, sharing the whole thread budget.
     // This keeps nominal workers busy even when the full fits are tiny.
-    const int concurrent=std::max(1,std::min(2,threads));
-    // Counts callers share auxiliary workers, so a completed fold leaves
-    // capacity for the other fold. Callers plus auxiliaries stay within threads.
-    const int auxiliary=counts&&concurrent>1?std::max(0,threads-concurrent):0;
-    std::unique_ptr<WorkerPool> shared_pool;
-    if(auxiliary)shared_pool=std::make_unique<WorkerPool>(auxiliary);
-    const int per_fit=shared_pool?auxiliary+1:std::max(1,threads/concurrent);
+    const int concurrent=std::max(1,std::min(2,workers));
+    // At most two fit coordinators occupy pool workers. Nested counts work
+    // uses only the remaining capacity; at p1/p2 no nested jobs are submitted.
+    const int auxiliary=counts&&concurrent>1?workers-concurrent:0;
+    const int per_fit=counts?auxiliary+1:std::max(1,threads/concurrent);
     for(int begin=0;begin<4;begin+=concurrent){std::array<std::future<std::optional<MixtureFit>>,4> futures;
+      try{
         for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<const PairLikelihood*> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(&p);
-            if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit,counts,pool=shared_pool.get()](){return counts?fit_mixture_counts(training,per_fit,pool):fit_mixture_views(training,per_fit);});else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
+            if(concurrent>1){
+                auto fit=[training=std::move(training),per_fit,counts,pool=out.pool.get()](){return counts?fit_mixture_counts(training,per_fit,pool):fit_mixture_views(training,per_fit);};
+                futures[k]=counts?out.pool->submit(std::move(fit)):std::async(std::launch::async,std::move(fit));
+            }else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
         if(concurrent>1)for(int k=begin;k<std::min(4,begin+concurrent);++k)fits[k/2][k%2]=futures[k].get();
+      }catch(...){
+        // Packaged-task futures do not join on destruction. Keep training
+        // rows alive until every sibling has finished, even when one fails.
+        for(auto& future:futures)if(future.valid())future.wait();
+        throw;
+      }
     }
-    shared_pool.reset();
     out.nominal_prior=prior_text(fits[0]);out.full_prior=prior_text(fits[1]);stage("prior_fit");
     if(timings)for(int mode=0;mode<2;++mode)for(int f=0;f<2;++f)if(fits[mode][f]){const auto& fit=*fits[mode][f];std::cerr<<"FIT_CACHE mode="<<mode<<" fold="<<f<<" pairs="<<fit.training_pairs<<" keys="<<fit.unique_likelihoods<<" calls="<<fit.exp_calls<<" hits="<<fit.exp_cache_hits<<'\n';std::cerr<<"FIT_PHASE mode="<<mode<<" fold="<<f<<" em_iterations="<<fit.iterations<<" em_seconds="<<fit.em_seconds<<" polish_iterations="<<fit.polish_iterations<<" polish_seconds="<<fit.polish_seconds<<" last_em_zero_cells="<<fit.last_em_zero_cells<<" last_em_subnormal_cells="<<fit.last_em_subnormal_cells<<" kkt_gap="<<fit.kkt_gap<<" newton_reentries="<<fit.newton_reentries<<" em_cells="<<fit.unique_likelihoods*mixture_components<<'\n';}
     for(auto& observations:pairs)std::vector<PairLikelihood>().swap(observations);
-    if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads);stage("native");}
+    if(counts&&!defer_routing){out.native=merge_native(out.family.pairs,settings,timings||debug,debug,threads,out.pool.get());stage("native");}
     if(defer_routing){NativeResult empty;empty.native_tsv=std::move(out.native.native_tsv);out.native=std::move(empty);}
     if(!debug){std::string().swap(out.family.edits_tsv);std::string().swap(out.family.families_tsv);std::string().swap(out.observations.proposed_edits_tsv);}
     out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);if(!defer_routing){out.routing=out.repair->route_records(out.native.records,debug);stage("router");}return out;
@@ -111,7 +121,9 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     // Deeper single-cut queues hide uneven pair work and output stalls. Multi-
     // cutoff jobs retain at most 4096 output rows, independent of input size.
     const std::size_t window=workers*(cuts.size()==1?16:4);
-    WorkerPool pool(workers);const auto pipeline_begin=Clock::now();
+    std::unique_ptr<WorkerPool> owned_pool;
+    if(!lib.pool)owned_pool=std::make_unique<WorkerPool>(workers);
+    auto& pool=lib.pool?*lib.pool:*owned_pool;const auto pipeline_begin=Clock::now();
     const bool native_debug=debug&&lib.native.native_tsv.empty();
     const auto process=[&](NativeRecords native,std::size_t start,double native_seconds){
         const std::size_t n=native.size();
@@ -137,17 +149,15 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
         return chunk;
     };
-    std::deque<std::future<OutputChunk>> output;
+    OrderedWriter<OutputChunk> writer(window,std::move(consume));
     std::size_t output_rows=0,output_chunks=0;
-    const auto consume_next=[&]{auto chunk=output.front().get();output.pop_front();consume(std::move(chunk));};
     const auto dispatch=[&](NativeRecords records,std::shared_ptr<const NativeResult> owner,std::size_t offset,double native_seconds){
         for(std::size_t pos=0;pos<records.size();pos+=chunk_rows){
-            if(output.size()>=window)consume_next();
             const auto n=std::min(chunk_rows,records.size()-pos),start=offset+pos;
             const auto native=records.slice(pos,n);const double seconds=pos==0?native_seconds:0;
             // Native views stay valid even after the coordinator advances to
             // another batch. Results own their emitted strings before returning.
-            output.push_back(pool.submit([&,native,start,seconds,keep_alive=owner]{
+            writer.submit(pool.submit([&,native,start,seconds,keep_alive=owner]{
                 (void)keep_alive;return process(native,start,seconds);
             }));
             output_rows+=n;++output_chunks;
@@ -170,7 +180,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
                 dispatch(owner->records,owner,chunk.start,chunk.seconds);
             }
         }
-        while(!output.empty())consume_next();
+        writer.finish();
     }catch(...){pool.stop();throw;}
     if(std::getenv("FQDUP_CHUNK_PROFILE"))std::fprintf(stderr,
         "CHUNK_PROFILE stage=streaming_pipeline workers=%d chunk_rows=%zu max_inflight=%zu rows=%zu chunks=%zu wall=%.6f timing_basis=wall_including_native_and_consume\n",
@@ -225,7 +235,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     for(auto& group:files)close_files(group);
     if(measure){
         output_seconds+=elapsed(close_begin);const double stream_seconds=elapsed(stream_begin);
-        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=main_thread_elapsed_including_open_close"<<memory_status()<<'\n';
+        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=writer_elapsed_plus_main_open_close"<<memory_status()<<'\n';
         std::cerr<<"MERGE_STAGE streaming_wall seconds="<<stream_seconds<<" timing_basis=wall_including_output"<<memory_status()<<'\n';
     }
     if(timings||debug)std::cerr<<"MERGE_STAGE streaming_native seconds="<<native_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';

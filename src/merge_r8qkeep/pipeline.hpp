@@ -2,6 +2,7 @@
 #include "census.hpp"
 #include "mixture_fit.hpp"
 #include "repair.hpp"
+#include "worker_pool.hpp"
 namespace fqdup::r8qkeep {
 struct LibraryPipeline {
     FamilyResult family;
@@ -11,6 +12,7 @@ struct LibraryPipeline {
     std::string nominal_prior,full_prior;
     std::unique_ptr<RepairPipeline> repair;
     RoutingResult routing;
+    std::shared_ptr<WorkerPool> pool;
 };
 struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; };
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false,bool defer_routing=false,bool counts=false);

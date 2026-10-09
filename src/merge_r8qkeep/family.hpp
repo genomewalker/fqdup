@@ -10,5 +10,6 @@ struct FamilyResult {
     std::string edits_tsv, families_tsv, stats_json;
 };
 std::vector<FamilyRead> read_family_fastq(const std::string& path);
-FamilyResult correct_family(std::vector<FamilyRead> r1, std::vector<FamilyRead> r2, int threads = 1,bool debug = true);
+class WorkerPool;
+FamilyResult correct_family(std::vector<FamilyRead> r1, std::vector<FamilyRead> r2, int threads = 1,bool debug = true,WorkerPool* shared_pool=nullptr);
 }
