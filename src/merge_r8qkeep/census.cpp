@@ -42,10 +42,19 @@ fqalign::FullResult full_columns(fqalign::FullCorrespondence& engine,const std::
     return r;
 }
 }
-CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start,bool counts) {
-    ParsedNativeRecords parsed;
-    if(native.records.empty()&&!native.native_tsv.empty())parsed=parse_native_records(native.native_tsv);
-    const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
+namespace {
+// Both source vectors remain immutable until ordered_index_chunks drains.
+// Only likelihoods/debug text are owned by each returned chunk.
+struct CensusPairs {
+    const std::vector<FamilyPair>& all;
+    std::size_t offset,count;
+    auto begin()const{return all.begin()+offset;}
+    auto end()const{return begin()+count;}
+    std::size_t size()const{return count;}
+    bool empty()const{return count==0;}
+    const FamilyPair& operator[](std::size_t i)const{return all[offset+i];}
+};
+CensusResult census_rows(CensusPairs pairs,NativeRecords native_rows,bool debug,int threads,std::size_t start,bool counts) {
     if(threads>1) {
         // Duplicate IDs share an accumulator in the frozen serial algorithm.
         // Keep that path unchanged; otherwise each pair's sums are independent.
@@ -56,16 +65,16 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
             const auto count=native_rows.size();
             if(std::size_t(count)!=pairs.size())throw std::runtime_error("native census row count");
             CensusResult result;result.nominal_pairs.reserve(pairs.size());bool first=true;
-            ordered_index_chunks(native_rows.size(),std::min(threads,4),start,[&](std::size_t offset,std::size_t n){
-                std::vector<FamilyPair> block(pairs.begin()+offset-start,pairs.begin()+offset-start+n);
-                NativeResult part;const auto range=native_rows.slice(offset-start,n);part.records.assign(range.begin(),range.end());return census(block,part,debug,1,offset,counts);
+            ordered_index_chunks(native_rows.size(),threads,start,[&](std::size_t offset,std::size_t n){
+                const CensusPairs block{pairs.all,pairs.offset+offset-start,n};
+                return census_rows(block,native_rows.slice(offset-start,n),debug,1,offset,counts);
             },[&](CensusResult part){
                 const auto append=[&](std::string& target,const std::string& text){target+=first?text:text.substr(text.find('\n')+1);};
                 if(debug){append(result.nominal_tsv,part.nominal_tsv);append(result.full_tsv,part.full_tsv);}
                 result.proposed_edits_tsv+=part.proposed_edits_tsv;
                 for(auto& p:part.nominal_pairs)result.nominal_pairs.push_back(std::move(p));
                 for(auto& p:part.full_pairs)result.full_pairs.push_back(std::move(p));first=false;
-            });
+            },"census");
             if(!pairs.empty())return result;
         }
     }
@@ -97,5 +106,12 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
     }
     if(row!=pairs.size())throw std::runtime_error("missing native row");
     return {debug?nominal.str():"",debug?full.str():"",edits.str(),nominal_pairs.take(),full_pairs.take()};
+}
+}
+CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& native,bool debug,int threads,std::size_t start,bool counts) {
+    ParsedNativeRecords parsed;
+    if(native.records.empty()&&!native.native_tsv.empty())parsed=parse_native_records(native.native_tsv);
+    const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
+    return census_rows({pairs,0,pairs.size()},native_rows,debug,threads,start,counts);
 }
 }
