@@ -96,9 +96,12 @@ public:
             const auto x=query^part.value;
             // Collapse each 3-bit code to one difference bit; query code 4
             // adds its N bit even when the stored code is also N.
-            auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
-            int differences=0;while(different&&differences<=2){different&=different-1;++differences;}
-            if(differences<=2)
+            const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
+            // Unsigned zero stays zero; clearing twice leaves zero iff <=2
+            // difference bits were set. Candidate order and N rules are intact.
+            auto remaining=different&(different-1);
+            remaining&=remaining-1;
+            if(remaining==0)
                 for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;
             for(int b=0;b<4;++b)if(at[b]<end[b]&&blocks_[b][at[b]]==minimum)++at[b];
         }
