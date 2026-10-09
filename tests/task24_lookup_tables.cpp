@@ -14,6 +14,7 @@ int main(){
   double e=Direct::component(t),d=2*e-4*e*e/3;
   const auto x=Model::tables().fixed[t][agree];const auto p=Direct::conditional(e,e,agree);
   bits(x.log,Direct::clipped_log(agree?1-d:d));bits(x.risk.first,p.first);bits(x.risk.second,p.second);
+  bits(x.log,Model::tables().fixed_log[agree][t]);
  }
  for(int a=33;a<=126;++a)for(int b=33;b<=126;++b)for(bool agree:{false,true}){
   double e1=fqalign::phred_error(char(a)),e2=fqalign::phred_error(char(b)),d=e1+e2-4*e1*e2/3;
@@ -33,6 +34,16 @@ int main(){
   for(int f=0;f<2;++f){std::array<double,66>w{};double total=0;for(int t=0;t<66;++t){w[t]=row%5==0?(t==row%66):double(rng()%100);total+=w[t];}
    prior<<f<<' '<<(row%17!=0);for(double v:w)prior<<' '<<(row%17==0?0:v/total);prior<<'\n';}
   std::istringstream a(prior.str()),b(prior.str());Model model(a);Direct direct(b);
+  // Public weight mutation must bypass constructor logs. Signed zero has the
+  // same nonpositive-weight result; swapped positive components change logs.
+  if(row%3==0)for(int f=0;f<2;++f){std::swap(model.weights[f][1],model.weights[f][33]);std::swap(direct.weights[f][1],direct.weights[f][33]);}
+  const int saved_rounding=std::fegetround();
+  for(int rounding:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
+   require(std::fesetround(rounding)==0);
+   for(int f=0;f<2;++f){auto logs=model.initial_log_weights(f);for(int t=0;t<Model::K;++t)
+    bits(logs[t],model.weights[f][t]>0?std::log(model.weights[f][t]):-std::numeric_limits<double>::infinity());}
+  }
+  require(std::fesetround(saved_rounding)==0);
   const size_t n=11+rng()%100;std::string s1(n,'A'),s2(n,'T'),q1(n,'I'),q2(n,'I');
   for(size_t i=0;i<n;++i){s1[i]="ACGTN"[rng()%5];q1[i]=char(33+rng()%94);q2[i]=char(33+rng()%94);}
   s2=fqalign::reverse_complement(s1);for(char& c:s2)if(rng()%8==0)c="ACGTN"[rng()%5];

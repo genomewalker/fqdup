@@ -1,5 +1,6 @@
 #pragma once
 #include "native_quality.hpp"
+#include <cfenv>
 #include <fstream>
 #include <sstream>
 namespace fqquality {
@@ -7,6 +8,18 @@ struct PairMixture {
  static constexpr int grid=64,K=66;
  std::array<std::array<double,K>,2> weights{};
  std::array<bool,2> supported{};
+private:
+ std::array<std::array<double,K>,2> original_weights{},original_logs{};
+ int log_rounding=FE_TONEAREST;
+public:
+ // The production model is immutable; legacy callers may still edit weights.
+ // Reuse only logs of the same weights computed in the same rounding mode.
+ std::array<double,K> initial_log_weights(int training)const {
+  if(std::fegetround()==log_rounding&&weights[training]==original_weights[training])return original_logs[training];
+  std::array<double,K> out{};
+  for(int j=0;j<K;++j)out[j]=weights[training][j]>0?std::log(weights[training][j]):-std::numeric_limits<double>::infinity();
+  return out;
+ }
  explicit PairMixture(std::istream& f) {
   std::string magic;int g;
   if(!(f>>magic>>g)||magic!="FQDUP_PAIR_MIXTURE_V1"||g!=grid)throw std::invalid_argument("invalid pair-mixture header");
@@ -16,6 +29,9 @@ struct PairMixture {
    supported[fold]=pairs>0;if((supported[fold]&&std::abs(sum-1)>1e-8)||(!supported[fold]&&sum!=0))throw std::invalid_argument("mixture weight mass");
   }
   std::string extra;if(f>>extra)throw std::invalid_argument("extra mixture data");
+  original_weights=weights;log_rounding=std::fegetround();
+  for(int fold=0;fold<2;++fold)for(int j=0;j<K;++j)
+   original_logs[fold][j]=weights[fold][j]>0?std::log(weights[fold][j]):-std::numeric_limits<double>::infinity();
  }
  bool prior_floor(fqalign::PairRisk& risk,const std::string& s1,const std::string& q1,const std::string& s2,const std::string& q2)const {
   int training=1-fold(s1,s2);if(!supported[training])return false;
@@ -36,13 +52,14 @@ struct PairMixture {
  struct Tables {
   std::array<double,K> components{};
   std::array<std::array<Entry,2>,K> fixed{};
+  std::array<std::array<double,K>,2> fixed_log{};
   std::array<std::array<Entry,2>,94*94> nominal{};
  };
  static const Tables& tables(){
   static const Tables value=[] {
    Tables out;
    for(int t=0;t<K;++t){double e=component_direct(t);out.components[t]=e;
-    if(t)for(int a=0;a<2;++a){double d=2*e-4*e*e/3;out.fixed[t][a]={clipped_log(a?1-d:d),conditional(e,e,a)};}
+    if(t)for(int a=0;a<2;++a){double d=2*e-4*e*e/3;out.fixed[t][a]={clipped_log(a?1-d:d),conditional(e,e,a)};out.fixed_log[a][t]=out.fixed[t][a].log;}
    }
    for(int q1=33;q1<=126;++q1)for(int q2=33;q2<=126;++q2){
     double e1=fqalign::phred_error(char(q1)),e2=fqalign::phred_error(char(q2)),d=e1+e2-4*e1*e2/3;
@@ -114,11 +131,13 @@ struct PairMixture {
    }
   }
   const auto rc=fqalign::reverse_complement(s2);std::vector<std::pair<int,int>> cols;for(auto c:risk.correspondence.invariant)if(s1.at(c.first)!='N'&&rc.at(c.second)!='N')cols.push_back(c);
-  std::array<double,K> logpost{},post{};
-  for(int j=0;j<K;++j)logpost[j]=weights[training][j]>0?std::log(weights[training][j]):-std::numeric_limits<double>::infinity();
+  auto logpost=initial_log_weights(training);std::array<double,K> post{};
   size_t n=0;for(auto [i,j]:cols){int k=int(s2.size())-1-j;if(s1.at(i)=='N'||rc.at(j)=='N')continue;++n;
    bool agree=s1.at(i)==rc.at(j);
-   for(int t=0;t<K;++t)logpost[t]+=lookup(t,q1.at(i),q2.at(k),agree).log;
+   // Component zero validates both qualities before the fixed table reads.
+   logpost[0]+=lookup(0,q1.at(i),q2.at(k),agree).log;
+   const auto& fixed_log=tables().fixed_log[agree];
+   for(int t=1;t<K;++t)logpost[t]+=fixed_log[t];
   }
   if(!n)return false;double maximum=*std::max_element(logpost.begin(),logpost.end()),mass=0;if(!std::isfinite(maximum))throw std::runtime_error("empty mixture posterior");
   for(int t=0;t<K;++t){post[t]=std::exp(logpost[t]-maximum);mass+=post[t];}for(double& p:post)p/=mass;
