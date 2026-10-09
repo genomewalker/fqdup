@@ -1,6 +1,7 @@
 #include "../src/merge_r8qkeep/repair.cpp"
 #include <cstring>
 #include <random>
+#include <limits>
 namespace fqalign = fqdup_r8qkeep_repair_internal::fqalign;
 #include "task24_pair_mixture_direct.hpp"
 using Model = fqdup_r8qkeep_repair_internal::fqquality::PairMixture;
@@ -28,10 +29,32 @@ int main(){
  for(int q:{0,32,127,255})for(int t:{0,1,65})for(bool first:{false,true}){
   bool threw=false;try{Model::lookup(t,first?char(q):'I',first?'I':char(q),true);}catch(const std::invalid_argument&){threw=true;}require(threw);
  }
+ // Sparse conditional products retain bitwise reductions under every rounding
+ // mode, including zero nominal mass, underflowed terms and signed zeros.
+ const int original_rounding=std::fegetround();
+ for(int rounding:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
+  require(std::fesetround(rounding)==0);
+  for(int variant=0;variant<8;++variant){
+   std::array<double,Model::K> posterior{};
+   posterior[variant%2?18:0]=.75;
+   posterior[variant%3?65:1]=.25;
+   posterior[33]=variant%2?std::numeric_limits<double>::denorm_min():-0.;
+   Model::ConditionalProducts products(posterior);
+   for(char q1:{'!','I','~'})for(char q2:{'!','J','~'})for(bool agree:{false,true}){
+    double p1=0,p2=0;
+    for(int z=0;z<Model::K;++z){const auto p=Model::lookup(z,q1,q2,agree).risk;p1+=posterior[z]*p.first;p2+=posterior[z]*p.second;}
+    for(int repeat=0;repeat<2;++repeat){const auto p=products.get(q1,q2,agree);bits(p.first,p1);bits(p.second,p2);}
+   }
+   for(int q:{0,32,127,255}){
+    bool threw=false;try{products.get(char(q),'I',true);}catch(const std::invalid_argument&){threw=true;}require(threw);
+   }
+  }
+ }
+ require(std::fesetround(original_rounding)==0);
  std::mt19937 rng(24);
- for(int row=0;row<250;++row){
+ for(int row=0;row<350;++row){
   std::ostringstream prior;prior.precision(17);prior<<"FQDUP_PAIR_MIXTURE_V1 64\n";
-  for(int f=0;f<2;++f){std::array<double,66>w{};double total=0;for(int t=0;t<66;++t){w[t]=row%5==0?(t==row%66):double(rng()%100);total+=w[t];}
+  for(int f=0;f<2;++f){std::array<double,66>w{};double total=0;for(int t=0;t<66;++t){w[t]=row%5==0?(t==row%66):row%5==1?(t==0||t==18?double(1+rng()%100):0):row%5==2?(t==1||t==65?double(1+rng()%100):0):double(rng()%100);total+=w[t];}
    prior<<f<<' '<<(row%17!=0);for(double v:w)prior<<' '<<(row%17==0?0:v/total);prior<<'\n';}
   std::istringstream a(prior.str()),b(prior.str());Model model(a);Direct direct(b);
   // Public weight mutation must bypass constructor logs. Signed zero has the

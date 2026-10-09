@@ -85,14 +85,19 @@ public:
   struct Entry {unsigned key=0;std::pair<double,double> risk{};};
   const std::array<double,K>& posterior;
   std::array<Entry,64> entries{};
-  explicit ConditionalProducts(const std::array<double,K>& p):posterior(p){}
+  std::array<int,K> active{};
+  int active_size=1;
+  explicit ConditionalProducts(const std::array<double,K>& p):posterior(p){
+   // Keep zero for quality validation; positive terms retain component order.
+   for(int z=1;z<K;++z)if(p[z]!=0)active[active_size++]=z;
+  }
   std::pair<double,double> get(char q1,char q2,bool agree){
    const unsigned key=1+static_cast<unsigned char>(q1)+
        (unsigned(static_cast<unsigned char>(q2))<<8)+(unsigned(agree)<<16);
    auto& entry=entries[(key*2654435761U)>>26];
    if(entry.key!=key){
     double p1=0,p2=0;
-    for(int z=0;z<K;++z){auto p=lookup(z,q1,q2,agree).risk;p1+=posterior[z]*p.first;p2+=posterior[z]*p.second;}
+    for(int a=0;a<active_size;++a){const int z=active[a];auto p=lookup(z,q1,q2,agree).risk;p1+=posterior[z]*p.first;p2+=posterior[z]*p.second;}
     entry={key,{p1,p2}};
    }
    return entry.risk;
@@ -135,12 +140,18 @@ public:
   }
   const auto rc=fqalign::reverse_complement(s2);std::vector<std::pair<int,int>> cols;for(auto c:risk.correspondence.invariant)if(s1.at(c.first)!='N'&&rc.at(c.second)!='N')cols.push_back(c);
   auto logpost=initial_log_weights(training);std::array<double,K> post{};
+  std::array<int,K> active{};int active_size=0;
+  for(int t=1;t<K;++t)if(weights[training][t]>0)active[active_size++]=t;
+  // Zero-weight log posteriors stay -infinity under every finite update.
+  // Use the original dense loop for broad support to retain vectorization.
+  const bool sparse=active_size<16;
   size_t n=0;for(auto [i,j]:cols){int k=int(s2.size())-1-j;if(s1.at(i)=='N'||rc.at(j)=='N')continue;++n;
    bool agree=s1.at(i)==rc.at(j);
    // Component zero validates both qualities before the fixed table reads.
    logpost[0]+=lookup(0,q1.at(i),q2.at(k),agree).log;
    const auto& fixed_log=tables().fixed_log[agree];
-   for(int t=1;t<K;++t)logpost[t]+=fixed_log[t];
+   if(sparse){for(int a=0;a<active_size;++a){const int t=active[a];logpost[t]+=fixed_log[t];}}
+   else for(int t=1;t<K;++t)logpost[t]+=fixed_log[t];
   }
   if(!n)return false;double maximum=*std::max_element(logpost.begin(),logpost.end()),mass=0;if(!std::isfinite(maximum))throw std::runtime_error("empty mixture posterior");
   for(int t=0;t<K;++t){post[t]=std::exp(logpost[t]-maximum);mass+=post[t];}for(double& p:post)p/=mass;
