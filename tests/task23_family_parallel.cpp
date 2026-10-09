@@ -2,6 +2,9 @@
 // Frozen B1 oracle from 456fc55: original seen-array and root-shortcut traversal.
 #include "task23_family_serial.hpp"
 #include "task25_columns_ref.hpp"
+#include "task25_family_counters_ref.hpp"
+#include <cfenv>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 static void require(bool ok){if(!ok)throw std::runtime_error("family parallel mismatch");}
@@ -22,13 +25,15 @@ static void column_parity(){
         for(std::size_t id=0;id<pairs.size();++id)for(int side=0;side<2;++side){
             auto& read=pairs[id].r[side];read.s.resize(1+rng()%30);
             for(auto& base:read.s)base="ACGTN"[rng()%5];
-            read.q.assign(read.s.size(),'I');
+            read.q.resize(read.s.size());for(char& q:read.q)q=char(33+rng()%61);
         }
         std::vector<int> group(24);std::iota(group.begin(),group.end(),0);
         std::shuffle(group.begin(),group.end(),rng);group.resize(size);
         // Exercise all bounded base slots, not only the usual four DNA bases.
         if(trial==0)for(int member=0;member<size;++member)
             for(int side=0;side<2;++side)pairs[group[member]].r[side].s[0]=char('A'+member);
+        require(second_molecule(pairs,group)==frozen_family_counters::second_molecule(pairs,group));
+        require(high_quality_counts(pairs,group)==frozen_family_counters::high_quality_counts(pairs,group));
         for(int side=0;side<2;++side){
             const auto expected=frozen_columns::columns(pairs,group,side);
             const auto actual=columns(pairs,group,side);
@@ -46,11 +51,30 @@ static void column_parity(){
             }
         }
     }
+    // Keep disagreement below MAXDIS so shared minority pairs, not the
+    // preliminary rate check, decide whether these shuffled-ID groups disband.
+    for(int pattern=0;pattern<3;++pattern){
+        std::vector<Pair> pairs(24);const std::vector<int> group{23,7,18,2,9,0};
+        for(auto& pair:pairs)for(auto& read:pair.r){read.s.assign(50,'A');read.q.assign(50,'I');}
+        for(int member:{1,4})pairs[group[member]].r[0].s[3]='C';
+        if(pattern)for(int member:{1,pattern==1?4:5})pairs[group[member]].r[1].s[8]='C';
+        require(second_molecule(pairs,group)==(pattern==1));
+        require(second_molecule(pairs,group)==frozen_family_counters::second_molecule(pairs,group));
+        require(high_quality_counts(pairs,group)==frozen_family_counters::high_quality_counts(pairs,group));
+    }
     std::cout<<"FAMILY_COLUMN_BYTES compact="<<sizeof(Column)
              <<" old_object="<<sizeof(frozen_columns::Column)
              <<" old_nested_allocations=excluded"<<std::endl;
 }
 int main(){try{
+    const int rounding=std::fegetround();
+    for(int mode:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
+        require(std::fesetround(mode)==0);const auto errors=family_quality_errors();
+        Read read;read.q.resize(1);
+        for(int byte=0;byte<256;++byte){read.q[0]=char(byte);double expected=std::pow(10.0,-qv(read,0)/10.0);
+            require(std::memcmp(&expected,&errors[byte],sizeof(double))==0);}
+    }
+    require(std::fesetround(rounding)==0);
     column_parity();
     std::mt19937 rng(2302);const std::string alphabet="ACGT";
     std::vector<std::string> keys;

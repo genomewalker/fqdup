@@ -255,16 +255,40 @@ std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& 
 }
 bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
     const std::array<std::vector<Column>,2> all_columns{columns(P,g,0),columns(P,g,1)};
-    std::map<std::pair<int, int>, int> shared; long multi = 0, cover = 0;
+    std::array<std::array<int,MAXCOMP>,MAXCOMP> shared{}; long multi = 0, cover = 0;
     for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
     if (cover && double(multi) / cover > MAXDIS) return true;
     for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) { if (col.top < 0) continue;
-        for (size_t v = 0; v < col.votes.size(); ++v) { if (int(v) == col.top || col.votes[v].second.size() < 2) continue; const auto& ids = col.votes[v].second;
-            for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) ++shared[{ids[x], ids[y]}]; } }
-    for (auto& [k, v] : shared) if (v >= 2) return true;
+        for (size_t v = 0; v < col.votes.size(); ++v) { if (int(v) == col.top || col.votes[v].second.size() < 2) continue;
+            const auto mask=col.votes[v].second.bits;
+            for(auto x=mask;x;x&=x-1)for(auto y=std::uint16_t(x&(x-1));y;y&=y-1)
+                if(++shared[__builtin_ctz(unsigned(x))][__builtin_ctz(unsigned(y))]>=2)return true;
+        }
+    }
     return false;
 }
 int qv(const Read& r, size_t c) { return r.q[c] - 33; }
+std::array<int,MAXCOMP> high_quality_counts(const std::vector<Pair>& P,const std::vector<int>& g) {
+    std::array<int,MAXCOMP> hiq{};
+    for(int side=0;side<2;++side){const auto cols=columns(P,g,side);
+        for(size_t c=0;c<cols.size();++c){const auto& col=cols[c];if(col.top<0)continue;
+            int topq=-1;for(int i:col.votes[col.top].second)topq=std::max(topq,qv(P[i].r[side],c));
+            if(topq<30)continue;
+            for(size_t v=0;v<col.votes.size();++v)if(int(v)!=col.top)
+                for(auto bits=col.votes[v].second.bits;bits;bits&=bits-1){
+                    const auto member=__builtin_ctz(unsigned(bits));
+                    if(qv(P[g[member]].r[side],c)>=30)++hiq[member];
+                }
+        }
+    }
+    return hiq;
+}
+std::array<double,256> family_quality_errors() {
+    std::array<double,256> out{};
+    // Preserve char signedness and the original qv/pow expression for every byte.
+    for(int byte=0;byte<256;++byte){const int q=char(byte)-33;out[byte]=std::pow(10.0,-q/10.0);}
+    return out;
+}
 // --damage-safe (DAMAGE_PREREG.md, validated): never change a C<->T / G<->A base, nor lower its Q, at read position < 10
 // or within 10 positions before the first adapter-seed occurrence in that read.
 constexpr int DSZONE = 10;
@@ -291,6 +315,7 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
             return 0;
         },[](int){},"family_disband");
         phase("disband");
+        const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         struct CorrectedChunk {std::string ledger;std::array<long,9> counts;};
         // Groups partition P; each worker changes only its own group's reads.
@@ -299,11 +324,8 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = begin; gi < begin+n; ++gi) {
             const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
-            std::map<int, int> hiq;
-            for (int side = 0; side < 2; ++side) { auto cols = columns(P, g0, side);
-                for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c]; if (col.top < 0) continue; int topq = -1; for (int i : col.votes[col.top].second) topq = std::max(topq, qv(P[i].r[side], c));
-                    if (topq < 30) continue; for (size_t v = 0; v < col.votes.size(); ++v) if (int(v) != col.top) for (int i : col.votes[v].second) if (qv(P[i].r[side], c) >= 30) ++hiq[i]; } }
-            std::vector<int> g; for (int i : g0) if (hiq[i] < 2) g.push_back(i);
+            const auto hiq=high_quality_counts(P,g0);
+            std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
             ++fam; members += long(g.size());
             for (int side = 0; side < 2; ++side) { auto cols = columns(P, g, side);
@@ -314,7 +336,7 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
                     else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
                         ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
                         for (auto v : col.votes) for (int i : v.second) { if (damage_safe && v.first != top && transition(v.first, top) && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, top, q); } }
-                    else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
+                    else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = quality_errors[static_cast<unsigned char>(P[i].r[side].q[c])]; w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
         return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded}};
