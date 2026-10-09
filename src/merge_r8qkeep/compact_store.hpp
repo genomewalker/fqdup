@@ -1,5 +1,6 @@
 #pragma once
 #include "family.hpp"
+#include "worker_pool.hpp"
 #include "packed_kernels.hpp"
 #include <algorithm>
 #include <array>
@@ -62,7 +63,8 @@ private:
         std::size_t value=0;unsigned shift=0;
         for(;;){const auto byte=headers_.at(offset++);value|=std::size_t(byte&127)<<shift;if(!(byte&128))return value;shift+=7;}
     }
-    void add_alphabet(std::string_view text) {
+    #include "parallel_quality.inc"
+    void add_alphabet(std::string_view text,WorkerPool* pool=nullptr,int workers=1) {
         const unsigned old_width=width_;bool changed=false;
         for(unsigned char c:text)if(codes_[c]<0){codes_[c]=int(alphabet_size_);alphabet_[alphabet_size_++]=c;changed=true;}
         if(!changed)return;
@@ -73,7 +75,7 @@ private:
         const auto n=starts_.back();
         qualities_.resize((n*width_+7)/8);
         // Widen backwards: destination bits cannot overwrite an unread code.
-        for(std::uint64_t i=n;i>0;){--i;const auto old=get(qualities_,i,old_width);const auto c=old_width==8?old:alphabet_[old];put(qualities_,i,width_,width_==8?c:codes_[c]);}
+        widen_qualities(old_width,pool,workers);
     }
     template<class Read> void append_read(const Read& read) {
         if(read.s.size()!=read.q.size())throw std::runtime_error("FASTQ lengths");
@@ -117,10 +119,11 @@ private:
         for(;e!=exception_positions_.end()&&*e<end;++e)read.s[*e-start]=char(exception_values_[e-exception_positions_.begin()]);
     }
 public:
+    #include "compact_join.inc"
     CompactPairStore(){codes_.fill(-1);}
     std::size_t size()const{return (starts_.size()-1)/2;}
     bool empty()const{return size()==0;}
-    void prepare_qualities(std::string_view symbols){add_alphabet(symbols);}
+    void prepare_qualities(std::string_view symbols,WorkerPool* pool=nullptr,int workers=1){add_alphabet(symbols,pool,workers);}
     std::array<std::size_t,5> capacity_bytes()const{return {bases_.capacity(),qualities_.capacity(),headers_.capacity()+8*checkpoints_.capacity(),8*starts_.capacity()+4*order_.capacity(),8*exception_positions_.capacity()+exception_values_.capacity()};}
     unsigned quality_width()const{return width_;}
     unsigned quality_alphabet_size()const{return alphabet_size_;}

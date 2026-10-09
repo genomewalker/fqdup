@@ -315,3 +315,11 @@ add_test(NAME task26_packed_kernels COMMAND test_task26_packed_kernels)
 
 add_executable(test_task26_content_memo tests/task26_content_memo.cpp)
 add_test(NAME task26_content_memo COMMAND test_task26_content_memo)
+
+foreach(task26_test compact_join parallel_quality parallel_input)
+  add_executable(test_task26_${task26_test} tests/task26_${task26_test}.cpp)
+  target_include_directories(test_task26_${task26_test} PRIVATE include)
+  target_link_libraries(test_task26_${task26_test} PRIVATE Threads::Threads)
+  add_test(NAME task26_${task26_test} COMMAND test_task26_${task26_test})
+endforeach()
+set_tests_properties(task26_parallel_input task26_parallel_quality PROPERTIES TIMEOUT 30)

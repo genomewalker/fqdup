@@ -82,7 +82,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
         phase("correction");
         std::array<bool,256> observed{};std::string alphabet;
         for(const auto& edit:all_edits){const auto q=static_cast<unsigned char>(edit.quality);if(!observed[q]){observed[q]=true;alphabet+=edit.quality;}}
-        store.prepare_qualities(alphabet);
+        store.prepare_qualities(alphabet,&pool,std::max(1,std::min(threads,8)));
         for(const auto& edit:all_edits)store.edit(edit.pair,edit.mate,edit.position,edit.base,edit.quality);
         std::vector<CompactEdit>().swap(all_edits);
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;

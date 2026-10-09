@@ -1,4 +1,7 @@
 #include "pipeline.hpp"
+#include "worker_pool.hpp"
+#include <array>
+#include <deque>
 #include "memory_status.hpp"
 #include "fqdup/fastq_types.hpp"
 #include <algorithm>
@@ -22,6 +25,7 @@ std::shared_ptr<CompactPairStore> compact_input(const std::vector<std::string>& 
         store->append(x.header,x.seq,x.qual,y.header,y.seq,y.qual);}
     return store;
 }
+#include "parallel_input.inc"
 void write(const std::filesystem::path& path,const std::string& text){std::ofstream out(path,std::ios::binary);out<<text;out.close();if(!out)throw std::runtime_error("write failed: "+path.string());}
 double number(const std::string& text){std::size_t n;const double x=std::stod(text,&n);if(n!=text.size()||!std::isfinite(x))throw std::runtime_error("invalid numeric argument");return x;}
 }
@@ -43,7 +47,7 @@ int merge_r8qkeep_main(int argc,char** argv){
         if(!std::filesystem::create_directory(outdir))throw std::runtime_error("output directory exists");const std::filesystem::path out=outdir;
         if(multiple)for(const auto& text:cuts)if(!std::filesystem::create_directory(out/text))throw std::runtime_error("duplicate cutoff directory");
         const auto input_start=std::chrono::steady_clock::now();
-        auto store=compact_input(r1,r2);
+        auto store=threads>1?parallel_compact_input(r1,r2,threads):compact_input(r1,r2);
         if(timings||debug)std::cerr<<"MERGE_STAGE input_wall seconds="
             <<std::chrono::duration<double>(std::chrono::steady_clock::now()-input_start).count()
             <<memory_status()<<'\n';
