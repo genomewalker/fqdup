@@ -104,7 +104,7 @@ struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Pigeonhole candidates with the frozen N/N mismatch rule.
 // Union roots are not output: groups/members are emitted by ascending read id.
-bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64){
+bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* shared_pool=nullptr){
     const auto code=[](char c){switch(c){case 'A':return 0;case 'C':return 1;case 'G':return 2;case 'T':return 3;case 'N':return 4;default:return -1;}};
     for(const auto& key:keys)if(!key.empty()){if(key.size()!=40||std::count(key.begin(),key.end(), 'N')>MAXN)return false;for(char c:key)if(code(c)<0)return false;}
     const auto started=std::chrono::steady_clock::now();
@@ -114,8 +114,9 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){auto [it,new_key]=exact.emplace(keys[i],representative.size());if(new_key)representative.push_back(i);else unite(i,representative[it->second]);}
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
     const int workers=std::max(1,std::min(threads,8));
-    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
-    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
+    std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
+    auto* pool=workers>1?shared_pool:nullptr;
+    if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
     const auto build_part=[&](int part){index[part].build(keys,representative,bounds[part],bounds[part+1]);};
     if(pool){
         std::array<std::future<void>,3> builds;
@@ -194,9 +195,10 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     return true;
 }
 
-std::vector<std::string> keys_of(const std::vector<Pair>& P) {
+std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::WorkerPool* pool=nullptr,int threads=1) {
     std::vector<std::string> keys(P.size());
-    for (size_t i = 0; i < P.size(); ++i) {
+    const auto collect=[&](std::size_t begin,std::size_t count){
+    for (size_t i = begin; i < begin+count; ++i) {
         const auto &a = P[i].r[0].s, &b = P[i].r[1].s; if (int(a.size()) < KEYLEN || int(b.size()) < KEYLEN) continue;
         std::string k = a.substr(0, KEYLEN) + b.substr(0, KEYLEN);
         if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
@@ -212,15 +214,23 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P) {
             if (ok) keys[i] = k;
         }
     }
+    };
+    if(pool)fqdup::r8qkeep::ordered_index_chunks(*pool,P.size(),threads,0,
+        [&](std::size_t begin,std::size_t count){collect(begin,count);return 0;},
+        [](int){},"family_keys");
+    else collect(0,P.size());
     return keys;
 }
 std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads) {
     auto last=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
-    const int n = int(P.size()); keys = keys_of(P);phase("keys");
+    const int workers=std::max(1,std::min(threads,8));
+    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
+    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
+    const int n = int(P.size()); keys = keys_of(P,pool.get(),threads);phase("keys");
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-    if(!neighbor_families(keys,parent,threads)){
+    if(!neighbor_families(keys,parent,threads,64,pool.get())){
     std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
     std::unordered_map<std::string, std::vector<int>> buckets;
     for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }

@@ -3,6 +3,7 @@
 #include "task23_family_serial.hpp"
 #include "task25_columns_ref.hpp"
 #include "task25_family_counters_ref.hpp"
+#include "task25_family_keys_ref.hpp"
 #include <cfenv>
 #include <cstring>
 #include <random>
@@ -66,7 +67,41 @@ static void column_parity(){
              <<" old_object="<<sizeof(frozen_columns::Column)
              <<" old_nested_allocations=excluded"<<std::endl;
 }
+static void key_parity(){
+    std::mt19937 rng(2538);std::vector<Pair> all(1025);
+    const std::array<std::size_t,10> lengths{0,1,19,20,21,31,64,100,150,512};
+    for(std::size_t id=0;id<all.size();++id)for(int side=0;side<2;++side){
+        auto& sequence=all[id].r[side].s;sequence.resize(lengths[(id+side*3)%lengths.size()]);
+        for(char& c:sequence)c="ACGT"[rng()%4];
+        switch((id/lengths.size())%8){
+        case 1:for(std::size_t k=0;k<std::min<std::size_t>(id%4,sequence.size());++k)sequence[k]='N';break;
+        case 2:sequence.assign(sequence.size(),'A');break;
+        case 3:{const std::size_t pos=std::array<std::size_t,5>{0,19,20,29,40}[id%5];if(pos+ADSEED<=sequence.size())sequence.replace(pos,ADSEED,ADAPTERS[side].substr(0,ADSEED));break;}
+        case 4:{const auto tail=std::min<std::size_t>(9+id%3,sequence.size());sequence.replace(sequence.size()-tail,tail,tail,'G');break;}
+        case 5:for(std::size_t k=0;k<sequence.size();++k)sequence[k]="ACGT"[k%4];break;
+        case 6:if(!sequence.empty())sequence[id%sequence.size()]='X';break;
+        default:break;
+        }
+    }
+    const int rounding=std::fegetround();std::size_t cases=0;
+    for(int mode:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
+        require(std::fesetround(mode)==0);
+        for(int workers:{2,8}){
+            fqdup::r8qkeep::WorkerPool pool(workers);
+            for(std::size_t count:{0,1,127,128,129,511,512,513,1023,1024,1025}){
+                std::vector<Pair> pairs(all.begin(),all.begin()+count);
+                const auto expected=frozen_keys_of(pairs);
+                require(keys_of(pairs)==expected);
+                require(keys_of(pairs,&pool,workers)==expected);++cases;
+            }
+        }
+    }
+    require(std::fesetround(rounding)==0);
+    std::cout<<"TASK25_FAMILY_KEYS_PASS cases="<<cases<<'\n';
+}
+
 int main(){try{
+    key_parity();
     const int rounding=std::fegetround();
     for(int mode:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}){
         require(std::fesetround(mode)==0);const auto errors=family_quality_errors();
