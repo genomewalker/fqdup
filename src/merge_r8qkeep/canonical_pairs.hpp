@@ -12,7 +12,8 @@ namespace fqdup::r8qkeep {
 // Validate before sorting so that sorting cannot conceal mispaired inputs.
 inline void canonicalize_family_input(std::vector<FamilyRead>& r1,
                                       std::vector<FamilyRead>& r2,
-                                      WorkerPool* pool=nullptr,int threads=1) {
+                                      WorkerPool* pool=nullptr,int threads=1,
+                                      std::vector<std::size_t>* input_order=nullptr) {
     if (r1.size() != r2.size()) throw std::runtime_error("pair count");
     for (std::size_t i = 0; i < r1.size(); ++i)
         if (r1[i].id != r2[i].id) throw std::runtime_error("pair order " + r1[i].id);
@@ -49,6 +50,7 @@ inline void canonicalize_family_input(std::vector<FamilyRead>& r1,
             order.swap(scratch);
         }
     }
+    if(input_order)*input_order=order;
     // order[destination] = source. Move cycles with two saved reads, retaining
     // only one size_t per pair instead of duplicating the sequence storage.
     for (std::size_t start = 0; start < order.size(); ++start) {

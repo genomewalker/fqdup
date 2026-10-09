@@ -12,6 +12,7 @@ struct NativeSettings {
 };
 inline constexpr std::size_t native_batch_size=2048;
 struct NativeResult {
+    std::shared_ptr<std::vector<FamilyPair>> raw_owner;
     std::vector<NativeRecord> records;
     std::string merged_fq, r1_fq, r2_fq, orphan_fq, outcomes_jsonl;
     std::string native_tsv, native_outcomes_json;

@@ -302,3 +302,11 @@ target_include_directories(test_task25_prior_sample PRIVATE src ${XXHASH_INCLUDE
 target_link_libraries(test_task25_prior_sample PRIVATE ${XXHASH_LIB})
 target_compile_options(test_task25_prior_sample PRIVATE -UNDEBUG)
 add_test(NAME task25_prior_sample COMMAND test_task25_prior_sample)
+
+add_executable(test_task26_compact_store tests/task26_compact_store.cpp)
+target_link_libraries(test_task26_compact_store PRIVATE Threads::Threads)
+add_test(NAME task26_compact_store COMMAND test_task26_compact_store)
+add_executable(test_task26_compact_family tests/task26_compact_family.cpp src/merge_r8qkeep/family.cpp)
+target_compile_options(test_task26_compact_family PRIVATE -ffp-contract=off)
+target_link_libraries(test_task26_compact_family PRIVATE Threads::Threads)
+add_test(NAME task26_compact_family COMMAND test_task26_compact_family)

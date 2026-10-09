@@ -2,7 +2,9 @@
 // Must be byte-identical to the JS reference on R1.fastq, R2.fastq, family-edits.tsv and families.tsv.
 // Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
 #include "family.hpp"
+#include "compact_family.hpp"
 #include "family_index.hpp"
+#include "family_key.hpp"
 #include "ordered_chunks.hpp"
 #include "memory_status.hpp"
 #include <algorithm>
@@ -16,6 +18,8 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <type_traits>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -63,9 +67,10 @@ bool low_complexity(std::string_view seq) {
     for (int i = wt; i < nt; ++i) {auto& slot=tri[cursor];del(slot);add(slot=triplet(i));if(exceeds())return true;if(++cursor==wt)cursor=0;}
     return false;
 }
-int mismatches(const std::string& a, const std::string& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
+template<class Key>
+int mismatches(const Key& a, const Key& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
 
-struct Group { std::vector<int> m; bool oversize = false; int diameter = 0; };
+using Group=fqdup::r8qkeep::FamilyGroup;
 // Masks index the original group order; views never own or reorder read IDs.
 struct MemberMask {
     const std::vector<int>* group;
@@ -109,7 +114,8 @@ struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
 // straddles in candidate records while retaining N as an explicit code.
 struct PackedFamilyKey {
     std::uint64_t lo,hi;
-    explicit PackedFamilyKey(const std::string& key):
+    template<class Key>
+    explicit PackedFamilyKey(const Key& key):
         lo(fqdup::r8qkeep::FamilyPartIndex::pack(key,0,20)),
         hi(fqdup::r8qkeep::FamilyPartIndex::pack(key,20,40)){}
     std::uint64_t part(int p) const {
@@ -125,11 +131,12 @@ struct PackedFamilyKey {
 static_assert(sizeof(PackedFamilyKey)==16);
 
 // Integer slots reference immutable full keys; hash collisions never imply equality.
+template<class Key>
 class ExactFamilyKeys {
-    const std::vector<std::string>& keys_;
+    const std::vector<Key>& keys_;
     std::vector<int> slots_;
 public:
-    ExactFamilyKeys(const std::vector<std::string>& keys,std::size_t eligible):keys_(keys){
+    ExactFamilyKeys(const std::vector<Key>& keys,std::size_t eligible):keys_(keys){
         std::size_t capacity=1;
         if(eligible>slots_.max_size()/2)throw std::length_error("family key table size");
         while(capacity<2*eligible)capacity*=2;
@@ -148,10 +155,20 @@ public:
 // Radius8 over40 bases implies radius2 in at least one13/13/14 block.
 // Pigeonhole candidates with the frozen N/N mismatch rule.
 // Union roots are not output: groups/members are emitted by ascending read id.
-bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* shared_pool=nullptr){
+bool indexable_key(const fqdup::r8qkeep::FamilyKey& key){return key.supported()&&key.ns()<=MAXN;}
+bool indexable_key(const std::string& key){
     const auto code=[](char c){switch(c){case 'A':return 0;case 'C':return 1;case 'G':return 2;case 'T':return 3;case 'N':return 4;default:return -1;}};
+    if(key.size()!=40||std::count(key.begin(),key.end(),'N')>MAXN)return false;
+    for(char c:key)if(code(c)<0)return false;return true;
+}
+std::size_t key_hash(const std::string& key){return std::hash<std::string_view>{}(key);}
+std::size_t key_hash(const fqdup::r8qkeep::FamilyKey& key){return key.hash();}
+std::size_t key_bytes(const std::vector<std::string>& keys){return fqdup::r8qkeep::strings_bytes(keys);}
+std::size_t key_bytes(const std::vector<fqdup::r8qkeep::FamilyKey>& keys){return fqdup::r8qkeep::vector_bytes(keys);}
+template<class Key>
+bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* shared_pool=nullptr){
     std::size_t eligible_keys=0;
-    for(const auto& key:keys)if(!key.empty()){++eligible_keys;if(key.size()!=40||std::count(key.begin(),key.end(), 'N')>MAXN)return false;for(char c:key)if(code(c)<0)return false;}
+    for(const auto& key:keys)if(!key.empty()){++eligible_keys;if(!indexable_key(key))return false;}
     const auto started=std::chrono::steady_clock::now();
     const auto root=[&](int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
     const auto unite=[&](int i,int j){i=root(i);j=root(j);if(i!=j)parent[i]=j;};
@@ -159,7 +176,7 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     {
         ExactFamilyKeys exact(keys,eligible_keys);
         for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){
-            const int first=exact.insert(i,std::hash<std::string_view>{}(keys[i]));
+            const int first=exact.insert(i,key_hash(keys[i]));
             if(first==int(i))representative.push_back(i);else unite(i,first);
         }
     } // Release duplicate lookup storage before constructing part indexes.
@@ -181,7 +198,7 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     for(int i:representative)packed_keys.emplace_back(keys[i]);
     if(fqdup::r8qkeep::memory_enabled()){
         fqdup::r8qkeep::MemoryUsage m;
-        m.family=index_bytes+fqdup::r8qkeep::vector_bytes(representative)+fqdup::r8qkeep::vector_bytes(packed_keys)+fqdup::r8qkeep::vector_bytes(parent)+fqdup::r8qkeep::strings_bytes(keys);
+        m.family=index_bytes+fqdup::r8qkeep::vector_bytes(representative)+fqdup::r8qkeep::vector_bytes(packed_keys)+fqdup::r8qkeep::vector_bytes(parent)+key_bytes(keys);
         m.report("family_index",keys.size(),"index_only_excludes_raw");
     }
     const auto generated=std::chrono::steady_clock::now();
@@ -255,23 +272,27 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
     return true;
 }
 
-std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::WorkerPool* pool=nullptr,int threads=1) {
-    std::vector<std::string> keys(P.size());
+bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* pool=nullptr){return neighbor_families_impl(keys,parent,threads,edge_limit,pool);}
+template<class Key=std::string>
+std::vector<Key> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::WorkerPool* pool=nullptr,int threads=1) {
+    std::vector<Key> keys(P.size());
     const auto collect=[&](std::size_t begin,std::size_t count){
     for (size_t i = begin; i < begin+count; ++i) {
         const auto &a = P[i].r[0].s, &b = P[i].r[1].s; if (int(a.size()) < KEYLEN || int(b.size()) < KEYLEN) continue;
-        std::string k;k.reserve(2*KEYLEN);k.append(a.data(),KEYLEN);k.append(b.data(),KEYLEN);
+        std::array<char,2*KEYLEN> bytes;
+        std::copy_n(a.data(),KEYLEN,bytes.data());std::copy_n(b.data(),KEYLEN,bytes.data()+KEYLEN);
+        const std::string_view k(bytes.data(),bytes.size());
         if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
         if (!g_rev8) {
             if (low_complexity(a) || low_complexity(b)) continue;
             bool adapter = false; for (int s = 0; s < 2; ++s) { auto at = P[i].r[s].s.find(ADAPTERS[s].substr(0, ADSEED)); if (at != std::string::npos && int(at) < ADZONE) adapter = true; }
-            if (!adapter) keys[i] = k;
+            if (!adapter) keys[i] = Key(k);
         } else { // Revision 8: complexity on the biological prefix (before adapter seed or terminal G>=10 run); adapter must start at >= KEYLEN
             bool ok = true;
             for (int s = 0; s < 2 && ok; ++s) { const auto& r = P[i].r[s].s; auto at = r.find(ADAPTERS[s].substr(0, ADSEED)); if (at != std::string::npos && int(at) < KEYLEN) { ok = false; break; }
                 size_t e = r.size(); if (at != std::string::npos) e = std::min(e, at); size_t g = r.size(); while (g > 0 && r[g - 1] == 'G') --g; if (r.size() - g >= 10) e = std::min(e, g);
                 if (low_complexity(std::string_view(r).substr(0, e))) ok = false; }
-            if (ok) keys[i] = std::move(k);
+            if (ok) keys[i] = Key(k);
         }
     }
     };
@@ -281,20 +302,29 @@ std::vector<std::string> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::Work
     else collect(0,P.size());
     return keys;
 }
-std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>& keys, int threads,fqdup::r8qkeep::WorkerPool* shared_pool) {
+template<class Key>
+std::vector<Group> families(const std::vector<Pair>& P, std::vector<Key>& keys, int threads,fqdup::r8qkeep::WorkerPool* shared_pool,bool supplied=false) {
     auto last=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
     const int workers=std::max(1,std::min(threads,8));
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
-    const int n = int(P.size()); keys = keys_of(P,pool,threads);phase("keys");
+    if(!supplied)keys=keys_of<Key>(P,pool,threads);
+    const int n=int(keys.size());phase("keys");
+    if constexpr(std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>){
+        // Unusual alphabets retain the complete frozen string fallback.
+        for(const auto& key:keys)if(!key.supported()){
+            if(supplied)throw std::logic_error("unsupported precomputed family key");
+            std::vector<std::string> original;return families(P,original,threads,pool);
+        }
+    }
     if(fqdup::r8qkeep::memory_enabled()){
-        fqdup::r8qkeep::MemoryUsage m;m.pairs(P);m.family=fqdup::r8qkeep::strings_bytes(keys);m.report("family_keys",P.size());
+        fqdup::r8qkeep::MemoryUsage m;m.pairs(P);m.family=key_bytes(keys);m.report("family_keys",n);
     }
     std::vector<int> parent(n); std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-    if(!neighbor_families(keys,parent,threads,64,pool)){
+    if(!neighbor_families_impl(keys,parent,threads,64,pool)){
     std::array<int, BLOCKS + 1> bounds{}; for (int b = 0; b <= BLOCKS; ++b) bounds[b] = int(std::lround(double(b) * 2 * KEYLEN / BLOCKS));
     std::unordered_map<std::string, std::vector<int>> buckets;
     for (int i = 0; i < n; ++i) { if (keys[i].empty()) continue; for (int b = 0; b < BLOCKS; ++b) { auto s = keys[i].substr(bounds[b], bounds[b + 1] - bounds[b]); if (s.find('N') != std::string::npos) continue; buckets[std::to_string(b) + ":" + s].push_back(i); } }
@@ -403,7 +433,27 @@ bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) retu
 } // namespace
 
 namespace fqdup::r8qkeep {
-FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool) {
+std::vector<FamilyKey> extract_family_keys(const std::vector<FamilyPair>& pairs){return keys_of<FamilyKey>(pairs);}
+FamilyPlan discover_family_keys(std::vector<FamilyKey> keys,int threads,WorkerPool* pool){
+    FamilyPlan plan;plan.pairs=keys.size();
+    if(keys.size()>std::size_t(std::numeric_limits<int>::max()))throw std::length_error("family pair count");
+    for(const auto& key:keys)if(!key.supported()){plan.supported=false;return plan;}
+    const std::vector<FamilyPair> no_records;
+    plan.groups=families(no_records,keys,threads,pool,true);
+    return plan;
+}
+void reorder_family_plan(FamilyPlan& plan,const std::vector<std::size_t>& order){
+    if(!plan.supported)return;
+    if(order.size()!=plan.pairs)throw std::logic_error("family plan order size");
+    std::vector<int> rank(order.size());
+    for(std::size_t i=0;i<order.size();++i)rank.at(order[i])=int(i);
+    for(auto& group:plan.groups){
+        for(auto& member:group.m)member=rank.at(member);
+        std::sort(group.m.begin(),group.m.end());
+    }
+    std::sort(plan.groups.begin(),plan.groups.end(),[](const auto& a,const auto& b){return a.m.front()<b.m.front();});
+}
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool,FamilyPlan* plan) {
         std::unique_ptr<WorkerPool> owned_pool;
         if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(std::max(1,std::min(threads,8)));shared_pool=owned_pool.get();}
         auto& pool=*shared_pool;
@@ -416,13 +466,16 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
         phase("pair_storage");
         if(memory_enabled()){MemoryUsage m;m.pairs(P);m.report("pair_storage",P.size());}
-        std::vector<std::string> keys; auto groups = families(P, keys, threads,shared_pool);phase("families_total");
+        if(plan&&plan->pairs!=P.size())throw std::runtime_error("input pair count changed between passes");
+        std::vector<FamilyKey> keys;
+        auto groups=plan&&plan->supported?std::move(plan->groups):families(P,keys,threads,shared_pool);
+        phase("families_total");
         if(memory_enabled()){
-            MemoryUsage m;m.pairs(P);m.family=strings_bytes(keys)+vector_bytes(groups);
+            MemoryUsage m;m.pairs(P);m.family=key_bytes(keys)+vector_bytes(groups);
             for(const auto& group:groups)m.family+=vector_bytes(group.m);
             m.report("family_groups",P.size());
         }
-        std::vector<std::string>().swap(keys);
+        std::vector<FamilyKey>().swap(keys);
         std::vector<char> disband(groups.size());
         const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
@@ -468,6 +521,7 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         FamilyResult result{std::move(P), debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str():std::string(), f.str(), stats.str()};
         phase("serialization");return result;
 }
+#include "compact_family.inc"
 std::vector<FamilyRead> read_family_fastq(const std::string& path) {
     const auto start=std::chrono::steady_clock::now();auto reads=read_fastq(path);
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_READ path="<<path<<" seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<'\n';

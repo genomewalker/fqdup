@@ -242,12 +242,14 @@ class FamilyPartIndex {
         }
     }
 public:
-    static std::uint64_t pack(const std::string& key, int begin, int end) {
+    template<class Key>
+    static std::uint64_t pack(const Key& key, int begin, int end) {
         std::uint64_t value = 0;
         for (int p = begin; p < end; ++p) value |= std::uint64_t(code(key[p])) << (3 * (p-begin));
         return value;
     }
-    void build(const std::vector<std::string>& keys, const std::vector<int>& representatives, int begin, int end, bool force_dense=false) {
+    template<class Key>
+    void build(const std::vector<Key>& keys, const std::vector<int>& representatives, int begin, int end, bool force_dense=false) {
         length_ = end - begin;
         bounds_ = {0, 4, length_ == 13 ? 7 : 8, length_ == 13 ? 10 : 11, length_};
         members_.resize(representatives.size());
@@ -273,7 +275,13 @@ public:
         paired_=!force_dense&&parts_.size()<=65536;
         compact_pairs_=paired_&&parts_.size()>=4096;
         for(auto& directory:pair_offsets_)std::vector<std::uint32_t>().swap(directory);
-        if(!paired_){build_dense();return;}
+        if(!paired_){
+            build_dense();
+            // Dense queries use bitmap ranks and the N trie, never values_.
+            // Keep values only for the small paired-posting representation.
+            std::vector<std::uint64_t>().swap(values_);
+            return;
+        }
         std::vector<std::uint64_t>().swap(dense_words_);
         std::vector<std::uint32_t>().swap(dense_ranks_);
         std::vector<int>().swap(dense_ids_);std::vector<NNode>().swap(n_nodes_);

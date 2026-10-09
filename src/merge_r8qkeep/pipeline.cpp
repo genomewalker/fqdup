@@ -3,6 +3,7 @@
 #include "prior_sample.hpp"
 #include "ordered_chunks.hpp"
 #include "ordered_writer.hpp"
+#include "decoded_pair_pool.hpp"
 #include "memory_status.hpp"
 #include "string_input.hpp"
 #include <algorithm>
@@ -24,7 +25,8 @@ template<class Record> std::size_t record_bytes(const std::vector<Record>& rows)
     std::size_t bytes=vector_bytes(rows);for(const auto& r:rows)bytes+=string_heap(r.outcome)+stage_read_bytes(r.first)+stage_read_bytes(r.second);return bytes;
 }
 std::size_t native_bytes(const NativeResult& n){
-    return record_bytes(n.records)+string_heap(n.merged_fq)+string_heap(n.r1_fq)+string_heap(n.r2_fq)+string_heap(n.orphan_fq)+string_heap(n.outcomes_jsonl)+string_heap(n.native_tsv)+string_heap(n.native_outcomes_json);
+    MemoryUsage raw;if(n.raw_owner)raw.pairs(*n.raw_owner);
+    return raw.raw+raw.ids+record_bytes(n.records)+string_heap(n.merged_fq)+string_heap(n.r1_fq)+string_heap(n.r2_fq)+string_heap(n.orphan_fq)+string_heap(n.outcomes_jsonl)+string_heap(n.native_tsv)+string_heap(n.native_outcomes_json);
 }
 std::size_t likelihood_bytes(const std::vector<PairLikelihood>& rows){
     std::size_t bytes=vector_bytes(rows);for(const auto& p:rows)bytes+=string_heap(p.id);return bytes;
@@ -33,7 +35,7 @@ std::size_t routing_bytes(const RoutingResult& r){
     return string_heap(r.routed_tsv)+string_heap(r.audit_tsv)+vector_bytes(r.routed)+strings_bytes(r.replacements)+vector_bytes(r.repair_bounds)+vector_bytes(r.clean_bounds)+vector_bytes(r.native_clean_bounds)+record_bytes(r.record_replacements);
 }
 MemoryUsage library_memory(const LibraryPipeline& lib){
-    MemoryUsage m;m.pairs(lib.family.pairs);m.native=native_bytes(lib.native);
+    MemoryUsage m;m.pairs(lib.family.pairs);if(lib.compact){const auto bytes=lib.compact->capacity_bytes();m.ids+=bytes[2];m.raw+=lib.compact->owned_bytes()-bytes[2];}m.native=native_bytes(lib.native);
     m.census=likelihood_bytes(lib.observations.nominal_pairs)+likelihood_bytes(lib.observations.full_pairs);
     m.routing=routing_bytes(lib.routing);
     m.diagnostics=string_heap(lib.family.edits_tsv)+string_heap(lib.family.families_tsv)+string_heap(lib.family.stats_json)+string_heap(lib.observations.nominal_tsv)+string_heap(lib.observations.full_tsv)+string_heap(lib.observations.proposed_edits_tsv)+string_heap(lib.nominal_prior)+string_heap(lib.full_prior);
@@ -106,6 +108,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     if(!debug){std::string().swap(out.family.edits_tsv);std::string().swap(out.family.families_tsv);std::string().swap(out.observations.proposed_edits_tsv);}
     out.repair=std::make_unique<RepairPipeline>(out.nominal_prior,out.full_prior);if(!defer_routing){out.routing=out.repair->route_records(out.native.records,debug);stage("router");}memory_stage("prepared");return out;
 }
+#include "compact_pipeline.inc"
 namespace {
 std::string_view read_id(const std::string& h){
     if(h.empty()||h[0]!='@')throw std::runtime_error("record identity");
@@ -181,7 +184,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto changed=alternative?lib.repair->repair_records(native,7,cuts[c],start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
             if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed));
             if(base.size()!=n||(alternative&&changed.size()!=n))throw std::runtime_error("chunk cardinality");
-            for(std::size_t i=0;i<n;++i)append_record(chunk.outputs[c],routing.routed[i]?changed[i]:base[i],lib.family.pairs.at(start+i));
+            for(std::size_t i=0;i<n;++i)append_record(chunk.outputs[c],routing.routed[i]?changed[i]:base[i],*native[i].raw);
             chunk.seconds[c]=elapsed(begin);
         }
         if(memory){
@@ -209,15 +212,21 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         if(!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
         else{
             struct NativeChunk {NativeResult result;std::size_t start;double seconds;};
+            auto raw_pool=std::make_shared<DecodedPairPool>(native_batch_size);
             std::deque<std::future<NativeChunk>> pending;std::size_t next=0;
             const auto launch=[&]{
-                const auto start=next,n=std::min(native_batch_size,lib.family.pairs.size()-next);next+=n;
-                pending.push_back(pool.submit([&,start,n]{const auto begin=Clock::now();auto result=merge_native_range(lib.family.pairs,start,n,lib.native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
+                const auto start=next,n=std::min(native_batch_size,lib.pair_count()-next);next+=n;
+                pending.push_back(pool.submit([&,start,n]{const auto begin=Clock::now();NativeResult result;
+                    if(lib.compact){
+                        auto raw=raw_pool->acquire();CompactPairStore::Decoder decoder;
+                        for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,(*raw)[i],decoder);
+                        result=merge_native_range(*raw,0,n,lib.native_settings,false,false);result.raw_owner=std::move(raw);
+                    }else result=merge_native_range(lib.family.pairs,start,n,lib.native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
             };
-            while(next<lib.family.pairs.size()&&pending.size()<std::size_t(workers))launch();
+            while(next<lib.pair_count()&&pending.size()<std::size_t(workers))launch();
             while(!pending.empty()){
                 auto chunk=pending.front().get();pending.pop_front();
-                if(next<lib.family.pairs.size())launch();
+                if(next<lib.pair_count())launch();
                 auto owner=std::make_shared<NativeResult>(std::move(chunk.result));
                 if(memory)maximum(max_native,native_bytes(*owner));
                 dispatch(owner->records,owner,chunk.start,chunk.seconds);
@@ -227,12 +236,12 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     }catch(...){pool.stop();throw;}
     if(memory){
         MemoryUsage m;m.native=max_native.load();m.routing=max_routing.load();m.output=max_output.load();
-        m.report("streaming_chunk_max",lib.family.pairs.size(),"independent_chunk_maxima_excludes_cache_and_dp_scratch");
+        m.report("streaming_chunk_max",lib.pair_count(),"independent_chunk_maxima_excludes_cache_and_dp_scratch");
         // Native batches may be referenced by queued outputs after the producer
         // advances. This is a conservative capacity bound, not simultaneous use.
         m.native*=workers+window+1;m.routing*=workers;m.output*=window+workers+1;
-        m.report("streaming_buffer_bound",lib.family.pairs.size(),"capacity_bound_excludes_cache_and_dp_scratch");
-        library_memory(lib).report("streaming_finished",lib.family.pairs.size());
+        m.report("streaming_buffer_bound",lib.pair_count(),"capacity_bound_excludes_cache_and_dp_scratch");
+        library_memory(lib).report("streaming_finished",lib.pair_count());
     }
     if(std::getenv("FQDUP_CHUNK_PROFILE"))std::fprintf(stderr,
         "CHUNK_PROFILE stage=streaming_pipeline workers=%d chunk_rows=%zu max_inflight=%zu rows=%zu chunks=%zu wall=%.6f timing_basis=wall_including_native_and_consume\n",
@@ -258,13 +267,13 @@ FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
         count+=chunk.count;const auto& out=chunk.outputs[0];
         result.merged+=out.merged;result.r1+=out.r1;result.r2+=out.r2;result.orphan+=out.orphan;result.outcomes+=out.outcomes;
     });
-    if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    if(count!=lib.pair_count())throw std::runtime_error("final cardinality");
     return result;
 }
 void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::string& directory,int threads,RepairShadow* shadow){
     OutputFiles files;open_files(files,directory);std::size_t count=0;
     process_records(lib,{cutoff},threads,false,shadow,[&](OutputChunk chunk){count+=chunk.count;write_files(files,chunk.outputs[0]);});
-    if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    if(count!=lib.pair_count())throw std::runtime_error("final cardinality");
     close_files(files);
 }
 void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records){
@@ -294,17 +303,17 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];write_files(files[c],chunk.outputs[c]);}
         if(measure)write_seconds+=elapsed(write_begin);
     });
-    if(count!=lib.family.pairs.size())throw std::runtime_error("final cardinality");
+    if(count!=lib.pair_count())throw std::runtime_error("final cardinality");
     std::future<double> reclaimed;double release_seconds=0;
     if(consume_records){
         // process_records joined every reader and writer. The task owns all
         // released storage, including on output-close failure. Debug text stays.
-        auto release=[pairs=std::move(lib.family.pairs),native=std::move(lib.native.records),
+        auto release=[compact=std::move(lib.compact),pairs=std::move(lib.family.pairs),native=std::move(lib.native.records),
                       replacements=std::move(lib.routing.record_replacements),measure]() mutable {
             const auto begin=measure?Clock::now():Clock::time_point{};
             std::vector<NativeRecord>().swap(replacements);
             std::vector<NativeRecord>().swap(native);
-            std::vector<FamilyPair>().swap(pairs);
+            std::vector<FamilyPair>().swap(pairs);compact.reset();
             return measure?std::chrono::duration<double>(Clock::now()-begin).count():0;
         };
         if(threads>1&&lib.pool)reclaimed=lib.pool->submit(std::move(release));

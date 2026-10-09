@@ -15,7 +15,13 @@ int merge_main(int argc,char** argv);
 namespace {
 using namespace fqdup::r8qkeep;
 std::vector<std::string> paths(const std::string& text){std::vector<std::string> out;std::istringstream in(text);std::string p;while(std::getline(in,p,',')){if(p.empty())throw std::runtime_error("empty input lane");out.push_back(p);}return out;}
-std::vector<FamilyRead> input(const std::vector<std::string>& paths){auto reader=make_chained_fastq_reader(paths,1);std::vector<FamilyRead> out;FastqRecord r;while(reader->read(r)){auto end=r.header.find_first_of(" \t");auto id=r.header.substr(1,end==std::string::npos?end:end-1);if(id.size()>2&&id[id.size()-2]=='/'&&(id.back()=='1'||id.back()=='2'))id.resize(id.size()-2);if(r.seq.size()!=r.qual.size())throw std::runtime_error("FASTQ lengths");out.push_back({r.header,id,r.seq,r.qual});}return out;}
+std::shared_ptr<CompactPairStore> compact_input(const std::vector<std::string>& first,const std::vector<std::string>& second){
+    auto a=make_chained_fastq_reader(first,1),b=make_chained_fastq_reader(second,1);
+    auto store=std::make_shared<CompactPairStore>();FastqRecord x,y;
+    for(;;){const bool one=a->read(x),two=b->read(y);if(one!=two)throw std::runtime_error("pair count");if(!one)break;
+        store->append(x.header,x.seq,x.qual,y.header,y.seq,y.qual);}
+    return store;
+}
 void write(const std::filesystem::path& path,const std::string& text){std::ofstream out(path,std::ios::binary);out<<text;out.close();if(!out)throw std::runtime_error("write failed: "+path.string());}
 double number(const std::string& text){std::size_t n;const double x=std::stod(text,&n);if(n!=text.size()||!std::isfinite(x))throw std::runtime_error("invalid numeric argument");return x;}
 }
@@ -37,18 +43,11 @@ int merge_r8qkeep_main(int argc,char** argv){
         if(!std::filesystem::create_directory(outdir))throw std::runtime_error("output directory exists");const std::filesystem::path out=outdir;
         if(multiple)for(const auto& text:cuts)if(!std::filesystem::create_directory(out/text))throw std::runtime_error("duplicate cutoff directory");
         const auto input_start=std::chrono::steady_clock::now();
-        std::vector<FamilyRead> mate1,mate2;
-        if(threads>1){
-            // Independent readers preserve each mate's lane and record order.
-            // An async future joins even if the other reader throws, before
-            // its referenced paths leave scope.
-            auto first=std::async(std::launch::async,[&]{return input(r1);});
-            mate2=input(r2);mate1=first.get();
-        }else{mate2=input(r2);mate1=input(r1);}
+        auto store=compact_input(r1,r2);
         if(timings||debug)std::cerr<<"MERGE_STAGE input_wall seconds="
             <<std::chrono::duration<double>(std::chrono::steady_clock::now()-input_start).count()
             <<memory_status()<<'\n';
-        auto library=prepare_library(std::move(mate1),std::move(mate2),settings,threads,debug,timings,true,counts);
+        auto library=prepare_compact_library(std::move(store),settings,threads,debug,timings,counts);
         std::vector<double> values;std::vector<std::string> directories;
         for(const auto& cut:cuts){values.push_back(number(cut));directories.push_back((multiple?out/cut:out).string());}
         write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow,true);

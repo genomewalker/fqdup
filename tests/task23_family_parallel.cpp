@@ -4,6 +4,7 @@
 #include "task25_columns_ref.hpp"
 #include "task25_family_counters_ref.hpp"
 #include "task25_family_keys_ref.hpp"
+#include "../src/merge_r8qkeep/canonical_pairs.hpp"
 #include <cfenv>
 #include <cstring>
 #include <random>
@@ -25,6 +26,12 @@ static void packed_key_parity(){
         std::string a(40,'A'),b(40,'A');
         for(char& c:a)c="ACGTN"[rng()%5];for(char& c:b)c="ACGTN"[rng()%5];
         const PackedFamilyKey x(a),y(b);
+        const fqdup::r8qkeep::FamilyKey compact(a),other(b);
+        require(compact.supported()&&!compact.empty()&&compact.substr(0,40)==a);
+        require(compact.ns()==std::count(a.begin(),a.end(),'N'));
+        require(mismatches(compact,other)==mismatches(a,b));
+        const PackedFamilyKey expanded(compact);
+        require(expanded.lo==x.lo&&expanded.hi==x.hi);
         for(int p=0;p<3;++p)require(x.part(p)==fqdup::r8qkeep::FamilyPartIndex::pack(a,bounds[p],bounds[p+1]));
         const auto lo=PackedFamilyKey::differences(x.lo,y.lo),hi=PackedFamilyKey::differences(x.hi,y.hi);
         require(__builtin_popcountll(lo)+__builtin_popcountll(hi)==mismatches(a,b));
@@ -39,6 +46,10 @@ static void check(const std::vector<std::string>& keys){
     for(int threads:{1,8})for(std::size_t limit:{0,1,64}){
         std::vector<int> actual(keys.size());std::iota(actual.begin(),actual.end(),0);
         require(neighbor_families(keys,actual,threads,limit));
+        require(roots(actual)==roots(expected));
+        std::vector<fqdup::r8qkeep::FamilyKey> compact(keys.begin(),keys.end());
+        std::iota(actual.begin(),actual.end(),0);
+        require(neighbor_families_impl(compact,actual,threads,limit));
         require(roots(actual)==roots(expected));
     }
 }
@@ -118,6 +129,23 @@ static void key_parity(){
                 const auto expected=frozen_keys_of(pairs);
                 require(keys_of(pairs)==expected);
                 require(keys_of(pairs,&pool,workers)==expected);++cases;
+                const auto compact=keys_of<fqdup::r8qkeep::FamilyKey>(pairs,&pool,workers);
+                bool unsupported=false;
+                for(std::size_t i=0;i<count;++i){
+                    if(compact[i].supported())require(compact[i].substr(0,40)==expected[i]);
+                    else{unsupported=true;require(expected[i].find_first_not_of("ACGTN")!=std::string::npos);}
+                }
+                if(unsupported){
+                    std::vector<std::string> old_keys;std::vector<fqdup::r8qkeep::FamilyKey> new_keys;
+                    const auto old_groups=families(pairs,old_keys,workers,&pool);
+                    const auto new_groups=families(pairs,new_keys,workers,&pool);
+                    require(old_groups.size()==new_groups.size());
+                    for(std::size_t i=0;i<old_groups.size();++i){
+                        require(old_groups[i].m==new_groups[i].m);
+                        require(old_groups[i].diameter==new_groups[i].diameter);
+                        require(old_groups[i].oversize==new_groups[i].oversize);
+                    }
+                }
             }
         }
     }
@@ -179,6 +207,25 @@ int main(){
     // Three identical high-complexity copies guarantee Q20->Q30 confirmations.
     for(int i=0;i<3;++i){std::string id="confirmed"+std::to_string(i),s="ACGTCAGTGCATGACTCAGT";r1.push_back({"@"+id+"/1",id,s,std::string(20,'5')});r2.push_back({"@"+id+"/2",id,s,std::string(20,'5')});}
     auto a=fqdup::r8qkeep::correct_family(r1,r2,1),b=fqdup::r8qkeep::correct_family(r1,r2,8);
+    for(int workers:{1,8})for(bool canonical:{false,true}){
+        auto first=r1,second=r2;std::vector<Pair> input;
+        for(std::size_t i=0;i<first.size();++i)input.push_back({first[i].id,{first[i],second[i]}});
+        auto plan=fqdup::r8qkeep::discover_family_keys(fqdup::r8qkeep::extract_family_keys(input),workers);
+        require(plan.supported);
+        if(canonical){
+            std::vector<std::size_t> order;
+            fqdup::r8qkeep::canonicalize_family_input(first,second,nullptr,workers,&order);
+            fqdup::r8qkeep::reorder_family_plan(plan,order);
+        }
+        const auto expected=fqdup::r8qkeep::correct_family(first,second,workers);
+        const auto actual=fqdup::r8qkeep::correct_family(first,second,workers,true,nullptr,&plan);
+        require(expected.edits_tsv==actual.edits_tsv&&expected.families_tsv==actual.families_tsv&&expected.stats_json==actual.stats_json);
+        require(expected.pairs.size()==actual.pairs.size());
+        for(std::size_t i=0;i<expected.pairs.size();++i)for(int side=0;side<2;++side){
+            const auto& x=expected.pairs[i].r[side];const auto& y=actual.pairs[i].r[side];
+            require(x.h==y.h&&x.id==y.id&&x.s==y.s&&x.q==y.q);
+        }
+    }
     require(a.edits_tsv==b.edits_tsv&&a.families_tsv==b.families_tsv&&a.stats_json==b.stats_json);
     const auto quiet=fqdup::r8qkeep::correct_family(r1,r2,8,false);
     require(quiet.edits_tsv.empty()&&quiet.families_tsv.empty()&&quiet.stats_json==a.stats_json);
