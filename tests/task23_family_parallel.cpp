@@ -40,6 +40,10 @@ int main(){try{
     for(int i=0;i<3;++i){std::string id="confirmed"+std::to_string(i),s="ACGTCAGTGCATGACTCAGT";r1.push_back({"@"+id+"/1",id,s,std::string(20,'5')});r2.push_back({"@"+id+"/2",id,s,std::string(20,'5')});}
     auto a=fqdup::r8qkeep::correct_family(r1,r2,1),b=fqdup::r8qkeep::correct_family(r1,r2,8);
     require(a.edits_tsv==b.edits_tsv&&a.families_tsv==b.families_tsv&&a.stats_json==b.stats_json);
+    const auto quiet=fqdup::r8qkeep::correct_family(r1,r2,8,false);
+    require(quiet.edits_tsv.empty()&&quiet.families_tsv.empty()&&quiet.stats_json==a.stats_json);
+    require(quiet.pairs.size()==a.pairs.size());
+    for(std::size_t i=0;i<a.pairs.size();++i)for(int m=0;m<2;++m){const auto& x=a.pairs[i].r[m];const auto& y=quiet.pairs[i].r[m];require(x.h==y.h&&x.id==y.id&&x.s==y.s&&x.q==y.q);}
     require(std::count(a.edits_tsv.begin(),a.edits_tsv.end(),'\n')>1);
     require(a.pairs.size()==b.pairs.size());for(std::size_t i=0;i<a.pairs.size();++i)for(int mate=0;mate<2;++mate){const auto& x=a.pairs[i].r[mate];const auto& y=b.pairs[i].r[mate];require(x.h==y.h&&x.id==y.id&&x.s==y.s&&x.q==y.q);}
     std::cout<<"TASK23_FAMILY_PARALLEL_UNIT_PASS serial-oracle p1/p8 overflow N duplicates chains edits\n";

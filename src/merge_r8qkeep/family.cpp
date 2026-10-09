@@ -3,6 +3,7 @@
 // Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
 #include "family.hpp"
 #include "family_index.hpp"
+#include "ordered_chunks.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -112,12 +113,15 @@ bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& pa
             if(result.overflow)return;
         }
     };
+    std::unique_ptr<fqdup::r8qkeep::WorkerPool> pool;
+    if(workers>1)pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);
+    std::array<std::future<void>,8> jobs;
     std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
     for(std::size_t begin=0;begin<representative.size();begin+=slots.size()){
         const auto count=std::min(slots.size(),representative.size()-begin);
         const auto work=[&](int worker){for(std::size_t s=worker;s<count;s+=workers){slots[s]=Slot{};enumerate(begin+s,slots[s],false);}};
         if(workers==1)work(0);
-        else {std::array<std::future<void>,8> jobs;for(int w=0;w<workers;++w)jobs[w]=std::async(std::launch::async,work,w);for(int w=0;w<workers;++w)jobs[w].get();}
+        else {try{for(int w=0;w<workers;++w)jobs[w]=pool->submit([work,w]{work(w);});for(int w=0;w<workers;++w)jobs[w].get();}catch(...){pool->stop();throw;}}
         for(std::size_t s=0;s<count;++s){auto& result=slots[s];
             if(result.overflow){++overflows;result=Slot{};enumerate(begin+s,result,true);}
             else for(std::size_t e=0;e<result.size;++e)unite(representative[begin+s],representative[result.edges[e]]);
@@ -178,12 +182,19 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<std::string>
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_CANDIDATES pairs="<<n<<" buckets="<<buckets.size()<<" candidates="<<candidates<<" unique="<<unique<<" rank_bytes="<<rank.capacity()*sizeof(rank[0])<<'\n';
     }
     phase("graph");
-    std::vector<int> order; std::map<int, int> slot; std::vector<Group> groups;
-    for (int i = 0; i < n; ++i) if (!keys[i].empty()) { int r = find(i); auto it = slot.find(r); if (it == slot.end()) { slot[r] = int(groups.size()); groups.push_back({}); it = slot.find(r); } groups[it->second].m.push_back(i); }
+    // Count roots first: singleton groups never enter the correction pre-pass.
+    // Negative slots then encode first-seen group indices, preserving order.
+    std::vector<int> slot(n,0);std::vector<Group> groups;
+    for(int i=0;i<n;++i)if(!keys[i].empty())++slot[find(i)];
+    for(int i=0;i<n;++i)if(!keys[i].empty()){
+        auto& at=slot[find(i)];if(at==1)continue;
+        if(at>1){const int members=at;at=-int(groups.size())-1;groups.push_back({});groups.back().m.reserve(members);}
+        groups[-at-1].m.push_back(i);
+    }
     std::vector<Group> out;
     for (auto& g : groups) { if (g.m.size() < 2) continue; int diam = 0;
         if (int(g.m.size()) <= MAXCOMP) for (size_t x = 0; x < g.m.size(); ++x) for (size_t y = x + 1; y < g.m.size(); ++y) diam = std::max(diam, mismatches(keys[g.m[x]], keys[g.m[y]]));
-        g.oversize = int(g.m.size()) > MAXCOMP || diam > MAXDIAM; g.diameter = diam; out.push_back(g); }
+        g.oversize = int(g.m.size()) > MAXCOMP || diam > MAXDIAM; g.diameter = diam; out.push_back(std::move(g)); }
     phase("groups");
     return out;
 }
@@ -200,10 +211,11 @@ std::vector<Column> columns(const std::vector<Pair>& P, const std::vector<int>& 
     return cols;
 }
 bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
+    const std::array<std::vector<Column>,2> all_columns{columns(P,g,0),columns(P,g,1)};
     std::map<std::pair<int, int>, int> shared; long multi = 0, cover = 0;
-    for (int side = 0; side < 2; ++side) for (auto& col : columns(P, g, side)) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
+    for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
     if (cover && double(multi) / cover > MAXDIS) return true;
-    for (int side = 0; side < 2; ++side) for (auto& col : columns(P, g, side)) { if (col.top < 0) continue;
+    for (int side = 0; side < 2; ++side) for (const auto& col : all_columns[side]) { if (col.top < 0) continue;
         for (size_t v = 0; v < col.votes.size(); ++v) { if (int(v) == col.top || col.votes[v].second.size() < 2) continue; const auto& ids = col.votes[v].second;
             for (size_t x = 0; x < ids.size(); ++x) for (size_t y = x + 1; y < ids.size(); ++y) ++shared[{ids[x], ids[y]}]; } }
     for (auto& [k, v] : shared) if (v >= 2) return true;
@@ -218,7 +230,7 @@ bool is_protected(const Read& r, size_t c, int side) { if (int(c) < DSZONE) retu
 } // namespace
 
 namespace fqdup::r8qkeep {
-FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads) {
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug) {
         auto last=std::chrono::steady_clock::now();
         const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
         constexpr bool damage_safe = false;
@@ -228,10 +240,21 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::vector<FamilyRead>().swap(R1);std::vector<FamilyRead>().swap(R2);
         phase("pair_storage");
         std::vector<std::string> keys; auto groups = families(P, keys, threads);phase("families_total");
-        std::vector<char> disband(groups.size()); for (size_t k = 0; k < groups.size(); ++k) disband[k] = groups[k].oversize || second_molecule(P, groups[k].m);
+        std::vector<std::string>().swap(keys);
+        WorkerPool pool(std::max(1,std::min(threads,8)));
+        std::vector<char> disband(groups.size());
+        ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
+            for(std::size_t k=begin;k<begin+n;++k)disband[k]=groups[k].oversize||second_molecule(P,groups[k].m);
+            return 0;
+        },[](int){},"family_disband");
         phase("disband");
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
-        for (size_t gi = 0; gi < groups.size(); ++gi) {
+        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;};
+        // Groups partition P; each worker changes only its own group's reads.
+        // Ordered consumption preserves ledger rows and all integer statistics.
+        ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
+        std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
+        for (size_t gi = begin; gi < begin+n; ++gi) {
             const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
             std::map<int, int> hiq;
             for (int side = 0; side < 2; ++side) { auto cols = columns(P, g0, side);
@@ -243,7 +266,7 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
             for (int side = 0; side < 2; ++side) { auto cols = columns(P, g, side);
                 for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
                     auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
-                        r.s[c] = base; r.q[c] = char(q + 33); ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
+                        r.s[c] = base; r.q[c] = char(q + 33); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
                     if (col.n >= 3 && col.votes.size() == 1) { ++confirmed; for (int i : col.votes[0].second) set(i, col.votes[0].first, std::max(qv(P[i].r[side], c), 30)); }
                     else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
                         ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
@@ -251,13 +274,19 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
                     else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::vector<double> w(col.votes.size(), 1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = std::pow(10.0, -qv(P[i].r[side], c) / 10.0); w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto& v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto& w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
+        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded}};
+        },[&](CorrectedChunk part){
+            if(debug)ledger<<part.ledger;const auto& c=part.counts;
+            prot+=c[0];rows+=c[1];fam+=c[2];dis+=c[3];members+=c[4];
+            corrected+=c[5];confirmed+=c[6];unresolved+=c[7];excluded+=c[8];
+        },"family_correct");
         phase("correction");
         std::ostringstream f, stats;
-        f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
+        if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
-              for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
+              for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }}        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
-        FamilyResult result{std::move(P), "pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str(), f.str(), stats.str()};
+        FamilyResult result{std::move(P), debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str():std::string(), f.str(), stats.str()};
         phase("serialization");return result;
 }
 std::vector<FamilyRead> read_family_fastq(const std::string& path) {

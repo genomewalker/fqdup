@@ -22,7 +22,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     if(counts){canonicalize_family_input(r1,r2);stage("canonical_input");}
-    LibraryPipeline out;out.native_settings=settings;out.family=correct_family(std::move(r1),std::move(r2),threads);stage("family");
+    LibraryPipeline out;out.native_settings=settings;out.family=correct_family(std::move(r1),std::move(r2),threads,debug);stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
         const auto selected=prior_sample_indices(out.family.pairs,requested);
