@@ -1,10 +1,63 @@
 #pragma once
 #include <cstddef>
+#include <algorithm>
+#include <memory>
+#include <stdexcept>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 namespace fqdup_fast_dp {
+// Full engines share one nonrecursive scratch allocation per worker. Every
+// valid cell is initialized by the descending fill before any traceback.
+struct PlanarCells {
+ struct Scores {int* values;std::size_t stride;int& operator[](std::size_t s)const{return values[s*stride];}};
+ struct Cell {Scores suffix;int& through;};
+ int* values=nullptr;std::size_t plane=0;
+ void resize(std::size_t required){
+  constexpr std::size_t maximum=513*513;
+  if(required>maximum)throw std::length_error("full alignment scratch length");
+  struct Buffer {std::unique_ptr<int[]> values;std::size_t capacity=0;};
+  static thread_local Buffer buffer;
+  if(required>buffer.capacity){
+   const auto capacity=std::min(maximum,std::max(required,std::max<std::size_t>(64,buffer.capacity*2)));
+   std::unique_ptr<int[]> next(new int[4*capacity]);
+   buffer.values=std::move(next);buffer.capacity=capacity;
+  }
+  values=buffer.values.get();plane=required;
+ }
+ int* score(std::size_t state,std::size_t index){return values+state*plane+index;}
+ Cell at(std::size_t index){return {{values+index,plane},values[3*plane+index]};}
+};
 #if defined(__AVX2__)
+// Same eight-cell recurrence as suffix_tile<false>; contiguous planes replace
+// gathers and AoS transposition with two loads and four stores.
+inline void suffix_eight_planar(PlanarCells& cells,std::size_t out,std::size_t below,char a,const char* b){
+ constexpr int neg=-1000000000;
+ const auto absent=_mm256_set1_epi32(-2147482624);
+ const auto equal=a=='N'?_mm_setzero_si128():_mm_cmpeq_epi8(_mm_set1_epi8(a),_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b)));
+ const auto substitution=_mm256_sub_epi32(_mm256_set1_epi32(-1),_mm256_slli_epi32(_mm256_cvtepi8_epi32(equal),1));
+ const auto diag=_mm256_add_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(cells.score(0,below+1))),substitution);
+ const auto down=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(cells.score(1,below)));
+ const auto one=_mm256_set1_epi32(1),four=_mm256_set1_epi32(4);
+ const auto vertical=_mm256_max_epi32(diag,_mm256_sub_epi32(down,one));
+ auto horizontal=diag;
+ auto shifted=_mm256_sub_epi32(_mm256_permutevar8x32_epi32(horizontal,_mm256_setr_epi32(1,2,3,4,5,6,7,7)),one);
+ horizontal=_mm256_max_epi32(horizontal,_mm256_blend_epi32(shifted,absent,0x80));
+ shifted=_mm256_sub_epi32(_mm256_permutevar8x32_epi32(horizontal,_mm256_setr_epi32(2,3,4,5,6,7,7,7)),_mm256_set1_epi32(2));
+ horizontal=_mm256_max_epi32(horizontal,_mm256_blend_epi32(shifted,absent,0xc0));
+ shifted=_mm256_sub_epi32(_mm256_permutevar8x32_epi32(horizontal,_mm256_setr_epi32(4,5,6,7,7,7,7,7)),four);
+ horizontal=_mm256_max_epi32(horizontal,_mm256_blend_epi32(shifted,absent,0xf0));
+ const int carry=*cells.score(2,out+8);
+ horizontal=_mm256_max_epi32(horizontal,_mm256_sub_epi32(_mm256_set1_epi32(carry),_mm256_setr_epi32(8,7,6,5,4,3,2,1)));
+ const auto right=_mm256_blend_epi32(_mm256_permutevar8x32_epi32(horizontal,_mm256_setr_epi32(1,2,3,4,5,6,7,7)),_mm256_set1_epi32(carry),0x80);
+ auto aligned=_mm256_max_epi32(diag,_mm256_set1_epi32(neg));
+ aligned=_mm256_max_epi32(aligned,_mm256_sub_epi32(down,four));
+ aligned=_mm256_max_epi32(aligned,_mm256_sub_epi32(right,four));
+ _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(0,out)),aligned);
+ _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(1,out)),vertical);
+ _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(2,out)),horizontal);
+ _mm256_storeu_si256(reinterpret_cast<__m256i*>(cells.score(3,out)),_mm256_setzero_si256());
+}
 // Eight full-matrix or seven banded interior cells of the +1/-1,
 // gap-open 4 / gap-extend 1 suffix DP.
 // Horizontal(j)=max(diag(j), Horizontal(j+1)-1). Three integer max scans

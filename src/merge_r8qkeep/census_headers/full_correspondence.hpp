@@ -1,5 +1,6 @@
 #pragma once
 #include "native_correspondence.hpp"
+#include "../fast_dp.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -16,15 +17,15 @@ namespace fqalign {
 struct FullResult {Correspondence corr;int min_informative=1000000000,max_gap=0;double max_fraction=0;};
 class FullCorrespondence {
  static constexpr int neg=-1000000000;
- using Cell=fqalign::AlignmentCell;
- Cell* cells=nullptr;
+ using Cell=::fqdup_fast_dp::PlanarCells::Cell;
+ ::fqdup_fast_dp::PlanarCells cells;
  int n=0,m=0;
  bool inside(int i,int j) const {return i>=1&&i<=n&&j>=1&&j<=m;}
- Cell& at(int i,int j) {return cells[i*(m+1)+j];}
+ Cell at(int i,int j) {return cells.at(i*(m+1)+j);}
  static int sub(char a,char b) {return a==b&&a!='N'?1:-1;}
  template<bool next_i,bool next_j>
  void fill_suffix(int i,int j,const std::string& a,const std::string& b) {
-    auto& c=at(i,j);c.through=0;int diag=neg;
+    auto c=at(i,j);c.through=0;int diag=neg;
     if constexpr(next_i&&next_j)diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((!next_i||!next_j)?0:neg,diag);
     if constexpr(next_i)c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
@@ -45,14 +46,18 @@ class FullCorrespondence {
    ::fqdup_fast_diagonal::fill(out,n,m,diagonal);
    result.min_informative=out.best;return result;
   }
-  cells=fqalign::alignment_scratch((n+1)*(m+1));
+  cells.resize((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.
   // Preserve descending row-major updates; specialize only boundary predicates.
   fill_suffix<false,false>(n,m,a,b);
   for(int j=m-1;j>=1;--j)fill_suffix<false,true>(n,j,a,b);
   for(int i=n-1;i>=1;--i){
     fill_suffix<true,false>(i,m,a,b);
-    for(int j=m-1;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
+    int j=m-1;
+#if defined(__AVX2__)
+    for(;j>=8;j-=8)::fqdup_fast_dp::suffix_eight_planar(cells,i*(m+1)+j-7,(i+1)*(m+1)+j-7,a[i],b.data()+j-7);
+#endif
+    for(;j>=1;--j)fill_suffix<true,true>(i,j,a,b);
   }
   // Original row-major boundary order: entire first row, then first column.
   for(int j=1;j<=m;++j)out.best=std::max(out.best,sub(a[0],b[j-1])+at(1,j).suffix[0]);

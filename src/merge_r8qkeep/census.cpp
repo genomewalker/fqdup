@@ -3,6 +3,7 @@
 #include "geometry_counts.hpp"
 #include "base_validation.hpp"
 #include "diagonal_certificate.hpp"
+#include "fast_dp.hpp"
 #include <string_view>
 #include "string_input.hpp"
 #include "fdlibm.hpp"

@@ -116,6 +116,26 @@ static void base_validation(){
 }
 
 int main(){
+#if defined(__AVX2__)
+    // Contiguous planes must equal the already scalar-verified AoS tile,
+    // including negative sentinels, carry input, Ns and untouched neighbors.
+    std::mt19937 planar_rng(2548);
+    for(int trial=0;trial<2000;++trial){
+        std::array<internal::fqalign::AlignmentCell,20> expected;
+        ::fqdup_fast_dp::PlanarCells actual;actual.resize(expected.size());
+        for(std::size_t i=0;i<expected.size();++i){auto cell=actual.at(i);
+            for(int s=0;s<3;++s)cell.suffix[s]=expected[i].suffix[s]=planar_rng()%5?int(planar_rng()%1040)-40:-1000000000;
+            cell.through=expected[i].through=31;
+        }
+        std::string b(8,'A');for(char& c:b)c="ACGTN"[planar_rng()%5];const char a="ACGTN"[planar_rng()%5];
+        ::fqdup_fast_dp::suffix_eight(expected.data()+1,expected.data()+11,a,b.data());
+        ::fqdup_fast_dp::suffix_eight_planar(actual,1,11,a,b.data());
+        for(std::size_t i=0;i<expected.size();++i){const auto cell=actual.at(i);
+            for(int s=0;s<3;++s)require(cell.suffix[s]==expected[i].suffix[s]);
+            require(cell.through==expected[i].through);
+        }
+    }
+#endif
     std::mt19937 diagonal_rng(2545);int shortcuts=0,fallbacks=0;
     for(int trial=0;trial<600;++trial){
         const int insert=30+trial%63,n=insert-8+trial%17,m=insert-8+(trial/17)%17;
