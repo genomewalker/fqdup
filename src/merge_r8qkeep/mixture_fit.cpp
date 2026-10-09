@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <cstring>
 #include <future>
+#include <type_traits>
 namespace fqdup::r8qkeep {
 namespace {
 using Values = std::array<double,mixture_components>;
@@ -172,18 +173,25 @@ static std::optional<MixtureFit> fit_mixture_impl(const std::vector<const PairLi
         };
         if constexpr(Counts){
             if(threads>1){
-                constexpr int width=4,blocks=(mixture_components+width-1)/width;
+                constexpr int width=8,blocks=(mixture_components+width-1)/width;
                 workers.run(blocks+1,[&](std::size_t block,int){
                     if(block==blocks){
                         for(std::size_t index:group){const double n=multiplicity[index];ll+=n*terms[index].log_sum;}
                         return;
                     }
-                    const int begin=int(block)*width,end=std::min(begin+width,mixture_components);
-                    std::array<double,width> partial{};
-                    for(std::size_t index:group){const double n=multiplicity[index];const auto& t=terms[index];
-                        for(int j=begin;j<end;++j)partial[j-begin]+=n*t.responsibility[j];
-                    }
-                    for(int j=begin;j<end;++j)count[j]=partial[j-begin];
+                    const int begin=int(block)*width;
+                    // Fixed extents expose independent components to the compiler.
+                    // Each component still visits every row in its original order.
+                    const auto reduce_block=[&](auto extent){
+                        constexpr int size=decltype(extent)::value;
+                        std::array<double,size> partial{};
+                        for(std::size_t index:group){const double n=multiplicity[index];const auto& t=terms[index];
+                            for(int j=0;j<size;++j)partial[j]+=n*t.responsibility[begin+j];
+                        }
+                        for(int j=0;j<size;++j)count[begin+j]=partial[j];
+                    };
+                    if(begin+width<=mixture_components)reduce_block(std::integral_constant<int,width>{});
+                    else reduce_block(std::integral_constant<int,mixture_components%width>{});
                 },1);
             }else reduce_serial();
         }else reduce_serial();
