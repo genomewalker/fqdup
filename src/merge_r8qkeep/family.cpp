@@ -293,9 +293,11 @@ const std::vector<Column>& columns(const std::vector<Pair>& P, const std::vector
         col.top = tie ? -1 : top; }
     return cols;
 }
-bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g) {
+bool second_molecule(const std::vector<Pair>& P, const std::vector<int>& g,
+                     std::array<const std::vector<Column>*,2>* prepared=nullptr) {
     if(g.size()<2)return false;
     const std::array<const std::vector<Column>*,2> all_columns{&columns(P,g,0),&columns(P,g,1)};
+    if(prepared)*prepared=all_columns;
     std::array<std::array<int,MAXCOMP>,MAXCOMP> shared{}; long multi = 0, cover = 0;
     for (int side = 0; side < 2; ++side) for (const auto& col : *all_columns[side]) if (col.n >= 2) { ++cover; if (col.votes.size() > 1) ++multi; }
     if (cover && double(multi) / cover > MAXDIS) return true;
@@ -313,7 +315,9 @@ std::array<int,MAXCOMP> high_quality_counts(const std::vector<Pair>& P,const std
                                          std::array<const std::vector<Column>*,2>& prepared) {
     std::array<int,MAXCOMP> hiq{};
     if(g.size()<2)return hiq;
-    for(int side=0;side<2;++side){const auto& cols=columns(P,g,side);prepared[side]=&cols;
+    for(int side=0;side<2;++side){
+        if(!prepared[side])prepared[side]=&columns(P,g,side);
+        const auto& cols=*prepared[side];
         for(size_t c=0;c<cols.size();++c){const auto& col=cols[c];if(col.top<0)continue;
             int topq=-1;for(int i:col.votes[col.top].second)topq=std::max(topq,qv(P[i].r[side],c));
             if(topq<30)continue;
@@ -355,11 +359,6 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::vector<std::string> keys; auto groups = families(P, keys, threads,shared_pool);phase("families_total");
         std::vector<std::string>().swap(keys);
         std::vector<char> disband(groups.size());
-        ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
-            for(std::size_t k=begin;k<begin+n;++k)disband[k]=groups[k].oversize||second_molecule(P,groups[k].m);
-            return 0;
-        },[](int){},"family_disband");
-        phase("disband");
         const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         struct CorrectedChunk {std::string ledger;std::array<long,9> counts;};
@@ -368,8 +367,10 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = begin; gi < begin+n; ++gi) {
-            const auto& g0 = groups[gi].m; if (disband[gi]) { ++dis; continue; }
+            const auto& g0 = groups[gi].m;
             std::array<const std::vector<Column>*,2> prepared{};
+            disband[gi]=groups[gi].oversize||second_molecule(P,g0,&prepared);
+            if(disband[gi]){++dis;continue;}
             const auto hiq=high_quality_counts(P,g0,prepared);
             std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }

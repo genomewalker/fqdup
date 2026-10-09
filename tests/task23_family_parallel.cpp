@@ -33,8 +33,8 @@ static void column_parity(){
         // Exercise all bounded base slots, not only the usual four DNA bases.
         if(trial==0)for(int member=0;member<size;++member)
             for(int side=0;side<2;++side)pairs[group[member]].r[side].s[0]=char('A'+member);
-        require(second_molecule(pairs,group)==frozen_family_counters::second_molecule(pairs,group));
         std::array<const std::vector<Column>*,2> prepared{};
+        require(second_molecule(pairs,group,&prepared)==frozen_family_counters::second_molecule(pairs,group));
         require(high_quality_counts(pairs,group,prepared)==frozen_family_counters::high_quality_counts(pairs,group));
         for(int side=0;side<2;++side){
             const auto expected=frozen_columns::columns(pairs,group,side);
