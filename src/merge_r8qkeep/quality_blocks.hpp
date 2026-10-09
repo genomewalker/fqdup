@@ -14,7 +14,7 @@ namespace fqdup::r8qkeep {
 class QualityBlocks {
 public:
     static constexpr std::size_t block_size=4096;
-    struct Cursor {const QualityBlocks* owner=nullptr;std::uint64_t generation=0;std::size_t block=std::numeric_limits<std::size_t>::max();bool decoded=false;std::vector<char> text;};
+    struct Cursor {const QualityBlocks* owner=nullptr;std::uint64_t generation=0;std::size_t block=std::numeric_limits<std::size_t>::max();bool decoded=false;std::vector<char> text;std::uint64_t end=0;unsigned contiguous=0;};
     struct Edit {
         std::uint64_t position:56,value:8;
         Edit(std::uint64_t p=0,unsigned char v=0):position(p),value(v){if(p>=(std::uint64_t(1)<<56))throw std::out_of_range("quality edit address");}
@@ -31,11 +31,26 @@ private:
     static void encode(std::string_view text,std::vector<unsigned char>& output){
         if(text.empty()||text.size()>block_size)throw std::logic_error("quality block size");
         std::array<int,256> codes;codes.fill(-1);std::array<unsigned char,16> alphabet{};unsigned count=0;
-        for(unsigned char c:text)if(codes[c]<0){codes[c]=count;if(count<16)alphabet[count]=c;if(++count==17)break;}
+        // Discover the alphabet at run boundaries while retaining run ends.
+        // Dense prefixes fall back to a byte alphabet scan; the first32 saved
+        // runs are still reused. This emits exactly the same block bytes.
+        std::array<std::uint16_t,block_size> ends;std::size_t stored=0;
+        for(std::size_t i=0;i<text.size();){
+            const auto c=static_cast<unsigned char>(text[i]);
+            if(count<17&&codes[c]<0){codes[c]=count;if(count<16)alphabet[count]=c;++count;}
+            auto end=i+1;while(end<text.size()&&text[end]==text[i])++end;
+            ends[stored++]=end;i=end;
+            if(stored==32&&i<128){
+                for(;i<text.size()&&count<17;++i){const auto c=static_cast<unsigned char>(text[i]);if(codes[c]<0){codes[c]=count;if(count<16)alphabet[count]=c;++count;}}
+                break;
+            }
+        }
+
         unsigned width=0;while((1U<<width)<count)++width;if(width>4)width=8;
-        std::array<unsigned char,2*block_size+16> runs{};std::size_t run_bytes=0;
-        std::array<std::uint16_t,16> seek_position{},seek_offset{};std::size_t seek_count=0;
-        if(width)for(std::size_t i=0;i<text.size();){auto end=i+1;while(end<text.size()&&text[end]==text[i])++end;
+        std::array<unsigned char,2*block_size+16> runs;std::size_t run_bytes=0;
+        std::array<std::uint16_t,16> seek_position,seek_offset;std::size_t seek_count=0,run=0;
+        if(width)for(std::size_t i=0;i<text.size();){
+            auto end=i+1;if(run<stored)end=ends[run++];else while(end<text.size()&&text[end]==text[i])++end;
             while(seek_count*256<end){seek_position[seek_count]=i;seek_offset[seek_count++]=run_bytes;}
             auto token=std::uint32_t((end-i-1)<<width)|(width==8?static_cast<unsigned char>(text[i]):unsigned(codes[static_cast<unsigned char>(text[i])]));
             do{runs[run_bytes++]=static_cast<unsigned char>((token&127)|(token>=128?128:0));token>>=7;}while(token);i=end;
@@ -140,8 +155,17 @@ public:
             const auto start=index?blocks_[index-1].end:0;const auto count=std::min<std::size_t>(n-written,blocks_[index].end-at);
             const auto* bytes=data_.data()+blocks_[index].offset;const unsigned mode=*bytes++,width=mode&15;
             if(mode&128){
-                slice_runs(index,at-start,count,out.data()+written);
-                cursor.owner=this;cursor.generation=generation_;cursor.block=index;cursor.decoded=false;
+                if(cached&&cursor.decoded)std::memcpy(out.data()+written,cursor.text.data()+at-start,count);
+                else{
+                    const auto contiguous=cached&&cursor.end==at?std::min(3U,cursor.contiguous+1):1U;
+                    // Two mates alone do not establish sequential locality.
+                    // Decode a whole block only after a third contiguous slice.
+                    if(contiguous==3){decode(index,cursor);std::memcpy(out.data()+written,cursor.text.data()+at-start,count);}
+                    else{slice_runs(index,at-start,count,out.data()+written);cursor.owner=this;cursor.generation=generation_;cursor.block=index;cursor.decoded=false;}
+                    cursor.contiguous=contiguous;
+                }
+                cursor.end=at+count;
+
             }else{
                 // Raw blocks support direct slices; random record order must
                 // never force 4096 decoded bytes for a short quality string.

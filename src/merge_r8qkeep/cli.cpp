@@ -1,3 +1,4 @@
+#include <time.h>
 #include "buffered_plain_input.hpp"
 #include "pipeline.hpp"
 #include "worker_pool.hpp"

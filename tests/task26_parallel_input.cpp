@@ -1,3 +1,4 @@
+#include <time.h>
 #include "../src/merge_r8qkeep/buffered_plain_input.hpp"
 #include "../src/merge_r8qkeep/compact_store.hpp"
 #include "fqdup/fastq_types.hpp"

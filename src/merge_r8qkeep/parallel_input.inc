@@ -24,6 +24,9 @@ public:
 };
 std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::string>& first,const std::vector<std::string>& second,int threads){
     constexpr std::size_t batch=4096;
+    const bool diagnostics=std::getenv("FQDUP_FAMILY_DIAGNOSTICS")!=nullptr;
+    const auto cpu_ns=[&]()->std::uint64_t {if(!diagnostics)return 0;struct timespec value{};if(::clock_gettime(CLOCK_THREAD_CPUTIME_ID,&value))throw std::runtime_error("thread CPU clock");return std::uint64_t(value.tv_sec)*1000000000ULL+value.tv_nsec;};
+    std::atomic<std::uint64_t> parse_cpu{0},encode_cpu{0};std::uint64_t join_cpu=0;
     struct Reader {std::unique_ptr<FastqReaderBase> input;FastqRecord record;std::unique_ptr<BufferedPlainInput> plain;};
     const auto source=[](const std::vector<std::string>& paths){Reader out;
         if(paths.size()==1)out.plain=BufferedPlainInput::open(paths[0]);
@@ -36,13 +39,13 @@ std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::
     const auto launch=[&]{
         std::array<std::future<std::shared_ptr<CompactRawBatch>>,2> next;
         for(unsigned side=0;side<2;++side)next[side]=readers.submit([&,side]{
-            auto raw=raw_pool->acquire();auto& source=reader[side];
+            const auto started=cpu_ns();auto raw=raw_pool->acquire();auto& source=reader[side];
             if(source.plain)source.plain->read(*raw,batch);
             else while(raw->rows.size()<batch&&source.input->read(source.record))raw->append(source.record);
-            return raw;
+            parse_cpu.fetch_add(cpu_ns()-started,std::memory_order_relaxed);return raw;
         });return next;
     };
-    const auto consume=[&]{auto part=pending.front().get();pending.pop_front();result->append_store(*part);};
+    const auto consume=[&]{auto part=pending.front().get();pending.pop_front();const auto started=cpu_ns();result->append_store(*part);join_cpu+=cpu_ns()-started;};
     try{
         auto next=launch();
         for(;;){
@@ -50,14 +53,17 @@ std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::
             if(a->rows.size()!=b->rows.size())throw std::runtime_error("pair count");
             if(a->rows.empty())break;
             next=launch();
-            pending.push_back(encoders.submit([a=std::move(a),b=std::move(b)]{
+            pending.push_back(encoders.submit([&,a=std::move(a),b=std::move(b)]{
+                const auto started=cpu_ns();
                 auto store=std::make_unique<CompactPairStore>();
                 for(std::size_t i=0;i<a->rows.size();++i){const auto x=a->read(i),y=b->read(i);store->append(x[0],x[1],x[2],y[0],y[1],y[2]);}
-                return store;
+                encode_cpu.fetch_add(cpu_ns()-started,std::memory_order_relaxed);return store;
             }));
             if(pending.size()>=std::size_t(std::max(2,std::min(threads,8))))consume();
         }
         while(!pending.empty())consume();
     }catch(...){readers.stop();encoders.stop();throw;}
-    readers.stop();encoders.stop();return result;
+    readers.stop();encoders.stop();
+    if(diagnostics)std::cerr<<"COMPACT_INPUT pairs="<<result->size()<<" parse_cpu_seconds="<<parse_cpu.load()/1e9<<" encode_cpu_seconds="<<encode_cpu.load()/1e9<<" join_cpu_seconds="<<join_cpu/1e9<<'\n';
+    return result;
 }
