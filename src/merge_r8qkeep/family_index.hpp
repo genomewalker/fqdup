@@ -43,6 +43,25 @@ class FamilyPartIndex {
         }();
         return table;
     }
+    struct PrefixDeltas {
+        std::array<std::uint32_t,33> one{};
+        std::array<std::uint32_t,495> two{};
+        int singles=0,doubles=0;
+    };
+    static const auto& prefix_deltas(){
+        static const auto table=[] {
+            std::array<PrefixDeltas,2> result{};
+            for(int t=0;t<2;++t){auto& out=result[t];
+                for(int a=0;a<10+t;++a)for(std::uint32_t x=1;x<=3;++x){
+                    out.one[out.singles++]=x<<(2*a);
+                    for(int b=0;b<a;++b)for(std::uint32_t y=1;y<=3;++y)
+                        out.two[out.doubles++]=(x<<(2*a))|(y<<(2*b));
+                }
+            }
+            return result;
+        }();
+        return table;
+    }
     void build_dense() {
         for(auto& v:blocks_)std::vector<int>().swap(v);
         for(auto& v:offsets_)std::vector<std::uint32_t>().swap(v);
@@ -70,7 +89,7 @@ class FamilyPartIndex {
         }
         std::uint32_t rank=0;
         for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
-        (void)suffix_masks();
+        (void)suffix_masks();(void)prefix_deltas();
     }
     template<class Visitor>
     void visit_dense(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
@@ -89,13 +108,19 @@ class FamilyPartIndex {
         }
         const auto& masks=suffix_masks()[query&511];
         const auto collect=[&](std::uint32_t row,int budget){
-            ++lookups;const auto present=dense_words_[row];auto matches=present&masks[budget];
+            const auto present=dense_words_[row];auto matches=present&masks[budget];
             while(matches){
                 hits[count++]=(row<<6)|__builtin_ctzll(matches);
                 matches&=matches-1;}
         };
-        const int budget=2-unknowns;
-        for(int expansion=0;expansion<(1<<(2*unknowns));++expansion){
+        const int budget=2-unknowns,expansions=1<<(2*unknowns);
+        lookups+=expansions*(1+(budget>=1?3*normals:0)+(budget>=2?9*normals*(normals-1)/2:0));
+        if(unknowns==0){
+            const auto& deltas=prefix_deltas()[length_-13];
+            collect(prefix,2);
+            for(int i=0;i<deltas.singles;++i)collect(prefix^deltas.one[i],1);
+            for(int i=0;i<deltas.doubles;++i)collect(prefix^deltas.two[i],0);
+        }else for(int expansion=0;expansion<expansions;++expansion){
             auto base=prefix;
             for(int i=0;i<unknowns;++i)base|=((expansion>>(2*i))&3)<<unknown[i];
             collect(base,budget);
