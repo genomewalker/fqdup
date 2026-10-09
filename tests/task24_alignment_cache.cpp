@@ -42,7 +42,9 @@ int main(){
         require(expected==actual);
     }
     std::mt19937 policy_rng(2511);bool relaxed_length=false,stricter_error=false;
-    for(int length=20;length<=100;length+=5)for(int variant=0;variant<8;++variant){
+    std::vector<int> lengths;for(int length=20;length<=100;length+=5)lengths.push_back(length);
+    lengths.insert(lengths.end(),{512,31,511,20}); // grow, shrink, reuse across engines
+    for(int length:lengths)for(int variant=0;variant<8;++variant){
         std::string a(length,'A');for(auto& base:a)base="ACGT"[policy_rng()%4];auto b=a;
         if(variant)for(int i=7;i<length;i+=std::max(5,20-variant*2))b[i]=b[i]=='A'?'C':'A';
         if(variant==6)b.insert(b.begin()+length/2,'G');

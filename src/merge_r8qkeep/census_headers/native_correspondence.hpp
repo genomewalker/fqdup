@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdlib>
 #include <functional>
+#include <memory>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <utility>
@@ -15,10 +17,28 @@ struct Correspondence {
  std::string reason="no_alignment";
  std::vector<std::pair<int,int>> invariant, certified;
 };
+// One bounded buffer per worker and namespace. No DP pointers escape a call;
+// all alignments on one thread finish before another engine uses this buffer.
+struct AlignmentCell {
+ std::array<int,3> suffix{-1000000000,-1000000000,-1000000000};
+ int through=0;
+};
+inline AlignmentCell* alignment_scratch(std::size_t required) {
+ constexpr std::size_t maximum=513*513;
+ if(required>maximum)throw std::length_error("alignment scratch length");
+ struct Buffer {std::unique_ptr<AlignmentCell[]> cells;std::size_t capacity=0;};
+ static thread_local Buffer buffer;
+ if(required>buffer.capacity){
+  const auto capacity=std::min(maximum,std::max(required,std::max<std::size_t>(64,buffer.capacity*2)));
+  auto cells=std::make_unique<AlignmentCell[]>(capacity);
+  buffer.cells=std::move(cells);buffer.capacity=capacity;
+ }
+ return buffer.cells.get();
+}
 class BandedCorrespondence {
  static constexpr int neg=-1000000000;
- struct Cell {std::array<int,3> suffix{neg,neg,neg}; int through=0;};
- std::vector<Cell> cells;
+ using Cell=fqalign::AlignmentCell;
+ Cell* cells=nullptr;
  int n=0,m=0,d0=0;
  bool inside(int i,int j) const {return i>=1&&i<=n&&j>=1&&j<=m&&std::abs(j-i-d0)<=3;}
  Cell& at(int i,int j) {return cells[i*7+(j-i-d0+3)];}
@@ -35,10 +55,10 @@ class BandedCorrespondence {
   bool any=false;
   for(int i=1;i<=n;++i)if(std::max(1,i+d0-3)<=std::min(m,i+d0+3)){any=true;break;}
   if(!any){out.reason="empty_band";return out;}
-  cells.assign((n+1)*7,Cell{});
+  cells=fqalign::alignment_scratch((n+1)*7);
   // Suffix after the current state. Terminal states must be aligned columns.
   for(int i=n;i>=1;--i) for(int j=std::min(m,i+d0+3);j>=std::max(1,i+d0-3);--j) {
-    auto& c=at(i,j); int diag=neg;
+    auto& c=at(i,j);c.through=0;int diag=neg;
     if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((i==n||j==m)?0:neg,diag);
     if(inside(i+1,j))c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);

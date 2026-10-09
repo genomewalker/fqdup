@@ -3,8 +3,8 @@
 namespace fqalign {
 class SelfCorrespondence {
  static constexpr int neg=-1000000000;
- struct Cell {std::array<int,3> suffix{neg,neg,neg}; int through=0;};
- std::vector<Cell> cells;
+ using Cell=fqalign::AlignmentCell;
+ Cell* cells=nullptr;
  int n=0,m=0;
  bool inside(int i,int j) const {return i>=1&&i<=n&&j>=1&&j<=m&&i!=j;}
  Cell& at(int i,int j) {return cells[i*(m+1)+j];}
@@ -16,11 +16,11 @@ class SelfCorrespondence {
   if(a.empty()||b.empty()){out.reason="empty_read";return result;}
   for(char c:a+b)if(std::string("ACGTN").find(c)==std::string::npos){out.reason="unsupported_base";return result;}
   n=a.size();m=b.size();
-  cells.assign((n+1)*(m+1),Cell{});
+  cells=fqalign::alignment_scratch((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.
   for(int i=n;i>=1;--i) for(int j=m;j>=1;--j) {
     if(!inside(i,j))continue;
-    auto& c=at(i,j); int diag=neg;
+    auto& c=at(i,j);c.through=0;int diag=neg;
     if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((i==n||j==m)?0:neg,diag);
     if(inside(i+1,j))c.suffix[0]=std::max(c.suffix[0],at(i+1,j).suffix[1]-4);
