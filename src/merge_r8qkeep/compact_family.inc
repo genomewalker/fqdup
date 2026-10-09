@@ -34,7 +34,8 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
     auto plan=discover_family_keys(std::move(keys),threads,shared_pool);
     if(!plan.supported)throw UnsupportedCompactAlphabet{};
     auto groups=std::move(plan.groups);
-    const auto phase=[](const char*){};
+    auto phase_start=std::chrono::steady_clock::now();
+    const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"COMPACT_FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-phase_start).count()<<'\n';phase_start=now;};
     constexpr bool damage_safe=false;
     std::vector<CompactEdit> all_edits;
         std::vector<char> disband(groups.size());
@@ -83,11 +84,15 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             corrected+=c[5];confirmed+=c[6];unresolved+=c[7];excluded+=c[8];
         },"family_correct");
         phase("correction");
+        const auto group_count=groups.size();
+        if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_edits);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
+        if(!debug){std::vector<FamilyGroup>().swap(groups);std::vector<char>().swap(disband);}
         store.apply_edits(std::move(all_edits),&pool,std::max(1,std::min(threads,8)));
+        phase("apply_edits");
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;
         if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
-              for(size_t x=0;x<groups[k].m.size();++x){store.id(groups[k].m[x],id,names);f<<(x?",":"")<<id;} f << '\n'; }}        stats << "{\"pairs\":" << store.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
+              for(size_t x=0;x<groups[k].m.size();++x){store.id(groups[k].m[x],id,names);f<<(x?",":"")<<id;} f << '\n'; }}        stats << "{\"pairs\":" << store.size() << ",\"groups\":" << group_count << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
         return FamilyResult{{},debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n"+ledger.str():std::string(),f.str(),stats.str()};
 }

@@ -2,6 +2,8 @@
 // Must be byte-identical to the JS reference on R1.fastq, R2.fastq, family-edits.tsv and families.tsv.
 // Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
 #include "family.hpp"
+#include "atomic_family_union.hpp"
+#include <atomic>
 #include "compact_family.hpp"
 #include "family_index.hpp"
 #include "family_key.hpp"
@@ -203,71 +205,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
         m.report("family_index",keys.size(),"index_only_excludes_raw");
     }
     const auto generated=std::chrono::steady_clock::now();
-    // Workers enumerate immutable indexes; only the ordered consumer touches
-    // parent, including overflow recomputation. No per-worker seen arrays.
-    struct Slot {
-        std::array<int,64> edges{};
-        std::size_t size=0;
-        bool overflow=false;
-        std::uint64_t lookups=0,candidates=0,verified=0;
-    };
-    constexpr std::size_t batch_rows=32;
-    const std::size_t query_window=4*workers;
-    edge_limit=std::min(edge_limit,Slot{}.edges.size());
-    const std::size_t scratch_bytes=sizeof(Slot)*(workers==1?1:query_window*batch_rows);
-    const auto& shared_index=index;
-    const auto enumerate=[&](std::size_t query,Slot& result,bool serial){
-        const auto& key=packed_keys[query];
-        for(int part=0;part<3;++part){
-            const auto value=key.part(part);
-            shared_index[part].visit(value,[&](int other){
-                if(std::size_t(other)>=query)return true;
-                const auto& candidate=packed_keys[other];
-                const auto d0=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.lo,candidate.lo);
-                const auto d1=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.hi,candidate.hi);
-                if(part>0&&__builtin_popcountll(d0&((1ULL<<26)-1))<=2)return true;
-                if(part>1&&__builtin_popcountll(d0>>26)+__builtin_popcountll(d1&((1ULL<<12)-1))<=2)return true;
-                ++result.verified;
-                if(serial&&root(representative[query])==root(representative[other]))return true;
-                if(__builtin_popcountll(d0)+__builtin_popcountll(d1)>MAXMIS)return true;
-                if(serial)unite(representative[query],representative[other]);
-                else if(result.size<edge_limit)result.edges[result.size++]=other;
-                else result.overflow=true;
-                return !result.overflow;
-            },result.lookups,result.candidates);
-            if(result.overflow)return;
-        }
-    };
-    std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
-    const auto consume=[&](std::size_t query,Slot& result){
-        if(result.overflow){++overflows;result=Slot{};enumerate(query,result,true);}
-        else for(std::size_t e=0;e<result.size;++e)unite(representative[query],representative[result.edges[e]]);
-        lookups+=result.lookups;candidates+=result.candidates;verified+=result.verified;
-    };
-    if(!pool){
-        for(std::size_t query=0;query<representative.size();++query){Slot result;enumerate(query,result,false);consume(query,result);}
-    }else{
-        struct QueryBatch {std::size_t begin;std::vector<Slot> slots;};
-        std::deque<std::future<QueryBatch>> pending;std::size_t next=0;
-        const auto launch=[&]{
-            const auto begin=next,count=std::min(batch_rows,representative.size()-next);next+=count;
-            pending.push_back(pool->submit([&,begin,count]{
-                QueryBatch batch{begin,std::vector<Slot>(count)};
-                for(std::size_t s=0;s<count;++s)enumerate(begin+s,batch.slots[s],false);
-                return batch;
-            }));
-        };
-        try{
-            while(next<representative.size()&&pending.size()<query_window)launch();
-            while(!pending.empty()){
-                // Destroy the consumed buffer before replenishing the queue:
-                // at most query_window*32 slots, including consumer, are live.
-                {auto batch=pending.front().get();pending.pop_front();
-                 for(std::size_t s=0;s<batch.slots.size();++s)consume(batch.begin+s,batch.slots[s]);}
-                if(next<representative.size())launch();
-            }
-        }catch(...){pool->stop();throw;}
-    }
+    #include "parallel_family.inc"
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))
 {const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<scratch_bytes<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
     return true;

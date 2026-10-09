@@ -242,6 +242,8 @@ class FamilyPartIndex {
         }
     }
 public:
+    // One entry per representative, sorted by this part and then original ID.
+    const std::vector<int>& ordered_queries()const{return members_;}
     template<class Key>
     static std::uint64_t pack(const Key& key, int begin, int end) {
         std::uint64_t value = 0;

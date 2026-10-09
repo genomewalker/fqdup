@@ -8,6 +8,8 @@ static void check(QualityBlocks& blocks,const std::string& expected,QualityBlock
     for(std::size_t at=0;at<expected.size();at+=151){const auto n=std::min<std::size_t>(151,expected.size()-at);blocks.read(at,n,out,cursor);require(out==expected.substr(at,n));}
 }
 int main(){
+    bool overflow=false;try{QualityBlocks::Edit e(std::uint64_t(1)<<56,255);(void)e;}catch(const std::out_of_range&){overflow=true;}if(!overflow)throw std::runtime_error("edit address overflow");
+    const QualityBlocks::Edit limit((std::uint64_t(1)<<56)-1,255);if(limit.position!=(std::uint64_t(1)<<56)-1||limit.value!=255)throw std::runtime_error("edit address boundary");
     std::mt19937 rng(2605);WorkerPool pool(8);
     for(unsigned alphabet:{1,2,3,5,9,16,17,94,256})for(bool runs:{false,true}){
         std::string expected;

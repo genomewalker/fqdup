@@ -15,7 +15,11 @@ class QualityBlocks {
 public:
     static constexpr std::size_t block_size=4096;
     struct Cursor {const QualityBlocks* owner=nullptr;std::uint64_t generation=0;std::size_t block=std::numeric_limits<std::size_t>::max();bool decoded=false;std::vector<char> text;};
-    struct Edit {std::uint64_t position;unsigned char value;};
+    struct Edit {
+        std::uint64_t position:56,value:8;
+        Edit(std::uint64_t p=0,unsigned char v=0):position(p),value(v){if(p>=(std::uint64_t(1)<<56))throw std::out_of_range("quality edit address");}
+    };
+    static_assert(sizeof(Edit)==8);
 private:
     struct Block {std::uint64_t end,offset;std::uint32_t bytes;};
     std::vector<unsigned char> data_;
@@ -134,10 +138,17 @@ public:
     }
     void rewrite(std::vector<Edit> edits,WorkerPool* pool=nullptr,int workers=1){
         if(edits.empty())return;finish();
-        std::stable_sort(edits.begin(),edits.end(),[](const auto& a,const auto& b){return a.position<b.position;});
-        if(edits.back().position>=size())throw std::out_of_range("quality bulk edit");
-        std::vector<std::size_t> offsets(blocks_.size()+1);std::size_t e=0;
-        for(std::size_t i=0;i<blocks_.size();++i){while(e<edits.size()&&edits[e].position<blocks_[i].end)++e;offsets[i+1]=e;}
+        // Blocks are independent. Stable bucketing preserves the journal order
+        // within each block (including repeated positions) in linear time;
+        // position ordering inside a block is unnecessary for exact replay.
+        std::vector<std::size_t> offsets(blocks_.size()+1);
+        for(const auto& edit:edits){if(edit.position>=size())throw std::out_of_range("quality bulk edit");++offsets[find(edit.position)+1];}
+        for(std::size_t i=1;i<offsets.size();++i)offsets[i]+=offsets[i-1];
+        {
+            auto next=offsets;std::vector<Edit> grouped(edits.size());
+            for(const auto& edit:edits)grouped[next[find(edit.position)]++]=edit;
+            edits.swap(grouped);
+        }
         struct Chunk {std::vector<Block> blocks;std::vector<unsigned char> data;};
         const auto produce=[&](std::size_t begin,std::size_t end){
             Chunk out;out.blocks.reserve(end-begin);Cursor cursor;
