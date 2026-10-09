@@ -3,6 +3,9 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <fstream>
+#include <future>
+#include <chrono>
 #include <stdexcept>
 
 using namespace fqdup::r8qkeep;
@@ -31,7 +34,39 @@ static void repeated_objective(const std::vector<PairLikelihood>& pairs,const Mi
     require(std::abs(gap-fit.kkt_gap)<1e-9*pairs.size(),"weighted KKT gradient differs from explicit pairs");
     require(gap<=1.01e-6*pairs.size(),"weighted fit violates KKT tolerance");
 }
-int main(){
+static int benchmark_workers(const char* census_path){
+    std::ifstream input(census_path);
+    require(bool(input),"cannot open worker benchmark census");
+    const auto pairs=read_census_likelihood(input);
+    std::array<std::vector<const PairLikelihood*>,2> training;
+    for(const auto& p:pairs)training[p.fold].push_back(&p);
+    std::array<std::optional<MixtureFit>,2> baseline;
+    for(int workers:{1,2,4,4,2,1}){
+        const auto begin=std::chrono::steady_clock::now();
+        std::array<std::future<std::optional<MixtureFit>>,2> jobs;
+        for(int fold=0;fold<2;++fold)
+            jobs[fold]=std::async(std::launch::async,[&,fold,workers]{
+                return fit_mixture_counts(training[fold],workers);
+            });
+        std::array<std::optional<MixtureFit>,2> fits;
+        for(int fold=0;fold<2;++fold)fits[fold]=jobs[fold].get();
+        const double wall=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+        for(int fold=0;fold<2;++fold){
+            require(bool(fits[fold]),"empty worker benchmark fit");
+            if(!baseline[fold])baseline[fold]=fits[fold];
+            identical(*baseline[fold],*fits[fold]);
+        }
+        require(prior_text(baseline)==prior_text(fits),"worker benchmark prior differs");
+        std::cout<<"FIT_WORKERS workers_per_fit="<<workers<<" wall="<<wall
+                 <<" keys="<<fits[0]->unique_likelihoods<<","<<fits[1]->unique_likelihoods
+                 <<" iterations="<<fits[0]->iterations<<","<<fits[1]->iterations
+                 <<" exact=1"<<std::endl;
+    }
+    return 0;
+}
+int main(int argc,char** argv){
+    if(argc==2)return benchmark_workers(argv[1]);
+    require(argc==1,"unexpected counts test arguments");
     // More than 64 distinct cells exercises persistent workers, including unwind.
     std::vector<PairLikelihood> parallel(96);
     for(std::size_t i=0;i<parallel.size();++i){

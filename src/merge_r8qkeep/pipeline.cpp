@@ -38,8 +38,10 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
 
     std::array<std::vector<PairLikelihood>,2> pairs{std::move(out.observations.nominal_pairs),std::move(out.observations.full_pairs)};
     std::array<std::array<std::optional<MixtureFit>,2>,2> fits;
-    // Counts measurements favor parallel independent fits over inner term jobs.
-    const int concurrent=std::max(1,std::min(4,threads)),per_fit=counts?1:std::max(1,threads/concurrent);
+    // Counts fits use two concurrent folds and split the thread budget between
+    // their persistent workers. Default full-fit scheduling is unchanged.
+    const int concurrent=std::max(1,std::min(counts?2:4,threads));
+    const int per_fit=std::max(1,threads/concurrent);
     for(int begin=0;begin<4;begin+=concurrent){std::array<std::future<std::optional<MixtureFit>>,4> futures;
         for(int k=begin;k<std::min(4,begin+concurrent);++k){const int mode=k/2,f=k%2;std::vector<const PairLikelihood*> training;for(const auto& p:pairs[mode])if(p.fold==f)training.push_back(&p);
             if(concurrent>1)futures[k]=std::async(std::launch::async,[training=std::move(training),per_fit,counts](){return counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);});else fits[mode][f]=counts?fit_mixture_counts(training,per_fit):fit_mixture_views(training,per_fit);}
