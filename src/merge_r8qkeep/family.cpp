@@ -109,11 +109,14 @@ struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
 // Union roots are not output: groups/members are emitted by ascending read id.
 bool neighbor_families(const std::vector<std::string>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* shared_pool=nullptr){
     const auto code=[](char c){switch(c){case 'A':return 0;case 'C':return 1;case 'G':return 2;case 'T':return 3;case 'N':return 4;default:return -1;}};
-    for(const auto& key:keys)if(!key.empty()){if(key.size()!=40||std::count(key.begin(),key.end(), 'N')>MAXN)return false;for(char c:key)if(code(c)<0)return false;}
+    std::size_t eligible_keys=0;
+    for(const auto& key:keys)if(!key.empty()){++eligible_keys;if(key.size()!=40||std::count(key.begin(),key.end(), 'N')>MAXN)return false;for(char c:key)if(code(c)<0)return false;}
     const auto started=std::chrono::steady_clock::now();
     const auto root=[&](int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
     const auto unite=[&](int i,int j){i=root(i);j=root(j);if(i!=j)parent[i]=j;};
-    std::unordered_map<std::string,int> exact;std::vector<int> representative;
+    // Views remain valid: keys is immutable and outlives this local index.
+    std::unordered_map<std::string_view,int> exact;exact.reserve(eligible_keys);
+    std::vector<int> representative;
     for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){auto [it,new_key]=exact.emplace(keys[i],representative.size());if(new_key)representative.push_back(i);else unite(i,representative[it->second]);}
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
     const int workers=std::max(1,std::min(threads,8));
