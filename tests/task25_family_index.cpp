@@ -38,7 +38,7 @@ static std::uint64_t expected_lookups(const std::string& query,std::size_t cells
 }
 static void boundary_and_rebuilds(){
     FamilyPartIndex index;fqdup::r8qkeep::FrozenFamilyPartIndex frozen;
-    for(std::size_t count:{65535,65536,65537,0,65536,1,65537}){
+    for(std::size_t count:{1023,1024,1025,65535,65536,65537,0,65536,1,65537}){
         std::vector<std::string> keys;keys.reserve(count);
         for(std::size_t i=0;i<count;++i){
             std::uint64_t word=(i*2654435761ULL)&((1ULL<<28)-1);std::string key(14,'A');

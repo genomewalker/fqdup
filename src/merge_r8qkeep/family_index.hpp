@@ -18,6 +18,21 @@ class FamilyPartIndex {
     std::array<std::vector<std::uint32_t>, 4> offsets_;
     std::array<int, 5> bounds_{};
     int length_ = 0;
+    template<class Id,class Key>
+    static void radix_ids(std::vector<Id>& ids,Key key,int bits) {
+        // Stable digits preserve the ascending-ID tie break from initial iota.
+        // Keys are at most 42 bits (part) or 24 bits (two sub-blocks).
+        std::vector<Id> scratch(ids.size());
+        std::array<std::size_t,4096> positions{};
+        for(int shift=0;shift<bits;shift+=12){
+            positions.fill(0);
+            for(auto id:ids)++positions[(key(id)>>shift)&4095];
+            std::size_t offset=0;
+            for(auto& count:positions){const auto next=offset+count;count=offset;offset=next;}
+            for(auto id:ids)scratch[positions[(key(id)>>shift)&4095]++]=id;
+            ids.swap(scratch);
+        }
+    }
     static int code(char c) {
         switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return 4; }
     }
@@ -83,7 +98,8 @@ public:
         for(int i:representatives)packed.push_back(pack(keys[i],begin,end));
         const auto value = [&](int i) { return packed[i]; };
         parts_.clear();
-        std::sort(members_.begin(), members_.end(), [&](int a, int b) {
+        if(members_.size()>=1024)radix_ids(members_,value,3*length_);
+        else std::sort(members_.begin(), members_.end(), [&](int a, int b) {
             const auto x = value(a), y = value(b); return x < y || (x == y && a < b);
         });
         std::size_t count = 0;
@@ -105,7 +121,8 @@ public:
             std::vector<std::uint16_t> ids(parts_.size());
             for(int b=0;b<6;++b){
                 std::iota(ids.begin(),ids.end(),std::uint16_t(0));
-                std::sort(ids.begin(),ids.end(),[&](int a,int c){
+                if(ids.size()>=1024)radix_ids(ids,[&](int id){return pair_key(parts_[id].value,b);},24);
+                else std::sort(ids.begin(),ids.end(),[&](int a,int c){
                     const auto x=pair_key(parts_[a].value,b),y=pair_key(parts_[c].value,b);
                     return x<y||(x==y&&a<c);
                 });
