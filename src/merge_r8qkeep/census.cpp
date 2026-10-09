@@ -1,5 +1,6 @@
 #include "census.hpp"
 #include "ordered_chunks.hpp"
+#include "geometry_counts.hpp"
 #include <string_view>
 #include "string_input.hpp"
 #include "fdlibm.hpp"

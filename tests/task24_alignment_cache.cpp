@@ -23,9 +23,28 @@ static void geometry_parity(const std::string& a,const std::string& b){
             expected.second==actual.second&&expected.eligible==actual.eligible);
 }
 int main(){
+    // All tail lengths and unaligned starts, including arbitrary byte equality.
+    std::mt19937 count_rng(2528);
+    std::array<char,576> left{},right{};
+    for(int variant=0;variant<4;++variant) {
+        for(std::size_t i=0;i<left.size();++i) {
+            left[i]=variant<2?"ACGTN"[count_rng()%5]:char(count_rng()%256);
+            right[i]=variant==0||variant==2?left[i]:
+                variant==1?"ACGTN"[count_rng()%5]:char(count_rng()%256);
+        }
+        for(int offset=0;offset<32;++offset)for(int n=0;n<=512;++n) {
+            const char* a=left.data()+offset;
+            const char* b=right.data()+31-offset;
+            int known=0,mismatch=0;
+            for(int i=0;i<n;++i)if(a[i]!='N'&&b[i]!='N') {
+                ++known;if(a[i]!=b[i])++mismatch;
+            }
+            require(geometry_counts(a,b,n)==std::make_pair(known,mismatch));
+        }
+    }
     std::mt19937 geometry_rng(2512);
-    for(int n:{0,1,10,11,12,29,30,31,59,100,151,511,512,513})
-        for(int m:{0,1,10,11,12,29,30,31,59,100,151,511,512,513})
+    for(int n:{0,1,10,11,12,29,30,31,32,33,63,64,65,100,151,511,512,513})
+        for(int m:{0,1,10,11,12,29,30,31,32,33,63,64,65,100,151,511,512,513})
             for(int variant=0;variant<4;++variant){
                 std::string a(n,'A'),b(m,'T');
                 if(variant==1){a.assign(n,'N');b.assign(m,'N');}

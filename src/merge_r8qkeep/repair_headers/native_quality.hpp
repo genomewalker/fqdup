@@ -53,14 +53,11 @@ inline Geometry quality_independent_geometry_uncached(const std::string& a,const
     for(char c:a)if(std::string_view("ACGTN").find(c)==std::string_view::npos)
         throw std::invalid_argument("unsupported base");
     auto count=[&](int insert) {
-        int informative=0,mismatches=0;
-        for(int i=std::max(0,insert-int(b.size()));i<std::min(int(a.size()),insert);++i) {
-            int j=i-insert+int(b.size());
-            const int known=(a[i]!='N') & (b[j]!='N');
-            informative+=known;
-            mismatches+=known & (a[i]!=b[j]);
-        }
-        return std::pair<int,int>{informative,mismatches};
+        const int begin=std::max(0,insert-int(b.size()));
+        const int end=std::min(int(a.size()),insert);
+        if(end<=begin)return std::pair<int,int>{0,0};
+        return ::fqdup::r8qkeep::geometry_counts(a.data()+begin,
+            b.data()+(begin-insert+int(b.size())),end-begin);
     };
     const int last=int(a.size()+b.size())-11;
     // At most 1013 offsets; exact integer counts are reused for runner-up.
