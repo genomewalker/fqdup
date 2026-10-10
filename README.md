@@ -1,5 +1,10 @@
 # fqdup
 
+> Status as of 2026-10-10: `fqdup merge` uses the compact in-memory core (Task 26, merged at c67cb4a); `--prior-fit counts` stays the default, `full` is the exact reference mode.
+> Outputs are byte-identical to the previous validated merger (d37e373): full gates, 680/680 default-mode dev files and 15/15 fresh 1M/5M files.
+> Same-node median of 5 (8 threads), fresh 5M pairs: 20.3 s and 1.19 GB, vs 34.2 s and 5.87 GB for d37e373 and 3.4 s and 0.05 GB for AdapterRemoval 3.0.2. On a quieter node the 5M median was 16.0 s. 1M pairs: 3.6 s and 0.37 GB vs 5.5 s and 1.22 GB.
+> Projected peak memory at 38M pairs is 8.1–9.2 GB.
+
 FASTQ deduplication for ancient DNA libraries, with damage-aware hashing and
 PCR error correction.
 
