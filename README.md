@@ -1,9 +1,9 @@
 # fqdup
 
-> Status as of 2026-10-10: `fqdup merge` uses the compact in-memory core (Task 26, merged at c67cb4a); `--prior-fit counts` stays the default, `full` is the exact reference mode.
-> Outputs are byte-identical to the previous validated merger (d37e373): full gates, 680/680 default-mode dev files and 15/15 fresh 1M/5M files.
-> Same-node median of 5 (8 threads), fresh 5M pairs: 20.3 s and 1.19 GB, vs 34.2 s and 5.87 GB for d37e373 and 3.4 s and 0.05 GB for AdapterRemoval 3.0.2. On a quieter node the 5M median was 16.0 s. 1M pairs: 3.6 s and 0.37 GB vs 5.5 s and 1.22 GB.
-> Projected peak memory at 38M pairs is 8.1–9.2 GB.
+> Status as of 2026-10-11: `fqdup merge` uses the compact in-memory core (Task 26) with exact fast read-ID ordering for real Illumina headers (Task 27, 2c933de). `--prior-fit counts` stays the default; `full` is the exact reference mode.
+> Outputs are byte-identical to the previous validated mergers (d37e373, 79bba87): full gates, 680/680 default-mode dev files, 15/15 fresh 1M/5M files, and 10/10 files on two real Ellesmere aDNA libraries (ds and ss, 10M pairs each).
+> Same-node median of 5 (8 threads), real ds aDNA, 10M pairs: 52.7 s and 2.65 GB, vs 87.5 s for 79bba87 and 6.0 s and 0.05 GB for AdapterRemoval 3.0.2. Fresh simulated 5M pairs: 15.9 s and 1.18 GB, unchanged from 79bba87; AdapterRemoval 3.0.2 takes 3.2 s.
+> On real data the remaining cost is the PCR-family stage (about 29 s of the 52.7 s), dominated by index probing for the many unique keys of low-duplication libraries.
 
 FASTQ deduplication for ancient DNA libraries, with damage-aware hashing and
 PCR error correction.
