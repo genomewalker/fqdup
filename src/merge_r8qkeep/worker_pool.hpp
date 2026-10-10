@@ -1,4 +1,8 @@
 #pragma once
+#include "worker_placement.hpp"
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -17,11 +21,14 @@ class WorkerPool {
     std::condition_variable ready_;
     std::deque<std::function<void()>> queue_;
     std::vector<std::thread> workers_;
-    bool stopping_=false;
+    bool stopping_=false,placement_reported_=false;
+    std::vector<int> placement_;
+    std::atomic<int> placed_{0};
 public:
-    explicit WorkerPool(int count) {
+    explicit WorkerPool(int count):placement_(worker_cpu_plan(count)) {
         try {
-            for(int i=0;i<count;++i)workers_.emplace_back([this]{
+            for(int i=0;i<count;++i)workers_.emplace_back([this,i]{
+                if(!placement_.empty()&&place_worker(placement_[i]))placed_.fetch_add(1,std::memory_order_relaxed);
                 for(;;){
                     std::function<void()> job;
                     {std::unique_lock<std::mutex> lock(mutex_);
@@ -40,6 +47,11 @@ public:
         {std::lock_guard<std::mutex> lock(mutex_);stopping_=true;}
         ready_.notify_all();
         for(auto& worker:workers_)if(worker.joinable())worker.join();
+        if(!placement_reported_&&!placement_.empty()&&std::getenv("FQDUP_FAMILY_DIAGNOSTICS")){
+            std::cerr<<"WORKER_PLACEMENT workers="<<workers_.size()<<" pinned="<<placed_.load()<<" cpus=";
+            for(auto cpu:placement_)std::cerr<<cpu<<',';std::cerr<<'\n';
+        }
+        placement_reported_=true;
     }
     template<class Work>
     auto submit(Work work)->std::future<decltype(work())>{
