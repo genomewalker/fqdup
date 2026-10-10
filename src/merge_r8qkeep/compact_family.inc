@@ -19,8 +19,6 @@ FamilyKey compact_family_key(const FamilyPair& pair) {
     }
     return FamilyKey(std::string_view(key.data(),key.size()));
 }
-struct CompactEdit {std::uint32_t pair,position;unsigned char mate;char base,quality;bool base_changed;};
-static_assert(sizeof(CompactEdit)==12); // Flag uses the existing padding byte.
 }
 FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool debug,WorkerPool* shared_pool) {
     std::unique_ptr<WorkerPool> owned;
@@ -38,16 +36,16 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
     auto phase_start=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"COMPACT_FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-phase_start).count()<<'\n';phase_start=now;};
     constexpr bool damage_safe=false;
-    std::vector<CompactEdit> all_edits;
+    std::vector<QualityBlocks::Edit> all_qualities,all_bases;
         std::vector<char> disband(groups.size());
         const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
-        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;std::vector<CompactEdit> edits;};
+        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;std::vector<QualityBlocks::Edit> qualities,bases;};
         // Groups partition P; each worker changes only its own group's reads.
         // Ordered consumption preserves ledger rows and all integer statistics.
         ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
         static thread_local std::vector<Pair> P(MAXCOMP);
-        CompactPairStore::Decoder decoder;std::vector<CompactEdit> edits;
+        CompactPairStore::Decoder decoder;std::vector<QualityBlocks::Edit> quality_edits,base_edits;
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = begin; gi < begin+n; ++gi) {
             if(groups[gi].oversize){disband[gi]=1;++dis;continue;}
@@ -69,7 +67,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             for (int side = 0; side < 2; ++side) { const auto& cols = g.size()==g0.size()?*prepared[side]:columns(P, g, side);
                 for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
                     auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
-                        r.s[c] = base; r.q[c] = char(q + 33); edits.push_back({std::uint32_t(original[i]),std::uint32_t(c),static_cast<unsigned char>(side),base,char(q+33),base!=ob}); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
+                        r.s[c] = base; r.q[c] = char(q + 33); const auto at=store.edit_address(std::uint32_t(original[i]),side,std::uint32_t(c)); quality_edits.emplace_back(at,static_cast<unsigned char>(q+33)); if(base!=ob)base_edits.emplace_back(at,static_cast<unsigned char>(base)); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
                     if (col.n >= 3 && col.votes.size() == 1) { ++confirmed; for (int i : col.votes[0].second) set(i, col.votes[0].first, std::max(qv(P[i].r[side], c), 30)); }
                     else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
                         ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
@@ -77,18 +75,20 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
                     else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = quality_errors[static_cast<unsigned char>(P[i].r[side].q[c])]; w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
-        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded},std::move(edits)};
+        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded},std::move(quality_edits),std::move(base_edits)};
         },[&](CorrectedChunk part){
-            all_edits.insert(all_edits.end(),part.edits.begin(),part.edits.end());
+            all_qualities.insert(all_qualities.end(),part.qualities.begin(),part.qualities.end());
+            all_bases.insert(all_bases.end(),part.bases.begin(),part.bases.end());
             if(debug)ledger<<part.ledger;const auto& c=part.counts;
             prot+=c[0];rows+=c[1];fam+=c[2];dis+=c[3];members+=c[4];
             corrected+=c[5];confirmed+=c[6];unresolved+=c[7];excluded+=c[8];
         },"family_correct");
         phase("correction");
         const auto group_count=groups.size();
-        if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_edits);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
+        if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"COMPACT_EDIT_JOURNALS quality_edits="<<all_qualities.size()<<" base_edits="<<all_bases.size()<<" quality_capacity_bytes="<<vector_bytes(all_qualities)<<" base_capacity_bytes="<<vector_bytes(all_bases)<<'\n';
+        if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_qualities)+vector_bytes(all_bases);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
         if(!debug){std::vector<FamilyGroup>().swap(groups);std::vector<char>().swap(disband);}
-        store.apply_edits(std::move(all_edits),&pool,std::max(1,std::min(threads,8)),[](const CompactEdit& edit){return edit.base_changed;});
+        store.apply_absolute_edits(std::move(all_qualities),std::move(all_bases),&pool,std::max(1,std::min(threads,8)));
         phase("apply_edits");
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;
         if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";

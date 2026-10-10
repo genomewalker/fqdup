@@ -128,6 +128,7 @@ private:
 public:
     #include "compact_join.inc"
     #include "parallel_quality.inc"
+#include "absolute_edits.inc"
     CompactPairStore(){codes_.fill(-1);}
     std::size_t size()const{return (starts_.size()-1)/2;}
     bool empty()const{return size()==0;}
