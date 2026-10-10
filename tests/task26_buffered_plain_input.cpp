@@ -14,12 +14,18 @@ static std::vector<std::array<std::string,3>> reference(const std::string& path)
 int main(){
     char name[]="/tmp/task26-plain-reader-XXXXXX";const char* directory=::mkdtemp(name);if(!directory)throw std::runtime_error("fixture directory");
     unsigned serial=0;
-    const auto check=[&](const std::string& text){const auto path=std::string(directory)+"/case-"+std::to_string(serial++);{std::ofstream out(path,std::ios::binary);out.write(text.data(),text.size());}
+    const auto check_one=[&](const std::string& text){const auto path=std::string(directory)+"/case-"+std::to_string(serial++);{std::ofstream out(path,std::ios::binary);out.write(text.data(),text.size());}
         bool bad=false;std::vector<std::array<std::string,3>> expected;try{expected=reference(path);}catch(const std::runtime_error&){bad=true;}
         for(std::size_t limit:{1,13,4096}){auto input=BufferedPlainInput::open(path);if(!input)throw std::runtime_error("plain input open");bool failed=false;std::vector<std::array<std::string,3>> actual;
             try{for(;;){Batch batch;input->read(batch,limit);if(batch.rows.empty())break;for(const auto& row:batch.rows){const auto p=row.offset;actual.push_back({batch.bytes.substr(p,row.header),batch.bytes.substr(p+row.header,row.sequence),batch.bytes.substr(p+row.header+row.sequence,row.quality)});}}}catch(const std::runtime_error&){failed=true;}
             if(failed!=bad||(!bad&&actual!=expected))throw std::runtime_error("plain reader parity");}
     };
+    const std::string prefix="@before/1\nACGT\n+\nIIII\n@before/2\nTGCA\n+\nIIII\n";
+    const auto check=[&](const std::string& text){check_one(text);check_one(prefix+text);};
+    for(unsigned field=0;field<4;++field)for(unsigned pos=0;pos<65;++pos){
+        std::array<std::string,4> lines{{"@"+std::string(64,'h'),std::string(65,'A'),"+"+std::string(64,'p'),std::string(65,'I')}};
+        lines[field][pos]=0;std::string text;for(const auto& line:lines)text+=line+"\n";check(text);
+    }
     check("");check("@x\nAC\n+\nII\n");check("@x\nAC\n+\nII");check("@x\n\n+\n\n");check("@x\r\nAC\r\n+\r\nII\r\n");
     for(const auto& text:{"@x","@x\n","@x\nAC","@x\nAC\n+","@x\nAC\n+\n"})check(text);
     for(unsigned length:{8190,8191,8192,16383,1048575,1048576,1048577}){std::string text="@x\n"+std::string(length,'A')+"\n+\n"+std::string(length,'I')+"\n";check(text);

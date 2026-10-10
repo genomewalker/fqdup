@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -41,6 +42,27 @@ class BufferedPlainInput {
             if(newline||segment==8191){segment=0;visible=true;}
         }
     }
+    // Commit only a complete, NUL-free four-line record already in the buffer.
+    // Longer lines, embedded NULs, EOF and buffer boundaries retain line()'s
+    // exact gzgets(8192) behavior. No cursor or output changes on fallback.
+    template<class Batch> bool short_record(Batch& batch){
+        if(at_==end_)return false;
+        const char* first=buffer_.data()+at_;const char* cursor=first;
+        std::array<const char*,4> lines;std::array<std::size_t,4> lengths;
+        for(unsigned i=0;i<4;++i){
+            lines[i]=cursor;
+            const auto available=std::min<std::size_t>(buffer_.data()+end_-cursor,8191);
+            const auto* newline=static_cast<const char*>(std::memchr(cursor,'\n',available));
+            if(!newline)return false;
+            lengths[i]=newline-cursor;cursor=newline+1;
+        }
+        if(std::memchr(first,0,cursor-first))return false;
+        const auto start=batch.bytes.size();
+        batch.bytes.append(lines[0],lengths[0]);batch.bytes.append(lines[1],lengths[1]);batch.bytes.append(lines[3],lengths[3]);
+        batch.rows.push_back({start,lengths[0],lengths[1],lengths[3]});
+        at_+=cursor-first;return true;
+    }
+
 public:
     static std::unique_ptr<BufferedPlainInput> open(const std::string& path){
         if(path=="-"||path=="/dev/stdin")return {};
@@ -53,6 +75,7 @@ public:
     }
     template<class Batch> void read(Batch& batch,std::size_t limit){
         while(batch.rows.size()<limit){
+            if(short_record(batch))continue;
             const auto start=batch.bytes.size();if(!line(batch.bytes))break;const auto h=batch.bytes.size()-start;
             if(!line(batch.bytes))throw std::runtime_error("truncated plain FASTQ sequence");const auto s=batch.bytes.size()-start-h;
             ignored_.clear();if(!line(ignored_))throw std::runtime_error("truncated plain FASTQ plus line");
