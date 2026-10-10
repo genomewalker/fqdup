@@ -29,8 +29,7 @@ inline char complement(char c) {
 }
 // Callers supply distinct input and output storage; capacity survives rows.
 inline void reverse_complement_into(std::string_view s,std::string& out) {
-    out.resize(s.size());
-    for(size_t i=0;i<s.size();++i)out[s.size()-1-i]=complement(s[i]);
+    ::fqdup_fast_bases::reverse_complement_into(s,out);
 }
 inline std::string reverse_complement(std::string_view s) {
     std::string out;reverse_complement_into(s,out);return out;
