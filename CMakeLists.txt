@@ -325,3 +325,12 @@ endforeach()
 set_tests_properties(task26_parallel_input task26_parallel_quality PROPERTIES TIMEOUT 30)
 
 target_link_libraries(test_task26_buffered_plain_input PRIVATE ZLIB::ZLIB)
+
+foreach(backend vector scalar)
+  add_executable(test_task26_quality_encoding_${backend} tests/task26_quality_encoding.cpp)
+  target_compile_options(test_task26_quality_encoding_${backend} PRIVATE -O2 -march=${FQDUP_MARCH})
+  if(backend STREQUAL "scalar")
+    target_compile_options(test_task26_quality_encoding_${backend} PRIVATE -mno-avx2)
+  endif()
+  add_test(NAME task26_quality_encoding_${backend} COMMAND test_task26_quality_encoding_${backend})
+endforeach()
