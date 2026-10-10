@@ -83,9 +83,37 @@ static void byte_directory_groups(){
  }
 }
 
+static void source_id_postings(){
+ std::mt19937 rng(260530);FamilyPartIndex source,baseline;
+ for(int length:{13,14})for(bool dense:{false,true})for(int mode=0;mode<3;++mode){
+  std::vector<std::string> keys(16403,std::string(length,'A'));std::vector<int> ids;
+  for(int i=1;i<16403;i+=2){ids.push_back(i);for(char& c:keys[i])c="ACGT"[rng()%4];
+   if(mode==1&&i%3==0)keys[i][i%length]='N';if(mode==2)keys[i].assign(length,'N');
+   if(i>3&&i%7==0)keys[i]=keys[i-2];}
+  baseline.build(keys,ids,0,length,dense);source.build_source(keys,ids,0,length,dense);
+  auto order=baseline.ordered_queries();for(auto& id:order)id=ids[id];
+  if(order!=source.ordered_queries())throw std::runtime_error("source query order");
+  for(int q=1;q<60;q+=2){std::string query=keys[q];if(mode==2)query.assign(length,'A');
+   const auto packed=FamilyPartIndex::pack(query,0,length);
+   for(int limit:{0,5}){std::vector<int> a,b;std::uint64_t la=0,ca=0,lb=0,cb=0;
+    baseline.visit(packed,[&](int id){a.push_back(ids[id]);return !limit||int(a.size())<limit;},la,ca);
+    source.visit(packed,[&](int id){b.push_back(id);return !limit||int(b.size())<limit;},lb,cb);
+    if(a!=b||la!=lb||ca!=cb)throw std::runtime_error("source ordered postings");
+   }
+   std::vector<int>a,b;std::uint64_t la=0,ca=0,lb=0,cb=0;
+   baseline.visit_unordered(packed,[&](int id){a.push_back(ids[id]);return true;},la,ca);
+   source.visit_unordered(packed,[&](int id){b.push_back(id);return true;},lb,cb);
+   if(a!=b||la!=lb||ca!=cb)throw std::runtime_error("source unordered postings");
+  }
+ }
+ std::vector<std::string> empty;std::vector<int> ids;source.build_source(empty,ids,0,13);
+ if(!source.ordered_queries().empty())throw std::runtime_error("source empty rebuild");
+}
+
+
 int main() {
     try {
-        boundary_and_rebuilds();identity_rebuilds();byte_directory_groups();
+        boundary_and_rebuilds();identity_rebuilds();byte_directory_groups();source_id_postings();
         std::mt19937 rng(2501); const std::string bases = "ACGT";
         for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) for(bool dense:{false,true}) {
             std::string query(length, 'A'); for (char& c : query) c = bases[rng()%4];

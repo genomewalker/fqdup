@@ -198,7 +198,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
-    const auto build_part=[&](int part){index[part].build(keys,representative,bounds[part],bounds[part+1]);};
+    const auto build_part=[&](int part){if constexpr(std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>)index[part].build_source(keys,representative,bounds[part],bounds[part+1]);else index[part].build(keys,representative,bounds[part],bounds[part+1]);};
     if(pool){
         std::array<std::future<void>,3> builds;
         try{for(int part=0;part<3;++part)builds[part]=pool->submit([&,part]{build_part(part);});for(auto& build:builds)build.get();}
@@ -206,9 +206,15 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
     }else for(int part=0;part<3;++part)build_part(part);
     std::size_t cells=0,max_bucket=0,index_bytes=0;
     for(int part=0;part<3;++part){cells+=index[part].cells();max_bucket=std::max(max_bucket,index[part].max_bucket());index_bytes+=index[part].bytes();}
-    // Cache both twenty-base halves once; part boundaries are exact slices.
-    std::vector<fqdup::r8qkeep::TwoBitFamilyKey> packed_keys;packed_keys.reserve(representative.size());
-    for(int i:representative)packed_keys.emplace_back(keys[i]);
+    const auto unique_keys=representative.size();
+    // Compact postings already hold original read IDs. The immutable key array
+    // is the verification cache, so its former ID translation can be released.
+    if constexpr(std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>)std::vector<int>().swap(representative);
+    std::vector<fqdup::r8qkeep::TwoBitFamilyKey> packed_keys;
+
+    if constexpr(!std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>){packed_keys.reserve(representative.size());for(int i:representative)packed_keys.emplace_back(keys[i]);}
+    const auto key_at=[&](int id)->const auto&{if constexpr(std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>)return keys[id];else return packed_keys[id];};
+    const auto source_id=[&](int id){if constexpr(std::is_same_v<Key,fqdup::r8qkeep::FamilyKey>)return id;else return representative[id];};
     if(fqdup::r8qkeep::memory_enabled()){
         fqdup::r8qkeep::MemoryUsage m;
         m.family=index_bytes+fqdup::r8qkeep::vector_bytes(representative)+fqdup::r8qkeep::vector_bytes(packed_keys)+fqdup::r8qkeep::vector_bytes(parent)+key_bytes(keys);
@@ -217,7 +223,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
     const auto generated=std::chrono::steady_clock::now();
     #include "parallel_family.inc"
     if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))
-{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<representative.size()<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<scratch_bytes<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
+{const auto finished=std::chrono::steady_clock::now();std::cerr<<"FAMILY_INDEX pairs="<<keys.size()<<" unique_keys="<<unique_keys<<" index_bytes="<<index_bytes<<" cells="<<cells<<" max_bucket="<<max_bucket<<" lookups="<<lookups<<" candidates="<<candidates<<" verified="<<verified<<" workers="<<workers<<" scratch_bytes="<<scratch_bytes<<" overflow_queries="<<overflows<<" generation_seconds="<<std::chrono::duration<double>(generated-started).count()<<" verification_seconds="<<std::chrono::duration<double>(finished-generated).count()<<'\n';}
     return true;
 }
 

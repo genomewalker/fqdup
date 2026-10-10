@@ -6,16 +6,16 @@
 struct QueryStats {std::uint64_t lookups=0,candidates=0,verified=0;};
 fqdup::r8qkeep::AtomicFamilyUnion components(parent);
 const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
-    const auto& key=packed_keys[query];
+    const fqdup::r8qkeep::TwoBitFamilyKey key(key_at(query));
     index[part].visit_unordered(key.part(part),[&](int other){
         if(std::size_t(other)>=query)return true;
-        const auto& candidate=packed_keys[other];
+        const auto& candidate=key_at(other);
         const auto d0=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.lo,candidate.lo);
         const auto d1=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.hi,candidate.hi);
         if(part>0&&__builtin_popcountll(d0&((1ULL<<26)-1))<=2)return true;
         if(part>1&&__builtin_popcountll(d0>>26)+__builtin_popcountll(d1&((1ULL<<12)-1))<=2)return true;
         ++stats.verified;
-        if(__builtin_popcountll(d0)+__builtin_popcountll(d1)<=MAXMIS)components.unite(representative[query],representative[other]);
+        if(__builtin_popcountll(d0)+__builtin_popcountll(d1)<=MAXMIS)components.unite(source_id(query),source_id(other));
         return true;
     },stats.lookups,stats.candidates);
 };

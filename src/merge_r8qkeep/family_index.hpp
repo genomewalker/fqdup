@@ -410,6 +410,12 @@ public:
         if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
         if(sparse_)visit_dense<false,true>(query,visitor,lookups,candidates);else visit_dense<false,false>(query,visitor,lookups,candidates);
     }
+    // Return original read IDs while preserving posting and query order.
+    template<class Key>
+    void build_source(const std::vector<Key>& keys,const std::vector<int>& representatives,int begin,int end,bool force_dense=false){
+        build(keys,representatives,begin,end,force_dense);
+        for(auto& id:members_)id=representatives[id];
+    }
     std::size_t cells() const { return parts_.size(); }
     std::size_t max_bucket() const {
         std::size_t n = 0; for (std::size_t i=0;i<parts_.size();++i){const auto p=parts_[i];n=std::max(n,std::size_t(p.end-p.begin));} return n;
