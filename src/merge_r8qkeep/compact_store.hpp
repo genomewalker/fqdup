@@ -4,6 +4,9 @@
 #include "packed_kernels.hpp"
 #include "quality_blocks.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -182,6 +185,11 @@ public:
         qualities_.edit(at,static_cast<unsigned char>(quality));set_base(at,base);
     }
     bool canonicalize(WorkerPool* pool=nullptr,int workers=1) {
+        auto measured=std::chrono::steady_clock::now();
+        const bool diagnostics=std::getenv("FQDUP_CANONICAL_DIAGNOSTICS")!=nullptr;
+        const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();
+            if(diagnostics)std::cerr<<"CANONICAL_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-measured).count()<<'\n';
+            measured=now;};
         if(!order_.empty())throw std::logic_error("already canonical");
         // A library often shares a long instrument/run prefix. It contributes
         // nothing to lexicographic order; index the first varying bytes.
@@ -200,6 +208,7 @@ public:
                 for(auto& task:pending)task.get();
             }catch(...){for(auto& task:pending)if(task.valid())task.wait();throw;}
         }else collect(0,size());
+        phase("collect");
         std::vector<std::uint32_t> order(size());std::iota(order.begin(),order.end(),std::uint32_t{0});
         FamilyPair a,b;Decoder da,db;std::string ha,hb;
         const auto compare_ids=[&](auto i,auto j){header(2*i,ha,da);header(2*j,hb,db);return id_view(ha).compare(id_view(hb));};
@@ -239,10 +248,11 @@ public:
                 if(end-begin>1)std::sort(order.begin()+begin,order.begin()+end,less);begin=end;}
         }
 
+        phase("ordering");
         bool unique=true;
         for(std::size_t i=1;i<order.size();++i)
             if(prefix[order[i-1]]==prefix[order[i]]&&!compare_ids(order[i-1],order[i]))unique=false;
-        order_=std::move(order);return unique;
+        order_=std::move(order);phase("duplicates");return unique;
     }
     void input_order(){std::vector<std::uint32_t>().swap(order_);}
     std::size_t owned_bytes()const {
