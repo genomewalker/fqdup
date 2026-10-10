@@ -75,9 +75,17 @@ static void identity_rebuilds(){
  }
 }
 
+static void byte_directory_groups(){
+ for(int length:{13,14}){std::vector<std::string> keys(8193,std::string(length,'A'));
+  for(unsigned i=0;i<keys.size();++i){unsigned word=i;for(char& c:keys[i]){c="ACGT"[word&3];word>>=2;}}
+  std::vector<int> ids(keys.size());std::iota(ids.begin(),ids.end(),0);FamilyPartIndex index;fqdup::r8qkeep::FrozenFamilyPartIndex frozen;index.build(keys,ids,0,length,true);frozen.build(keys,ids,0,length);
+  for(unsigned q:{0,63,64,4095,8191,8192}){const auto query=FamilyPartIndex::pack(keys[q],0,length);std::vector<int> a,b;std::uint64_t l=0,c=0;index.visit(query,[&](int i){a.push_back(i);return true;},l,c);frozen.visit(query,[&](int i){b.push_back(i);return true;},l,c);if(a!=b)throw std::runtime_error("byte directory full128-row group");}
+ }
+}
+
 int main() {
     try {
-        boundary_and_rebuilds();identity_rebuilds();
+        boundary_and_rebuilds();identity_rebuilds();byte_directory_groups();
         std::mt19937 rng(2501); const std::string bases = "ACGT";
         for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) for(bool dense:{false,true}) {
             std::string query(length, 'A'); for (char& c : query) c = bases[rng()%4];

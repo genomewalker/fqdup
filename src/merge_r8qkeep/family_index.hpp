@@ -41,6 +41,19 @@ class FamilyPartIndex {
     std::vector<std::uint64_t> dense_words_;
     std::vector<std::uint32_t> dense_ranks_;
     std::vector<int> dense_ids_;
+    bool sparse_=false;
+    std::vector<std::uint64_t> sparse_words_,sparse_presence_;
+    std::vector<std::uint32_t> sparse_ranks_,sparse_offsets_;
+    void clear_sparse(){std::vector<std::uint64_t>().swap(sparse_words_);std::vector<std::uint64_t>().swap(sparse_presence_);std::vector<std::uint32_t>().swap(sparse_ranks_);std::vector<std::uint32_t>().swap(sparse_offsets_);}
+    std::uint32_t sparse_slot(std::uint32_t row)const{
+        const std::uint64_t present=sparse_presence_[row>>6],bit=1ULL<<(row&63);
+        // Slot zero is an immutable empty word. Masking avoids an unpredictable
+        // occupied-row branch before the usual rare-candidate branch.
+        const auto slot=sparse_offsets_[row>>6]+__builtin_popcountll(present&(bit-1))+1;
+        return slot&(0U-std::uint32_t((present&bit)!=0));
+    }
+
+
     struct NNode { std::array<int,5> child{{-1,-1,-1,-1,-1}}; int id=-1; };
     std::vector<NNode> n_nodes_;
     static const auto& suffix_masks() {
@@ -79,7 +92,14 @@ class FamilyPartIndex {
         for(auto& v:blocks_)std::vector<int>().swap(v);
         for(auto& v:offsets_)std::vector<std::uint32_t>().swap(v);
         const std::size_t rows=std::size_t(1)<<(2*(length_-3));
-        dense_words_.assign(rows,0);dense_ranks_.assign(rows,0);
+        // Upper-bound row occupancy by the number of distinct parts. Quarter
+        // occupancy limits extra rank-directory work to genuinely sparse data.
+        sparse_=parts_.size()<=rows/4;clear_sparse();
+        if(sparse_){std::vector<std::uint64_t>().swap(dense_words_);std::vector<std::uint32_t>().swap(dense_ranks_);
+            sparse_presence_.assign(rows/64,0);sparse_offsets_.assign(rows/64,0);sparse_words_.reserve(parts_.size()+1);sparse_ranks_.reserve(parts_.size()+1);sparse_words_.push_back(0);sparse_ranks_.push_back(0);
+        }else{dense_words_.assign(rows,0);dense_ranks_.assign(rows,0);}
+        std::uint32_t previous_row=UINT32_MAX,clean_rank=0;
+
         dense_ids_.clear();n_nodes_.clear();
         for(std::size_t id=0;id<parts_.size();++id){
             const auto value=values_[id];
@@ -102,17 +122,23 @@ class FamilyPartIndex {
             }else{
                 std::uint32_t word=0;
                 for(int p=0;p<length_;++p)word|=((value>>(3*p))&3)<<(2*p);
-                dense_words_[word>>6]|=1ULL<<(word&63);
+                if(sparse_){const auto row=word>>6;
+                    if(row!=previous_row){sparse_presence_[row>>6]|=1ULL<<(row&63);sparse_words_.push_back(0);sparse_ranks_.push_back(clean_rank);previous_row=row;}
+                    sparse_words_.back()|=1ULL<<(word&63);++clean_rank;
+                }else dense_words_[word>>6]|=1ULL<<(word&63);
+
                 if(!n_nodes_.empty())dense_ids_.push_back(id);
             }
         }
         // With no N-bearing parts, dense rank already equals the part ID.
         if(dense_ids_.empty())std::vector<int>().swap(dense_ids_);
         std::uint32_t rank=0;
-        for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
+        if(sparse_)for(std::size_t i=0;i<sparse_presence_.size();++i){sparse_offsets_[i]=rank;rank+=__builtin_popcountll(sparse_presence_[i]);}
+        else for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
+
         (void)suffix_masks();(void)prefix_deltas();
     }
-    template<bool Ordered=true,class Visitor>
+    template<bool Ordered=true,bool Sparse=false,class Visitor>
     void visit_dense(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates) const {
         // Radius two over fourteen five-letter positions has at most
         // 1+14*4+C(14,2)*16=1513 values, independent of library size.
@@ -129,7 +155,11 @@ class FamilyPartIndex {
         }
         const auto& masks=suffix_masks()[query&511];
         const auto collect=[&](std::uint32_t row,int budget){
-            const auto present=dense_words_[row];auto matches=present&masks[budget];
+            std::uint64_t present;
+            if constexpr(Sparse)present=sparse_words_[sparse_slot(row)];
+            else present=dense_words_[row];
+            auto matches=present&masks[budget];
+
             while(matches){
                 hits[count++]=(row<<6)|__builtin_ctzll(matches);
                 matches&=matches-1;}
@@ -157,7 +187,9 @@ class FamilyPartIndex {
         if constexpr(Ordered)std::sort(hits.begin(),hits.begin()+count);
         for(std::size_t i=0;i<count;++i){const auto code=std::uint32_t(hits[i]);
             const auto row=code>>6;const auto bit=std::uint64_t(1)<<(code&63);
-            hits[i]=dense_ranks_[row]+__builtin_popcountll(dense_words_[row]&(bit-1));}
+            if constexpr(Sparse){const auto slot=sparse_slot(row);hits[i]=sparse_ranks_[slot]+__builtin_popcountll(sparse_words_[slot]&(bit-1));}
+            else hits[i]=dense_ranks_[row]+__builtin_popcountll(dense_words_[row]&(bit-1));}
+
         if(!dense_ids_.empty())for(std::size_t i=0;i<count;++i)hits[i]=dense_ids_[hits[i]];
         if(!n_nodes_.empty()){
             const auto walk=[&](auto&& self,int node,int p,int remaining)->void {
@@ -313,6 +345,7 @@ public:
             std::vector<std::uint64_t>().swap(values_);
             return;
         }
+        sparse_=false;clear_sparse();
         std::vector<std::uint64_t>().swap(dense_words_);
         std::vector<std::uint32_t>().swap(dense_ranks_);
         std::vector<int>().swap(dense_ids_);std::vector<NNode>().swap(n_nodes_);
@@ -368,14 +401,14 @@ public:
     template<class Visitor>
     void visit(std::uint64_t query, Visitor visitor, std::uint64_t& lookups, std::uint64_t& candidates) const {
         if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
-        visit_dense(query,visitor,lookups,candidates);
+        if(sparse_)visit_dense<true,true>(query,visitor,lookups,candidates);else visit_dense<true,false>(query,visitor,lookups,candidates);
     }
     // Identical unique candidates in unspecified order, for commutative
     // component unions. The ordered API above retains its existing contract.
     template<class Visitor>
     void visit_unordered(std::uint64_t query,Visitor visitor,std::uint64_t& lookups,std::uint64_t& candidates)const {
         if(paired_){visit_pairs(query,visitor,lookups,candidates);return;}
-        visit_dense<false>(query,visitor,lookups,candidates);
+        if(sparse_)visit_dense<false,true>(query,visitor,lookups,candidates);else visit_dense<false,false>(query,visitor,lookups,candidates);
     }
     std::size_t cells() const { return parts_.size(); }
     std::size_t max_bucket() const {
@@ -387,6 +420,7 @@ public:
         for (const auto& offsets : offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
         for (const auto& offsets : pair_offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
         n+=dense_words_.capacity()*sizeof(std::uint64_t)+dense_ranks_.capacity()*sizeof(std::uint32_t);
+        n+=(sparse_words_.capacity()+sparse_presence_.capacity())*sizeof(std::uint64_t)+(sparse_ranks_.capacity()+sparse_offsets_.capacity())*sizeof(std::uint32_t);
         n+=dense_ids_.capacity()*sizeof(int)+n_nodes_.capacity()*sizeof(NNode);
         return n;
     }
