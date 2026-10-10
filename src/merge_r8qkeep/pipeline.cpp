@@ -339,9 +339,9 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     if(reclaimed.valid())release_seconds=reclaimed.get();
     if(measure){
         if(consume_records)std::cerr<<"MERGE_STAGE release_input seconds="<<release_seconds<<" timing_basis=worker_elapsed_overlaps_output_close\n";
-        std::uint64_t writeback_bytes=0;std::size_t disabled=0;
-        for(const auto& cut:files)for(const auto& file:cut){writeback_bytes+=file.writeback_bytes();disabled+=!file.writeback_enabled();}
-        std::cerr<<"MERGE_WRITEBACK submitted_bytes="<<writeback_bytes<<" disabled_streams="<<disabled<<'\n';
+        std::uint64_t writeback_bytes=0;std::size_t disabled=0;double hint_seconds=0;
+        for(const auto& cut:files)for(const auto& file:cut){writeback_bytes+=file.writeback_bytes();hint_seconds+=file.writeback_seconds();disabled+=!file.writeback_enabled();}
+        std::cerr<<"MERGE_WRITEBACK submitted_bytes="<<writeback_bytes<<" disabled_streams="<<disabled<<" hint_seconds="<<hint_seconds<<" timing_basis=caller_elapsed"<<'\n';
         const double output_seconds=open_seconds+write_seconds+close_seconds;
         const double stream_seconds=elapsed(stream_begin);
         std::cerr<<"MERGE_STAGE output_open seconds="<<open_seconds<<" timing_basis=wall\n";

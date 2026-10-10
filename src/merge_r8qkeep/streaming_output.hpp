@@ -1,5 +1,6 @@
 #pragma once
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
@@ -29,6 +30,7 @@ private:
     std::FILE* file_=nullptr;
     Writeback writeback_;
     std::uint64_t written_=0,scheduled_=0,submitted_=0;
+    double writeback_seconds_=0;
     std::size_t window_;
     bool good_=false,enabled_=true;
     void failed(){good_=false;throw std::runtime_error("write output");}
@@ -38,12 +40,12 @@ public:
     }
     StreamingOutput(const StreamingOutput&)=delete;
     StreamingOutput& operator=(const StreamingOutput&)=delete;
-    StreamingOutput(StreamingOutput&& other)noexcept:file_(std::exchange(other.file_,nullptr)),writeback_(other.writeback_),written_(other.written_),scheduled_(other.scheduled_),submitted_(other.submitted_),window_(other.window_),good_(other.good_),enabled_(other.enabled_){other.good_=false;}
+    StreamingOutput(StreamingOutput&& other)noexcept:file_(std::exchange(other.file_,nullptr)),writeback_(other.writeback_),written_(other.written_),scheduled_(other.scheduled_),submitted_(other.submitted_),writeback_seconds_(other.writeback_seconds_),window_(other.window_),good_(other.good_),enabled_(other.enabled_){other.good_=false;}
     ~StreamingOutput(){if(file_)std::fclose(file_);}
     explicit operator bool()const{return good_;}
     void open(const std::filesystem::path& path){
         if(file_)throw std::logic_error("output already open");
-        written_=scheduled_=submitted_=0;enabled_=true;file_=std::fopen(path.c_str(),"wb");good_=file_!=nullptr;
+        written_=scheduled_=submitted_=0;writeback_seconds_=0;enabled_=true;file_=std::fopen(path.c_str(),"wb");good_=file_!=nullptr;
     }
     void append(std::string_view text){
         if(!file_||!good_)failed();
@@ -52,8 +54,11 @@ public:
         written_+=text.size();
         if(enabled_&&written_-scheduled_>=window_){
             if(std::fflush(file_))failed();
-            if(writeback_(::fileno(file_),scheduled_,written_-scheduled_)){
-                if(errno==ENOSYS||errno==EINVAL||errno==EOPNOTSUPP||errno==ESPIPE)enabled_=false;
+            const auto started=std::chrono::steady_clock::now();
+            const int result=writeback_(::fileno(file_),scheduled_,written_-scheduled_),error=errno;
+            writeback_seconds_+=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+            if(result){
+                if(error==ENOSYS||error==EINVAL||error==EOPNOTSUPP||error==ESPIPE)enabled_=false;
                 else failed();
             }
             else submitted_+=written_-scheduled_;
@@ -61,6 +66,7 @@ public:
         }
     }
     std::uint64_t writeback_bytes()const{return submitted_;}
+    double writeback_seconds()const{return writeback_seconds_;}
     bool writeback_enabled()const{return enabled_;}
     void close(){if(file_){const auto owned=std::exchange(file_,nullptr);if(std::fclose(owned))good_=false;}}
 };

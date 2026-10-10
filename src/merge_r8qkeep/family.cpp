@@ -73,6 +73,15 @@ bool low_complexity(std::string_view seq) {
 template<class Key>
 int mismatches(const Key& a, const Key& b) { int m = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] == 'N' || b[i] == 'N' || a[i] != b[i]) ++m; return m; }
 
+// FamilyKey stores the exact N masks used by the scalar character comparison.
+// Group diameter requires the full distance, including an N/N mismatch.
+int mismatches(const fqdup::r8qkeep::FamilyKey& a,const fqdup::r8qkeep::FamilyKey& b){
+    if(a.empty())return 0;
+    using fqdup::r8qkeep::TwoBitFamilyKey;
+    return __builtin_popcountll(TwoBitFamilyKey::differences(a.lo,b.lo))
+        +__builtin_popcountll(TwoBitFamilyKey::differences(a.hi,b.hi));
+}
+
 using Group=fqdup::r8qkeep::FamilyGroup;
 // Masks index the original group order; views never own or reorder read IDs.
 struct MemberMask {

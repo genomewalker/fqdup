@@ -19,7 +19,8 @@ FamilyKey compact_family_key(const FamilyPair& pair) {
     }
     return FamilyKey(std::string_view(key.data(),key.size()));
 }
-struct CompactEdit {std::uint32_t pair,position;unsigned char mate;char base,quality;};
+struct CompactEdit {std::uint32_t pair,position;unsigned char mate;char base,quality;bool base_changed;};
+static_assert(sizeof(CompactEdit)==12); // Flag uses the existing padding byte.
 }
 FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool debug,WorkerPool* shared_pool) {
     std::unique_ptr<WorkerPool> owned;
@@ -68,7 +69,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             for (int side = 0; side < 2; ++side) { const auto& cols = g.size()==g0.size()?*prepared[side]:columns(P, g, side);
                 for (size_t c = 0; c < cols.size(); ++c) { auto& col = cols[c];
                     auto set = [&](int i, char base, int q) { auto& r = P[i].r[side]; if (r.s[c] == base && qv(r, c) == q) return; char ob = r.s[c]; int oq = qv(r, c);
-                        r.s[c] = base; r.q[c] = char(q + 33); edits.push_back({std::uint32_t(original[i]),std::uint32_t(c),static_cast<unsigned char>(side),base,char(q+33)}); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
+                        r.s[c] = base; r.q[c] = char(q + 33); edits.push_back({std::uint32_t(original[i]),std::uint32_t(c),static_cast<unsigned char>(side),base,char(q+33),base!=ob}); if(debug)ledger << P[i].id << '\t' << side + 1 << '\t' << c << '\t' << ob << '\t' << oq << '\t' << base << '\t' << q << '\n'; ++rows; };
                     if (col.n >= 3 && col.votes.size() == 1) { ++confirmed; for (int i : col.votes[0].second) set(i, col.votes[0].first, std::max(qv(P[i].r[side], c), 30)); }
                     else if (col.n >= 3 && col.top >= 0 && col.votes[col.top].second.size() >= 3 && col.votes[col.top].second.size() * 3 >= size_t(2 * col.n)) {
                         ++corrected; int q = 0; for (int i : col.votes[col.top].second) q = std::max(q, qv(P[i].r[side], c)); q = std::min(40, q); char top = col.votes[col.top].first;
@@ -87,7 +88,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
         const auto group_count=groups.size();
         if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_edits);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
         if(!debug){std::vector<FamilyGroup>().swap(groups);std::vector<char>().swap(disband);}
-        store.apply_edits(std::move(all_edits),&pool,std::max(1,std::min(threads,8)));
+        store.apply_edits(std::move(all_edits),&pool,std::max(1,std::min(threads,8)),[](const CompactEdit& edit){return edit.base_changed;});
         phase("apply_edits");
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;
         if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";

@@ -20,7 +20,7 @@ int main(){
     }
     // Bulk corrections must preserve logical-to-physical mapping and the last
     // value at duplicate positions, including edits to existing exceptions.
-    struct Edit {unsigned pair,position,mate;char base,quality;};
+    struct Edit {unsigned pair,position,mate;char base,quality;bool base_changed=true;};
     for(bool canonical:{false,true})for(int workers:{1,8}){
         CompactPairStore bulk,scalar;
         for(unsigned row=0;row<4096;++row){
@@ -29,12 +29,14 @@ int main(){
             scalar.append("@"+id+"/1 comment",seq,q,"@"+id+"/2 comment",seq,q);
         }
         if(canonical){bulk.canonicalize();scalar.canonicalize();}
+        auto generic=bulk;
         std::vector<Edit> edits;
-        for(unsigned i=0;i<1200;++i){const auto row=(i*239)%4096;edits.push_back({row,7,i%2,'T',char(33+i%70)});edits.push_back({row,7,i%2,'C',char(33+(i+1)%70)});edits.push_back({row,136,(i+1)%2,'N','!'});}
+        for(unsigned i=0;i<1200;++i){const auto row=(i*239)%4096;edits.push_back({row,7,i%2,'T',char(33+i%70)});edits.push_back({row,7,i%2,'T',char(33+(i+3)%70),false});edits.push_back({row,7,i%2,'C',char(33+(i+1)%70)});edits.push_back({row,136,(i+1)%2,'N','!'});}
         for(const auto& e:edits)scalar.edit(e.pair,e.mate,e.position,e.base,e.quality);
-        bulk.apply_edits(std::move(edits),&pool,workers);
-        FamilyPair a,b;CompactPairStore::Decoder da,db;
-        for(unsigned row=0;row<4096;++row){bulk.read(row,a,da);scalar.read(row,b,db);if(a.id!=b.id)throw std::runtime_error("bulk ID");
+        generic.apply_edits(edits,&pool,workers);
+        bulk.apply_edits(std::move(edits),&pool,workers,[](const Edit& e){return e.base_changed;});
+        FamilyPair a,b,c;CompactPairStore::Decoder da,db,dc;
+        for(unsigned row=0;row<4096;++row){bulk.read(row,a,da);scalar.read(row,b,db);generic.read(row,c,dc);for(unsigned m=0;m<2;++m)if(c.r[m].s!=a.r[m].s||c.r[m].q!=a.r[m].q)throw std::runtime_error("filtered versus generic edits");if(a.id!=b.id)throw std::runtime_error("bulk ID");
             for(unsigned m=0;m<2;++m)if(a.r[m].h!=b.r[m].h||a.r[m].s!=b.r[m].s||a.r[m].q!=b.r[m].q)throw std::runtime_error("bulk corrected content");
             bulk.content(row,b,db);for(unsigned m=0;m<2;++m)if(a.r[m].s!=b.r[m].s||a.r[m].q!=b.r[m].q)throw std::runtime_error("content-only decoder");}
     }
