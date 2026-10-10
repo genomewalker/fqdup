@@ -1,6 +1,7 @@
 #pragma once
 #include "family.hpp"
 #include <algorithm>
+#include <iterator>
 #include <utility>
 #include <sstream>
 #include <stdexcept>
@@ -24,19 +25,33 @@ struct NativeRecord {
     }
 };
 class NativeRecords {
-    const NativeRecord* data_=nullptr;std::size_t size_=0;
+ const NativeRecord* data_=nullptr;std::size_t size_=0;const std::size_t* indices_=nullptr;
+ NativeRecords(const NativeRecord* data,std::size_t n,const std::size_t* indices):data_(data),size_(n),indices_(indices){}
 public:
-    NativeRecords()=default;
-    NativeRecords(const std::vector<NativeRecord>& rows):data_(rows.data()),size_(rows.size()){}
-    NativeRecords(const NativeRecord* data,std::size_t size):data_(data),size_(size){}
-    std::size_t size()const{return size_;}
-    const NativeRecord& operator[](std::size_t i)const{return data_[i];}
-    const NativeRecord* begin()const{return data_;}
-    const NativeRecord* end()const{return size_?data_+size_:data_;}
-    NativeRecords slice(std::size_t first,std::size_t n)const{
-        if(first>size_||n>size_-first)throw std::out_of_range("native slice");
-        return {first?data_+first:data_,n};
-    }
+ struct Iterator {
+  using iterator_category=std::forward_iterator_tag;using value_type=NativeRecord;using difference_type=std::ptrdiff_t;using pointer=const NativeRecord*;using reference=const NativeRecord&;
+  const NativeRecord* data=nullptr;const std::size_t* indices=nullptr;std::size_t position=0;
+  reference operator*()const{return data[indices?indices[position]:position];}pointer operator->()const{return &**this;}
+  Iterator& operator++(){++position;return *this;}Iterator operator++(int){auto old=*this;++*this;return old;}
+  bool operator==(const Iterator& b)const{return data==b.data&&indices==b.indices&&position==b.position;}bool operator!=(const Iterator& b)const{return !(*this==b);}
+ };
+ NativeRecords()=default;
+ NativeRecords(const std::vector<NativeRecord>& rows):data_(rows.data()),size_(rows.size()){}
+ NativeRecords(const NativeRecord* data,std::size_t n):data_(data),size_(n){}
+ std::size_t size()const{return size_;}
+ const NativeRecord& operator[](std::size_t i)const{return data_[indices_?indices_[i]:i];}
+ Iterator begin()const{return {data_,indices_,0};}Iterator end()const{return {data_,indices_,size_};}
+ NativeRecords slice(std::size_t first,std::size_t n)const{
+  if(first>size_||n>size_-first)throw std::out_of_range("native slice");
+  if(indices_)return {data_,n,first?indices_+first:indices_};
+  return {first?data_+first:data_,n};
+ }
+ // Both record storage and index storage must outlive the borrowed view.
+ NativeRecords select(const std::vector<std::size_t>& indices)const{
+  if(indices_)throw std::logic_error("nested native selection");
+  for(auto i:indices)if(i>=size_)throw std::out_of_range("native selection");
+  return {data_,indices.size(),indices.data()};
+ }
 };
 // Full-span fast results borrow native sequence/quality instead of allocating
 // one set of strings per row/cutoff. Other results own the guard's moved output.

@@ -50,7 +50,17 @@ struct RepairPipeline::Impl {
     Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)),bound(nominal),native_clean(nominal){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
-RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std::size_t start,RepairAlignmentCache* cache,bool shadow,double clean_cutoff) const {
+std::vector<int64_t> RepairPipeline::native_clean_bounds(NativeRecords native,double cutoff) const {
+    std::vector<int64_t> bounds;bounds.reserve(native.size());
+    for(const auto& row:native){
+        // Dropped rows also retain the original repair wrapper's length check.
+        const bool lengths=row[1].size()==row[2].size()&&row[4].size()==row[5].size();
+        bounds.push_back(lengths?impl_->native_clean(row,cutoff):-1);
+    }
+    return bounds;
+}
+RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std::size_t start,RepairAlignmentCache* cache,bool shadow,double clean_cutoff,const std::vector<int64_t>* certified) const {
+    if(certified&&certified->size()!=native.size())throw std::logic_error("native certificate cardinality");
     const auto& model=impl_->nominal;fqalign::QualityProcessor processor;std::ostringstream out,audit;RoutingResult result;std::size_t row=start;
     result.routed.reserve(native.size());result.repair_bounds.reserve(native.size());result.clean_bounds.reserve(native.size());result.record_replacements.reserve(native.size());
     result.native_clean_bounds.reserve(native.size());
@@ -60,7 +70,7 @@ RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std:
         alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(row-cache->impl_->start):nullptr);
         fqquality::PairMixture::CacheScope posterior_scope(cache?&cache->impl_->posteriors.at(row-cache->impl_->start):nullptr);
         bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;int64_t repair_bound=-1;
-        const int64_t early=impl_->native_clean(v,clean_cutoff);
+        const int64_t early=certified?certified->at(row-start):impl_->native_clean(v,clean_cutoff);
         const int64_t clean=early>=0?early:clean_pair_bound(v,model,processor);
         if(early>=0){++result.native_clean;result.native_clean_bounds.push_back(early);}
         else result.native_clean_bounds.push_back(-1);

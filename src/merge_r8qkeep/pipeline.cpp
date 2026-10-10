@@ -148,7 +148,7 @@ struct OutputChunk {
     double router_seconds=0,native_seconds=0;
     std::string routed,audit,native;
     std::size_t count=0;
-    std::size_t native_clean=0;
+    std::size_t native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass;
 };
 template<class Consume>
@@ -167,15 +167,35 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     if(!lib.pool)owned_pool=std::make_unique<WorkerPool>(workers);
     auto& pool=lib.pool?*lib.pool:*owned_pool;const auto pipeline_begin=Clock::now();
     const bool native_debug=debug&&lib.native.native_tsv.empty();
+    const auto structural_switch=std::getenv("FQDUP_STRUCTURAL_SKIP");
+    const bool structural=!debug&&!counters&&(!structural_switch||std::string_view(structural_switch)!="0")
+        &&!cuts.empty()&&std::all_of(cuts.begin(),cuts.end(),[](double cut){return std::isfinite(cut)&&cut>=0&&cut<=1;});
     const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr){
         const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
-        RepairAlignmentCache cache(start,n);const auto route_begin=Clock::now();
-        const auto routing=lib.repair->route_records(native,debug,start,&cache,counters!=nullptr,*std::min_element(cuts.begin(),cuts.end()));
-        chunk.native_clean=routing.native_clean;chunk.native_clean_pass.resize(cuts.size());
+        const auto route_begin=Clock::now();const double minimum=*std::min_element(cuts.begin(),cuts.end());
+        std::vector<int64_t> certified,unresolved_bounds;std::vector<std::size_t> unresolved;
+        NativeRecords work=native;std::size_t work_start=start;
+        if(structural){
+            certified=lib.repair->native_clean_bounds(native,minimum);
+            unresolved.reserve(n);unresolved_bounds.reserve(n);
+            const auto budget=int64_t(std::floor(minimum*1000000000000LL+.5));
+            for(std::size_t i=0;i<n;++i){
+                if(certified[i]>=0&&certified[i]<=budget*int64_t(native[i][8].size()))continue;
+                unresolved.push_back(i);unresolved_bounds.push_back(certified[i]);
+            }
+            work=native.select(unresolved);work_start=0;chunk.native_direct=n-work.size();
+        }
+        // Compact slots only key pair-local scratch here. Diagnostic paths keep
+        // original indices and run the complete reference router/repair path.
+        RepairAlignmentCache cache(work_start,work.size());
+        const auto routing=lib.repair->route_records(work,debug,work_start,&cache,counters!=nullptr,minimum,structural?&unresolved_bounds:nullptr);
+        const auto& bounds=structural?certified:routing.native_clean_bounds;
+        chunk.native_clean=std::count_if(bounds.begin(),bounds.end(),[](int64_t bound){return bound>=0;});
+        chunk.native_clean_pass.resize(cuts.size());
         for(std::size_t c=0;c<cuts.size();++c)for(std::size_t i=0;i<n;++i){
-            const auto bound=routing.native_clean_bounds[i];
+            const auto bound=bounds[i];
             if(bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()))++chunk.native_clean_pass[c];
         }
         chunk.router_seconds=elapsed(route_begin);
@@ -183,15 +203,20 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         if(debug){chunk.routed=routing.routed_tsv;chunk.audit=routing.audit_tsv;}
         for(std::size_t c=0;c<cuts.size();++c){
             const auto begin=Clock::now();
-            const auto base=lib.repair->repair_records(native,9,cuts[c],start,counters?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache,&routing.clean_bounds);
-            const auto changed=alternative?lib.repair->repair_records(native,7,cuts[c],start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
-            if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed));
-            if(base.size()!=n||(alternative&&changed.size()!=n))throw std::runtime_error("chunk cardinality");
-            for(std::size_t i=0;i<n;++i){
-                const auto& record=routing.routed[i]?changed[i]:base[i];
-                if(collected){const auto bound=routing.native_clean_bounds[i];
+            const auto base=lib.repair->repair_records(work,9,cuts[c],work_start,counters?&counters[c]:nullptr,&routing.routed,&routing.repair_bounds,&cache,&routing.clean_bounds);
+            const auto changed=alternative?lib.repair->repair_records(work,7,cuts[c],work_start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
+            if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed)+vector_bytes(certified)+vector_bytes(unresolved)+vector_bytes(unresolved_bounds));
+            if(base.size()!=work.size()||(alternative&&changed.size()!=work.size()))throw std::runtime_error("chunk cardinality");
+            const auto emit=[&](std::size_t i,const RepairedRecord& record){
+                if(collected){const auto bound=bounds[i];
                     (*collected)[i]=memo_owned(record,bound>=0,bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()));}
                 else append_record(chunk.outputs[c],record,*native[i].raw);
+            };
+            std::size_t slot=0;RepairedRecord direct;
+            for(std::size_t i=0;i<n;++i){
+                if(structural&&(slot==unresolved.size()||unresolved[slot]!=i)){
+                    direct.native=&native[i];emit(i,direct);
+                }else{const auto at=structural?slot++:i;emit(i,routing.routed[at]?changed[at]:base[at]);}
             }
             chunk.seconds[c]=elapsed(begin);
         }
@@ -309,11 +334,11 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     std::unique_ptr<ParallelOutputFiles> file_writers;
     if(threads>=8&&cuts.size()==1)file_writers=std::make_unique<ParallelOutputFiles>(files[0],measure);
     std::vector<RepairShadow> counters(cuts.size());std::vector<double> seconds(cuts.size());
-    double router_seconds=0,native_seconds=0;std::size_t count=0,native_clean=0;
+    double router_seconds=0,native_seconds=0;std::size_t count=0,native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass(cuts.size());
     process_records(lib,cuts,threads,debug,shadow?counters.data():nullptr,[&](OutputChunk chunk){
         count+=chunk.count;router_seconds+=chunk.router_seconds;native_seconds+=chunk.native_seconds;
-        native_clean+=chunk.native_clean;
+        native_clean+=chunk.native_clean;native_direct+=chunk.native_direct;
         for(std::size_t c=0;c<cuts.size();++c)native_clean_pass[c]+=chunk.native_clean_pass[c];
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
@@ -371,6 +396,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     if(timings||debug)std::cerr<<"MERGE_STAGE router seconds="<<router_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
     for(std::size_t c=0;c<cuts.size();++c){
         if(timings||debug)std::cerr<<"CLEAN_FIRST cutoff="<<labels[c]<<" native_certified="<<native_clean<<" bound_pass="<<native_clean_pass[c]<<" pairs="<<count<<" reference_checks="<<(debug||shadow)<<'\n';
+        if(timings||debug)std::cerr<<"STRUCTURAL_SKIP cutoff="<<labels[c]<<" direct_clean_rows="<<native_direct<<" pairs="<<count<<" fraction="<<(count?double(native_direct)/count:0)<<" reference_checks="<<(debug||shadow)<<'\n';
         if(shadow)std::cerr<<"REPAIR_SHADOW cutoff="<<labels[c]<<" skip_and_unchanged="<<counters[c].skip_and_unchanged.load()<<" skip_but_changed="<<counters[c].skip_but_changed.load()<<" noskip_unchanged="<<counters[c].noskip_unchanged.load()<<" noskip_changed="<<counters[c].noskip_changed.load()<<" clean_and_unchanged="<<counters[c].clean_and_unchanged.load()<<" clean_but_changed="<<counters[c].clean_but_changed.load()<<" notclean="<<counters[c].notclean.load()<<'\n';
         if(timings||debug)std::cerr<<"MERGE_STAGE repair_assemble_write cutoff="<<labels[c]<<" seconds="<<seconds[c]<<" timing_basis=worker_elapsed_excluding_write"<<memory_status()<<'\n';
     }
