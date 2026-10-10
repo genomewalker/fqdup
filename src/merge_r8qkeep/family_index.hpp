@@ -1,4 +1,5 @@
 #pragma once
+#include "packed_kernels.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -249,6 +250,14 @@ public:
         std::uint64_t value = 0;
         for (int p = begin; p < end; ++p) value |= std::uint64_t(code(key[p])) << (3 * (p-begin));
         return value;
+    }
+    static std::uint64_t pack(const FamilyKey& key,int begin,int end){
+        if(!key.empty()&&key.supported()){
+            if(begin==0&&end==13)return TwoBitFamilyKey(key).part(0);
+            if(begin==13&&end==26)return TwoBitFamilyKey(key).part(1);
+            if(begin==26&&end==40)return TwoBitFamilyKey(key).part(2);
+        }
+        return pack<FamilyKey>(key,begin,end);
     }
     template<class Key>
     void build(const std::vector<Key>& keys, const std::vector<int>& representatives, int begin, int end, bool force_dense=false) {

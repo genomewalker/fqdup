@@ -52,5 +52,18 @@ int main(){
         for(int p=0;p<3;++p)require(pa.part(p)==FamilyPartIndex::pack(a,p==0?0:p==1?13:26,p==0?13:p==1?26:40));
     }
     require(!packed::Bases(std::string(513,'A')).supported());require(!packed::Bases("ACGTry").supported());
+    // Exact allocation boundaries catch vector overreads at every bit offset.
+    for(unsigned shift:{0U,2U,4U,6U})for(unsigned i=0;i<10000;++i){
+        std::vector<unsigned char> bytes(8+(shift!=0));for(auto& byte:bytes)byte=rng();
+        std::array<char,32> a,b;packed::scalar_decode32(bytes.data(),shift,a.data());packed::decode32(bytes.data(),shift,b.data());require(a==b);
+    }
+    // N overrides stored base codes, including nonzero codes under its mask.
+    for(unsigned i=0;i<20000;++i){FamilyKey key;key.lo=FamilyKey::present;key.hi=0;
+        for(unsigned p=0;p<40;++p){auto& word=p<20?key.lo:key.hi;word|=std::uint64_t(rng()%4)<<(2*(p%20));if(rng()%3==0)word|=1ULL<<(40+p%20);}
+        const TwoBitFamilyKey packed(key);
+        for(int p=0;p<3;++p){const int begin=p==0?0:p==1?13:26,end=p==2?40:begin+13;
+            require(packed.part(p)==packed.scalar_part(p));require(packed.part(p)==FamilyPartIndex::pack(key,begin,end));
+            require(packed.part(p)==FamilyPartIndex::pack<FamilyKey>(key,begin,end));}
+    }
     std::cout<<"packed/scalar blocks, all lengths 0..512, offsets, N rules, thresholds and family parts PASS\n";
 }

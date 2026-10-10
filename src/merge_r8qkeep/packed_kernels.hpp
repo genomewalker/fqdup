@@ -59,12 +59,35 @@ inline void store32(unsigned char* bytes,unsigned shift,std::uint64_t codes){
     for(unsigned i=0;i<8;++i)bytes[i]=static_cast<unsigned char>(low>>(8*i));
     if(shift)bytes[8]=static_cast<unsigned char>(codes>>(64-shift));
 }
-inline void decode32(const unsigned char* bytes,unsigned shift,char* output){
+inline void scalar_decode32(const unsigned char* bytes,unsigned shift,char* output){
     for(unsigned i=0;i<8;++i){
         const unsigned code=(bytes[i]>>shift)|(shift?unsigned(bytes[i+1])<<(8-shift):0);
         std::memcpy(output+4*i,decoded_bytes[code&255].data(),4);
     }
 }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2"))) inline void avx2_decode32(const unsigned char* bytes,unsigned shift,char* output){
+    std::uint64_t bits;std::memcpy(&bits,bytes,8);
+    if(shift)bits=(bits>>shift)|(std::uint64_t(bytes[8])<<(64-shift));
+    auto values=_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bits));
+    values=_mm256_or_si256(values,_mm256_slli_epi32(values,6));
+    values=_mm256_or_si256(values,_mm256_slli_epi32(values,12));
+    values=_mm256_and_si256(values,_mm256_set1_epi8(3));
+    const auto alphabet=_mm256_setr_epi8('A','C','G','T',0,0,0,0,0,0,0,0,0,0,0,0,'A','C','G','T',0,0,0,0,0,0,0,0,0,0,0,0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(output),_mm256_shuffle_epi8(alphabet,values));
+}
+#endif
+inline void decode32(const unsigned char* bytes,unsigned shift,char* output){
+#if defined(__AVX2__)
+    avx2_decode32(bytes,shift,output);
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if(__builtin_cpu_supports("avx2"))avx2_decode32(bytes,shift,output);
+    else scalar_decode32(bytes,shift,output);
+#else
+    scalar_decode32(bytes,shift,output);
+#endif
+}
+
 enum class NRule {ignore,always_mismatch,equal};
 class Bases {
     std::array<std::uint64_t,17> codes_{},ns_{};
@@ -106,13 +129,36 @@ struct TwoBitFamilyKey {
     std::uint64_t lo,hi;
     explicit TwoBitFamilyKey(const FamilyKey& key):lo(key.lo),hi(key.hi){if(key.empty()||!key.supported())throw std::invalid_argument("packed family alphabet");}
     explicit TwoBitFamilyKey(const std::string& key):TwoBitFamilyKey(FamilyKey(key)){}
-    std::uint64_t part(int p)const{
+    std::uint64_t scalar_part(int p)const{
         if(p<0||p>2)throw std::out_of_range("family part");
         const unsigned begin=p==0?0:p==1?13:26,end=p==2?40:begin+13;
         std::uint64_t value=0;
         for(unsigned i=begin;i<end;++i){const auto word=i<20?lo:hi;const auto pos=i%20;
             const auto code=word&(1ULL<<(40+pos))?4:(word>>(2*pos))&3;value|=code<<(3*(i-begin));}
         return value;
+    }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    __attribute__((target("bmi2"))) std::uint64_t bmi2_part(int p)const{
+        std::uint64_t codes,ns;
+        if(p==0){codes=lo&0x3ffffffULL;ns=(lo>>40)&8191U;}
+        else if(p==1){codes=((lo>>26)&16383U)|((hi&4095U)<<14);ns=((lo>>53)&127U)|(((hi>>40)&63U)<<7);}
+        else{codes=(hi>>12)&0xfffffffULL;ns=(hi>>46)&16383U;}
+        constexpr auto mask=[](){std::uint64_t value=0;for(unsigned i=0;i<14;++i)value|=3ULL<<(3*i);return value;}();
+        auto result=_pdep_u64(codes,mask);
+        // N overrides both underlying base bits, including constructed keys
+        // whose N positions retain nonzero codes. The index alphabet is 0..4.
+        if(ns){const auto flags=_pdep_u64(ns,(mask<<1)&~mask);result=(result&~((flags>>1)|(flags>>2)))|flags;}
+        return result;
+    }
+#endif
+    std::uint64_t part(int p)const{
+        if(p<0||p>2)throw std::out_of_range("family part");
+#if defined(__BMI2__)
+        return bmi2_part(p);
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if(__builtin_cpu_supports("bmi2"))return bmi2_part(p);
+#endif
+        return scalar_part(p);
     }
     static std::uint64_t differences(std::uint64_t a,std::uint64_t b){
         const auto x=a^b;auto bits=(x|(x>>1))&0x5555555555ULL;

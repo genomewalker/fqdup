@@ -4,6 +4,7 @@
 #include "prior_sample.hpp"
 #include "ordered_chunks.hpp"
 #include "ordered_writer.hpp"
+#include "streaming_output.hpp"
 #include "decoded_pair_pool.hpp"
 #include "memory_status.hpp"
 #include "string_input.hpp"
@@ -260,17 +261,17 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         "CHUNK_PROFILE stage=streaming_pipeline workers=%d chunk_rows=%zu max_inflight=%zu rows=%zu chunks=%zu wall=%.6f timing_basis=wall_including_native_and_consume\n",
         workers,chunk_rows,window,output_rows,output_chunks,elapsed(pipeline_begin));
 }
-using OutputFiles=std::array<std::ofstream,5>;
-void open_file(std::ofstream& file,const std::string& directory,std::size_t index){
+using OutputFiles=std::array<StreamingOutput,5>;
+void open_file(StreamingOutput& file,const std::string& directory,std::size_t index){
     static const char* names[]={"merged.fq","r1.fq","r2.fq","orphan.fq","outcomes.jsonl"};
-    file.open(std::filesystem::path(directory)/names[index],std::ios::binary);
+    file.open(std::filesystem::path(directory)/names[index]);
     if(!file)throw std::runtime_error("open output");
 }
 void open_files(OutputFiles& files,const std::string& directory){
     for(std::size_t i=0;i<files.size();++i)open_file(files[i],directory,i);
 }
 void write_files(OutputFiles& files,const FinalOutput& out){
-    files[0]<<out.merged;files[1]<<out.r1;files[2]<<out.r2;files[3]<<out.orphan;files[4]<<out.outcomes;
+    files[0].append(out.merged);files[1].append(out.r1);files[2].append(out.r2);files[3].append(out.orphan);files[4].append(out.outcomes);
 }
 void close_files(OutputFiles& files){for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}}
 }
@@ -338,6 +339,9 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     if(reclaimed.valid())release_seconds=reclaimed.get();
     if(measure){
         if(consume_records)std::cerr<<"MERGE_STAGE release_input seconds="<<release_seconds<<" timing_basis=worker_elapsed_overlaps_output_close\n";
+        std::uint64_t writeback_bytes=0;std::size_t disabled=0;
+        for(const auto& cut:files)for(const auto& file:cut){writeback_bytes+=file.writeback_bytes();disabled+=!file.writeback_enabled();}
+        std::cerr<<"MERGE_WRITEBACK submitted_bytes="<<writeback_bytes<<" disabled_streams="<<disabled<<'\n';
         const double output_seconds=open_seconds+write_seconds+close_seconds;
         const double stream_seconds=elapsed(stream_begin);
         std::cerr<<"MERGE_STAGE output_open seconds="<<open_seconds<<" timing_basis=wall\n";
