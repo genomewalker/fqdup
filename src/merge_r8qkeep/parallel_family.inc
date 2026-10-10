@@ -1,8 +1,8 @@
 // Included inside neighbor_families_impl after immutable indexes are built.
 // Component roots are internal; families() emits members and groups by ascending
 // read ID. Atomically union every verified edge, then join before that traversal.
-// Each part's existing sorted posting order also orders its queries. Visiting
-// one part at a time keeps related bitmap neighborhoods together in cache.
+// Each part retains its sorted posting/query order. The shared queue lets
+// workers cross part boundaries without waiting for another worker's tail.
 struct QueryStats {std::uint64_t lookups=0,candidates=0,verified=0;};
 fqdup::r8qkeep::AtomicFamilyUnion components(parent);
 const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
@@ -22,7 +22,26 @@ const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
 std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
 constexpr std::size_t scratch_bytes=sizeof(QueryStats)*8;
 const auto consume=[&](QueryStats stats){lookups+=stats.lookups;candidates+=stats.candidates;verified+=stats.verified;};
-for(int part=0;part<3;++part){
+if(pool){
+    // Query parts are immutable; minimum-root unions are scheduling-independent.
+    std::array<std::size_t,4> offsets{0,0,0,0};
+    for(int part=0;part<3;++part)offsets[part+1]=offsets[part]+index[part].ordered_queries().size();
+    std::atomic<std::size_t> next{0};std::vector<std::future<QueryStats>> tasks;tasks.reserve(workers);
+    try{
+        for(int worker=0;worker<workers;++worker)tasks.push_back(pool->submit([&]{
+            QueryStats stats;
+            for(;;){auto begin=next.fetch_add(128,std::memory_order_relaxed);if(begin>=offsets[3])break;
+                const auto end=std::min(offsets[3],begin+128);
+                while(begin<end){const int part=begin<offsets[1]?0:begin<offsets[2]?1:2;
+                    const auto stop=std::min(end,offsets[part+1]);const auto& queries=index[part].ordered_queries();
+                    for(;begin<stop;++begin)enumerate(part,queries[begin-offsets[part]],stats);
+                }
+            }
+            return stats;
+        }));
+        for(auto& task:tasks)consume(task.get());
+    }catch(...){for(auto& task:tasks)if(task.valid())task.wait();throw;}
+}else for(int part=0;part<3;++part){
     const auto& queries=index[part].ordered_queries();
     if(!pool){QueryStats stats;for(int query:queries)enumerate(part,query,stats);consume(stats);}
     else{
