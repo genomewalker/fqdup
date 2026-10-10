@@ -195,11 +195,14 @@ public:
         // nothing to lexicographic order; index the first varying bytes.
         workers=pool?std::max(1,std::min(workers,8)):1;
         const auto skip=id_common_.size();
-        std::vector<std::uint64_t> prefix(size());
+        // Three big-endian words cover the varying tile/x/y suffix of lane
+        // headers. Short generator IDs retain the original single-word passes.
+        std::vector<std::array<std::uint64_t,3>> prefix(size());
         const auto collect=[&](std::size_t begin,std::size_t end){
             Decoder decoder;std::string h;
             for(auto i=begin;i<end;++i){header(2*i,h,decoder);const auto id=id_view(h);
-                for(std::size_t j=0;j<8;++j)prefix[i]=(prefix[i]<<8)|(skip+j<id.size()?static_cast<unsigned char>(id[skip+j]):0);}
+                for(std::size_t j=0;j<24;++j){auto& word=prefix[i][j/8];
+                    word=(word<<8)|(skip+j<id.size()?static_cast<unsigned char>(id[skip+j]):0);}}
         };
         if(pool&&workers>1&&size()>=4096){
             std::vector<std::future<void>> pending;pending.reserve(workers);
@@ -223,7 +226,8 @@ public:
             // Stable radix passes order only the fixed-size prefix. Full IDs
             // and the frozen seven-field tuple still resolve every collision.
             constexpr unsigned digit_bits=11,buckets=1U<<digit_bits;
-            std::uint64_t varying=0;for(auto value:prefix)varying|=value^prefix[0];
+            std::array<std::uint64_t,3> varying{};
+            for(const auto& value:prefix)for(unsigned word=0;word<3;++word)varying[word]|=value[word]^prefix[0][word];
             std::vector<std::uint32_t> scratch(order.size());
             std::vector<std::array<std::size_t,buckets>> positions(workers);
             const auto ranges=[&](auto work){
@@ -234,14 +238,14 @@ public:
                     for(auto& task:pending)task.get();
                 }catch(...){for(auto& task:pending)if(task.valid())task.wait();throw;}
             };
-            for(unsigned shift=0;shift<64;shift+=digit_bits){
-                if(!((varying>>shift)&(buckets-1)))continue;
+            for(int word=2;word>=0;--word)for(unsigned shift=0;shift<64;shift+=digit_bits){
+                if(!((varying[word]>>shift)&(buckets-1)))continue;
                 ranges([&](int worker,std::size_t begin,std::size_t end){auto& counts=positions[worker];counts.fill(0);
-                    for(auto i=begin;i<end;++i)++counts[(prefix[order[i]]>>shift)&(buckets-1)];});
+                    for(auto i=begin;i<end;++i)++counts[(prefix[order[i]][word]>>shift)&(buckets-1)];});
                 std::size_t offset=0;
                 for(unsigned bucket=0;bucket<buckets;++bucket)for(auto& counts:positions){const auto next=offset+counts[bucket];counts[bucket]=offset;offset=next;}
                 ranges([&](int worker,std::size_t begin,std::size_t end){auto& at=positions[worker];
-                    for(auto i=begin;i<end;++i){const auto id=order[i];scratch[at[(prefix[id]>>shift)&(buckets-1)]++]=id;}});
+                    for(auto i=begin;i<end;++i){const auto id=order[i];scratch[at[(prefix[id][word]>>shift)&(buckets-1)]++]=id;}});
                 order.swap(scratch);
             }
             for(std::size_t begin=0;begin<order.size();){auto end=begin+1;while(end<order.size()&&prefix[order[begin]]==prefix[order[end]])++end;

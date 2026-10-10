@@ -354,6 +354,10 @@ foreach(backend vector scalar)
   add_test(NAME task26_trace_chain_${backend} COMMAND test_task26_trace_chain_${backend})
 endforeach()
 
+add_executable(test_task27_canonical tests/task27_canonical.cpp)
+target_link_libraries(test_task27_canonical PRIVATE Threads::Threads)
+add_test(NAME task27_canonical COMMAND test_task27_canonical)
+
 add_executable(test_task26_indexed_native_records tests/task26_indexed_native_records.cpp)
 add_test(NAME task26_indexed_native_records COMMAND test_task26_indexed_native_records)
 
