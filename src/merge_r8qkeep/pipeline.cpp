@@ -5,6 +5,7 @@
 #include "ordered_chunks.hpp"
 #include "ordered_writer.hpp"
 #include "streaming_output.hpp"
+#include "parallel_output.hpp"
 #include "decoded_pair_pool.hpp"
 #include "memory_status.hpp"
 #include "string_input.hpp"
@@ -305,6 +306,8 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     };
     each_file([&](std::size_t c,std::size_t f){open_file(files[c][f],directories[c],f);},"output_open");
     const double open_seconds=measure?elapsed(stream_begin):0;double write_seconds=0;
+    std::unique_ptr<ParallelOutputFiles> file_writers;
+    if(threads>=8&&cuts.size()==1)file_writers=std::make_unique<ParallelOutputFiles>(files[0],measure);
     std::vector<RepairShadow> counters(cuts.size());std::vector<double> seconds(cuts.size());
     double router_seconds=0,native_seconds=0;std::size_t count=0,native_clean=0;
     std::vector<std::size_t> native_clean_pass(cuts.size());
@@ -314,9 +317,18 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         for(std::size_t c=0;c<cuts.size();++c)native_clean_pass[c]+=chunk.native_clean_pass[c];
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
-        for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];write_files(files[c],chunk.outputs[c]);}
+        for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];auto& out=chunk.outputs[c];
+            if(file_writers)file_writers->append({&out.merged,&out.r1,&out.r2,&out.orphan,&out.outcomes});
+            else write_files(files[c],out);}
         if(measure)write_seconds+=elapsed(write_begin);
     });
+    double enqueue_seconds=0,drain_seconds=0;
+    if(file_writers){
+        const auto drain_begin=measure?Clock::now():Clock::time_point{};
+        file_writers->finish();drain_seconds=measure?elapsed(drain_begin):0;
+        enqueue_seconds=write_seconds;write_seconds=file_writers->seconds();
+        if(memory_enabled()){MemoryUsage memory;memory.output=file_writers->text_capacity_bound();memory.report("parallel_output_text_bound",lib.pair_count(),"queued_text_capacity_only");}
+    }
     if(count!=lib.pair_count())throw std::runtime_error("final cardinality");
     std::future<double> reclaimed;double release_seconds=0;
     if(consume_records){
@@ -345,9 +357,14 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         const double output_seconds=open_seconds+write_seconds+close_seconds;
         const double stream_seconds=elapsed(stream_begin);
         std::cerr<<"MERGE_STAGE output_open seconds="<<open_seconds<<" timing_basis=wall\n";
-        std::cerr<<"MERGE_STAGE output_write seconds="<<write_seconds<<" timing_basis=writer_elapsed\n";
+        std::cerr<<"MERGE_STAGE output_write seconds="<<write_seconds<<" timing_basis="<<(file_writers?"file_writer_elapsed_sum":"writer_elapsed")<<'\n';
+        if(file_writers){
+            std::cerr<<"MERGE_STAGE output_enqueue seconds="<<enqueue_seconds<<" timing_basis=ordered_writer_elapsed\n";
+            std::cerr<<"MERGE_STAGE output_drain seconds="<<drain_seconds<<" timing_basis=wall_after_producer_join\n";
+            std::cerr<<"MERGE_OUTPUT_WRITERS workers=5 queue_limit=16 text_capacity_bound="<<file_writers->text_capacity_bound()<<'\n';
+        }
         std::cerr<<"MERGE_STAGE output_close seconds="<<close_seconds<<" timing_basis=wall\n";
-        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis=writer_elapsed_plus_open_close_wall"<<memory_status()<<'\n';
+        std::cerr<<"MERGE_STAGE output_io seconds="<<output_seconds<<" timing_basis="<<(file_writers?"file_writer_elapsed_sum_plus_open_close_wall":"writer_elapsed_plus_open_close_wall")<<memory_status()<<'\n';
         std::cerr<<"MERGE_STAGE streaming_wall seconds="<<stream_seconds<<" timing_basis=wall_including_output"<<memory_status()<<'\n';
     }
     if(timings||debug)std::cerr<<"MERGE_STAGE streaming_native seconds="<<native_seconds<<" timing_basis=worker_elapsed"<<memory_status()<<'\n';
