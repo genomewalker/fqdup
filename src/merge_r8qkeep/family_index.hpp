@@ -14,7 +14,19 @@ namespace fqdup::r8qkeep {
 class FamilyPartIndex {
     struct Part { int begin, end; };
     std::vector<int> members_;
-    std::vector<Part> parts_;
+    // Contiguous postings share adjacent endpoints; retain each boundary once.
+    class PartRanges {
+        std::vector<int> offsets_;
+    public:
+        void clear(){offsets_.clear();}
+        void reserve(std::size_t count){offsets_.reserve(count+1);}
+        std::size_t size()const{return offsets_.empty()?0:offsets_.size()-1;}
+        void push_back(Part p){if(offsets_.empty())offsets_.push_back(p.begin);else if(offsets_.back()!=p.begin)throw std::logic_error("noncontiguous family postings");offsets_.push_back(p.end);}
+        Part operator[](std::size_t i)const{return {offsets_[i],offsets_[i+1]};}
+        std::size_t owned_bytes()const{return offsets_.capacity()*sizeof(int);}
+    };
+    PartRanges parts_;
+
     std::vector<std::uint64_t> values_;
     std::array<std::vector<int>, 4> blocks_;
     std::array<std::vector<std::uint32_t>, 4> offsets_;
@@ -72,7 +84,13 @@ class FamilyPartIndex {
         for(std::size_t id=0;id<parts_.size();++id){
             const auto value=values_[id];
             if(value&0x24924924924ULL){
-                if(n_nodes_.empty())n_nodes_.emplace_back();
+                if(n_nodes_.empty()){
+                    // Materialize earlier identity IDs only when the first N
+                    // actually requires a rank-to-part translation.
+                    for(std::size_t previous=0;previous<id;++previous)dense_ids_.push_back(previous);
+                    n_nodes_.emplace_back();
+                }
+
                 int node=0;
                 for(int p=length_-1;p>=0;--p){
                     const int c=(value>>(3*p))&7;
@@ -85,9 +103,11 @@ class FamilyPartIndex {
                 std::uint32_t word=0;
                 for(int p=0;p<length_;++p)word|=((value>>(3*p))&3)<<(2*p);
                 dense_words_[word>>6]|=1ULL<<(word&63);
-                dense_ids_.push_back(id);
+                if(!n_nodes_.empty())dense_ids_.push_back(id);
             }
         }
+        // With no N-bearing parts, dense rank already equals the part ID.
+        if(dense_ids_.empty())std::vector<int>().swap(dense_ids_);
         std::uint32_t rank=0;
         for(std::size_t i=0;i<rows;++i){dense_ranks_[i]=rank;rank+=__builtin_popcountll(dense_words_[i]);}
         (void)suffix_masks();(void)prefix_deltas();
@@ -138,7 +158,7 @@ class FamilyPartIndex {
         for(std::size_t i=0;i<count;++i){const auto code=std::uint32_t(hits[i]);
             const auto row=code>>6;const auto bit=std::uint64_t(1)<<(code&63);
             hits[i]=dense_ranks_[row]+__builtin_popcountll(dense_words_[row]&(bit-1));}
-        for(std::size_t i=0;i<count;++i)hits[i]=dense_ids_[hits[i]];
+        if(!dense_ids_.empty())for(std::size_t i=0;i<count;++i)hits[i]=dense_ids_[hits[i]];
         if(!n_nodes_.empty()){
             const auto walk=[&](auto&& self,int node,int p,int remaining)->void {
                 if(p<0){hits[count++]=n_nodes_[node].id;return;}
@@ -359,10 +379,10 @@ public:
     }
     std::size_t cells() const { return parts_.size(); }
     std::size_t max_bucket() const {
-        std::size_t n = 0; for (const auto& p : parts_) n = std::max(n, std::size_t(p.end-p.begin)); return n;
+        std::size_t n = 0; for (std::size_t i=0;i<parts_.size();++i){const auto p=parts_[i];n=std::max(n,std::size_t(p.end-p.begin));} return n;
     }
     std::size_t bytes() const {
-        std::size_t n = members_.capacity()*sizeof(int) + parts_.capacity()*sizeof(Part) + values_.capacity()*sizeof(std::uint64_t);
+        std::size_t n = members_.capacity()*sizeof(int) + parts_.owned_bytes() + values_.capacity()*sizeof(std::uint64_t);
         for (const auto& b : blocks_) n += b.capacity()*sizeof(int);
         for (const auto& offsets : offsets_) n += offsets.capacity()*sizeof(std::uint32_t);
         for (const auto& offsets : pair_offsets_) n += offsets.capacity()*sizeof(std::uint32_t);

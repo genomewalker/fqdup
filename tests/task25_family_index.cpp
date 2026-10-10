@@ -64,9 +64,20 @@ static void boundary_and_rebuilds(){
         }
     }
 }
+static void identity_rebuilds(){
+ FamilyPartIndex index;fqdup::r8qkeep::FrozenFamilyPartIndex frozen;std::mt19937 rng(260114);
+ for(int length:{13,14})for(int kind:{0,1,2,3,0}){std::vector<std::string> keys(256,std::string(length,'A'));
+  for(std::size_t i=0;i<keys.size();++i){for(char& c:keys[i])c="ACGT"[rng()%4];if(kind==2||(kind==1&&i%7==0))keys[i][0]='N';}if(kind==3)keys.back()[length-1]='N';keys.push_back(keys[0]);
+  std::vector<int> ids(keys.size());std::iota(ids.begin(),ids.end(),0);index.build(keys,ids,0,length,true);frozen.build(keys,ids,0,length);
+  for(int q:{0,1,7,17,255})for(bool add_n:{false,true}){auto query=keys[q];if(add_n)query[4]='N';const auto packed=FamilyPartIndex::pack(query,0,length);std::vector<int> a,b,u;std::uint64_t lookups=0,candidates=0;
+   index.visit(packed,[&](int i){a.push_back(i);return true;},lookups,candidates);frozen.visit(packed,[&](int i){b.push_back(i);return true;},lookups,candidates);index.visit_unordered(packed,[&](int i){u.push_back(i);return true;},lookups,candidates);std::sort(u.begin(),u.end());auto sorted=a;std::sort(sorted.begin(),sorted.end());if(a!=b||u!=sorted)throw std::runtime_error("identity mapping rebuild");
+  }
+ }
+}
+
 int main() {
     try {
-        boundary_and_rebuilds();
+        boundary_and_rebuilds();identity_rebuilds();
         std::mt19937 rng(2501); const std::string bases = "ACGT";
         for (int length : {13, 14}) for (int ns = 0; ns <= 2; ++ns) for (int trial = 0; trial < 12; ++trial) for(bool dense:{false,true}) {
             std::string query(length, 'A'); for (char& c : query) c = bases[rng()%4];
