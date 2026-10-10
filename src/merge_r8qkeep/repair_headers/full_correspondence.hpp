@@ -72,21 +72,38 @@ class FullCorrespondence {
   int threshold=out.best-2;
   int max_counted_score=neg;
   static thread_local ::fqdup_fast_dp::TracePath path;path.clear();int informative=0,mismatches=0,gaps=0;
+  // Follow an unbranched diagonal chain without recursive calls. Viable
+  // gaps still recurse in diagonal/down/right order; restore the entry path
+  // and counters after the chain. Suffix scores, terminals and cap are exact.
   auto visit=[&](auto&& recurse,int i,int j,int state,int score)->void{
    if(out.paths>256||score+at(i,j).suffix[state]<threshold)return;
-   bool info=state==0&&a[i-1]!='N'&&b[j-1]!='N';bool mm=info&&a[i-1]!=b[j-1];
-   if(state==0)path.emplace_back(i,j);else ++gaps;informative+=info;mismatches+=mm;
-   if(state==0&&(i==n||j==m)&&score>=threshold){
-    result.min_informative=std::min(result.min_informative,informative);result.max_gap=std::max(result.max_gap,gaps);result.max_fraction=std::max(result.max_fraction,double(mismatches+gaps)/std::max(1,informative+gaps));
-    ++out.paths;max_counted_score=std::max(max_counted_score,score);
-    if(out.paths<=256)::fqdup_fast_dp::intersect_path(out.invariant,path,out.paths);
-   }
-   if(out.paths<=256){
+   const auto saved_size=path.size();
+   const int saved_info=informative,saved_mm=mismatches,saved_gaps=gaps;
+   for(;;){
+    bool info=state==0&&a[i-1]!='N'&&b[j-1]!='N';bool mm=info&&a[i-1]!=b[j-1];
+    if(state==0)path.emplace_back(i,j);else ++gaps;informative+=info;mismatches+=mm;
+    if(state==0&&(i==n||j==m)&&score>=threshold){
+     result.min_informative=std::min(result.min_informative,informative);result.max_gap=std::max(result.max_gap,gaps);result.max_fraction=std::max(result.max_fraction,double(mismatches+gaps)/std::max(1,informative+gaps));
+     ++out.paths;max_counted_score=std::max(max_counted_score,score);
+     if(out.paths<=256)::fqdup_fast_dp::intersect_path(out.invariant,path,out.paths);
+    }
+    if(out.paths>256)break;
+    const int down_score=score-(state==1?1:4),right_score=score-(state==2?1:4);
+    const bool down=state!=2&&inside(i+1,j)&&down_score+at(i+1,j).suffix[1]>=threshold;
+    const bool right=state!=1&&inside(i,j+1)&&right_score+at(i,j+1).suffix[2]>=threshold;
+    if(!down&&!right){
+     if(!inside(i+1,j+1))break;
+     score+=sub(a[i],b[j]);++i;++j;state=0;
+     if(score+at(i,j).suffix[0]<threshold)break;
+     continue;
+    }
     if(inside(i+1,j+1))recurse(recurse,i+1,j+1,0,score+sub(a[i],b[j]));
-    if(state!=2&&inside(i+1,j))recurse(recurse,i+1,j,1,score-(state==1?1:4));
-    if(state!=1&&inside(i,j+1))recurse(recurse,i,j+1,2,score-(state==2?1:4));
+    if(down)recurse(recurse,i+1,j,1,down_score);
+    if(right)recurse(recurse,i,j+1,2,right_score);
+    break;
    }
-   if(state==0)path.pop_back();else --gaps;informative-=info;mismatches-=mm;
+   while(path.size()>saved_size)path.pop_back();
+   informative=saved_info;mismatches=saved_mm;gaps=saved_gaps;
   };
   for(int j=1;j<=m&&out.paths<=256;++j)visit(visit,1,j,0,sub(a[0],b[j-1]));
   for(int i=2;i<=n&&out.paths<=256;++i)visit(visit,i,1,0,sub(a[i-1],b[0]));
