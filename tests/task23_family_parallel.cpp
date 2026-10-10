@@ -53,6 +53,18 @@ static void check(const std::vector<std::string>& keys){
         require(roots(actual)==roots(expected));
     }
 }
+static void reused_column_parity(){
+    std::mt19937 rng(260112);std::vector<Pair> pairs(12);std::vector<int> group;
+    for(unsigned trial=0;trial<156;++trial){group.clear();for(unsigned i=0;i<trial%13;++i)group.push_back(i);std::shuffle(group.begin(),group.end(),rng);
+        for(auto& pair:pairs)for(auto& read:pair.r){read.s.resize(rng()%513);for(char& c:read.s)c=char(rng()%256);}
+        for(int side:{0,1}){const auto expected=frozen_columns::columns(pairs,group,side);const auto& actual=columns(pairs,group,side);require(expected.size()==actual.size());
+            for(std::size_t c=0;c<actual.size();++c){require(expected[c].n==actual[c].n&&expected[c].top==actual[c].top&&expected[c].votes.size()==actual[c].votes.size());
+                for(std::size_t k=0;k<actual[c].votes.size();++k){const auto vote=actual[c].votes[k];require(vote.first==expected[c].votes[k].first);std::vector<int> ids;for(int i:vote.second)ids.push_back(i);require(ids==expected[c].votes[k].second);}
+            }
+        }
+    }
+}
+
 static void column_parity(){
     std::mt19937 rng(2516);
     for(int size=0;size<=MAXCOMP;++size)for(int trial=0;trial<32;++trial){
@@ -182,7 +194,7 @@ int main(){
             require(std::memcmp(&expected,&errors[byte],sizeof(double))==0);}
     }
     require(std::fesetround(rounding)==0);
-    column_parity();
+    column_parity();reused_column_parity();
     std::mt19937 rng(2302);const std::string alphabet="ACGT";
     std::vector<std::string> keys;
     for(int family=0;family<32;++family){std::string key(40,'A');for(char& c:key)c=alphabet[rng()%4];

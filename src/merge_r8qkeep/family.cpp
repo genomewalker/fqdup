@@ -102,11 +102,12 @@ struct MemberMask {
         return (*group)[__builtin_ctz(unsigned(remaining))];
     }
 };
+static_assert(MAXCOMP<=255,"family vote count fits one byte");
 struct ColumnVotes {
     const std::vector<int>* group=nullptr;
     std::array<char,MAXCOMP> bases{};
     std::array<std::uint16_t,MAXCOMP> masks{};
-    std::size_t count=0;
+    std::uint8_t count=0;
     struct Vote {char first;MemberMask second;};
     Vote operator[](std::size_t index) const {return {bases[index],{group,masks[index]}};}
     std::size_t size() const {return count;}
@@ -120,7 +121,7 @@ struct ColumnVotes {
     Iterator begin() const {return {this,0};}
     Iterator end() const {return {this,count};}
 };
-struct Column {int n=0;ColumnVotes votes;int top=-1;}; // first-seen base order
+struct Column {int n=0,top=-1;ColumnVotes votes;}; // first-seen base order
 
 // Forty three-bit bases fit in two sixty-bit words. This avoids cache-line
 // straddles in candidate records while retaining N as an explicit code.
@@ -313,16 +314,17 @@ std::vector<Group> families(const std::vector<Pair>& P, std::vector<Key>& keys, 
 }
 const std::vector<Column>& columns(const std::vector<Pair>& P, const std::vector<int>& g, int side) {
     if(g.size()>MAXCOMP)throw std::logic_error("unbounded family column group");
-    size_t L = 0; for (int i : g) L = std::max(L, P[i].r[side].s.size());
+    // Cache immutable views once; reuse scratch and initialize only live vote slots.
+    std::array<std::string_view,MAXCOMP> sequences;size_t L=0;for(std::size_t member=0;member<g.size();++member){sequences[member]=P[g[member]].r[side].s;L=std::max(L,sequences[member].size());}
     static thread_local std::array<std::vector<Column>,2> scratch;
-    auto& cols=scratch.at(side);cols.assign(L,Column{});
-    for (size_t c = 0; c < L; ++c) { auto& col = cols[c];col.votes.group=&g;
+    auto& cols=scratch.at(side);cols.resize(L);
+    for (size_t c = 0; c < L; ++c) { auto& col=cols[c];col.n=0;col.votes.count=0;col.votes.group=&g;
         for(std::size_t member=0;member<g.size();++member){
-            const auto& s=P[g[member]].r[side].s;
+            const auto& s=sequences[member];
             if(c>=s.size()||s[c]=='N')continue;
             ++col.n;const char base=s[c];std::size_t slot=0;
             while(slot<col.votes.count&&col.votes.bases[slot]!=base)++slot;
-            if(slot==col.votes.count)col.votes.bases[col.votes.count++]=base;
+            if(slot==col.votes.count){col.votes.bases[slot]=base;col.votes.masks[slot]=0;++col.votes.count;}
             col.votes.masks[slot]|=std::uint16_t(1U<<member);
         }
         int top = -1; for (size_t v = 0; v < col.votes.size(); ++v) if (top < 0 || col.votes[v].second.size() > col.votes[top].second.size()) top = int(v);
