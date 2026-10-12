@@ -1,5 +1,6 @@
 #pragma once
 #include "stage_records.hpp"
+#include "shared_alignment.hpp"
 #include <memory>
 #include <atomic>
 #include <cstdint>
@@ -21,7 +22,7 @@ class RepairAlignmentCache {
     std::shared_ptr<Impl> impl_;
     friend class RepairPipeline;
 public:
-    RepairAlignmentCache(std::size_t start,std::size_t count);
+    RepairAlignmentCache(std::size_t start,std::size_t count,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared=nullptr,std::size_t offset=0,const std::vector<std::size_t>* selected=nullptr);
 };
 class RepairPipeline {
     struct Impl;

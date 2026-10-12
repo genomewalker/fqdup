@@ -13,7 +13,7 @@ namespace fqdup::r8qkeep {
 // remains ordered. Four jobs per worker hide uneven chunks; p1 stays serial.
 template<class Work,class Consume>
 void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0) {
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     const std::size_t window=workers==1?1:4*workers;
     const std::size_t chunk_rows=rows_per_chunk?rows_per_chunk:std::max<std::size_t>(1,1024/workers);
     using Result=decltype(work(row_offset,std::size_t{}));
@@ -51,14 +51,14 @@ void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::si
 template<class Work,class Consume>
 void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0,WorkerPool* shared_pool=nullptr) {
     if(shared_pool){ordered_index_chunks(*shared_pool,count,threads,row_offset,std::move(work),std::move(consume),label,rows_per_chunk);return;}
-    WorkerPool pool(std::max(1,std::min(threads,8)));
+    WorkerPool pool(fqdup::r8qkeep::bounded_worker_count(threads));
     ordered_index_chunks(pool,count,threads,row_offset,std::move(work),std::move(consume),label,rows_per_chunk);
 }
 
 // Bound outstanding row chunks and consume results in original input order.
 template<class Work,class Consume>
 void ordered_text_chunks(const std::string& text,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="chunks") {
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
     using Result=decltype(work(std::string(),row_offset));
     struct TimedResult { Result value;double wall,cpu; };

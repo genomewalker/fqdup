@@ -12,15 +12,15 @@ const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
         const auto& candidate=key_at(other);
         const auto d0=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.lo,candidate.lo);
         const auto d1=fqdup::r8qkeep::TwoBitFamilyKey::differences(key.hi,candidate.hi);
-        if(part>0&&__builtin_popcountll(d0&((1ULL<<26)-1))<=2)return true;
-        if(part>1&&__builtin_popcountll(d0>>26)+__builtin_popcountll(d1&((1ULL<<12)-1))<=2)return true;
+        if(part>0&&__builtin_popcountll(d0&((1ULL<<26)-1))<=index[0].radius())return true;
+        if(part>1&&__builtin_popcountll(d0>>26)+__builtin_popcountll(d1&((1ULL<<12)-1))<=index[1].radius())return true;
         ++stats.verified;
         if(__builtin_popcountll(d0)+__builtin_popcountll(d1)<=MAXMIS)components.unite(source_id(query),source_id(other));
         return true;
     },stats.lookups,stats.candidates);
 };
 std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
-constexpr std::size_t scratch_bytes=sizeof(QueryStats)*8;
+const std::size_t scratch_bytes=sizeof(QueryStats)*std::size_t(workers);
 const auto consume=[&](QueryStats stats){lookups+=stats.lookups;candidates+=stats.candidates;verified+=stats.verified;};
 if(pool){
     // Query parts are immutable; minimum-root unions are scheduling-independent.

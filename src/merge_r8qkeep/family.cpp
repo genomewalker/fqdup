@@ -35,6 +35,11 @@ namespace {
 constexpr int KEYLEN = 20, MAXMIS = 8, MAXN = 2, BLOCKS = 9, MAXCOMP = 12, MAXDIAM = 16, ADSEED = 10, ADZONE = 2 * KEYLEN;
 constexpr double DUST_MAX = 0.10, MAXDIS = 0.5;
 constexpr bool g_rev8 = true;
+// By default, FQDUP_FAMILY_EXCLUDE_ALLG keeps pairs whose R2 key bases are all G (2-colour no-signal R2) out of the family search.
+// Task 29 experiment 3 (A0 arm): FQDUP_FAMILY_DISABLE gives no pair a family key, so no consensus runs.
+bool family_disabled(){static const bool on=std::getenv("FQDUP_FAMILY_DISABLE")!=nullptr;return on;}
+bool exclude_allg_r2(std::string_view r2){static const bool on=[] {const char* value=std::getenv("FQDUP_FAMILY_EXCLUDE_ALLG");return !value||std::string_view(value)!="0";}();if(family_disabled())return true;
+    return on&&r2.size()>=std::size_t(KEYLEN)&&std::all_of(r2.begin(),r2.begin()+KEYLEN,[](char c){return c=='G';});}
 // --phred-unresolved (arm r8qkeep): an unresolved family column sets each copy to -10log10 P(copy wrong), with
 // P(allele a true) proportional to prod_{i in a}(1-e_i) * prod_{j not in a} e_j/3 from the copies own qualities, clamped to Q2..Q40 (the data floor; Q0 makes risk 1, rejected downstream), instead of Q2
 constexpr bool g_phred = true;
@@ -194,7 +199,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
         }
     } // Release duplicate lookup storage before constructing part indexes.
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
@@ -237,6 +242,7 @@ std::vector<Key> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::WorkerPool* 
         std::array<char,2*KEYLEN> bytes;
         std::copy_n(a.data(),KEYLEN,bytes.data());std::copy_n(b.data(),KEYLEN,bytes.data()+KEYLEN);
         const std::string_view k(bytes.data(),bytes.size());
+        if (exclude_allg_r2(b)) continue;
         if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
         if (!g_rev8) {
             if (low_complexity(a) || low_complexity(b)) continue;
@@ -261,7 +267,7 @@ template<class Key>
 std::vector<Group> families(const std::vector<Pair>& P, std::vector<Key>& keys, int threads,fqdup::r8qkeep::WorkerPool* shared_pool,bool supplied=false) {
     auto last=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
@@ -411,7 +417,7 @@ void reorder_family_plan(FamilyPlan& plan,const std::vector<std::size_t>& order)
 }
 FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool,FamilyPlan* plan) {
         std::unique_ptr<WorkerPool> owned_pool;
-        if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(std::max(1,std::min(threads,8)));shared_pool=owned_pool.get();}
+        if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(fqdup::r8qkeep::bounded_worker_count(threads));shared_pool=owned_pool.get();}
         auto& pool=*shared_pool;
         auto last=std::chrono::steady_clock::now();
         const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};

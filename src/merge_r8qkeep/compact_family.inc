@@ -5,6 +5,7 @@ namespace {
 FamilyKey compact_family_key(const FamilyPair& pair) {
     const auto& a=pair.r[0].s;const auto& b=pair.r[1].s;
     if(a.size()<KEYLEN||b.size()<KEYLEN)return {};
+    if(exclude_allg_r2(b))return {};
     std::array<char,2*KEYLEN> key;
     std::copy_n(a.data(),KEYLEN,key.data());std::copy_n(b.data(),KEYLEN,key.data()+KEYLEN);
     if(std::count(key.begin(),key.end(),'N')>MAXN)return {};
@@ -22,7 +23,7 @@ FamilyKey compact_family_key(const FamilyPair& pair) {
 }
 FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool debug,WorkerPool* shared_pool) {
     std::unique_ptr<WorkerPool> owned;
-    if(!shared_pool){owned=std::make_unique<WorkerPool>(std::max(1,std::min(threads,8)));shared_pool=owned.get();}
+    if(!shared_pool){owned=std::make_unique<WorkerPool>(bounded_worker_count(threads));shared_pool=owned.get();}
     auto& pool=*shared_pool;
     std::vector<FamilyKey> keys(store.size());
     ordered_index_chunks(pool,store.size(),threads,0,[&](std::size_t begin,std::size_t n){
@@ -88,7 +89,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
         if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"COMPACT_EDIT_JOURNALS quality_edits="<<all_qualities.size()<<" base_edits="<<all_bases.size()<<" quality_capacity_bytes="<<vector_bytes(all_qualities)<<" base_capacity_bytes="<<vector_bytes(all_bases)<<'\n';
         if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_qualities)+vector_bytes(all_bases);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
         if(!debug){std::vector<FamilyGroup>().swap(groups);std::vector<char>().swap(disband);}
-        store.apply_absolute_edits(std::move(all_qualities),std::move(all_bases),&pool,std::max(1,std::min(threads,8)));
+        store.apply_absolute_edits(std::move(all_qualities),std::move(all_bases),&pool,bounded_worker_count(threads));
         phase("apply_edits");
         std::ostringstream f, stats;CompactPairStore::Decoder names;std::string id;
         if(debug){f << "family\tsize\tdiameter\tdisbanded\tmembers\n";

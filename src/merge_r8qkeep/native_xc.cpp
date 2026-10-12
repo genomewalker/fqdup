@@ -1,4 +1,5 @@
 #include "packed_kernels.hpp"
+#include "shared_alignment.hpp"
 namespace packed26 = fqdup::r8qkeep::packed;
 #define fqdup fqdup_r8qkeep_native_headers
 #define fqalign fqdup_r8qkeep_native_alignment
@@ -1862,7 +1863,7 @@ static std::pair<int, int> find_adaptive_gapped_clip_boundaries(
 static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                          const MergeOpts& opts,
                          taph::SampleDamageProfile* prof_out,
-                         OverlapSubstCounts* subst_out) {
+                         OverlapSubstCounts* subst_out, std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* alignments=nullptr) {
     fqalign::QualityProcessor quality_processor;
     std::string rc2_seq, rc2_qual;
     taph::SampleDamageProfile local_prof;
@@ -2014,7 +2015,9 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
         out.id = batch.id;
         out.records.reserve(batch.pairs.size());
 
+        std::size_t alignment_row=0;
         for (auto& pr : batch.pairs) {
+            fqdup_shared_alignment::Scope alignment_scope(alignments?alignments->at(alignment_row++).get():nullptr);
             PairOutcomeGuard outcome_guard(out, pr, !opts.outcomes_out.empty());
             NativeQualityGuard<MergeBatch,FastqRecord> quality_guard(out,pr.r1,pr.r2,quality_processor,opts.experimental_gapped_mott,opts.experimental_disagreement_risk,opts.experimental_selective_disagreement,opts.experimental_pair_mixture.get(),opts.experimental_pair_mixture_mode,opts.experimental_full_pair_mixture.get(),opts.experimental_merged_disagreement_floor);
             FastqRecord& r1 = pr.r1;
@@ -2819,11 +2822,15 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
     memory("input_copied");
     PairQueue in(1); MergeOutQueue out(1);
     in.push(std::move(input)); in.set_done();
-    merge_worker(in, out, opts, nullptr, nullptr);
+    std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>> alignments(count);
+    const auto fusion_switch=std::getenv("FQDUP_STREAMING_FUSION");
+    const bool fusion=!fusion_switch||std::string_view(fusion_switch)!="0";
+    if(fusion)for(auto& pair:alignments)pair=std::make_shared<fqdup_shared_alignment::Pair>();
+    merge_worker(in, out, opts, nullptr, nullptr, fusion?&alignments:nullptr);
     MergeBatch batch;
     if (!out.pop_ordered(0, batch)) throw std::runtime_error("native batch missing");
     memory("batch_ready");
-    NativeResult result;result.records.reserve(pairs.size());if(audit)result.outcomes_jsonl = batch.outcomes_jsonl;
+    NativeResult result;result.alignments=std::move(alignments);result.records.reserve(pairs.size());if(audit)result.outcomes_jsonl = batch.outcomes_jsonl;
     auto append = [](std::string& text, const FastqRecord& r) {
         text += r.header + "\n" + r.seq + "\n" + r.plus + "\n" + r.qual + "\n";
     };

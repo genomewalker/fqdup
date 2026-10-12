@@ -33,7 +33,7 @@ std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::
         if(!out.plain)out.input=make_chained_fastq_reader(paths,1);return out;};
     std::array<Reader,2> reader{{source(first),source(second)}};
     auto raw_pool=std::make_shared<CompactRawPool>();
-    WorkerPool readers(2),encoders(std::max(1,std::min(threads,8)-2));
+    WorkerPool readers(2),encoders(std::max(1,fqdup::r8qkeep::bounded_worker_count(threads)-2));
     auto result=std::make_shared<CompactPairStore>();
     std::deque<std::future<std::unique_ptr<CompactPairStore>>> pending;
     const auto launch=[&]{
@@ -59,7 +59,7 @@ std::shared_ptr<CompactPairStore> parallel_compact_input(const std::vector<std::
                 for(std::size_t i=0;i<a->rows.size();++i){const auto x=a->read(i),y=b->read(i);store->append(x[0],x[1],x[2],y[0],y[1],y[2]);}
                 encode_cpu.fetch_add(cpu_ns()-started,std::memory_order_relaxed);return store;
             }));
-            if(pending.size()>=std::size_t(std::max(2,std::min(threads,8))))consume();
+            if(pending.size()>=std::size_t(std::max(2,fqdup::r8qkeep::bounded_worker_count(threads))))consume();
         }
         while(!pending.empty())consume();
     }catch(...){readers.stop();encoders.stop();throw;}
