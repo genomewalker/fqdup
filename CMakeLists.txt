@@ -370,3 +370,14 @@ foreach(backend vector scalar)
   endif()
   add_test(NAME task26_structural_skip_${backend} COMMAND test_task26_structural_skip_${backend})
 endforeach()
+
+add_executable(test_task30_family_radius tests/task30_family_radius.cpp)
+target_compile_options(test_task30_family_radius PRIVATE -O2 -march=${FQDUP_MARCH})
+add_test(NAME task30_family_radius COMMAND test_task30_family_radius)
+add_executable(test_task30_family_suppression tests/task30_family_suppression.cpp)
+target_compile_options(test_task30_family_suppression PRIVATE -ffp-contract=off)
+target_link_libraries(test_task30_family_suppression PRIVATE Threads::Threads)
+add_test(NAME task30_family_suppression COMMAND test_task30_family_suppression)
+# These frozen family tests compare the old radius-2 enumeration and outputs.
+set_tests_properties(task25_family_index task23_family_parallel task26_compact_family
+  PROPERTIES ENVIRONMENT "FQDUP_FAMILY_RADIUS=2")

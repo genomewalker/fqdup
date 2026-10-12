@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -12,6 +14,14 @@
 namespace fqdup::r8qkeep {
 // Compact postings over distinct 13/14-base parts, not over all reads.
 class FamilyPartIndex {
+    static int configured_radius() {
+        const char* value = std::getenv("FQDUP_FAMILY_RADIUS");
+        if (!value) return 1;
+        if (std::strcmp(value,"1")==0) return 1;
+        if (std::strcmp(value,"2")==0) return 2;
+        throw std::invalid_argument("FQDUP_FAMILY_RADIUS must be 1 or 2");
+    }
+    int radius_;
     struct Part { int begin, end; };
     std::vector<int> members_;
     // Contiguous postings share adjacent endpoints; retain each boundary once.
@@ -144,7 +154,7 @@ class FamilyPartIndex {
         // 1+14*4+C(14,2)*16=1513 values, independent of library size.
         std::array<int,1513> hits;std::size_t count=0;
         int ns=0;for(int p=0;p<length_;++p)ns+=((query>>(3*p))&7)==4;
-        if(ns>2)return;
+        if(ns>radius_)return;
         std::uint32_t prefix=0;
         std::array<int,11> normal{};int normals=0;
         std::array<int,2> unknown{};int unknowns=0;
@@ -164,13 +174,13 @@ class FamilyPartIndex {
                 hits[count++]=(row<<6)|__builtin_ctzll(matches);
                 matches&=matches-1;}
         };
-        const int budget=2-unknowns,expansions=1<<(2*unknowns);
+        const int budget=radius_-unknowns,expansions=1<<(2*unknowns);
         lookups+=expansions*(1+(budget>=1?3*normals:0)+(budget>=2?9*normals*(normals-1)/2:0));
         if(unknowns==0){
             const auto& deltas=prefix_deltas()[length_-13];
-            collect(prefix,2);
-            for(int i=0;i<deltas.singles;++i)collect(prefix^deltas.one[i],1);
-            for(int i=0;i<deltas.doubles;++i)collect(prefix^deltas.two[i],0);
+            collect(prefix,radius_);
+            for(int i=0;i<deltas.singles;++i)collect(prefix^deltas.one[i],radius_-1);
+            if(radius_==2)for(int i=0;i<deltas.doubles;++i)collect(prefix^deltas.two[i],0);
         }else for(int expansion=0;expansion<expansions;++expansion){
             auto base=prefix;
             for(int i=0;i<unknowns;++i)base|=((expansion>>(2*i))&3)<<unknown[i];
@@ -199,7 +209,7 @@ class FamilyPartIndex {
                     const int cost=q==4||q!=c;
                     if(next>=0&&cost<=remaining){++lookups;self(self,next,p-1,remaining-cost);}}
             };
-            walk(walk,0,length_-1,2);
+            walk(walk,0,length_-1,radius_);
             if constexpr(Ordered)std::sort(hits.begin(),hits.begin()+count);
         }
         for(std::size_t i=0;i<count;++i){++candidates;const auto& part=parts_[hits[i]];
@@ -286,8 +296,7 @@ class FamilyPartIndex {
             if(minimum==exhausted)return;
             ++candidates;const auto x=query^values_[minimum];
             const auto different=((x|(x>>1)|(x>>2))|(query>>2))&0x9249249249ULL;
-            auto remaining=different&(different-1);remaining&=remaining-1;
-            if(remaining==0){const auto& part=parts_[minimum];
+            if(__builtin_popcountll(different)<=radius_){const auto& part=parts_[minimum];
                 for(int i=part.begin;i<part.end;++i)if(!visitor(members_[i]))return;}
             for(int b=0;b<6;++b)if(heads[b]==minimum){
                 ++at[b];heads[b]=at[b]<end[b]?posting(b,at[b]):exhausted;
@@ -295,6 +304,10 @@ class FamilyPartIndex {
         }
     }
 public:
+    explicit FamilyPartIndex(int radius=configured_radius()):radius_(radius) {
+        if(radius!=1 && radius!=2)throw std::invalid_argument("family radius must be 1 or 2");
+    }
+    int radius()const{return radius_;}
     // One entry per representative, sorted by this part and then original ID.
     const std::vector<int>& ordered_queries()const{return members_;}
     template<class Key>
