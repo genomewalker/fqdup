@@ -53,7 +53,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     const bool memory=memory_enabled();
     const auto memory_stage=[&](const char* name){if(memory)library_memory(out).report(name,out.family.pairs.size());};
     if(memory){MemoryUsage m;m.reads(r1);m.reads(r2);m.report("input",r1.size());}
-    const int workers=std::max(1,std::min(threads,8));out.pool=std::make_shared<WorkerPool>(workers);
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);out.pool=std::make_shared<WorkerPool>(workers);
     if(counts){canonicalize_family_input(r1,r2,out.pool.get(),workers);stage("canonical_input");}
     out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
     memory_stage("family");
@@ -155,7 +155,7 @@ template<class Consume>
 void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,Consume consume){
     using Clock=std::chrono::steady_clock;
     const auto elapsed=[](auto start){return std::chrono::duration<double>(Clock::now()-start).count();};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
     // Deeper single-cut queues hide uneven pair work and output stalls. Multi-
     // cutoff jobs retain at most 4096 output rows, independent of input size.
@@ -170,7 +170,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     const auto structural_switch=std::getenv("FQDUP_STRUCTURAL_SKIP");
     const bool structural=!debug&&!counters&&(!structural_switch||std::string_view(structural_switch)!="0")
         &&!cuts.empty()&&std::all_of(cuts.begin(),cuts.end(),[](double cut){return std::isfinite(cut)&&cut>=0&&cut<=1;});
-    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr){
+    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared=nullptr,std::size_t shared_offset=0){
         const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
@@ -189,7 +189,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
         // Compact slots only key pair-local scratch here. Diagnostic paths keep
         // original indices and run the complete reference router/repair path.
-        RepairAlignmentCache cache(work_start,work.size());
+        RepairAlignmentCache cache(work_start,work.size(),shared,shared_offset,structural?&unresolved:nullptr);
         const auto routing=lib.repair->route_records(work,debug,work_start,&cache,counters!=nullptr,minimum,structural?&unresolved_bounds:nullptr);
         const auto& bounds=structural?certified:routing.native_clean_bounds;
         chunk.native_clean=std::count_if(bounds.begin(),bounds.end(),[](int64_t bound){return bound>=0;});
@@ -238,8 +238,8 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto native=records.slice(pos,n);const double seconds=pos==0?native_seconds:0;
             // Native views stay valid even after the coordinator advances to
             // another batch. Results own their emitted strings before returning.
-            writer.submit(pool.submit([&,native,start,seconds,keep_alive=owner]{
-                (void)keep_alive;return process(native,start,seconds);
+            writer.submit(pool.submit([&,native,start,seconds,pos,keep_alive=owner]{
+                return process(native,start,seconds,nullptr,keep_alive?&keep_alive->alignments:nullptr,pos);
             }));
             output_rows+=n;++output_chunks;
         }

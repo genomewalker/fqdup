@@ -4,7 +4,7 @@ LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;out.compact=store;
-    const int workers=std::max(1,std::min(threads,8));out.pool=std::make_shared<WorkerPool>(workers);
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);out.pool=std::make_shared<WorkerPool>(workers);
     const bool memory=memory_enabled();
     const auto memory_stage=[&](const char* name){if(memory){library_memory(out).report(name,store->size());const auto bytes=store->capacity_bytes();std::cerr<<"MERGE_COMPACT stage="<<name<<" pairs="<<store->size()<<" bases_bytes="<<bytes[0]<<" quality_bytes="<<bytes[1]<<" header_bytes="<<bytes[2]<<" offset_bytes="<<bytes[3]<<" exception_bytes="<<bytes[4]<<" quality_width="<<store->quality_width()<<" alphabet="<<store->quality_alphabet_size()<<'\n';}};
     memory_stage("compact_input");

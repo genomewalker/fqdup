@@ -39,11 +39,7 @@ struct PairRisk {
     std::vector<std::pair<int,int>> discounted;
     Correspondence correspondence;
 };
-struct Geometry {
-    int insert=-1, informative=0, mismatches=0;
-    double fraction=1.0, second=9.0;
-    bool eligible=false;
-};
+using Geometry = ::fqdup_shared_alignment::Geometry;
 // Frozen Phase-A search: min overlap 11; selection 30/.30/.45.
 // O(read_length) scratch, rather than an offsets-by-positions matrix.
 inline Geometry quality_independent_geometry_uncached(const std::string& a,const std::string& raw_b) {
