@@ -1,9 +1,9 @@
 # fqdup
 
-> Status as of 2026-10-11: `fqdup merge` uses the compact in-memory core (Task 26) with exact fast read-ID ordering for real Illumina headers (Task 27, 2c933de). `--prior-fit counts` stays the default; `full` is the exact reference mode.
-> Outputs are byte-identical to the previous validated mergers (d37e373, 79bba87): full gates, 680/680 default-mode dev files, 15/15 fresh 1M/5M files, and 10/10 files on two real Ellesmere aDNA libraries (ds and ss, 10M pairs each).
-> Same-node median of 5 (8 threads), real ds aDNA, 10M pairs: 52.7 s and 2.65 GB, vs 87.5 s for 79bba87 and 6.0 s and 0.05 GB for AdapterRemoval 3.0.2. Fresh simulated 5M pairs: 15.9 s and 1.18 GB, unchanged from 79bba87; AdapterRemoval 3.0.2 takes 3.2 s.
-> On real data the remaining cost is the PCR-family stage (about 29 s of the 52.7 s), dominated by index probing for the many unique keys of low-duplication libraries.
+> Status as of 2026-10-12: `fqdup merge` uses the compact in-memory core (Task 26), exact fast read-ID ordering for real Illumina headers (Task 27), and the Task 30 family and streaming changes (add6928): PCR-family candidates at Hamming radius 1 per 13/14-base part, all-G R2 keys excluded from families, one native correspondence shared by router and repair, and every stage scaling to `-p` (the former 8-worker cap is gone). `--prior-fit counts` stays the default; `full` is the exact reference mode.
+> Radius 1 and the all-G exclusion were accepted on truth evidence (TASK30_FAMILY_RADIUS.md): dev outputs stay 680/680 identical to the accepted default, real-data merged sequences change by well under 0.01%. Fusion and scaling are byte-identical to their parents at `-p` 1, 8 and 16 (full850, default680, fresh 1M/5M, real ds/ss).
+> Same-node median of 5 (16 CPUs), real Ellesmere aDNA, 10M pairs: ds 29.11 s vs 51.68 s for the previous main (fcedd09) vs 3.63 s for AdapterRemoval 3.0.2; ss 29.92 s vs 48.01 s vs 3.44 s. Fresh simulated 5M pairs: 13.45 s vs 15.81 s vs 2.27 s. Peak RSS stays about 2.7 GB on real 10M (AR3: 0.08 GB) and 1.24 GB on simulated 5M.
+> The remaining gap to AR3 is the streaming tail (string-heavy native/repair records and per-row FASTQ/JSON formatting for all 10M rows, about 17 s of 33 s at `-p 8`), then the family stage; the diagnosis and ranked exact next steps are in TASK30_HANDOFF.md and the Task 30 prep notes. The T30-6 probe-locality change was tested and rejected (family medians worse).
 
 FASTQ deduplication for ancient DNA libraries, with damage-aware hashing and
 PCR error correction.
