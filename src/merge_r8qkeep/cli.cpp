@@ -49,6 +49,7 @@ int merge_r8qkeep_main(int argc,char** argv){
         if(!std::filesystem::create_directory(outdir))throw std::runtime_error("output directory exists");const std::filesystem::path out=outdir;
         if(multiple)for(const auto& text:cuts)if(!std::filesystem::create_directory(out/text))throw std::runtime_error("duplicate cutoff directory");
         const auto input_start=std::chrono::steady_clock::now();
+        threads=bounded_worker_count(threads);
         auto store=threads>1?parallel_compact_input(r1,r2,threads):compact_input(r1,r2);
         if(timings||debug)std::cerr<<"MERGE_STAGE input_wall seconds="
             <<std::chrono::duration<double>(std::chrono::steady_clock::now()-input_start).count()

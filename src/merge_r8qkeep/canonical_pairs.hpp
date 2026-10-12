@@ -25,7 +25,7 @@ inline void canonicalize_family_input(std::vector<FamilyRead>& r1,
                         r2[i].h, r2[i].s, r2[i].q);
     };
     const auto less=[&](std::size_t a,std::size_t b){return key(a)<key(b);};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     if(!pool||workers==1||order.size()<4096)std::sort(order.begin(),order.end(),less);
     else{
         // Sort only indices. Equal keys identify byte-identical mate records,
