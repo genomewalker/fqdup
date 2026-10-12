@@ -227,8 +227,10 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
         return chunk;
     };
+    const auto content_memo_switch=std::getenv("FQDUP_CONTENT_MEMO");
+    const bool force_memo=content_memo_switch&&std::string_view(content_memo_switch)=="1";
     #include "memo_pipeline.inc"
-    const auto memo_switch=std::getenv("FQDUP_MEMO");
+    const auto memo_switch=content_memo_switch?content_memo_switch:std::getenv("FQDUP_MEMO");
     const bool use_memo=lib.compact&&cuts.size()==1&&!debug&&!counters&&(!memo_switch||std::string_view(memo_switch)!="0");
     OrderedWriter<OutputChunk> writer(window,std::move(consume));
     std::size_t output_rows=0,output_chunks=0;
@@ -272,7 +274,8 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             }
         }
         writer.finish();
-        std::cerr<<"MERGE_MEMO enabled="<<use_memo<<" rows="<<memo_rows.load()<<" hits="<<memo_hits.load()<<" bypassed="<<memo_bypassed.load()<<" hit_rate="<<(memo_rows.load()?double(memo_hits.load())/memo_rows.load():0)<<" cache_capacity_bound_per_worker="<<ContentMemo::capacity_bound()<<'\n';
+        std::cerr<<"MERGE_CHUNK rows="<<output_rows<<" chunks="<<output_chunks<<" chunk_rows="<<(use_memo?512:chunk_rows)<<" workers="<<workers<<" max_inflight="<<window<<'\n';
+        std::cerr<<"MERGE_MEMO enabled="<<use_memo<<" forced="<<force_memo<<" pilot_rows="<<memo_pilot_rows<<" rows="<<memo_rows.load()<<" hits="<<memo_hits.load()<<" bypassed="<<memo_bypassed.load()<<" hit_rate="<<(memo_rows.load()?double(memo_hits.load())/memo_rows.load():0)<<" cache_capacity_bound_per_worker="<<ContentMemo::capacity_bound()<<'\n';
     }catch(...){pool.stop();throw;}
     if(memory){
         MemoryUsage m;m.native=max_native.load();m.routing=max_routing.load();m.output=max_output.load();

@@ -54,6 +54,7 @@ class ContentMemo {
 public:
     void context(std::uint64_t id){if(context_!=id){entries_.clear();entries_.resize(slots);context_=id;}}
     void discard(){entries_.clear();entries_.resize(slots);}
+    void release(){std::vector<Entry>().swap(entries_);}
     static std::size_t hash(std::string_view key){return std::hash<std::string_view>{}(key);}
     const MemoValue* find(std::string_view key,std::size_t h)const{
         const auto& e=entries_[h%slots];return e.hash==h&&e.key==key?&e.value:nullptr;
