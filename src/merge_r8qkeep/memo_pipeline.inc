@@ -32,7 +32,7 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
     if(scratch.bypass){
         for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,scratch.raw[i],decoder);
         auto native=merge_native_range(scratch.raw,0,n,lib.native_settings,false,false);
-        auto out=process(native.records,start,elapsed(native_begin));account(native,out);
+        auto out=process(native.records,start,elapsed(native_begin),nullptr,&native.alignments);account(native,out);
         memo_rows.fetch_add(n,std::memory_order_relaxed);memo_bypassed.fetch_add(n,std::memory_order_relaxed);return out;
     };
     for(std::size_t i=0;i<n;++i){
@@ -52,7 +52,7 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
     const auto native_seconds=elapsed(native_begin);
     OutputChunk out;
     if(unique){
-        out=process(native.records,0,native_seconds,&scratch.computed);
+        out=process(native.records,0,native_seconds,&scratch.computed,&native.alignments);
         for(std::size_t j=0;j<unique;++j){const auto i=scratch.representative[j];scratch.cache.put(scratch.keys[i],scratch.hash[i],scratch.computed[j]);}
     }else{out.outputs.resize(1);out.seconds.resize(1);out.native_seconds=native_seconds;}
     out.count=n;out.native_clean=0;out.native_clean_pass.assign(1,0);

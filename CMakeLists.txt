@@ -378,6 +378,11 @@ add_executable(test_task30_family_suppression tests/task30_family_suppression.cp
 target_compile_options(test_task30_family_suppression PRIVATE -ffp-contract=off)
 target_link_libraries(test_task30_family_suppression PRIVATE Threads::Threads)
 add_test(NAME task30_family_suppression COMMAND test_task30_family_suppression)
+
+add_executable(test_task30_fusion tests/task30_fusion.cpp)
+target_compile_options(test_task30_fusion PRIVATE -O2 -march=${FQDUP_MARCH} -ffp-contract=off)
+target_link_libraries(test_task30_fusion PRIVATE Threads::Threads)
+add_test(NAME task30_fusion COMMAND test_task30_fusion)
 # These frozen family tests compare the old radius-2 enumeration and outputs.
 set_tests_properties(task25_family_index task23_family_parallel task26_compact_family
   PROPERTIES ENVIRONMENT "FQDUP_FAMILY_RADIUS=2")

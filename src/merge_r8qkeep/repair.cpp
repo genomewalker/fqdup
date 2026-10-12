@@ -38,11 +38,16 @@ using namespace ::fqdup_r8qkeep_repair_internal;
 #include "clean_pair.hpp"
 struct RepairAlignmentCache::Impl {
     std::size_t start;
-    std::vector<alignment_cache::Pair> pairs;
+    std::vector<std::shared_ptr<alignment_cache::Pair>> pairs;
     std::vector<std::vector<fqquality::PairMixture::CachedApply>> posteriors;
     Impl(std::size_t s,std::size_t n):start(s),pairs(n),posteriors(n){}
 };
-RepairAlignmentCache::RepairAlignmentCache(std::size_t s,std::size_t n):impl_(std::make_shared<Impl>(s,n)){}
+RepairAlignmentCache::RepairAlignmentCache(std::size_t s,std::size_t n,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared,std::size_t offset,const std::vector<std::size_t>* selected):impl_(std::make_shared<Impl>(s,n)){
+    for(std::size_t i=0;i<n;++i){
+        if(shared)impl_->pairs[i]=shared->at(offset+(selected?selected->at(i):i));
+        if(!impl_->pairs[i])impl_->pairs[i]=std::make_shared<alignment_cache::Pair>();
+    }
+}
 struct RepairPipeline::Impl {
     fqquality::PairMixture nominal,full;
     RepairSkipBound bound;
@@ -67,7 +72,7 @@ RoutingResult RepairPipeline::route_records(NativeRecords native,bool debug,std:
     std::string rc;
     for(const auto& v:native) {
         NativeRecord replacement;
-        alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(row-cache->impl_->start):nullptr);
+        alignment_cache::Scope scope(cache?cache->impl_->pairs.at(row-cache->impl_->start).get():nullptr);
         fqquality::PairMixture::CacheScope posterior_scope(cache?&cache->impl_->posteriors.at(row-cache->impl_->start):nullptr);
         bool routed=false;double worst=0;std::string reason="native_nonmerged";int insert=0;int64_t repair_bound=-1;
         const int64_t early=certified?certified->at(row-start):impl_->native_clean(v,clean_cutoff);
@@ -106,7 +111,7 @@ std::vector<RepairedRecord> RepairPipeline::repair_records(NativeRecords input,i
     NativeQualityScratch<Record> guard_scratch;
     for(std::size_t i=0;i<input.size();++i){
         const auto index=start+i,mask=mask_offset+i;
-        alignment_cache::Scope scope(cache?&cache->impl_->pairs.at(index-cache->impl_->start):nullptr);
+        alignment_cache::Scope scope(cache?cache->impl_->pairs.at(index-cache->impl_->start).get():nullptr);
         fqquality::PairMixture::CacheScope posterior_scope(cache?&cache->impl_->posteriors.at(index-cache->impl_->start):nullptr);
         if(selected&&!selected->at(mask)){output.emplace_back();continue;}
         const auto& v=replacements?replacements->at(mask):input[i];
