@@ -1,5 +1,8 @@
 #pragma once
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <thread>
 #include <fstream>
 #include <map>
 #include <string>
@@ -9,6 +12,24 @@
 #include <sched.h>
 #endif
 namespace fqdup::r8qkeep {
+// Cache the inherited allocation before any worker narrows its affinity.
+inline int allocation_cpu_count(){
+    static const int count=[] {
+        int available=static_cast<int>(std::max(1u,std::thread::hardware_concurrency()));
+#if defined(__linux__)
+        cpu_set_t mask;CPU_ZERO(&mask);
+        if(sched_getaffinity(0,sizeof(mask),&mask)==0)available=std::max(1,CPU_COUNT(&mask));
+#endif
+        if(const char* value=std::getenv("SLURM_CPUS_PER_TASK")){
+            char* end=nullptr;const long allocated=std::strtol(value,&end,10);
+            if(end!=value&&*end=='\0'&&allocated>0&&allocated<=std::numeric_limits<int>::max())
+                available=std::min(available,static_cast<int>(allocated));
+        }
+        return available;
+    }();
+    return count;
+}
+inline int bounded_worker_count(int requested){return std::max(1,std::min(requested,allocation_cpu_count()));}
 struct WorkerCpu {int logical,package,core;};
 // Only specialize a CPU set that supplies exactly one physical core per
 // worker plus SMT siblings. Larger, smaller and incomplete sets stay unbound.

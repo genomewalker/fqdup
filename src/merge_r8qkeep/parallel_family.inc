@@ -20,7 +20,7 @@ const auto enumerate=[&](int part,std::size_t query,QueryStats& stats){
     },stats.lookups,stats.candidates);
 };
 std::uint64_t lookups=0,candidates=0,verified=0,overflows=0;
-constexpr std::size_t scratch_bytes=sizeof(QueryStats)*8;
+const std::size_t scratch_bytes=sizeof(QueryStats)*std::size_t(workers);
 const auto consume=[&](QueryStats stats){lookups+=stats.lookups;candidates+=stats.candidates;verified+=stats.verified;};
 if(pool){
     // Query parts are immutable; minimum-root unions are scheduling-independent.

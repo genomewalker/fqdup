@@ -199,7 +199,7 @@ bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& paren
         }
     } // Release duplicate lookup storage before constructing part indexes.
     std::array<fqdup::r8qkeep::FamilyPartIndex,3> index; const int bounds[]={0,13,26,40};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
@@ -267,7 +267,7 @@ template<class Key>
 std::vector<Group> families(const std::vector<Pair>& P, std::vector<Key>& keys, int threads,fqdup::r8qkeep::WorkerPool* shared_pool,bool supplied=false) {
     auto last=std::chrono::steady_clock::now();
     const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};
-    const int workers=std::max(1,std::min(threads,8));
+    const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     std::unique_ptr<fqdup::r8qkeep::WorkerPool> owned_pool;
     auto* pool=workers>1?shared_pool:nullptr;
     if(workers>1&&!pool){owned_pool=std::make_unique<fqdup::r8qkeep::WorkerPool>(workers);pool=owned_pool.get();}
@@ -417,7 +417,7 @@ void reorder_family_plan(FamilyPlan& plan,const std::vector<std::size_t>& order)
 }
 FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool,FamilyPlan* plan) {
         std::unique_ptr<WorkerPool> owned_pool;
-        if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(std::max(1,std::min(threads,8)));shared_pool=owned_pool.get();}
+        if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(fqdup::r8qkeep::bounded_worker_count(threads));shared_pool=owned_pool.get();}
         auto& pool=*shared_pool;
         auto last=std::chrono::steady_clock::now();
         const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"FAMILY_PHASE "<<name<<" seconds="<<std::chrono::duration<double>(now-last).count()<<'\n';last=now;};

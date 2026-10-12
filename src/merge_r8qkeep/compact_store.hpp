@@ -193,7 +193,7 @@ public:
         if(!order_.empty())throw std::logic_error("already canonical");
         // A library often shares a long instrument/run prefix. It contributes
         // nothing to lexicographic order; index the first varying bytes.
-        workers=pool?std::max(1,std::min(workers,8)):1;
+        workers=pool?bounded_worker_count(workers):1;
         const auto skip=id_common_.size();
         // Three big-endian words cover the varying tile/x/y suffix of lane
         // headers. Short generator IDs retain the original single-word passes.
