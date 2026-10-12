@@ -5,6 +5,7 @@ namespace {
 FamilyKey compact_family_key(const FamilyPair& pair) {
     const auto& a=pair.r[0].s;const auto& b=pair.r[1].s;
     if(a.size()<KEYLEN||b.size()<KEYLEN)return {};
+    if(exclude_allg_r2(b))return {};
     std::array<char,2*KEYLEN> key;
     std::copy_n(a.data(),KEYLEN,key.data());std::copy_n(b.data(),KEYLEN,key.data()+KEYLEN);
     if(std::count(key.begin(),key.end(),'N')>MAXN)return {};
