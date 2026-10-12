@@ -156,9 +156,9 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     using Clock=std::chrono::steady_clock;
     const auto elapsed=[](auto start){return std::chrono::duration<double>(Clock::now()-start).count();};
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
-    const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
+    const std::size_t chunk_rows=128;
     // Deeper single-cut queues hide uneven pair work and output stalls. Multi-
-    // cutoff jobs retain at most 4096 output rows, independent of input size.
+    // cutoff jobs retain at most 512 output rows per worker.
     const std::size_t window=workers*(cuts.size()==1?16:4);
     const bool memory=memory_enabled();
     std::atomic<std::size_t> max_native{0},max_routing{0},max_output{0};
