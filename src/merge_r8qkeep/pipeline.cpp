@@ -170,7 +170,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     const auto structural_switch=std::getenv("FQDUP_STRUCTURAL_SKIP");
     const bool structural=!debug&&!counters&&(!structural_switch||std::string_view(structural_switch)!="0")
         &&!cuts.empty()&&std::all_of(cuts.begin(),cuts.end(),[](double cut){return std::isfinite(cut)&&cut>=0&&cut<=1;});
-    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr){
+    const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared=nullptr,std::size_t shared_offset=0){
         const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
@@ -189,7 +189,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         }
         // Compact slots only key pair-local scratch here. Diagnostic paths keep
         // original indices and run the complete reference router/repair path.
-        RepairAlignmentCache cache(work_start,work.size());
+        RepairAlignmentCache cache(work_start,work.size(),shared,shared_offset,structural?&unresolved:nullptr);
         const auto routing=lib.repair->route_records(work,debug,work_start,&cache,counters!=nullptr,minimum,structural?&unresolved_bounds:nullptr);
         const auto& bounds=structural?certified:routing.native_clean_bounds;
         chunk.native_clean=std::count_if(bounds.begin(),bounds.end(),[](int64_t bound){return bound>=0;});
@@ -238,8 +238,8 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto native=records.slice(pos,n);const double seconds=pos==0?native_seconds:0;
             // Native views stay valid even after the coordinator advances to
             // another batch. Results own their emitted strings before returning.
-            writer.submit(pool.submit([&,native,start,seconds,keep_alive=owner]{
-                (void)keep_alive;return process(native,start,seconds);
+            writer.submit(pool.submit([&,native,start,seconds,pos,keep_alive=owner]{
+                return process(native,start,seconds,nullptr,keep_alive?&keep_alive->alignments:nullptr,pos);
             }));
             output_rows+=n;++output_chunks;
         }
