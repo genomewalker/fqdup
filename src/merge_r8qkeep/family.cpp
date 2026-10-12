@@ -35,6 +35,11 @@ namespace {
 constexpr int KEYLEN = 20, MAXMIS = 8, MAXN = 2, BLOCKS = 9, MAXCOMP = 12, MAXDIAM = 16, ADSEED = 10, ADZONE = 2 * KEYLEN;
 constexpr double DUST_MAX = 0.10, MAXDIS = 0.5;
 constexpr bool g_rev8 = true;
+// By default, FQDUP_FAMILY_EXCLUDE_ALLG keeps pairs whose R2 key bases are all G (2-colour no-signal R2) out of the family search.
+// Task 29 experiment 3 (A0 arm): FQDUP_FAMILY_DISABLE gives no pair a family key, so no consensus runs.
+bool family_disabled(){static const bool on=std::getenv("FQDUP_FAMILY_DISABLE")!=nullptr;return on;}
+bool exclude_allg_r2(std::string_view r2){static const bool on=[] {const char* value=std::getenv("FQDUP_FAMILY_EXCLUDE_ALLG");return !value||std::string_view(value)!="0";}();if(family_disabled())return true;
+    return on&&r2.size()>=std::size_t(KEYLEN)&&std::all_of(r2.begin(),r2.begin()+KEYLEN,[](char c){return c=='G';});}
 // --phred-unresolved (arm r8qkeep): an unresolved family column sets each copy to -10log10 P(copy wrong), with
 // P(allele a true) proportional to prod_{i in a}(1-e_i) * prod_{j not in a} e_j/3 from the copies own qualities, clamped to Q2..Q40 (the data floor; Q0 makes risk 1, rejected downstream), instead of Q2
 constexpr bool g_phred = true;
@@ -237,6 +242,7 @@ std::vector<Key> keys_of(const std::vector<Pair>& P,fqdup::r8qkeep::WorkerPool* 
         std::array<char,2*KEYLEN> bytes;
         std::copy_n(a.data(),KEYLEN,bytes.data());std::copy_n(b.data(),KEYLEN,bytes.data()+KEYLEN);
         const std::string_view k(bytes.data(),bytes.size());
+        if (exclude_allg_r2(b)) continue;
         if (std::count(k.begin(), k.end(), 'N') > MAXN) continue;
         if (!g_rev8) {
             if (low_complexity(a) || low_complexity(b)) continue;
