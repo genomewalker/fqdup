@@ -184,7 +184,9 @@ public:
         add_alphabet(std::string_view(&quality,1));const auto at=start+position;
         qualities_.edit(at,static_cast<unsigned char>(quality));set_base(at,base);
     }
-    bool canonicalize(WorkerPool* pool=nullptr,int workers=1) {
+    bool canonicalize(WorkerPool* pool=nullptr,int workers=1,
+                      std::vector<std::pair<std::string,std::size_t>>* sample=nullptr,
+                      std::uint64_t (*sample_hash)(std::string_view)=nullptr) {
         auto measured=std::chrono::steady_clock::now();
         const bool diagnostics=std::getenv("FQDUP_CANONICAL_DIAGNOSTICS")!=nullptr;
         const auto phase=[&](const char* name){const auto now=std::chrono::steady_clock::now();
@@ -198,15 +200,19 @@ public:
         // Three big-endian words cover the varying tile/x/y suffix of lane
         // headers. Short generator IDs retain the original single-word passes.
         std::vector<std::array<std::uint64_t,3>> prefix(size());
+        std::vector<std::uint64_t> selected(sample?(size()+63)/64:0);
+        const auto threshold=size()?(static_cast<unsigned __int128>(std::min<std::size_t>(25000,size()))<<64)/size():0;
         const auto collect=[&](std::size_t begin,std::size_t end){
             Decoder decoder;std::string h;
             for(auto i=begin;i<end;++i){header(2*i,h,decoder);const auto id=id_view(h);
+                if(sample&&static_cast<unsigned __int128>(sample_hash(id))<threshold)selected[i/64]|=std::uint64_t{1}<<(i%64);
                 for(std::size_t j=0;j<24;++j){auto& word=prefix[i][j/8];
                     word=(word<<8)|(skip+j<id.size()?static_cast<unsigned char>(id[skip+j]):0);}}
         };
         if(pool&&workers>1&&size()>=4096){
             std::vector<std::future<void>> pending;pending.reserve(workers);
-            const auto span=((size()+workers*16-1)/(workers*16))*16;
+            // Keep sample-bit words private to each collector.
+            const auto span=((size()+workers*64-1)/(workers*64))*64;
             try{for(std::size_t begin=0;begin<size();begin+=span){const auto end=std::min(size(),begin+span);pending.push_back(pool->submit([&,begin,end]{collect(begin,end);}));}
                 for(auto& task:pending)task.get();
             }catch(...){for(auto& task:pending)if(task.valid())task.wait();throw;}
@@ -256,6 +262,12 @@ public:
         bool unique=true;
         for(std::size_t i=1;i<order.size();++i)
             if(prefix[order[i-1]]==prefix[order[i]]&&!compare_ids(order[i-1],order[i]))unique=false;
+        if(sample){
+            sample->clear();Decoder decoder;std::string id;
+            for(std::size_t i=0;i<order.size();++i)if(selected[order[i]/64]&(std::uint64_t{1}<<(order[i]%64))){
+                header(2*order[i],id,decoder);sample->emplace_back(id_view(id),i);
+            }
+        }
         order_=std::move(order);phase("duplicates");return unique;
     }
     void input_order(){std::vector<std::uint32_t>().swap(order_);}

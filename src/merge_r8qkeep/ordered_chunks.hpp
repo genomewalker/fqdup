@@ -15,7 +15,7 @@ template<class Work,class Consume>
 void ordered_index_chunks(WorkerPool& pool,std::size_t count,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="records",std::size_t rows_per_chunk=0) {
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
     const std::size_t window=workers==1?1:4*workers;
-    const std::size_t chunk_rows=rows_per_chunk?rows_per_chunk:std::max<std::size_t>(1,1024/workers);
+    const std::size_t chunk_rows=rows_per_chunk?rows_per_chunk:128;
     using Result=decltype(work(row_offset,std::size_t{}));
     struct TimedResult {Result value;double wall,cpu;};
     const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
@@ -59,7 +59,7 @@ void ordered_index_chunks(std::size_t count,int threads,std::size_t row_offset,W
 template<class Work,class Consume>
 void ordered_text_chunks(const std::string& text,int threads,std::size_t row_offset,Work work,Consume consume,const char* label="chunks") {
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
-    const std::size_t chunk_rows=std::max<std::size_t>(1,1024/workers);
+    const std::size_t chunk_rows=128;
     using Result=decltype(work(std::string(),row_offset));
     struct TimedResult { Result value;double wall,cpu; };
     const bool profile=std::getenv("FQDUP_CHUNK_PROFILE")!=nullptr;
