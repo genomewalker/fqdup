@@ -2,6 +2,8 @@
 // cache context is unique for this immutable library/prior/settings/cutoff.
 static std::atomic<std::uint64_t> memo_context_counter{0};
 const auto memo_context=++memo_context_counter;
+// One fixed 512-row chunk per worker; fewer than 1% hits disables probing.
+constexpr std::size_t memo_pilot_rows=512;
 std::atomic<std::uint64_t> memo_hits{0},memo_rows{0},memo_bypassed{0};
 const auto memo_process=[&](std::size_t start,std::size_t n){
     constexpr std::size_t batch=512,table_size=1024;
@@ -65,6 +67,6 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
     }
     out.seconds[0]+=elapsed(emit_begin);memo_hits.fetch_add(hits,std::memory_order_relaxed);memo_rows.fetch_add(n,std::memory_order_relaxed);
     account(native,out);scratch.seen+=n;scratch.hits+=hits;
-    if(scratch.seen>=4096&&scratch.hits*100<scratch.seen){scratch.bypass=true;scratch.cache.discard();}
+    if(!force_memo&&scratch.seen==memo_pilot_rows&&scratch.hits*100<scratch.seen){scratch.bypass=true;scratch.cache.release();}
     return out;
 };

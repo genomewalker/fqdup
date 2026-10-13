@@ -8,7 +8,9 @@ LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,
     const bool memory=memory_enabled();
     const auto memory_stage=[&](const char* name){if(memory){library_memory(out).report(name,store->size());const auto bytes=store->capacity_bytes();std::cerr<<"MERGE_COMPACT stage="<<name<<" pairs="<<store->size()<<" bases_bytes="<<bytes[0]<<" quality_bytes="<<bytes[1]<<" header_bytes="<<bytes[2]<<" offset_bytes="<<bytes[3]<<" exception_bytes="<<bytes[4]<<" quality_width="<<store->quality_width()<<" alphabet="<<store->quality_alphabet_size()<<'\n';}};
     memory_stage("compact_input");
-    const bool unique=store->canonicalize(out.pool.get(),workers);
+    std::vector<std::pair<std::string,std::size_t>> selected;
+    const bool unique=store->canonicalize(out.pool.get(),workers,counts?&selected:nullptr,
+        [](std::string_view id)->std::uint64_t{return XXH64(id.data(),id.size(),prior_sample_seed);});
     if(!counts)store->input_order();
     stage("canonical_input");
     // Full census merges repeated IDs in one scalar accumulator. Preserve that
@@ -25,11 +27,27 @@ LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,
     stage("family");memory_stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
-        std::vector<std::pair<std::string,std::size_t>> selected;
         CompactPairStore::Decoder decoder;std::string id;
-        if(store->size()){
+        if(std::getenv("FQDUP_PRIOR_SAMPLE_VERIFY")){
+            std::vector<std::pair<std::string,std::size_t>> reference;
+            if(store->size()){
             const auto threshold=(static_cast<unsigned __int128>(std::min(requested,store->size()))<<64)/store->size();
-            for(std::size_t i=0;i<store->size();++i){store->id(i,id,decoder);if(static_cast<unsigned __int128>(XXH64(id.data(),id.size(),prior_sample_seed))<threshold)selected.emplace_back(id,i);}
+            for(std::size_t i=0;i<store->size();++i){store->id(i,id,decoder);if(static_cast<unsigned __int128>(XXH64(id.data(),id.size(),prior_sample_seed))<threshold)reference.emplace_back(id,i);}
+            }
+            std::sort(reference.begin(),reference.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+            std::sort(selected.begin(),selected.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+            if(const char* prefix=std::getenv("FQDUP_PRIOR_SAMPLE_DUMP")){
+                const auto dump=[&](const char* suffix,const auto& rows){
+                    std::ofstream file(std::string(prefix)+suffix);
+                    if(!file)throw std::runtime_error("cannot open prior sample dump");
+                    for(const auto& row:rows)file<<row.first<<'\t'<<row.second<<'\n';
+                    file.close();if(!file)throw std::runtime_error("cannot write prior sample dump");
+                };
+                dump(".before.tsv",reference);dump(".after.tsv",selected);
+            }
+            if(selected!=reference)throw std::logic_error("canonical prior sample differs from reference scan");
+
+            std::cerr<<"PRIOR_SAMPLE_VERIFY pairs="<<reference.size()<<" identical=1\n";
         }
         std::sort(selected.begin(),selected.end(),[](const auto& a,const auto& b){return a.first<b.first;});
         for(std::size_t i=1;i<selected.size();++i)if(selected[i-1].first==selected[i].first)throw std::invalid_argument("subsample prior fit requires unique selected read IDs");
