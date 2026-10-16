@@ -1504,16 +1504,16 @@ int profile_main(int argc, char** argv) {
     // and DART cannot re-derive a different one. dp carries the d_max_3 certification because
     // that correction now runs unconditionally at finalize time, not inside a report block.
     if (!damage_summary_path.empty()) {
-        // pi_damaged_point carries the length-stratified joint mixture prevalence
-        // (lsd.pi_joint_damaged), a mixture over length x GC cells -- NOT dp.pi_damaged (the
-        // pooled terminal ratio damaged_obs/total_obs, a different and DamageConfidence-gated
-        // estimand). Both are functionals of the same terminal-deamination channel, so the
-        // mixture value is used as an empirical-Bayes PRIOR, not as independent evidence.
-        // If the joint did not resolve (bins empty / pi_joint_damaged <= 0), pass -1.0 so the
-        // summary field stays undetermined and DART's apply_to guard drops to no-auth tier.
-        const double lsd_prior = lsd.bins.empty() ? -1.0 : lsd.pi_joint_damaged;
+        // pi_damaged_point carries the read-level damaged fraction dp.pi.point, the same value
+        // the summary's pi_point holds. It used to carry lsd.pi_joint_damaged, the weight of a
+        // two-component mixture over length x GC cells: that is not a read fraction, and it
+        // tends to 1 whenever damage is even across cells (0.999 on the Ellesmere ds library
+        // once libtaph f97613b stopped reading the position-0 artifact; the earlier 0.110 came
+        // from that artifact). pi.point is DamageConfidence-gated; when it is undetermined
+        // (<= 0) the field is written as -1.0 and DART's apply_to guard drops to no-auth tier.
+        const double read_prior = dp.pi.point;
         if (!taph::write_damage_summary(damage_summary_path,
-                                        taph::DamageSummary::from_profile(dp, lsd_prior))) {
+                                        taph::DamageSummary::from_profile(dp, read_prior))) {
             std::cerr << "Error: cannot write damage summary: " << damage_summary_path << "\n";
             return 1;
         }
