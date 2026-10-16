@@ -386,3 +386,8 @@ add_test(NAME task30_fusion COMMAND test_task30_fusion)
 # These frozen family tests compare the old radius-2 enumeration and outputs.
 set_tests_properties(task25_family_index task23_family_parallel task26_compact_family
   PROPERTIES ENVIRONMENT "FQDUP_FAMILY_RADIUS=2")
+
+add_executable(test_task32_self_kernel tests/task32_self_kernel.cpp)
+target_compile_options(test_task32_self_kernel PRIVATE -O2 -march=${FQDUP_MARCH} -ffp-contract=off)
+target_link_libraries(test_task32_self_kernel PRIVATE Threads::Threads)
+add_test(NAME task32_self_kernel COMMAND test_task32_self_kernel)

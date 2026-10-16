@@ -1,5 +1,6 @@
 #pragma once
 #include "full_correspondence.hpp"
+#include <cstdlib>
 namespace fqalign {
 class SelfCorrespondence {
  static constexpr int neg=-1000000000;
@@ -14,6 +15,12 @@ class SelfCorrespondence {
   return alignment_cache::get<SelfCorrespondence>(a,b,0,[&]{return align_uncached(a,b);});
  }
  FullResult align_uncached(const std::string&a,const std::string&b) {
+  const char* control=std::getenv("FQDUP_SCALAR_KERNELS");
+  return align_impl(a,b,control&&control[0]=='1');
+ }
+ FullResult align_scalar(const std::string&a,const std::string&b) {return align_impl(a,b,true);}
+ private:
+ FullResult align_impl(const std::string&a,const std::string&b,bool scalar) {
   FullResult result;auto& out=result.corr;
   if(a.size()>512||b.size()>512){out.reason="unsupported_read_length";return result;}
   if(a.empty()||b.empty()){out.reason="empty_read";return result;}
@@ -21,8 +28,8 @@ class SelfCorrespondence {
   n=a.size();m=b.size();
   cells=fqalign::alignment_scratch((n+1)*(m+1));
   // Suffix after the current state. Terminal states must be aligned columns.
-  for(int i=n;i>=1;--i) for(int j=m;j>=1;--j) {
-    if(!inside(i,j))continue;
+  auto fill_boundary=[&](int i,int j) {
+    if(!inside(i,j))return;
     auto& c=at(i,j);c.through=0;int diag=neg;
     if(inside(i+1,j+1))diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
     c.suffix[0]=std::max((i==n||j==m)?0:neg,diag);
@@ -31,6 +38,32 @@ class SelfCorrespondence {
     c.suffix[1]=diag;c.suffix[2]=diag;
     if(inside(i+1,j))c.suffix[1]=std::max(c.suffix[1],at(i+1,j).suffix[1]-1);
     if(inside(i,j+1))c.suffix[2]=std::max(c.suffix[2],at(i,j+1).suffix[2]-1);
+  };
+  if(scalar){
+   for(int i=n;i>=1;--i)for(int j=m;j>=1;--j)fill_boundary(i,j);
+  }else{
+   // Away from the terminal edges and forbidden diagonal, every
+   // successor exists. Keep the same descending update order and scores.
+   auto fill_interior=[&](int i,int j){
+    auto& c=at(i,j);c.through=0;
+    const int diag=at(i+1,j+1).suffix[0]+sub(a[i],b[j]);
+    const int down=at(i+1,j).suffix[1],right=at(i,j+1).suffix[2];
+    c.suffix[0]=std::max(neg,diag);
+    c.suffix[0]=std::max(c.suffix[0],down-4);
+    c.suffix[0]=std::max(c.suffix[0],right-4);
+    c.suffix[1]=std::max(diag,down-1);
+    c.suffix[2]=std::max(diag,right-1);
+   };
+   for(int j=m;j>=1;--j)fill_boundary(n,j);
+   for(int i=n-1;i>=1;--i){
+    fill_boundary(i,m);
+    int j=m-1;
+    for(;j>=i+2;--j)fill_interior(i,j);
+    if(j==i+1){fill_boundary(i,j);--j;}
+    if(j==i)--j;
+    if(j==i-1){fill_boundary(i,j);--j;}
+    for(;j>=1;--j)fill_interior(i,j);
+   }
   }
   for(int i=1;i<=n;++i)for(int j=1;j<=m;++j)
    if(inside(i,j)&&(i==1||j==1))out.best=std::max(out.best,sub(a[i-1],b[j-1])+at(i,j).suffix[0]);
