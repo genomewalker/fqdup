@@ -85,10 +85,35 @@ if(NOT FQDUP_ALLOW_REMOTE_LIBTAPH AND NOT FETCHCONTENT_SOURCE_DIR_LIBTAPH)
         "-DFETCHCONTENT_SOURCE_DIR_LIBTAPH=/path/to/libtaph, or set -DFQDUP_ALLOW_REMOTE_LIBTAPH=ON "
         "to intentionally fetch the remote (CI only).")
 endif()
+# The libtaph revision is part of every damage number fqdup writes, including the TDM1 sidecar
+# DART reads, so it is pinned to the same SHA as DART. 2026-10-16: libtaph main was force-pushed;
+# 7540cc8 has the same tree (fb1d5e3c) as be1f750, which every fqdup gate of Tasks 25-34 ran on.
+# A local checkout must be exactly this revision and clean; a remote fetch checks out exactly it.
+set(LIBTAPH_PINNED_SHA "7540cc8646d9c59f9286c78c0af4020e5a93441d")
+if(FETCHCONTENT_SOURCE_DIR_LIBTAPH)
+    execute_process(COMMAND git -C "${FETCHCONTENT_SOURCE_DIR_LIBTAPH}" rev-parse HEAD
+        OUTPUT_VARIABLE LIBTAPH_HEAD_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND git -C "${FETCHCONTENT_SOURCE_DIR_LIBTAPH}" status --porcelain
+        OUTPUT_VARIABLE LIBTAPH_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT LIBTAPH_HEAD_SHA STREQUAL LIBTAPH_PINNED_SHA)
+        message(FATAL_ERROR
+            "libtaph at ${FETCHCONTENT_SOURCE_DIR_LIBTAPH} is not the pinned revision.\n"
+            "  pinned: ${LIBTAPH_PINNED_SHA}\n"
+            "  HEAD:   ${LIBTAPH_HEAD_SHA}\n"
+            "Damage numbers depend on this. Check out the pin, or change LIBTAPH_PINNED_SHA deliberately "
+            "together with DART.")
+    endif()
+    if(LIBTAPH_DIRTY)
+        message(FATAL_ERROR
+            "libtaph at ${FETCHCONTENT_SOURCE_DIR_LIBTAPH} is at the pinned revision but the tree is dirty:\n"
+            "${LIBTAPH_DIRTY}")
+    endif()
+    message(STATUS "Using local libtaph, pinned and clean: ${LIBTAPH_PINNED_SHA}")
+endif()
 FetchContent_Declare(
     libtaph
     GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-    GIT_TAG        main
+    GIT_TAG        ${LIBTAPH_PINNED_SHA}
     GIT_SHALLOW    FALSE
 )
 set(TAPH_MARCH "${FQDUP_MARCH}" CACHE STRING "" FORCE)
@@ -150,6 +175,22 @@ target_link_libraries(fqdup PRIVATE
     taph
 )
 target_compile_definitions(fqdup PRIVATE HAVE_BBHASH)
+# Build provenance for `fqdup --version`. The libtaph revision is always the enforced pin above.
+# The fqdup commit comes from -DFQDUP_GIT_COMMIT=<sha> when given (builds from a git archive have no
+# .git), else from the source tree's git HEAD at configure time, else "unknown".
+# ceiling: an incremental build does not reconfigure on a new commit, so the stamped commit can lag;
+# upgrade: generate it with a custom command that runs on every build.
+set(FQDUP_GIT_COMMIT "" CACHE STRING "fqdup commit stamped into --version (empty: ask git)")
+if(NOT FQDUP_GIT_COMMIT)
+    execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse HEAD
+        OUTPUT_VARIABLE FQDUP_GIT_COMMIT_DETECTED OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    set(FQDUP_GIT_COMMIT "${FQDUP_GIT_COMMIT_DETECTED}")
+endif()
+if(NOT FQDUP_GIT_COMMIT)
+    set(FQDUP_GIT_COMMIT "unknown")
+endif()
+set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS
+    "FQDUP_GIT_COMMIT=\"${FQDUP_GIT_COMMIT}\";FQDUP_LIBTAPH_SHA=\"${LIBTAPH_PINNED_SHA}\"")
 target_compile_options(fqdup PRIVATE -O2 -march=${FQDUP_MARCH})
 
 # The native snapshot's headers must not change other subcommands' include paths.
@@ -200,6 +241,13 @@ add_test(NAME syncmer_index COMMAND test_syncmer_index)
 
 add_test(NAME smoke
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh $<TARGET_FILE:fqdup>)
+
+add_executable(tdm1_dump tests/tdm1_dump.cpp)
+target_link_libraries(tdm1_dump PRIVATE taph)
+target_compile_options(tdm1_dump PRIVATE -O2)
+add_test(NAME tdm1_roundtrip
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tdm1_roundtrip.sh
+                 $<TARGET_FILE:fqdup> $<TARGET_FILE:gen_synthetic> $<TARGET_FILE:tdm1_dump>)
 
 add_test(NAME damage_auto
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_damage_auto.sh
