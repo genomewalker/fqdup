@@ -89,7 +89,15 @@ endif()
 # DART reads, so it is pinned to the same SHA as DART. 2026-10-16: libtaph main was force-pushed;
 # 7540cc8 has the same tree (fb1d5e3c) as be1f750, which every fqdup gate of Tasks 25-34 ran on.
 # A local checkout must be exactly this revision and clean; a remote fetch checks out exactly it.
-set(LIBTAPH_PINNED_SHA "7540cc8646d9c59f9286c78c0af4020e5a93441d")
+# The pin lives in LIBTAPH_PIN (one line, 40-hex SHA) so libtaph/scripts/check-stack.sh and
+# bump-libtaph.sh can read and rewrite it for fqdup and DART alike.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/LIBTAPH_PIN" LIBTAPH_PINNED_SHA LIMIT_COUNT 1)
+string(STRIP "${LIBTAPH_PINNED_SHA}" LIBTAPH_PINNED_SHA)
+string(LENGTH "${LIBTAPH_PINNED_SHA}" LIBTAPH_PIN_LENGTH)
+if(NOT LIBTAPH_PIN_LENGTH EQUAL 40 OR NOT LIBTAPH_PINNED_SHA MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "LIBTAPH_PIN must hold one full 40-hex libtaph SHA, got '${LIBTAPH_PINNED_SHA}'")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/LIBTAPH_PIN")
 if(FETCHCONTENT_SOURCE_DIR_LIBTAPH)
     execute_process(COMMAND git -C "${FETCHCONTENT_SOURCE_DIR_LIBTAPH}" rev-parse HEAD
         OUTPUT_VARIABLE LIBTAPH_HEAD_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
