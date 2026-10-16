@@ -116,6 +116,13 @@ std::vector<RepairedRecord> RepairPipeline::repair_records(NativeRecords input,i
         if(selected&&!selected->at(mask)){output.emplace_back();continue;}
         const auto& v=replacements?replacements->at(mask):input[i];
         if(v[1].size()!=v[2].size()||v[4].size()!=v[5].size())throw std::runtime_error("raw lengths");
+
+#if defined(FQDUP_TRUTH_ABLATION) && FQDUP_TRUTH_ABLATION
+        static const std::string ablation=[] {const char* p=std::getenv("FQDUP_TRUTH_ABLATION_ARM");return p?std::string(p):std::string();}();
+        if(mode==9&&((ablation=="skip-merged"&&v[6]=="merged")||(ablation=="skip-nonmerged"&&v[6]!="merged"))){
+            RepairedRecord result;result.native=&v;output.push_back(std::move(result));continue;
+        }
+#endif
     const bool candidate=mode==9&&(!excluded||!excluded->at(mask));
     const bool clean=candidate&&clean_bounds&&clean_bounds->at(mask)>=0&&clean_bounds->at(mask)<=int64_t(std::floor(cut*RepairSkipBound::scale+.5))*int64_t(v[8].size());
     const bool skip=candidate&&(clean||impl_->bound.unchanged(v,model,cut,repair_bounds?repair_bounds->at(mask):-1));

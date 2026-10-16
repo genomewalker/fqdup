@@ -185,6 +185,19 @@ std::size_t key_bytes(const std::vector<std::string>& keys){return fqdup::r8qkee
 std::size_t key_bytes(const std::vector<fqdup::r8qkeep::FamilyKey>& keys){return fqdup::r8qkeep::vector_bytes(keys);}
 template<class Key>
 bool neighbor_families_impl(const std::vector<Key>& keys,std::vector<int>& parent,int threads=1,std::size_t edge_limit=64,fqdup::r8qkeep::WorkerPool* shared_pool=nullptr){
+#if defined(FQDUP_TRUTH_ABLATION) && FQDUP_TRUTH_ABLATION
+    static const bool exact_only=[] {const char* p=std::getenv("FQDUP_TRUTH_ABLATION_ARM");return p&&std::string_view(p)=="exact-family";}();
+    if(exact_only){
+        std::size_t count=0;for(const auto& key:keys)if(!key.empty())++count;
+        ExactFamilyKeys exact(keys,count);
+        const auto root=[&](int i){while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
+        for(std::size_t i=0;i<keys.size();++i)if(!keys[i].empty()){
+            const int first=exact.insert(i,key_hash(keys[i]));
+            if(first!=int(i)){const int a=root(i),b=root(first);if(a!=b)parent[a]=b;}
+        }
+        return true;
+    }
+#endif
     std::size_t eligible_keys=0;
     for(const auto& key:keys)if(!key.empty()){++eligible_keys;if(!indexable_key(key))return false;}
     const auto started=std::chrono::steady_clock::now();
