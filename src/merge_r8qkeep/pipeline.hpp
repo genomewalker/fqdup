@@ -21,8 +21,8 @@ struct LibraryPipeline {
     std::shared_ptr<WorkerPool> pool;
 };
 struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; std::array<std::size_t,5> outcome_counts{}; };
-LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,const NativeSettings& settings,int threads,bool debug,bool timings,bool counts);
-LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false,bool defer_routing=false,bool counts=false);
+LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,const NativeSettings& settings,int threads,bool debug,bool timings,bool counts,bool no_family=false);
+LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false,bool defer_routing=false,bool counts=false,bool no_family=false);
 void write_library_cutoffs(LibraryPipeline& library,const std::vector<double>& cutoffs,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records=false);
 FinalOutput emit_library(const LibraryPipeline& library,double cutoff);
 void write_library_outputs(const LibraryPipeline& library,double cutoff,const std::string& directory,int threads=1,RepairShadow* shadow=nullptr);
