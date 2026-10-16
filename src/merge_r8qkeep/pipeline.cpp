@@ -46,7 +46,7 @@ MemoryUsage library_memory(const LibraryPipeline& lib){
 }
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
-LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts){
+LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts,bool no_family){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;
@@ -55,7 +55,17 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     if(memory){MemoryUsage m;m.reads(r1);m.reads(r2);m.report("input",r1.size());}
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);out.pool=std::make_shared<WorkerPool>(workers);
     if(counts){canonicalize_family_input(r1,r2,out.pool.get(),workers);stage("canonical_input");}
-    out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
+    if(no_family){
+        if(r1.size()!=r2.size())throw std::runtime_error("pair count");
+        out.family.pairs.reserve(r1.size());
+        for(std::size_t i=0;i<r1.size();++i){
+            if(r1[i].id!=r2[i].id)throw std::runtime_error("pair order "+r1[i].id);
+            out.family.pairs.push_back({r1[i].id,{std::move(r1[i]),std::move(r2[i])}});
+        }
+        std::vector<FamilyRead>().swap(r1);std::vector<FamilyRead>().swap(r2);
+    }else out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());
+    stage("family");
+
     memory_stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
