@@ -46,7 +46,7 @@ MemoryUsage library_memory(const LibraryPipeline& lib){
 }
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
-LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts){
+LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts,bool no_family){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;
@@ -55,7 +55,17 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
     if(memory){MemoryUsage m;m.reads(r1);m.reads(r2);m.report("input",r1.size());}
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);out.pool=std::make_shared<WorkerPool>(workers);
     if(counts){canonicalize_family_input(r1,r2,out.pool.get(),workers);stage("canonical_input");}
-    out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());stage("family");
+    if(no_family){
+        if(r1.size()!=r2.size())throw std::runtime_error("pair count");
+        out.family.pairs.reserve(r1.size());
+        for(std::size_t i=0;i<r1.size();++i){
+            if(r1[i].id!=r2[i].id)throw std::runtime_error("pair order "+r1[i].id);
+            out.family.pairs.push_back({r1[i].id,{std::move(r1[i]),std::move(r2[i])}});
+        }
+        std::vector<FamilyRead>().swap(r1);std::vector<FamilyRead>().swap(r2);
+    }else out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());
+    stage("family");
+
     memory_stage("family");
     if(counts){
         constexpr std::size_t requested=25000;
@@ -120,7 +130,7 @@ std::string_view read_id(const std::string& h){
     if(view.size()>2&&view[view.size()-2]=='/'&&(view.back()=='1'||view.back()=='2'))view.remove_suffix(2);
     return view;
 }
-void append_record(FinalOutput& out,const RepairedRecord& record,const FamilyPair& pair){
+void append_record(FinalOutput& out,const RepairedRecord& record,const FamilyPair& pair,OutcomesMode mode){
     const auto& kind=record.native?record.native->outcome:record.outcome;
     const auto& first=record.native?record.native->first:record.first;
     const auto& second=record.native?record.native->second:record.second;
@@ -138,6 +148,11 @@ void append_record(FinalOutput& out,const RepairedRecord& record,const FamilyPai
     else if(kind=="unmerged"){add(first,out.r1,"r1",1);add(second,out.r2,"r2",2);}
     else if(kind=="orphan_r1"||kind=="orphan_r2")add(first,out.orphan,"orphan",kind=="orphan_r1"?1:2);
     else if(kind!="dropped")throw std::runtime_error("chunk outcome");
+    if(mode==OutcomesMode::none)return;
+    if(mode==OutcomesMode::summary){
+        const std::size_t index=kind=="merged"?0:kind=="unmerged"?1:kind=="orphan_r1"?2:kind=="orphan_r2"?3:4;
+        ++out.outcome_counts[index];return;
+    }
     out.outcomes+="{\"r1_header\":";json_string(out.outcomes,pair.r[0].h);
     out.outcomes+=",\"r2_header\":";json_string(out.outcomes,pair.r[1].h);
     out.outcomes+=",\"outcome\":";json_string(out.outcomes,kind);out.outcomes+="}\n";
@@ -210,7 +225,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto emit=[&](std::size_t i,const RepairedRecord& record){
                 if(collected){const auto bound=bounds[i];
                     (*collected)[i]=memo_owned(record,bound>=0,bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()));}
-                else append_record(chunk.outputs[c],record,*native[i].raw);
+                else append_record(chunk.outputs[c],record,*native[i].raw,lib.outcomes_mode);
             };
             std::size_t slot=0;RepairedRecord direct;
             for(std::size_t i=0;i<n;++i){
@@ -300,7 +315,7 @@ void open_files(OutputFiles& files,const std::string& directory){
     for(std::size_t i=0;i<files.size();++i)open_file(files[i],directory,i);
 }
 void write_files(OutputFiles& files,const FinalOutput& out){
-    files[0].append(out.merged);files[1].append(out.r1);files[2].append(out.r2);files[3].append(out.orphan);files[4].append(out.outcomes);
+    files[0].append(out.merged);files[1].append(out.r1);files[2].append(out.r2);files[3].append(out.orphan);if(!out.outcomes.empty())files[4].append(out.outcomes);
 }
 void close_files(OutputFiles& files){for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}}
 }
@@ -325,14 +340,15 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
     const bool measure=timings||debug;const auto stream_begin=Clock::now();
     const auto elapsed=[](auto begin){return std::chrono::duration<double>(Clock::now()-begin).count();};
     std::vector<OutputFiles> files(cuts.size());
+    std::vector<std::array<std::size_t,5>> outcome_counts(cuts.size());
     const auto each_file=[&](auto work,const char* label){
         if(threads>1&&lib.pool){
             ordered_index_chunks(*lib.pool,files.size()*5,threads,0,
-                [&](std::size_t begin,std::size_t n){for(std::size_t i=begin;i<begin+n;++i)work(i/5,i%5);return 0;},
+                [&](std::size_t begin,std::size_t n){for(std::size_t i=begin;i<begin+n;++i)if(i%5!=4||lib.outcomes_mode!=OutcomesMode::none)work(i/5,i%5);return 0;},
                 [](int){},label,1);
-        }else for(std::size_t c=0;c<files.size();++c)for(std::size_t f=0;f<5;++f)work(c,f);
+        }else for(std::size_t c=0;c<files.size();++c)for(std::size_t f=0;f<5;++f)if(f!=4||lib.outcomes_mode!=OutcomesMode::none)work(c,f);
     };
-    each_file([&](std::size_t c,std::size_t f){open_file(files[c][f],directories[c],f);},"output_open");
+    each_file([&](std::size_t c,std::size_t f){if(f==4&&lib.outcomes_mode==OutcomesMode::summary){files[c][f].open(std::filesystem::path(directories[c])/"outcomes.summary.tsv");if(!files[c][f])throw std::runtime_error("open output");}else open_file(files[c][f],directories[c],f);},"output_open");
     const double open_seconds=measure?elapsed(stream_begin):0;double write_seconds=0;
     std::unique_ptr<ParallelOutputFiles> file_writers;
     if(threads>=8&&cuts.size()==1)file_writers=std::make_unique<ParallelOutputFiles>(files[0],measure);
@@ -346,6 +362,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];auto& out=chunk.outputs[c];
+            if(lib.outcomes_mode==OutcomesMode::summary)for(std::size_t k=0;k<5;++k)outcome_counts[c][k]+=out.outcome_counts[k];
             if(file_writers)file_writers->append({&out.merged,&out.r1,&out.r2,&out.orphan,&out.outcomes});
             else write_files(files[c],out);}
         if(measure)write_seconds+=elapsed(write_begin);
@@ -374,6 +391,14 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         else release_seconds=release();
     }
     const auto close_begin=measure?Clock::now():Clock::time_point{};
+    if(lib.outcomes_mode==OutcomesMode::summary){
+        static const char* kinds[]={"merged","unmerged","orphan_r1","orphan_r2","dropped"};
+        for(std::size_t c=0;c<cuts.size();++c){
+            std::string text="outcome\tcount\n";std::size_t total=0;
+            for(std::size_t k=0;k<5;++k){text+=kinds[k];text+='\t';text+=std::to_string(outcome_counts[c][k]);text+='\n';total+=outcome_counts[c][k];}
+            text+="total\t"+std::to_string(total)+"\n";files[c][4].append(text);
+        }
+    }
     each_file([&](std::size_t c,std::size_t f){files[c][f].close();if(!files[c][f])throw std::runtime_error("write output");},"output_close");
     const double close_seconds=measure?elapsed(close_begin):0;
     if(reclaimed.valid())release_seconds=reclaimed.get();

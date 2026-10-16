@@ -1,6 +1,6 @@
 // Included by pipeline.cpp inside fqdup::r8qkeep. Fitting consumes exactly the
 // same ordered observations; only the source of decoded pair scratch changes.
-LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,const NativeSettings& settings,int threads,bool debug,bool timings,bool counts) {
+LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,const NativeSettings& settings,int threads,bool debug,bool timings,bool counts,bool no_family) {
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;out.compact=store;
@@ -19,10 +19,10 @@ LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,
         std::vector<FamilyRead> first(store->size()),second(store->size());FamilyPair pair;CompactPairStore::Decoder decoder;
         for(std::size_t i=0;i<store->size();++i){store->read(i,pair,decoder);first[i]=std::move(pair.r[0]);second[i]=std::move(pair.r[1]);}
         out.compact.reset();store.reset();
-        return prepare_library(std::move(first),std::move(second),settings,threads,debug,timings,true,counts);
+        return prepare_library(std::move(first),std::move(second),settings,threads,debug,timings,true,counts,no_family);
     };
     if(!counts&&!unique)return legacy();
-    try{out.family=correct_compact_family(*store,threads,debug,out.pool.get());}
+    if(!no_family)try{out.family=correct_compact_family(*store,threads,debug,out.pool.get());}
     catch(const UnsupportedCompactAlphabet&){return legacy();}
     stage("family");memory_stage("family");
     if(counts){
