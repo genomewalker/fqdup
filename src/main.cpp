@@ -40,6 +40,7 @@ static void usage(const char* prog) {
               << "  merge       Overlap-detect and merge paired-end reads (aDNA-optimised)\n"
               << "  consensus   Emit per-cluster consensus FASTQ from .fqcl\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
+              << "Run '" << prog << " --version' for the fqdup commit and the pinned libtaph revision.\n"
               << "\nTypical workflow:\n"
               << "  " << prog << " sort        -i merged.fq.gz  -o merged.sorted.fq.gz  --max-memory 64G\n"
               << "  " << prog << " extend      -i merged.sorted.fq.gz -o extended.fq.gz\n"
@@ -69,6 +70,11 @@ int main(int argc, char** argv) {
     if (sub == "trim")        return trim_main(argc - 1, argv + 1);
     if (sub == "merge")       return merge_r8qkeep_main(argc - 1, argv + 1);
     if (sub == "consensus")   return consensus_main(argc - 1, argv + 1);
+
+    if (sub == "-V" || sub == "--version") {
+        std::cout << "fqdup " << FQDUP_GIT_COMMIT << "\nlibtaph " << FQDUP_LIBTAPH_SHA << "\n";
+        return 0;
+    }
 
     if (sub == "-h" || sub == "--help") {
         usage(argv[0]);
