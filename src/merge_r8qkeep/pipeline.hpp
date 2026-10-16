@@ -4,8 +4,11 @@
 #include "mixture_fit.hpp"
 #include "repair.hpp"
 #include "worker_pool.hpp"
+#include <array>
 namespace fqdup::r8qkeep {
+enum class OutcomesMode { full, summary, none };
 struct LibraryPipeline {
+    OutcomesMode outcomes_mode=OutcomesMode::full;
     FamilyResult family;
     std::shared_ptr<CompactPairStore> compact;
     std::size_t pair_count()const{return compact?compact->size():family.pairs.size();}
@@ -17,7 +20,7 @@ struct LibraryPipeline {
     RoutingResult routing;
     std::shared_ptr<WorkerPool> pool;
 };
-struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; };
+struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; std::array<std::size_t,5> outcome_counts{}; };
 LibraryPipeline prepare_compact_library(std::shared_ptr<CompactPairStore> store,const NativeSettings& settings,int threads,bool debug,bool timings,bool counts);
 LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug=false,bool timings=false,bool defer_routing=false,bool counts=false);
 void write_library_cutoffs(LibraryPipeline& library,const std::vector<double>& cutoffs,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records=false);
