@@ -63,7 +63,7 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
         auto& value=scratch.values[i];if(scratch.which[i]!=batch)value=scratch.computed[scratch.which[i]];
         out.native_clean+=value.native_clean;out.native_clean_pass[0]+=value.clean_pass;
         memo_restore_header(value.record.first.header,scratch.raw[i]);memo_restore_header(value.record.second.header,scratch.raw[i]);
-        append_record(out.outputs[0],value.record,scratch.raw[i]);
+        append_record(out.outputs[0],value.record,scratch.raw[i],lib.outcomes_mode);
     }
     out.seconds[0]+=elapsed(emit_begin);memo_hits.fetch_add(hits,std::memory_order_relaxed);memo_rows.fetch_add(n,std::memory_order_relaxed);
     account(native,out);scratch.seen+=n;scratch.hits+=hits;
