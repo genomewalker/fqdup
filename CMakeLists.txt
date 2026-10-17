@@ -454,3 +454,7 @@ target_compile_options(test_task34_outcomes PRIVATE -O2 -ffp-contract=off -ffunc
 target_link_options(test_task34_outcomes PRIVATE -Wl,--gc-sections)
 target_link_libraries(test_task34_outcomes PRIVATE Threads::Threads)
 add_test(NAME task34_outcomes COMMAND test_task34_outcomes)
+
+# Standalone truth-scoring helper; does not link into fqdup.
+add_executable(task35_mate_score tests/task35_mate_score.cpp)
+target_compile_features(task35_mate_score PRIVATE cxx_std_17)

@@ -147,7 +147,11 @@ public:
         prefix(r.merged,raw1);prefix(r.unmerged2,raw2);
         const size_t parent2_length=r.unmerged2.seq.size();
         fqalign::Correspondence repair_corr;
-        if(mixture_mode==9){fqalign::reverse_complement_into(r.unmerged2.seq,scratch.reverse);repair_corr=fqrepair::full_trusted_correspondence(r.merged.seq,scratch.reverse);}
+        if(mixture_mode==9){fqalign::reverse_complement_into(r.unmerged2.seq,scratch.reverse);repair_corr=fqrepair::full_trusted_correspondence(r.merged.seq,scratch.reverse
+#if defined(FQDUP_TRUTH_ABLATION) && FQDUP_TRUTH_ABLATION
+,true
+#endif
+);}
         std::array<fqalign::TrimInterval,2> intervals{fqalign::mott_segment(p.r1,r.merged.seq.size(),cutoff),fqalign::mott_segment(p.r2,r.unmerged2.seq.size(),cutoff)};
         if(mixture_mode==7&&!mixture_applied){auto& a=scratch.a;auto& b=scratch.b;a.assign(p.r1.begin(),p.r1.begin()+r.merged.seq.size());b.assign(p.r2.begin(),p.r2.begin()+r.unmerged2.seq.size());intervals={fqalign::mott_segment(a,a.size(),fqquality::retained_median_cutoff(a,raw1.qual.substr(0,a.size()),cutoff)),fqalign::mott_segment(b,b.size(),fqquality::retained_median_cutoff(b,raw2.qual.substr(0,b.size()),cutoff))};}
         if(mixture_applied && (mixture_mode==5||mixture_mode>=6)) {
