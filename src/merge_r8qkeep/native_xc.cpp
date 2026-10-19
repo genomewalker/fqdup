@@ -2724,8 +2724,24 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     }
                 }
                 if (!sequence_supported) {
-                    // Rejected geometry supplies no valid shared clipping boundary.
-                    emit_unmerged(r1, r2, out, false, -1);
+                    // A rejected body cannot establish geometry from one approximate
+                    // adapter anchor. Require unique complete exact adapters on both
+                    // raw mates at the same coordinate, at or after best_ov.
+                    // Leave uncertain mates intact for normal downstream repair.
+                    auto exact_adapter_start = [&](const std::string& read,
+                                                   const std::string& adapter) {
+                        if (adapter.empty()) return -1;
+                        const auto start = read.find(adapter);
+                        if (start == std::string::npos ||
+                            start < static_cast<std::size_t>(best_ov) ||
+                            read.find(adapter, start + 1) != std::string::npos)
+                            return -1;
+                        return static_cast<int>(start);
+                    };
+                    const int clip1 = exact_adapter_start(r1.seq, opts.adapter1);
+                    const int clip2 = exact_adapter_start(r2.seq, opts.adapter2);
+                    const int clip = clip1 >= 0 && clip1 == clip2 ? clip1 : -1;
+                    emit_unmerged(r1, r2, out, false, clip);
                     continue;
                 }
             }
