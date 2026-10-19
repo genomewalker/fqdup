@@ -75,6 +75,7 @@ struct PairBatch {
 };
 
 struct MergeRecord {
+    int pending_adapter_clip = -1;
     FastqRecord merged;    // merged read (is_merged), trimmed R1 (unmerged), or orphan read (is_orphan)
     FastqRecord unmerged2; // trimmed R2 when is_merged=false and !is_orphan
     bool is_merged = false;
@@ -2725,23 +2726,45 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                 }
                 if (!sequence_supported) {
                     // A rejected body cannot establish geometry from one approximate
-                    // adapter anchor. Require unique complete exact adapters on both
-                    // raw mates at the same coordinate, at or after best_ov.
-                    // Leave uncertain mates intact for normal downstream repair.
-                    auto exact_adapter_start = [&](const std::string& read,
-                                                   const std::string& adapter) {
-                        if (adapter.empty()) return -1;
-                        const auto start = read.find(adapter);
-                        if (start == std::string::npos ||
-                            start < static_cast<std::size_t>(best_ov) ||
-                            read.find(adapter, start + 1) != std::string::npos)
-                            return -1;
-                        return static_cast<int>(start);
+                    // anchor. Confirm a unique visible adapter prefix on each raw mate
+                    // at the same insert coordinate, at or after the anchored boundary.
+                    // Compare the full visible prefix (at least 11 bases); mismatches
+                    // are permitted only below Q20, never for N. Uncertain pairs retain
+                    // the normal downstream repair path. Merge decisions are unchanged.
+                    auto visible_adapter_start = [&](const std::string& read,
+                                                     const std::string& qual,
+                                                     const std::string& adapter) {
+                        if (adapter.empty() || qual.size() != read.size()) return -1;
+                        int result = -1;
+                        for (int p = std::max(0, best_ov); p < static_cast<int>(read.size()); ++p) {
+                            const int n = std::min(static_cast<int>(adapter.size()),
+                                                   static_cast<int>(read.size()) - p);
+                            if (n < 11) continue;
+                            bool matches = true;
+                            for (int j = 0; j < n; ++j) {
+                                if (read[p + j] == adapter[j]) continue;
+                                if (read[p + j] == 'N' ||
+                                    static_cast<unsigned char>(qual[p + j]) - 33 >= 20) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            if (matches) {
+                                if (result >= 0) return -1;
+                                result = p;
+                            }
+                        }
+                        return result;
                     };
-                    const int clip1 = exact_adapter_start(r1.seq, opts.adapter1);
-                    const int clip2 = exact_adapter_start(r2.seq, opts.adapter2);
+                    const int clip1 = visible_adapter_start(r1.seq, r1.qual, opts.adapter1);
+                    const int clip2 = visible_adapter_start(r2.seq, r2.qual, opts.adapter2);
                     const int clip = clip1 >= 0 && clip1 == clip2 ? clip1 : -1;
-                    emit_unmerged(r1, r2, out, false, clip);
+                    // Preserve native QC and all downstream parent repair decisions.
+                    // Intersect retained raw spans only at final pipeline emission.
+                    const auto before = out.records.size();
+                    emit_unmerged(r1, r2, out, false, -1);
+                    if(out.records.size() == before + 1)
+                        out.records.back().pending_adapter_clip = clip;
                     continue;
                 }
             }
@@ -2872,6 +2895,7 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
         if (kind != "dropped") {
             if (emitted >= batch.records.size()) throw std::runtime_error("missing native output");
             auto& record = batch.records[emitted++];
+            native.pending_adapter_clip = record.pending_adapter_clip;
             native.first={std::move(record.merged.header),std::move(record.merged.seq),std::move(record.merged.qual)};
             if(kind=="unmerged")native.second={std::move(record.unmerged2.header),std::move(record.unmerged2.seq),std::move(record.unmerged2.qual)};
         }

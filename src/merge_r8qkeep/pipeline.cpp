@@ -1,4 +1,5 @@
 #include "content_memo.hpp"
+#include "deferred_adapter_clip.hpp"
 #include "pipeline.hpp"
 #include "canonical_pairs.hpp"
 #include "prior_sample.hpp"
@@ -222,7 +223,11 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             const auto changed=alternative?lib.repair->repair_records(work,7,cuts[c],work_start,nullptr,nullptr,nullptr,&cache,nullptr,&routing.routed,&routing.record_replacements):std::vector<RepairedRecord>{};
             if(memory)maximum(max_routing,routing_bytes(routing)+record_bytes(base)+record_bytes(changed)+vector_bytes(certified)+vector_bytes(unresolved)+vector_bytes(unresolved_bounds));
             if(base.size()!=work.size()||(alternative&&changed.size()!=work.size()))throw std::runtime_error("chunk cardinality");
-            const auto emit=[&](std::size_t i,const RepairedRecord& record){
+            const auto emit=[&](std::size_t i,const RepairedRecord& selected){
+                RepairedRecord clipped;
+                const auto& record = native[i].pending_adapter_clip >= 0
+                    ? (clipped = final_adapter_clip(selected, native[i].pending_adapter_clip))
+                    : selected;
                 if(collected){const auto bound=bounds[i];
                     (*collected)[i]=memo_owned(record,bound>=0,bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()));}
                 else append_record(chunk.outputs[c],record,*native[i].raw,lib.outcomes_mode);
