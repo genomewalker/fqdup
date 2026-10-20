@@ -126,6 +126,7 @@ int main(int argc,char** argv){try{
   for(int ai=0;ai<4;++ai)shared=shared&&state[ai]=="unmerged";
   auto addc=[&](const string& cohort,int ai){MateStats s;for(int k=0;k<3;++k)s.add(pm[ai][k]);string key=lib+"\t"+cohort+"\t"+arms[ai].name;cohorts[key].add(s);cohorts_pairs[key]++;};
   if(shared)for(int ai=0;ai<4;++ai)addc("shared_unmerged",ai);
+  for(int ai=1;ai<=2;++ai)if(!ambiguous[0]&&!ambiguous[ai]&&state[0]=="unmerged"&&state[ai]=="unmerged"){string cohort="shared_"+arms[ai].name;addc(cohort,0);addc(cohort,ai);}
   bool fq_un=state[0]=="unmerged"||state[0]=="orphan";
   for(int ai=1;ai<4;++ai){bool ar_merged=state[ai]=="exact"||state[ai]=="base_err"||state[ai]=="wrong_len"||state[ai]=="FP";
    bool ar_un=state[ai]=="unmerged"||state[ai]=="orphan";bool fq_merged=state[0]=="exact"||state[0]=="base_err"||state[0]=="wrong_len"||state[0]=="FP";

@@ -11,6 +11,7 @@ namespace packed26 = fqdup::r8qkeep::packed;
 #include "fqdup/expected_error_qc.hpp"
 #include "fqdup/terminal_learning.hpp"
 #include <memory>
+#include <cstdio>
 #include "fqdup/adapter_catalogue.hpp"
 // fqdup merge — ultrafast paired-end read overlap detection and merging
 //
@@ -2693,20 +2694,26 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                 continue;
             }
 
-            // Quality weights may rank consensus evidence, but Q0 cannot make
-            // disagreeing sequences establish a molecule boundary. Apply the
-            // sequence evidence floor to every anchored prefix merge.
+            // Use the anchored body check's quality-weighted mismatch evidence.
+            // Keep raw mismatches for the unchanged Chernoff anchor rescue.
+            // Apply the same rate and terminal handling to every anchored prefix.
             // The tail/head path above already uses sequence-only geometry.
             if (!opts.experimental_adaptive_overlap && opts.pair_supported_boundaries) {
                 int informative = 0, mismatches = 0;
+                float weighted_mismatches = 0;
                 for (int j = opts.skip_terminal; j < best_ov; ++j) {
                     const char a = r1.seq[j], b = rc2_seq[r2_offset + j];
                     if (a == "N"[0] || b == "N"[0]) continue;
                     ++informative;
-                    mismatches += a != b;
+                    if (a != b) {
+                        ++mismatches;
+                        weighted_mismatches +=
+                            std::min(static_cast<int>(r1.qual[j]) - 33,
+                                     static_cast<int>(rc2_qual[r2_offset + j]) - 33) / 30.f;
+                    }
                 }
                 bool sequence_supported = informative >= opts.min_ov &&
-                    static_cast<float>(mismatches) <= opts.max_mm_rate * informative;
+                    weighted_mismatches <= opts.max_mm_rate * informative;
                 if (!sequence_supported && informative >= opts.min_ov &&
                     paired_boundary == best_ov) {
                     // Unique full anchors on BOTH mates can rescue a genuinely
@@ -2724,6 +2731,23 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                         sequence_supported = informative * divergence >= std::log(1e6);
                     }
                 }
+#if defined(FQDUP_NATIVE_REASONS) && FQDUP_NATIVE_REASONS
+                bool raw_supported = informative >= opts.min_ov &&
+                    mismatches <= opts.max_mm_rate * informative;
+                if (!raw_supported && informative >= opts.min_ov && paired_boundary == best_ov) {
+                    const double f = static_cast<double>(informative - mismatches) / informative;
+                    if (f > 0.25) {
+                        double d = f * std::log(f / 0.25);
+                        if (f < 1.0) d += (1.0 - f) * std::log((1.0 - f) / 0.75);
+                        raw_supported = informative * d >= std::log(1e6);
+                    }
+                }
+                std::fprintf(stderr, "T41_FLOOR\t%.*s\t%d\t%d\t%d\t%.9g\t%d\t%d\n",
+                    static_cast<int>(r1.header.find_first_of(" \t")), r1.header.c_str(),
+                    best_ov, informative, mismatches, static_cast<double>(weighted_mismatches),
+                    raw_supported,
+                    sequence_supported);
+#endif
                 if (!sequence_supported) {
                     // A rejected body cannot establish geometry from one approximate
                     // anchor. Confirm a unique visible adapter prefix on each raw mate
