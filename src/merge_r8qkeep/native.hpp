@@ -7,6 +7,7 @@ struct NativeSettings {
     std::string adapter1 = "AGATCGGAAGAGCACACGTCTGAACTCCAG";
     std::string adapter2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAG";
     std::string library_type = "ds";
+    bool posterior_tailhead_rescue = true;
     int min_overlap = 11;
     int min_length = 1;
     float max_mismatch_rate = 0.08f;

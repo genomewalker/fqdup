@@ -33,7 +33,7 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
     const auto native_begin=Clock::now();
     if(scratch.bypass){
         for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,scratch.raw[i],decoder);
-        auto native=merge_native_range(scratch.raw,0,n,lib.native_settings,false,false);
+        auto native=merge_native_range(scratch.raw,0,n,native_settings,false,false);
         auto out=process(native.records,start,elapsed(native_begin),nullptr,&native.alignments);account(native,out);
         memo_rows.fetch_add(n,std::memory_order_relaxed);memo_bypassed.fetch_add(n,std::memory_order_relaxed);return out;
     };
@@ -50,7 +50,7 @@ const auto memo_process=[&](std::size_t start,std::size_t n){
         scratch.misses[unique]=scratch.raw[i];memo_headers(scratch.misses[unique]);++unique;
     }
     NativeResult native;
-    if(unique)native=merge_native_range(scratch.misses,0,unique,lib.native_settings,false,false);
+    if(unique)native=merge_native_range(scratch.misses,0,unique,native_settings,false,false);
     const auto native_seconds=elapsed(native_begin);
     OutputChunk out;
     if(unique){

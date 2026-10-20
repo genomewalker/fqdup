@@ -1084,6 +1084,7 @@ struct MergeOpts {
     bool experimental_merged_disagreement_floor = false;
     std::shared_ptr<const fqquality::PairMixture> experimental_pair_mixture;
     int   min_ov        = 11;
+    bool posterior_tailhead_rescue = true;
     float max_mm_rate   = 0.08f;
     // Default 16 bp; 0=disabled. Enforced on ALL emit paths via passes_qc (merged +
     // unmerged mates). Raise to 30nt for DART: predict cannot use shorter reads, so
@@ -2632,7 +2633,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #endif
                 if (!opts.experimental_adaptive_overlap && opts.pair_supported_boundaries &&
                     best_ov >= opts.min_ov && best_ov < 20) {
-                    const bool posterior_pass = fqdup_tailhead::unique(
+                    const bool posterior_pass = opts.posterior_tailhead_rescue && fqdup_tailhead::unique(
                         r1.seq, r1.qual, rc2_seq, rc2_qual,
                         best_ov, opts.min_ov, overlap_is_low_complexity);
 #ifdef FQDUP_NATIVE_REASONS
@@ -2894,6 +2895,7 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
     MergeOpts opts;
     opts.adapter1 = settings.adapter1;
     opts.adapter2 = settings.adapter2;
+    opts.posterior_tailhead_rescue = settings.posterior_tailhead_rescue;
     opts.min_ov = settings.min_overlap;
     opts.min_length = settings.min_length;
     opts.max_mm_rate = settings.max_mismatch_rate;

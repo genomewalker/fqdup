@@ -167,8 +167,36 @@ struct OutputChunk {
     std::size_t native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass;
 };
-template<class Consume>
-void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,Consume consume){
+void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,std::function<void(OutputChunk)> consume){
+    // Native geometry differs across the declared rescue boundary. Process each
+    // homogeneous cutoff group through the complete existing router and repair.
+    const bool low=std::any_of(cuts.begin(),cuts.end(),[](double c){return c<0.05;});
+    const bool high=std::any_of(cuts.begin(),cuts.end(),[](double c){return c>=0.05;});
+    if(low&&high){
+        for(bool restricted:{false,true}){
+            std::vector<double> selected;std::vector<std::size_t> slots;
+            for(std::size_t c=0;c<cuts.size();++c)if((cuts[c]<0.05)==restricted){selected.push_back(cuts[c]);slots.push_back(c);}
+            std::vector<RepairShadow> local_counters(selected.size());
+            process_records(lib,selected,threads,debug,counters?local_counters.data():nullptr,[&](OutputChunk chunk){
+                OutputChunk expanded;expanded.count=restricted?0:chunk.count;
+                expanded.outputs.resize(cuts.size());expanded.seconds.resize(cuts.size());expanded.native_clean_pass.resize(cuts.size());
+                for(std::size_t j=0;j<slots.size();++j){expanded.outputs[slots[j]]=std::move(chunk.outputs[j]);expanded.seconds[slots[j]]=chunk.seconds[j];expanded.native_clean_pass[slots[j]]=chunk.native_clean_pass[j];}
+                expanded.router_seconds=chunk.router_seconds;expanded.native_seconds=chunk.native_seconds;
+                if(!restricted){expanded.native_clean=chunk.native_clean;expanded.native_direct=chunk.native_direct;expanded.routed=std::move(chunk.routed);expanded.audit=std::move(chunk.audit);expanded.native=std::move(chunk.native);}
+                consume(std::move(expanded));
+            });
+            if(counters)for(std::size_t j=0;j<slots.size();++j){
+#define COPY_COUNTER(name) counters[slots[j]].name.store(local_counters[j].name.load());
+                COPY_COUNTER(skip_and_unchanged) COPY_COUNTER(skip_but_changed) COPY_COUNTER(noskip_unchanged) COPY_COUNTER(noskip_changed)
+                COPY_COUNTER(clean_and_unchanged) COPY_COUNTER(clean_but_changed) COPY_COUNTER(notclean)
+#undef COPY_COUNTER
+            }
+        }
+        return;
+    }
+    auto native_settings=lib.native_settings;
+    native_settings.posterior_tailhead_rescue=!low;
+
     using Clock=std::chrono::steady_clock;
     const auto elapsed=[](auto start){return std::chrono::duration<double>(Clock::now()-start).count();};
     const int workers=fqdup::r8qkeep::bounded_worker_count(threads);
@@ -270,7 +298,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
         if(use_memo){
             for(std::size_t start=0;start<lib.pair_count();start+=512){const auto n=std::min<std::size_t>(512,lib.pair_count()-start);
                 writer.submit(pool.submit([&,start,n]{return memo_process(start,n);}));output_rows+=n;++output_chunks;}
-        }else if(!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
+        }else if(native_settings.posterior_tailhead_rescue&&!lib.native.records.empty())dispatch(lib.native.records,{},0,0);
         else{
             struct NativeChunk {NativeResult result;std::size_t start;double seconds;};
             auto raw_pool=std::make_shared<DecodedPairPool>(native_batch_size);
@@ -281,8 +309,8 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
                     if(lib.compact){
                         auto raw=raw_pool->acquire();CompactPairStore::Decoder decoder;
                         for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,(*raw)[i],decoder);
-                        result=merge_native_range(*raw,0,n,lib.native_settings,false,false);result.raw_owner=std::move(raw);
-                    }else result=merge_native_range(lib.family.pairs,start,n,lib.native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
+                        result=merge_native_range(*raw,0,n,native_settings,false,false);result.raw_owner=std::move(raw);
+                    }else result=merge_native_range(lib.family.pairs,start,n,native_settings,false,false);return NativeChunk{std::move(result),start,elapsed(begin)};}));
             };
             while(next<lib.pair_count()&&pending.size()<std::size_t(workers))launch();
             while(!pending.empty()){
