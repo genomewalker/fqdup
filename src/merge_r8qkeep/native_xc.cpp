@@ -1,5 +1,6 @@
 #include "packed_kernels.hpp"
 #include "shared_alignment.hpp"
+#include "tailhead_posterior.hpp"
 namespace packed26 = fqdup::r8qkeep::packed;
 #define fqdup fqdup_r8qkeep_native_headers
 #define fqalign fqdup_r8qkeep_native_alignment
@@ -2588,16 +2589,36 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             }
             if (best_ov < opts.min_ov) {
                 // Scan from the declared minimum so a shorter passing offset
-                // still vetoes a competing longer geometry. A unique unanchored
-                // overlap below 20 bases is too weak to construct a molecule.
+                // still vetoes a competing longer geometry. Short unanchored
+                // overlaps require the predeclared posterior uniqueness evidence.
                 best_ov = opts.experimental_adaptive_overlap ? adaptive_tail :
                     find_tail_head_ov(r1.seq.data(), L1,
                                             rc2_seq.data(), L2,
                                             opts.min_ov, opts.max_mm_rate,
                                             opts.pair_supported_boundaries);
+#ifdef FQDUP_NATIVE_REASONS
+                const auto tailhead_reason = [&](const char* stage, int posterior = -1) {
+                    static std::mutex reason_mutex;
+                    std::lock_guard<std::mutex> lock(reason_mutex);
+                    std::cerr << (posterior < 0 ? "T41_TAILHEAD\t" : "T41_POSTERIOR\t")
+                              << r1.header.substr(0, r1.header.find_first_of(" \t"))
+                              << '\t' << best_ov << '\t';
+                    if (posterior < 0) std::cerr << stage;
+                    else std::cerr << posterior;
+                    std::cerr << '\n';
+                };
+                tailhead_reason("proposed");
+#endif
                 if (!opts.experimental_adaptive_overlap && opts.pair_supported_boundaries &&
-                    best_ov >= opts.min_ov && best_ov < 20)
-                    best_ov = -1;
+                    best_ov >= opts.min_ov && best_ov < 20) {
+                    const bool posterior_pass = fqdup_tailhead::unique(
+                        r1.seq, r1.qual, rc2_seq, rc2_qual,
+                        best_ov, opts.min_ov, overlap_is_low_complexity);
+#ifdef FQDUP_NATIVE_REASONS
+                    tailhead_reason("posterior", posterior_pass);
+#endif
+                    if (!posterior_pass) best_ov = -1;
+                }
                 if (best_ov >= opts.min_ov && near_boundary_conflict) {
                     emit_unmerged(r1, r2, out, false, paired_boundary);
                     continue;
@@ -2632,6 +2653,9 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                         emit_unmerged(r1, r2, out, false, paired_boundary);
                         continue;
                     }
+#ifdef FQDUP_NATIVE_REASONS
+                    tailhead_reason("accepted");
+#endif
                     if (do_profile)
                         taph::FrameSelector::update_sample_profile_paired(local_prof, r1.seq, r2.seq);
                     // Phase 2 overlap is at R1[L1-best_ov:] vs RC(R2)[0:best_ov] — interior
