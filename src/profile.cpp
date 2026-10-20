@@ -32,13 +32,14 @@ static void print_usage(const char* prog) {
         << "  --mask-threshold FLOAT     Mask when excess P(deam) > T (default: 0.05)\n"
         << "  --tsv FILE                 Write per-position table as TSV\n"
         << "  --json FILE                Write full damage profile as JSON\n"
+        << "  --json-level LEVEL         summary | standard | full (default: standard)\n"
         << "  --count-table-json FILE    Write Layer-0 stop-channel count tables as JSONL (golden-gate source of truth)\n"
         << "  --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg). This is the\n"
         << "                             profile DART consumes via --library-profile: it takes the fit\n"
         << "                             VERBATIM (pi.state, pi.point, both end shapes) instead of\n"
         << "                             re-deriving it, so the damage verdict is made once, here.\n"
         << "  --html FILE                Write interactive damage report as self-contained HTML\n"
-        << "  --length-bins SPEC         Length-stratified damage: auto | N | e1,e2,... (default: off)\n"
+        << "  --length-bins SPEC         Length-stratified damage: auto | off | N | e1,e2,... (default: auto)\n"
         << "  --adapter-scan-reads N     Reads sampled (single-thread) for adapter-stub detection\n"
         << "                             (default: 1000000; 0 = scan all reads)\n"
         << "  --min-length N             Floor for reads entering the estimator. N<30 lowers the\n"
@@ -46,7 +47,10 @@ static void print_usage(const char* prog) {
         << "                             JOINT length-isotonic re-fit (>=30 bulk delta/tau/preservation\n"
         << "                             then reflect ALL lengths, NOT purely additive). N>=30 keeps the\n"
         << "                             legacy >=30-only path (default: 0 = off)\n"
-        << "  --max-length N             Drop reads longer than N from the estimator (default: 0 = off)\n";
+        << "  --max-length N             Drop reads longer than N from the estimator (default: 0 = off)\n"
+        << "  --subst-in FILE[,FILE]     fqdup merge .bsubst files (comma-separated); also supplies the\n"
+        << "                             library type when --library-type is not given\n"
+        << "  --no-oxog                  Skip the 8-oxoG channels\n";
 }
 
 namespace {

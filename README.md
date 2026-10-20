@@ -1,5 +1,6 @@
 # fqdup
 
+> Status as of 2026-10-21: libtaph is pinned to `c3b3a5d46e6112e61a461c3a6f10ae9fc30345dd`, the same revision as DART v2.0.0. `fqdup profile` now runs libtaph's library profiler (`taph::run_library_profile`), the same code as `dart profile`, so the JSON and `.tdmg` are byte-identical between the two for the same reads (checked on the DART tutorial reads). fqdup's own copies of the profiler, the HTML report and the oxoG code are gone; `--html` and `--no-oxog` still work, through libtaph. Changes in the profile JSON: each length bin has `pi_authentic` (damaged-fraction interval present and tau DETECTED; the tau cutoffs come from three labelled libraries, so treat it as provisional), `tau_discriminator.point` and `burial_fingerprint.tau_hat` are null unless tau is DETECTED, `w_length` is deprecated (it reads about 0.5 everywhere), and the preservation f_coh, evidence and score are lower by up to 0.074, 0.27 and 0.18 because the w_length term is gone. The bulk damage fit uses SQUAREM. fqdup merge output is not affected. ctest 57/57 with `scripts/libtaph-consumer-test.sh`, which now sets a UTF-8 locale: under an ASCII locale six Python tests fail on printing non-ASCII characters. Regenerating the TDM1 fixture with `scripts/make-tdm1-fixture.sh` changes one field, `pi_shape_3p_lambda`, in its 15th significant digit.
 > Status as of 2026-10-17: Task 35 (truth-equivalent repair and family changes) added one change to the default path: at cutoffs of 0.05 and above, mode-9 repair is skipped for pairs the native merger already merged, because across all 34 dev cutoffs it changed no output file from 0.05 upward (below 0.05 it trims merged reads under `--cutoff`, so the original path runs there). Output is byte-identical to the previous main b1687c3: all 34 dev cutoffs in both prior modes, fresh 1M/5M, full-fit 1M and real ds/ss at `-p 8` and `-p 16`, plus the full gates (G-final 850 with G3, shadow, family G1, 1M memory, ctest 57/57, default680 680/680, 25/25 identity). Same-node median of 5 (16 CPUs, `-p 16`): real ds 10M 17.26 s vs 18.00 s for b1687c3 vs 3.32 s for AdapterRemoval 3.0.2 (−4.1 %), real ss 10M 17.88 s vs 18.94 s vs 3.20 s (−5.6 %), fresh simulated 5M 9.09 s vs 9.37 s vs 1.90 s; total streaming worker time falls on every set, peak RSS within 2 %. The other Task 35 candidates were measured against dev truth for merged reads and, per base, for unmerged mates (TASK35_SKIP_MERGED.md, ABLATION-T35.md): skipping repair on non-merged rows, exact-key families only and cheaper banded repair either lose accuracy or run slower, so they are not used. On real ds the remaining wall time is roughly input parsing 20 %, the family pass 26 % and streaming 52 %.
 > Status as of 2026-10-16: `fqdup merge` is the Task 32 pipeline (compact core, exact fast read-ID ordering, radius-1 PCR families with all-G R2 keys excluded, shared native correspondence, every stage scaling to `-p`, prior sample from canonicalisation, self-bypassing memo, fixed chunks, exact self-correspondence fill) plus two opt-in output modes from Task 34. With neither option the output is byte-identical to the previous main (eb967da): full gates pass (G-final 850 with G3, shadow, family G1, 1M memory, ctest 56/56, default680 680/680) and fresh 1M/5M plus real ds/ss outputs match 25/25. `--prior-fit counts` stays the default; `full` is the exact reference mode.
 > `--outcomes full|summary|none` (default `full`): `summary` writes `outcomes.summary.tsv` per cutoff (counts for merged, unmerged, orphan_r1, orphan_r2, dropped, total) instead of one JSON line per pair, and `none` writes no outcomes file. Neither builds per-row JSON; `merged.fq`, `r1.fq`, `r2.fq` and `orphan.fq` stay byte-identical to `full`.
@@ -282,11 +283,16 @@ fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
                              subsequent fqdup derep --collapse-damage run.
   --tsv FILE                 Write per-position frequency table as TSV
   --json FILE                Write full damage profile as JSON
+  --json-level LEVEL         summary | standard | full (default: standard)
   --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg) for
                              DART --library-profile (v3 carries pi_damaged_point)
   --html FILE                Write interactive damage report as self-contained HTML
-  --length-bins SPEC         Length-stratified damage curves: auto | N | e1,e2,...
+  --length-bins SPEC         Length-stratified damage curves: auto | off | N | e1,e2,...
+                             (default: auto)
   --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
+  --subst-in FILE[,FILE]     fqdup merge .bsubst files; also give the library type
+                             when --library-type is not set
+  --no-oxog                  Skip the 8-oxoG channels
 ```
 
 When adapter stubs are detected, the report includes a per-stub read fraction
