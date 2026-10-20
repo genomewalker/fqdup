@@ -1,7 +1,11 @@
+#include "native_reason_log.hpp"
 #include "packed_kernels.hpp"
 #include "shared_alignment.hpp"
 #include "tailhead_posterior.hpp"
 namespace packed26 = fqdup::r8qkeep::packed;
+#ifdef FQDUP_NATIVE_REASONS
+namespace task42_reason_log = fqdup::r8qkeep;
+#endif
 #define fqdup fqdup_r8qkeep_native_headers
 #define fqalign fqdup_r8qkeep_native_alignment
 #define fqquality fqdup_r8qkeep_native_quality
@@ -2620,8 +2624,7 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                                             opts.pair_supported_boundaries);
 #ifdef FQDUP_NATIVE_REASONS
                 const auto tailhead_reason = [&](const char* stage, int posterior = -1) {
-                    static std::mutex reason_mutex;
-                    std::lock_guard<std::mutex> lock(reason_mutex);
+                    std::lock_guard<std::mutex> lock(task42_reason_log::native_reason_mutex());
                     std::cerr << (posterior < 0 ? "T41_TAILHEAD\t" : "T41_POSTERIOR\t")
                               << r1.header.substr(0, r1.header.find_first_of(" \t"))
                               << '\t' << best_ov << '\t';
@@ -2818,8 +2821,9 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     // Intersect retained raw spans only at final pipeline emission.
                     const auto before = out.records.size();
                     emit_unmerged(r1, r2, out, false, -1);
-                    if(out.records.size() == before + 1)
+                    if(out.records.size() == before + 1){
                         out.records.back().pending_adapter_clip = clip;
+                    }
                     continue;
                 }
             }
@@ -2881,6 +2885,45 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #include "memory_status.hpp"
 #include "ordered_chunks.hpp"
 namespace fqdup::r8qkeep {
+bool place_family_member(const FamilyPair& pair,int length,const NativeSettings& settings,NativeRecord& placed) {
+    using namespace ::fqdup_native_xc_internal;
+    FastqRecord r1,r2;
+    r1.header=pair.r[0].h;r1.seq=pair.r[0].s;r1.qual=pair.r[0].q;r1.plus="+";
+    r2.header=pair.r[1].h;r2.seq=pair.r[1].s;r2.qual=pair.r[1].q;r2.plus="+";
+    const int l1=r1.seq.size(),l2=r2.seq.size();
+    const bool anchored=length<=std::min(l1,l2);
+    if(length<=0||length<settings.min_length||(!anchored&&length<std::max(l1,l2)))return false;
+    const int ov=anchored?length:l1+l2-length;
+    if(ov<settings.min_overlap||(!anchored&&ov<20))return false;
+    std::string rc2,qual2;rc_record(r2,rc2,qual2);
+    const int start1=anchored?0:l1-ov,start2=anchored?l2-length:0;
+    if(anchored) {
+        const auto supported=[&](const FastqRecord& r,const std::string& adapter){
+            const int visible=std::min({33,int(adapter.size()),int(r.seq.size())-length});
+            for(int j=0;j<visible;++j)if(r.seq[length+j]!=adapter[j]&&int(uint8_t(r.qual[length+j]))-33>=20)return false;
+            return true;
+        };
+        if(!supported(r1,settings.adapter1)||!supported(r2,settings.adapter2))return false;
+    }else if(ov<=30&&tail_head_word_repeats(r1.seq.data(),l1,rc2.data(),l2,ov))return false;
+    int informative=0;float weighted=0;
+    for(int j=0;j<ov;++j) {
+        const char a=r1.seq[start1+j],b=rc2[start2+j];
+        if(a=='N'||b=='N')continue;
+        ++informative;
+        if(a!=b)weighted+=std::min(int(uint8_t(r1.qual[start1+j]))-33,int(uint8_t(qual2[start2+j]))-33)/30.f;
+    }
+    if(informative<settings.min_overlap||weighted>settings.max_mismatch_rate*informative)return false;
+    FastqRecord overlap=r1,consensus;
+    overlap.seq=r1.seq.substr(start1,ov);overlap.qual=r1.qual.substr(start1,ov);
+    consensus_merge(overlap,rc2,qual2,ov,start2,consensus);
+    placed.raw=&pair;placed.outcome="merged";
+    placed.first={consensus.header,consensus.seq,consensus.qual};
+    if(!anchored) {
+        placed.first.seq=r1.seq.substr(0,start1)+consensus.seq+rc2.substr(ov);
+        placed.first.qual=r1.qual.substr(0,start1)+consensus.qual+qual2.substr(ov);
+    }
+    return int(placed.first.seq.size())==length;
+}
 NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t begin,std::size_t count,const NativeSettings& settings,bool trace,bool audit) {
     static_assert(native_batch_size==PAIR_BATCH_SZ);
     if(begin>all.size()||count>all.size()-begin||count>native_batch_size)throw std::runtime_error("native range");
