@@ -1667,7 +1667,7 @@ int derep_main(int argc, char** argv) {
             profile.ss_mode       = (forced_library_type ==
                                      taph::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
             profile.populate_mask_from_model();
-            profile.print_info(/*typical_read_length=*/0);
+            profile.print_info(/*typical_read_length=*/0, log_info);
         }
         if (damage_auto && errcor.enabled && !profile.enabled) {
             log_warn("WARNING: --error-correct is ON but no ancient DNA damage detected. "

@@ -343,7 +343,7 @@ static DamageProfile estimate_damage_impl(
              (deam_profile.damage_validated  ? " [validated]" : "") +
              (deam_profile.damage_artifact   ? " [ARTIFACT]" : ""));
     if (profile.enabled && typical_len > 0) {
-        profile.print_info(typical_len);
+        profile.print_info(typical_len, log_info);
     } else {
         log_info("  Damage below threshold — standard exact hashing will be used");
     }
