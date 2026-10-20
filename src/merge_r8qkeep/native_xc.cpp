@@ -452,6 +452,28 @@ static bool has_exact_long_self_overlap(const char* seq, int len) {
     return false;
 }
 
+ // Fixed before evaluation: flank-only copies, one mismatch, N is a mismatch.
+static constexpr int REPEAT_VETO_MAX_MM = 1;
+static constexpr int REPEAT_VETO_MIN_OV = 20, REPEAT_VETO_MAX_OV = 30;
+static bool word_in_flank(const char* word, int ov, const char* read, int lo, int hi) {
+    for (int j = lo; j <= hi; ++j) {
+        int mm = 0;
+        for (int i = 0; i < ov && mm <= REPEAT_VETO_MAX_MM; ++i)
+            mm += word[i] != read[j+i] || word[i] == 'N' || read[j+i] == 'N';
+        if (mm <= REPEAT_VETO_MAX_MM) return true;
+    }
+    return false;
+}
+static bool tail_head_word_repeats(const char* r1, int L1, const char* rc2, int L2, int ov) {
+    if (ov < REPEAT_VETO_MIN_OV || ov > REPEAT_VETO_MAX_OV) return false;
+    const char* words[] = {r1 + L1 - ov, rc2};
+    for (const char* word : words) {
+        if (word_in_flank(word, ov, r1, 0, L1 - 2*ov) ||
+            word_in_flank(word, ov, rc2, ov, L2 - ov)) return true;
+    }
+    return false;
+}
+
 static int find_tail_head_ov(const char* r1, int L1,
                              const char* rc2, int L2,
                              int min_ov, float max_mm_rate,
@@ -2649,6 +2671,14 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     if (opts.pair_supported_boundaries &&
                         (has_exact_long_self_overlap(r1.seq.data(), L1) ||
                          has_exact_long_self_overlap(rc2_seq.data(), L2))) {
+                        emit_unmerged(r1, r2, out, false, paired_boundary);
+                        continue;
+                    }
+                    if (opts.pair_supported_boundaries &&
+                        tail_head_word_repeats(r1.seq.data(), L1, rc2_seq.data(), L2, best_ov)) {
+#ifdef FQDUP_NATIVE_REASONS
+                        tailhead_reason("phase2_repeat_copy");
+#endif
                         emit_unmerged(r1, r2, out, false, paired_boundary);
                         continue;
                     }
