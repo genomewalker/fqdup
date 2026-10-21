@@ -15,8 +15,20 @@
 > bases, within an accepted tolerance of 0.001 % of correctly emitted bases.
 > Caveats: real libraries with 101 bp reads exercise only the 15–19 bp part of
 > the tail/head rescue; terminal-damage and repeat behaviour of rescued reads
-> are underpowered on real data; all accuracy figures are from the development
-> set and await a single run on the held-out validation set.
+> are underpowered on real data.
+> Held-out validation (a freshly generated and sealed simulated set of 400,000
+> pairs, run once with every tool's settings and the scorers frozen beforehand,
+> cutoff 0.316): fqdup emitted the most correct molecule bases (36,222,545) and
+> the most exact merges (346,071) of 18 tool configurations, with 0
+> wrong-length merges, 3 false merges, 6,506 missed merges and 2,364 adapter
+> bases left in unmerged mates. Ranking safety first (false and wrong-length
+> merges), then molecule retention, then merge geometry, fqdup is ahead of 12
+> of the 14 fair configurations (AdapterRemoval 2 and 3, leeHom, fastp,
+> BBMerge with error correction, NGmerge, PEAR, FLASH2, SeqPrep); it is not
+> comparable with BBMerge in strict mode (fewer false merges, 1 vs 3, but
+> 191,318 missed merges) and the comparison with AdapterRemoval 3 with Mott
+> quality trimming is unresolved (one ambiguous pair). PEAR and leeHom miss
+> fewer merges and leave no adapter, at the cost of 956 and 52 false merges.
 
 > Historical (undated specifics omitted): across several internal revisions,
 > the merge pipeline's default repair-skip, outcomes-file, and
