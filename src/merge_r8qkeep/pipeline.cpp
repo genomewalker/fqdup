@@ -1,3 +1,4 @@
+#include "native_reason_log.hpp"
 #include "content_memo.hpp"
 #include "deferred_adapter_clip.hpp"
 #include "pipeline.hpp"
@@ -167,7 +168,10 @@ struct OutputChunk {
     std::size_t native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass;
 };
-void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,std::function<void(OutputChunk)> consume){
+struct FamilyPlacementEvidence {
+    std::vector<int> membership, merged_lengths, agreed_lengths;
+};
+void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,std::function<void(OutputChunk)> consume,FamilyPlacementEvidence* evidence=nullptr,bool collect=false){
     // Native geometry differs across the declared rescue boundary. Process each
     // homogeneous cutoff group through the complete existing router and repair.
     const bool low=std::any_of(cuts.begin(),cuts.end(),[](double c){return c<0.05;});
@@ -196,6 +200,27 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     }
     auto native_settings=lib.native_settings;
     native_settings.posterior_tailhead_rescue=!low;
+
+    FamilyPlacementEvidence owned_evidence;
+    if(!evidence&&!lib.family.placement_groups.empty()){
+        evidence=&owned_evidence;
+        evidence->membership.assign(lib.pair_count(),-1);
+        evidence->merged_lengths.assign(lib.pair_count()*cuts.size(),0);
+        evidence->agreed_lengths.assign(lib.family.placement_groups.size()*cuts.size(),0);
+        for(std::size_t g=0;g<lib.family.placement_groups.size();++g)
+            for(int i:lib.family.placement_groups[g].m)evidence->membership.at(i)=g;
+        // This complete baseline pass supplies final accepted lengths. Rescues
+        // never enter this evidence, including across chunks or cutoff arms.
+        process_records(lib,cuts,threads,false,nullptr,[](OutputChunk){},evidence,true);
+        for(std::size_t g=0;g<lib.family.placement_groups.size();++g)for(std::size_t c=0;c<cuts.size();++c){
+            int agreed=0;
+            for(int i:lib.family.placement_groups[g].m){
+                const int n=evidence->merged_lengths[i*cuts.size()+c];
+                if(n){if(agreed&&agreed!=n){agreed=-1;break;}agreed=n;}
+            }
+            evidence->agreed_lengths[g*cuts.size()+c]=agreed;
+        }
+    }
 
     using Clock=std::chrono::steady_clock;
     const auto elapsed=[](auto start){return std::chrono::duration<double>(Clock::now()-start).count();};
@@ -256,6 +281,47 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
                 const auto& record = native[i].pending_adapter_clip >= 0
                     ? (clipped = final_adapter_clip(selected, native[i].pending_adapter_clip))
                     : selected;
+                const auto& kind=record.native?record.native->outcome:record.outcome;
+                const auto& first=record.native?record.native->first:record.first;
+                const auto global=start+i;
+                if(collect){
+                    if(kind=="merged")evidence->merged_lengths[global*cuts.size()+c]=first.seq.size();
+                    return;
+                }
+                if(evidence&&kind!="merged"&&native[i].outcome!="merged"){
+                    const int group=evidence->membership[global];
+                    const int length=group<0?0:evidence->agreed_lengths[group*cuts.size()+c];
+                    NativeRecord placed;
+                    if(length>0&&place_family_member(*native[i].raw,length,lib.native_settings,placed)){
+                        // Apply the existing pair posterior and consensus repair
+                        // at this cutoff. Failure preserves the baseline record.
+                        const NativeRecords placement(&placed,1);
+                        const auto routed=lib.repair->route_records(placement,false,0,nullptr,false,cuts[c]);
+                        const auto repaired=routed.routed.at(0)
+                            ? lib.repair->repair_records(placement,7,cuts[c],0,nullptr,nullptr,nullptr,nullptr,nullptr,&routed.routed,&routed.record_replacements)
+                            : lib.repair->repair_records(placement,9,cuts[c]);
+                        const auto& rescued=repaired.at(0);
+                        const auto& rescued_kind=rescued.native?rescued.native->outcome:rescued.outcome;
+                        const auto& rescued_first=rescued.native?rescued.native->first:rescued.first;
+                        if(rescued_kind=="merged"&&int(rescued_first.seq.size())==length){
+#ifdef FQDUP_NATIVE_REASONS
+                            std::lock_guard<std::mutex> lock(::fqdup::r8qkeep::native_reason_mutex());
+                            std::cerr<<"T42_FAMILY\t"<<native[i].raw->id<<'\t'<<cuts[c]<<'\t'<<lib.family.placement_groups[group].runtime_id<<'\t'<<length<<'\t';
+                            bool comma=false;
+                            for(int sibling:lib.family.placement_groups[group].m)if(evidence->merged_lengths[sibling*cuts.size()+c]){
+                                if(std::size_t(sibling)==global)throw std::logic_error("self family anchor");
+                                FamilyPair decoded;CompactPairStore::Decoder decoder;
+                                const FamilyPair* anchor=nullptr;
+                                if(lib.compact){lib.compact->read(sibling,decoded,decoder);anchor=&decoded;}else anchor=&lib.family.pairs[sibling];
+                                std::cerr<<(comma?",":"")<<anchor->id;comma=true;
+                            }
+                            std::cerr<<'\n';
+#endif
+                            append_record(chunk.outputs[c],rescued,*native[i].raw,lib.outcomes_mode);
+                            return;
+                        }
+                    }
+                }
                 if(collected){const auto bound=bounds[i];
                     (*collected)[i]=memo_owned(record,bound>=0,bound>=0&&bound<=int64_t(std::floor(cuts[c]*1000000000000LL+.5))*int64_t(native[i][8].size()));}
                 else append_record(chunk.outputs[c],record,*native[i].raw,lib.outcomes_mode);
@@ -279,7 +345,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     const bool force_memo=content_memo_switch&&std::string_view(content_memo_switch)=="1";
     #include "memo_pipeline.inc"
     const auto memo_switch=content_memo_switch?content_memo_switch:std::getenv("FQDUP_MEMO");
-    const bool use_memo=lib.compact&&cuts.size()==1&&!debug&&!counters&&(!memo_switch||std::string_view(memo_switch)!="0");
+    const bool use_memo=!evidence&&lib.compact&&cuts.size()==1&&!debug&&!counters&&(!memo_switch||std::string_view(memo_switch)!="0");
     OrderedWriter<OutputChunk> writer(window,std::move(consume));
     std::size_t output_rows=0,output_chunks=0;
     const auto dispatch=[&](NativeRecords records,std::shared_ptr<const NativeResult> owner,std::size_t offset,double native_seconds){

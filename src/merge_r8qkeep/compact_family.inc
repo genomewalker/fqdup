@@ -88,6 +88,8 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
         const auto group_count=groups.size();
         if(std::getenv("FQDUP_FAMILY_DIAGNOSTICS"))std::cerr<<"COMPACT_EDIT_JOURNALS quality_edits="<<all_qualities.size()<<" base_edits="<<all_bases.size()<<" quality_capacity_bytes="<<vector_bytes(all_qualities)<<" base_capacity_bytes="<<vector_bytes(all_bases)<<'\n';
         if(memory_enabled()){MemoryUsage memory;memory.family=vector_bytes(all_qualities)+vector_bytes(all_bases);memory.report("family_edit_journal",store.size(),"journal_only_excludes_store_and_groups");}
+        std::vector<FamilyGroup> placement_groups;
+        for(std::size_t k=0;k<groups.size();++k)if(!disband[k]){groups[k].runtime_id=k;placement_groups.push_back(groups[k]);}
         if(!debug){std::vector<FamilyGroup>().swap(groups);std::vector<char>().swap(disband);}
         store.apply_absolute_edits(std::move(all_qualities),std::move(all_bases),&pool,bounded_worker_count(threads));
         phase("apply_edits");
@@ -96,5 +98,5 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
               for(size_t x=0;x<groups[k].m.size();++x){store.id(groups[k].m[x],id,names);f<<(x?",":"")<<id;} f << '\n'; }}        stats << "{\"pairs\":" << store.size() << ",\"groups\":" << group_count << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
-        return FamilyResult{{},debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n"+ledger.str():std::string(),f.str(),stats.str()};
+        return FamilyResult{{},debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n"+ledger.str():std::string(),f.str(),stats.str(),std::move(placement_groups)};
 }
