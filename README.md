@@ -1,11 +1,14 @@
 # fqdup
 
-> Status as of 2026-10-17: Task 35 (truth-equivalent repair and family changes) added one change to the default path: at cutoffs of 0.05 and above, mode-9 repair is skipped for pairs the native merger already merged, because across all 34 dev cutoffs it changed no output file from 0.05 upward (below 0.05 it trims merged reads under `--cutoff`, so the original path runs there). Output is byte-identical to the previous main b1687c3: all 34 dev cutoffs in both prior modes, fresh 1M/5M, full-fit 1M and real ds/ss at `-p 8` and `-p 16`, plus the full gates (G-final 850 with G3, shadow, family G1, 1M memory, ctest 57/57, default680 680/680, 25/25 identity). Same-node median of 5 (16 CPUs, `-p 16`): real ds 10M 17.26 s vs 18.00 s for b1687c3 vs 3.32 s for AdapterRemoval 3.0.2 (−4.1 %), real ss 10M 17.88 s vs 18.94 s vs 3.20 s (−5.6 %), fresh simulated 5M 9.09 s vs 9.37 s vs 1.90 s; total streaming worker time falls on every set, peak RSS within 2 %. The other Task 35 candidates were measured against dev truth for merged reads and, per base, for unmerged mates (TASK35_SKIP_MERGED.md, ABLATION-T35.md): skipping repair on non-merged rows, exact-key families only and cheaper banded repair either lose accuracy or run slower, so they are not used. On real ds the remaining wall time is roughly input parsing 20 %, the family pass 26 % and streaming 52 %.
-> Status as of 2026-10-16: `fqdup merge` is the Task 32 pipeline (compact core, exact fast read-ID ordering, radius-1 PCR families with all-G R2 keys excluded, shared native correspondence, every stage scaling to `-p`, prior sample from canonicalisation, self-bypassing memo, fixed chunks, exact self-correspondence fill) plus two opt-in output modes from Task 34. With neither option the output is byte-identical to the previous main (eb967da): full gates pass (G-final 850 with G3, shadow, family G1, 1M memory, ctest 56/56, default680 680/680) and fresh 1M/5M plus real ds/ss outputs match 25/25. `--prior-fit counts` stays the default; `full` is the exact reference mode.
-> `--outcomes full|summary|none` (default `full`): `summary` writes `outcomes.summary.tsv` per cutoff (counts for merged, unmerged, orphan_r1, orphan_r2, dropped, total) instead of one JSON line per pair, and `none` writes no outcomes file. Neither builds per-row JSON; `merged.fq`, `r1.fq`, `r2.fq` and `orphan.fq` stay byte-identical to `full`.
-> `--no-family` skips PCR-duplicate family correction and changes output. On the dev truth sets (L1–L4, 400,000 pairs, cutoff 0.316) it keeps false merges at 10 but raises missed merges from 7,109 to 9,335 (+31 %) and merges with base errors from 8,645 to 9,309, and lowers exact merges from 345,198 to 342,308. On real 10M it loses 13,160 (ds) and 11,968 (ss) merged reads relative to the default, changes quality strings on 238,850 and 130,122 reads and merged sequence on 1,461 and 938.
-> Same-node median of 5 (16 CPUs, `-p 16`), real Ellesmere aDNA 10M pairs, ds / ss: default 18.04 / 18.78 s (previous main 17.91 / 18.74); `--outcomes summary` 17.34 / 17.96 s; `--outcomes none` 17.46 / 18.02 s; `--no-family` 12.87 / 15.21 s; `--no-family --outcomes none` 12.15 / 14.50 s; AdapterRemoval 3.0.2 `--threads 16` 3.39 / 3.18 s with gzip output, 3.27 / 3.15 s with plain FASTQ. Writing `outcomes.jsonl` costs under 1 s; the family pass costs about 5 s (ds) and 3.5 s (ss). Details: MODES-T34.md.
-> Build provenance, status as of 2026-10-16: libtaph is pinned to `f97613b6a8f08db1a575db4759d820b9f3c5e719`, the same revision as DART. It fixes libtaph's combined d_max on libraries whose position 0 carries an adapter artifact: the GC-stratified estimate now skips position 0 when it is flagged, as the per-end estimate already did (on the Ellesmere ds library, `fqdup profile` on merged reads reported 0.0136 at the previous pin 7540cc8 and 0.176 now, against per-end d_max 0.166 / 0.165). `fqdup profile --damage-summary` now writes the read-level damaged fraction `pi.point` into the TDM1 `pi_damaged_point` field (0.166 on that library); it used to write the length x GC cell-mixture weight, which is not a read fraction (0.110 at 7540cc8, an artifact of the position-0 bug, and 0.999 once the bug was fixed). Like `pi_point`, the field is now -1 when the damage call is undetermined. fqdup merge output does not change with the pin: fresh 1M/5M, full-fit 1M and real ds/ss 25/25 identical to the 7540cc8 build, default680 680/680, ctest 57/57. The pin lives in `LIBTAPH_PIN` (one 40-hex SHA that CMake reads and validates; libtaph's `scripts/check-stack.sh` and `scripts/bump-libtaph.sh` keep it in step with DART's). CMake refuses to configure unless `FETCHCONTENT_SOURCE_DIR_LIBTAPH` is a clean checkout at exactly the pin (`-DFQDUP_ALLOW_REMOTE_LIBTAPH=ON` fetches exactly the pin). `fqdup --version` prints the fqdup commit (`-DFQDUP_GIT_COMMIT=<sha>` for archive builds) and `libtaph <sha>`; TDM1 version 3 cannot carry it. `scripts/libtaph-consumer-test.sh <build_dir> <libtaph_dir>` builds and runs ctest against a libtaph checkout; `scripts/make-tdm1-fixture.sh <fqdup_bin> <out_dir>` regenerates the TDM1 fixture DART's reader test uses.
+> Status as of 2026-10-19: documentation accuracy pass against `main`. `fqdup
+> merge` without `--legacy-merge` runs the native r8qkeep merge described
+> below; the previous pipeline is unchanged but reachable only via
+> `--legacy-merge`, documented in its own subsection under Options.
+
+> Historical (undated specifics omitted): across several internal revisions,
+> the merge pipeline's default repair-skip, outcomes-file, and
+> family-correction behavior changed, and libtaph was repinned without
+> changing merge output.
 
 FASTQ deduplication for ancient DNA libraries, with damage-aware hashing and
 PCR error correction.
@@ -27,13 +30,17 @@ command, `fqdup profile`, can be run beforehand to inspect the damage profile
 and verify library-type detection.
 
 **Input. `fqdup merge`**: overlap-merge R1 and RC(R2) into one full-length
-ancient DNA molecule. A pre-scan over the first 200k pairs auto-detects
-library type (DS/SS), adapters, and UDG status, then adapter, library-construct,
-and poly-G artifacts are removed before emitting the merged stream (plus
-unmerged pairs and orphans, both optionally adapter-trimmed). Tuned for aDNA
-overlap detection: high mismatch tolerance in the overlap (`--max-mm-rate`
-default 0.08) and Bayesian quality consensus at each overlapping base.
-`fastp --merge` remains a supported alternative merger.
+ancient DNA molecule, writing into a new output directory (`merged.fq`,
+`r1.fq`, `r2.fq`, `orphan.fq`, plus an outcomes file). Tuned for aDNA overlap
+detection: high mismatch tolerance in the overlap (`--max-mm-rate` default
+0.08) and Bayesian quality consensus at each overlapping base. Adapter
+sequences and library type are supplied by the caller — there is no
+auto-detection pre-scan — and PCR-duplicate family correction runs by default.
+`fastp --merge` remains a supported alternative merger. The previous merge
+pipeline (pre-scan auto-detection of library type/adapters/UDG status, a
+single merged-file output, and `--json`/`--damage-out`/`--subst-out`
+diagnostics) is unchanged but reachable only via `--legacy-merge`; see that
+subsection under Options.
 
 **0. `fqdup profile` (optional diagnostic)**: standalone multi-threaded damage
 profiler. Scans the input reads and reports d_max, lambda, background rate, and
@@ -49,7 +56,7 @@ stubs that end up at the start of ultra-short collapsed reads that have read int
 the ligation junction. fastp trims the 3′ adapter but doesn't catch these on the
 5′ end. Uses hexamer frequency analysis on the first `--scan-reads` reads;
 single-pass — the scan buffer is replayed into the clip pipeline with no second
-file open. Run when `fqdup profile` reports adapter stubs at &gt; ~0.5% of reads.
+file open. Run when `fqdup profile` reports adapter stubs at > ~0.5% of reads.
 
 **DS libraries only.** Single-stranded (SS) libraries prepared with the
 CircLigase protocol (Gansauge & Meyer) ligate only a 3′ adapter; the 5′ end of
@@ -80,7 +87,7 @@ sequencing; its input is single-end merged reads from `fqdup merge` or
 `fastp --merge`.
 
 **4. `fqdup derep`**: biological deduplication of the merged-read output.
-Two mechanisms, both on by default:
+Three mechanisms:
 
 - **PCR error correction (Phase 3, default: on).** A pigeonhole Hamming
   search finds low-count clusters that differ from a high-count cluster by one
@@ -136,8 +143,9 @@ Two mechanisms, both on by default:
   and are not running downstream damage analysis.
 
 Use `--no-error-correct` to disable PCR error correction. For non-aDNA data,
-error correction is the only relevant step, `--no-damage` is already the
-default.
+PCR error correction (on by default) is the only relevant step; damage-variant
+collapsing is off by default unless `--damage collapse` / `--collapse-damage`
+is passed, so no flag is needed to skip it.
 
 ---
 
@@ -175,8 +183,7 @@ fqdup derep \
 ```bash
 fqdup sort -i reads.fq.gz -o reads.sorted.fq.gz --max-memory 32G
 fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz \
-  --min-length 30 \
-  --no-error-correct
+  --min-length 30
 ```
 
 ---
@@ -187,11 +194,16 @@ fqdup derep -i reads.sorted.fq.gz -o reads.deduped.fq.gz \
 git clone https://github.com/genomewalker/fqdup.git
 cd fqdup
 mkdir build && cd build
-cmake ..
+cmake -DFETCHCONTENT_SOURCE_DIR_LIBTAPH=/path/to/libtaph ..
 make -j$(nproc)
 ```
 
-**Required:** CMake 3.10+, C++17 compiler, zlib, xxHash
+A bare `cmake ..` fails: CMake refuses to configure unless
+`FETCHCONTENT_SOURCE_DIR_LIBTAPH` points at a clean local libtaph checkout at
+the pinned commit (see Build provenance below), or `-DFQDUP_ALLOW_REMOTE_LIBTAPH=ON`
+is passed to fetch that exact pin from GitHub instead (`CMakeLists.txt`).
+
+**Required:** CMake 3.10+, C++17 compiler, zlib, xxHash, a local or fetchable libtaph checkout
 
 ```bash
 # Ubuntu/Debian
@@ -221,22 +233,83 @@ bash tests/smoke.sh $(pwd)/build/fqdup
 
 ### `fqdup merge`
 
-Overlap-merge R1/R2 pairs into single collapsed reads. Optimized for ancient
-DNA: high damage-tolerance in the overlap, Bayesian quality consensus, and
-incremental-Hamming overlap detection. An upstream alternative to
-`fastp --merge`; see [[Merge]] for the phase-by-phase algorithm.
+Overlap-merge R1/R2 pairs into single collapsed reads, writing output into a
+new directory. `fastp --merge` remains a supported alternative merger.
 
 ```
-fqdup merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz --min-length N [options]
+fqdup merge -1 R1.fq[,LANE,...] -2 R2.fq[,LANE,...] -o NEW_OUTPUT_DIR [options]
+
+Required:
+  -1 FILE[,...] / -2 FILE[,...]  R1 / R2 input FASTQ, repeatable or
+                                  comma-separated; lanes are concatenated into
+                                  one logical stream per mate
+  -o DIR                          Output directory; must not already exist
+
+Cutoff and threading:
+  --cutoff F             Merge-quality cutoff (default: 0.316)
+  --cutoffs FILE         Sweep several cutoffs, one per line; each gets its
+                         own subdirectory under -o, named by the cutoff text
+  -p, --threads N        Worker threads (default: 1, capped at available CPUs)
+
+Merge parameters:
+  --adapter1 / --adapter2 SEQ  R1 / R2 adapter sequence (default: fixed
+                                adapter sequences; no auto-detection)
+  --library-type ds|ss          Library type (default: ds; "auto" not accepted)
+  --min-length N                  Minimum merged length (default: 1)
+  --min-overlap N                  Minimum overlap length (default: 11)
+  --max-mm-rate F                   Max mismatch rate in overlap (default: 0.08)
+
+Family correction (on by default):
+  --no-family            Skip PCR-duplicate family correction (changes output)
+
+Prior fit:
+  --prior-fit counts|full  counts (default) is the production mode; full is
+                           the exact reference mode
+
+Outcomes reporting:
+  --outcomes full|summary|none  (default: full). full writes one JSON line
+                                 per pair to outcomes.jsonl; summary writes
+                                 outcomes.summary.tsv (counts for merged,
+                                 unmerged, orphan_r1, orphan_r2, dropped,
+                                 total); none writes neither. merged.fq,
+                                 r1.fq, r2.fq, and orphan.fq are the same
+                                 across all three modes.
+
+Diagnostics:
+  --debug-stages   Emit extra timing/memory lines to stderr, plus one
+                   debug/ directory directly under -o (not per cutoff) with
+                   family, routing, and prior-model intermediate files
+  --repair-shadow  Diagnostic repair-routing mode for internal comparison;
+                   affects accounting only, not the written reads
+  --timings        Emit stage wall-clock lines to stderr
+
+Accepted but currently no-ops: --no-poly-g, --no-internal-panel,
+--experimental-short-tail, --experimental-gapped-clipping.
+```
+
+Any flag not listed above is rejected, with a hint to use `--legacy-merge`.
+Output files are written directly into `-o` (or into each per-cutoff
+subdirectory when `--cutoff`/`--cutoffs` names more than one value):
+`merged.fq`, `r1.fq`, `r2.fq`, `orphan.fq` (plain, uncompressed FASTQ) and,
+unless `--outcomes none`, `outcomes.jsonl` or `outcomes.summary.tsv`.
+
+#### `--legacy-merge`
+
+`fqdup merge --legacy-merge ...` (the flag may appear anywhere in the
+arguments) runs the previous merge pipeline instead, with its own CLI and a
+single merged-file output rather than a directory:
+
+```
+fqdup merge --legacy-merge -1 R1.fq.gz -2 R2.fq.gz -o merged.fq.gz [options]
 
 Required:
   -1 FILE[,...] / -2 FILE[,...]  R1 / R2 input FASTQ; repeatable or comma-separated
-                             (multiple lanes stream into one merged output + one bsubst)
-  -o FILE                    Output: merged reads
-  --min-length N             Read-length floor, all emit paths (REQUIRED, >= 1)
+  -o FILE                    Output: merged reads (single file)
 
 Library:
   --library-type ds|ss       Override auto-detected library type
+  --min-length N              Read-length floor, all emit paths (default: 16; 0=off)
+  --max-length N               Drop reads longer than N bp (default: off)
 
 Optional output:
   --r1-out / --r2-out FILE   Unmerged R1 / R2 reads (adapter-trimmed if --adapterN given)
@@ -247,11 +320,10 @@ Optional output:
 Overlap:
   --min-overlap N            Minimum overlap length (default: 11)
   --max-mm-rate F            Max mismatch rate in overlap (default: 0.08)
-  --min-length N             (listed under Required above; REQUIRED, no default)
   --clip-r1-5p N             Hard-clip N bases from R1 5' end before overlap
   --min-entropy F            Discard low-complexity merged reads by Shannon entropy (default: off)
   --max-n-rate F             Discard merged reads with N fraction above F (default: 1.0=off)
-  --json FILE                Write comprehensive lossless merge-QC report
+  --json FILE                Write lossless merge-QC report
 
 Adapter trimming (for unmerged pairs):
   --adapter1 / --adapter2 SEQ  R1 / R2 adapter sequence
@@ -259,8 +331,10 @@ Adapter trimming (for unmerged pairs):
   --no-internal-panel          Disable built-in aDNA construct read-through trimming (default: on)
 ```
 
-Library type, adapters, and UDG status are auto-detected from a 200k-read
-pre-scan unless overridden with `--library-type`/`--adapter1`/`--adapter2`.
+Unlike the default merge above, library type, adapters, and UDG status are
+auto-detected from a 200k-read pre-scan unless overridden with
+`--library-type`/`--adapter1`/`--adapter2`, and `--min-length` has a default
+rather than being required.
 
 ### `fqdup profile`
 
@@ -270,6 +344,7 @@ library type, and which positions would be masked.
 ```
 fqdup profile -i INPUT [options]
 fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
+fqdup profile -i MERGED -1 R1.fq.gz -2 R2.fq.gz [options]  # combined: see below
 
   -i FILE                    Single-end / merged input FASTQ (.gz or plain)
   -1 FILE -2 FILE            Raw paired-end reads (R1 → 5' counters, R2 → 3')
@@ -280,14 +355,33 @@ fqdup profile -1 R1.fq.gz -2 R2.fq.gz [options]   # raw paired-end input
                              Output lists which positions exceed the threshold —
                              these are the positions that would be masked in a
                              subsequent fqdup derep --collapse-damage run.
-  --tsv FILE                 Write per-position frequency table as TSV
-  --json FILE                Write full damage profile as JSON
-  --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg) for
-                             DART --library-profile (v3 carries pi_damaged_point)
-  --html FILE                Write interactive damage report as self-contained HTML
+  --min-length N             Drop reads shorter than N bp before profiling
+  --max-length N             Drop reads longer than N bp before profiling (default: off)
+  --no-oxog                  Skip the 8-oxoG asymmetry channels
+  --subst-in FILE[,FILE...]  Read a merge-produced bsubst file; if
+                             --library-type is not given, adopt the library
+                             type merge explicitly declared (not one it
+                             auto-detected)
   --length-bins SPEC         Length-stratified damage curves: auto | N | e1,e2,...
   --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
+
+Outputs:
+  --tsv FILE                 Write per-position frequency table as TSV
+  --json FILE                Write the damage profile as JSON
+  --json-level summary|standard|full  Detail level of --json (default: standard)
+  --count-table-json FILE    Write raw per-position count tables as JSONL
+                             (one JSON object per line)
+  --damage-summary FILE      Write the taph DamageSummary sidecar (.tdmg) for
+                             DART --library-profile (v3 carries pi_damaged_point)
+  --damage-json-out FILE     Write a scalar damage model for `fqdup split --damage-json`
+  --model-bin-out FILE       Write a full split model for `fqdup split --model-bin`
+  --html FILE                Write interactive damage report as self-contained HTML
 ```
+
+With both `-i` and `-1`/`-2` given (combined mode), the merged input carries
+both termini while the unmerged R1/R2 stream adds independent 5'/3' depth; the
+two are profiled and finalized separately, not pooled into one set of
+estimates.
 
 When adapter stubs are detected, the report includes a per-stub read fraction
 counted over all reads: `adapter stubs: 5'=CTCTTC (1.2% of reads) 3'=TTTCCC (1.6% of reads)`.
@@ -306,48 +400,15 @@ empirical-Bayes prior downstream; it is `-1.0` when the length-stratified joint 
 resolve. This is the same terminal-deamination signal DART would otherwise self-profile, so it is
 a prior, not independent evidence.
 
-The `--json` output includes the complete machine-readable profile:
-
-- **Deamination** (`deamination`): `d_max_5prime`, `d_max_combined`, `d_metamatch`
-  (channel-B anchored blended estimate calibrated against metaDMG, r=0.818 on clean DS
-  samples), per-position CT/GA arrays (15 positions each end), BIC scores for
-  library-type classification, CpG vs non-CpG amplitude split (`cpg_like`), and
-  length-stratified d_max bins (`by_length`, populated when `--length-bins` is given).
-- **CpG context** (`deamination.cpg_like`): 5' C→T fitted separately for CpG (`xG`)
-  vs non-CpG positions. `cpg_ratio = dmax_cpg / dmax_noncpg`; values below 1.0 indicate
-  CpG protection consistent with methylation.
-- **Interior C→T clustering** (`interior_ct_cluster`): excess co-occurrence of T at
-  non-CpG `{C,T}` sites within the read interior at separations d=1-10 bp.
-  `short_asym_log2oe` is CT-track minus AG-control log2 observed/expected; positive values
-  indicate clustered interior deamination.
-- **8-oxoG asymmetry** (`complement_asymmetry`): `s_oxog` (overall strand asymmetry)
-  and `s_oxog_16ctx[16]` (G→T asymmetry across all 16 flanking-dinucleotide contexts).
-- **Depurination** (`depurination`): A/G enrichment at 5' and 3' termini; `detected`
-  flag with z-score and p-value.
-- **Damage-context summary** (`damage_context`): training-free, reference-free summary
-  with six damage-process scores (`terminal_deamination_score`, `cpg_context_score`,
-  `dipyrimidine_context_score`, `oxidative_context_score`, `fragmentation_context_score`,
-  `library_artifact_score`) and a `dominant_process` string indicating the most likely
-  damage mechanism. The `evidence` sub-object records the raw inputs used.
-- **Damage-type channels** (`damage_types`): array of 8 entries (channels A-H) each
-  covering an independent damage mechanism: A=cytosine deamination, B=stop-codon
-  deamination validator, C=8-oxoG top strand, D=Chargaff G→T asymmetry, E=purine
-  enrichment/depurination, F=8-oxoG bottom strand, G=hydantoin oxidation, H=adenine
-  oxidation. Each entry carries `detected`, mechanism-specific rates, and z-scores.
-  All eight channels are always present.
-- **Ancient fraction** (`ancient_fraction`): soft-EM mixture decomposition
-  separating damaged from non-damaged reads. `ancient.fraction`
-  is the posterior-weighted π estimate (sigmoid-weighted, not a hard-call
-  threshold). `ancient.d_max_5prime_fit`, `lambda_5prime`, `d_max_3prime_fit`,
-  `lambda_3prime` are WLS+IRLS exponential fits on the per-position rate arrays
-  for each class. `ancient.n_reads` is the hard-call read count. `modern`
-  carries the same fields for the non-damaged fraction. Requires bulk d_max > 0.01
-  to activate; `valid: false` when damage is below threshold.
-- **Preservation score** (`preservation`): composite score (0-1) combining deamination
-  evidence, exponential fit quality, CpG age-bias, and oxidation evidence. The
-  `authenticity_eff` field is the deamination-only component.
-- **Library QC** (`library_qc`): adapter remnant flags, hexamer entropy, composition
-  bias z-scores, and a `flags` array listing detected artifacts.
+The `--json` output is libtaph's damage profile, with detail controlled by
+`--json-level` (`summary` < `standard` < `full`); `--no-oxog` drops the 8-oxoG
+channels from it. The fields themselves (deamination, CpG context, interior
+C→T clustering, 8-oxoG asymmetry, depurination, the damage-context summary,
+the eight damage-type channels, the ancient-fraction mixture decomposition,
+the preservation score, library QC) are libtaph's, not fqdup's — see the
+libtaph repository's `docs/fields/` (one page per field) and
+`docs/interpretation.md` for what each one means and how to read it. This
+README documents only what `fqdup profile` writes and which flags change it.
 
 Library-type classification returns `unknown` when no damage signal is detectable
 (BIC cannot distinguish DS from SS on a flat profile). This is the correct conservative
@@ -708,33 +769,23 @@ libraries.
 
 ## Performance
 
+No general performance numbers are published here; they depend on library
+complexity, depth, and read length. Dataset-specific benchmark figures, where
+they exist, are kept in internal task records rather than this README.
+
 ### fqdup extend
 
-Benchmarked on DS4, 198 M reads, 16 threads, a compute node:
-
-| Metric | Value |
-|--------|-------|
-| Reads extended | 50% |
-| Average extension | 3.82 / 3.83 bp per side |
-| Wall time | 6:56 (pass1=68 s, finalize=19 s, pass2=5:27) |
-| Peak RSS | 41.3 GB |
-
-Comparison: Tadpole achieves 14.75% extension on the same dataset in ~5 min; `fqdup extend` achieves 50% in 7 min.
+Extension works outward from both ends of each merged read using the
+built-in de Bruijn graph; the fraction of reads extended, the average
+per-side extension, wall time, and peak RSS all scale with input size,
+library complexity, and thread count.
 
 ### fqdup derep_pairs / derep
 
-Benchmarked on `a88af16f35`, 25.8 M fastp-merged reads, ~91 bp mean length,
-`d_max_5 ≈ 0.19`, NFS-mounted storage:
-
-| Step | Unique clusters | Wall time |
-|------|----------------|-----------|
-| `derep_pairs` (25.8 M in) | 5,582,073 | ~25 s |
-| `derep` standard | 3,531,821 | ~22 s |
-| `derep --no-error-correct` | 3,511,607 | ~31 s |
-| `derep` (default) | 3,510,151 | ~33 s |
-
-Across 31 ancient DNA libraries (2.97 B reads total), `derep` with default
-settings absorbed a further 8.6% of reads beyond `derep_pairs`.
+`derep_pairs` performs the first, structural pass of deduplication; `derep`'s
+additional PCR error correction (Phase 3) typically absorbs further reads
+beyond what `derep_pairs` alone collapses, at added wall-clock cost. See
+Algorithm summary below for the stage breakdown.
 
 **Memory:**
 
@@ -752,7 +803,7 @@ ASCII. Sequences containing N are stored but skipped during Phase 3.
 ## Algorithm summary
 
 ```
-fqdup extend:      [Pass 0] damage estimation (samples 500k reads)
+fqdup extend:      [Pass 0] damage estimation (samples 1M reads by default, --damage-sample)
                    [Pass 1] build oriented k-mer graph (masks damaged terminals)
                    [Pass 2] multi-threaded anchor scan + unitig walk → write extended reads
 fqdup sort:        chunk ingestion → parallel sort → k-way merge
