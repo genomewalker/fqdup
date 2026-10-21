@@ -7,7 +7,7 @@
 // e_. Friendship (declared in DerepEngine) grants the private access.
 //
 // Compiler-checked completeness: a member the body uses but the alias block
-// misses fails to resolve -> build error. See docs/PHASE3_REFACTOR_SPEC.md.
+// misses fails to resolve -> build error.
 //
 // Included INSIDE derep.cpp's anonymous namespace, AFTER the complete DerepEngine
 // definition, so DerepEngine and all file-local types/functions are visible.
