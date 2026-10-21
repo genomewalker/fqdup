@@ -1,9 +1,22 @@
 # fqdup
 
-> Status as of 2026-10-19: documentation accuracy pass against `main`. `fqdup
-> merge` without `--legacy-merge` runs the native r8qkeep merge described
-> below; the previous pipeline is unchanged but reachable only via
-> `--legacy-merge`, documented in its own subsection under Options.
+> Status as of 2026-10-21: `fqdup merge` (native r8qkeep merge; the previous
+> pipeline remains reachable only via `--legacy-merge`) now clips confirmed
+> adapter from mates it leaves unmerged, accepts 11–19 bp tail/head overlaps
+> only when a quality-weighted posterior shows the placement is unique (at
+> cutoffs ≥ 0.05 only), rejects 20–30 bp tail/head overlaps whose overlap word
+> recurs in a read flank, and places unmerged duplicates at the insert length
+> of their merged family siblings. On the simulated development benchmark
+> (400,000 pairs with known truth, default cutoff 0.316, against the previous
+> release): false merges 10 → 1, missed merges 7,109 → 6,464, exact merges
+> 345,198 → 345,589, wrong-length merges 0 → 0 with none added at any cutoff,
+> adapter bases left in unmerged mates 25,114 → 1,462, and no true molecule
+> base removed by clipping; true positions emitted only wrongly rose by 3
+> bases, within an accepted tolerance of 0.001 % of correctly emitted bases.
+> Caveats: real libraries with 101 bp reads exercise only the 15–19 bp part of
+> the tail/head rescue; terminal-damage and repeat behaviour of rescued reads
+> are underpowered on real data; all accuracy figures are from the development
+> set and await a single run on the held-out validation set.
 
 > Historical (undated specifics omitted): across several internal revisions,
 > the merge pipeline's default repair-skip, outcomes-file, and

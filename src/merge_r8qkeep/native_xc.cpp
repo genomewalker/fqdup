@@ -1,6 +1,11 @@
+#include "native_reason_log.hpp"
 #include "packed_kernels.hpp"
 #include "shared_alignment.hpp"
+#include "tailhead_posterior.hpp"
 namespace packed26 = fqdup::r8qkeep::packed;
+#ifdef FQDUP_NATIVE_REASONS
+namespace task42_reason_log = fqdup::r8qkeep;
+#endif
 #define fqdup fqdup_r8qkeep_native_headers
 #define fqalign fqdup_r8qkeep_native_alignment
 #define fqquality fqdup_r8qkeep_native_quality
@@ -75,6 +80,7 @@ struct PairBatch {
 };
 
 struct MergeRecord {
+    int pending_adapter_clip = -1;
     FastqRecord merged;    // merged read (is_merged), trimmed R1 (unmerged), or orphan read (is_orphan)
     FastqRecord unmerged2; // trimmed R2 when is_merged=false and !is_orphan
     bool is_merged = false;
@@ -446,6 +452,28 @@ static bool has_exact_long_self_overlap(const char* seq, int len) {
     // prior, preserve the mates instead of choosing either geometry.
     for (int shift = 20; shift <= len - 20; ++shift) {
         if (std::memcmp(seq, seq + shift, len - shift) == 0) return true;
+    }
+    return false;
+}
+
+ // Fixed before evaluation: flank-only copies, one mismatch, N is a mismatch.
+static constexpr int REPEAT_VETO_MAX_MM = 1;
+static constexpr int REPEAT_VETO_MIN_OV = 20, REPEAT_VETO_MAX_OV = 30;
+static bool word_in_flank(const char* word, int ov, const char* read, int lo, int hi) {
+    for (int j = lo; j <= hi; ++j) {
+        int mm = 0;
+        for (int i = 0; i < ov && mm <= REPEAT_VETO_MAX_MM; ++i)
+            mm += word[i] != read[j+i] || word[i] == 'N' || read[j+i] == 'N';
+        if (mm <= REPEAT_VETO_MAX_MM) return true;
+    }
+    return false;
+}
+static bool tail_head_word_repeats(const char* r1, int L1, const char* rc2, int L2, int ov) {
+    if (ov < REPEAT_VETO_MIN_OV || ov > REPEAT_VETO_MAX_OV) return false;
+    const char* words[] = {r1 + L1 - ov, rc2};
+    for (const char* word : words) {
+        if (word_in_flank(word, ov, r1, 0, L1 - 2*ov) ||
+            word_in_flank(word, ov, rc2, ov, L2 - ov)) return true;
     }
     return false;
 }
@@ -1060,6 +1088,7 @@ struct MergeOpts {
     bool experimental_merged_disagreement_floor = false;
     std::shared_ptr<const fqquality::PairMixture> experimental_pair_mixture;
     int   min_ov        = 11;
+    bool posterior_tailhead_rescue = true;
     float max_mm_rate   = 0.08f;
     // Default 16 bp; 0=disabled. Enforced on ALL emit paths via passes_qc (merged +
     // unmerged mates). Raise to 30nt for DART: predict cannot use shorter reads, so
@@ -2586,16 +2615,35 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
             }
             if (best_ov < opts.min_ov) {
                 // Scan from the declared minimum so a shorter passing offset
-                // still vetoes a competing longer geometry. A unique unanchored
-                // overlap below 20 bases is too weak to construct a molecule.
+                // still vetoes a competing longer geometry. Short unanchored
+                // overlaps require the predeclared posterior uniqueness evidence.
                 best_ov = opts.experimental_adaptive_overlap ? adaptive_tail :
                     find_tail_head_ov(r1.seq.data(), L1,
                                             rc2_seq.data(), L2,
                                             opts.min_ov, opts.max_mm_rate,
                                             opts.pair_supported_boundaries);
+#ifdef FQDUP_NATIVE_REASONS
+                const auto tailhead_reason = [&](const char* stage, int posterior = -1) {
+                    std::lock_guard<std::mutex> lock(task42_reason_log::native_reason_mutex());
+                    std::cerr << (posterior < 0 ? "T41_TAILHEAD\t" : "T41_POSTERIOR\t")
+                              << r1.header.substr(0, r1.header.find_first_of(" \t"))
+                              << '\t' << best_ov << '\t';
+                    if (posterior < 0) std::cerr << stage;
+                    else std::cerr << posterior;
+                    std::cerr << '\n';
+                };
+                tailhead_reason("proposed");
+#endif
                 if (!opts.experimental_adaptive_overlap && opts.pair_supported_boundaries &&
-                    best_ov >= opts.min_ov && best_ov < 20)
-                    best_ov = -1;
+                    best_ov >= opts.min_ov && best_ov < 20) {
+                    const bool posterior_pass = opts.posterior_tailhead_rescue && fqdup_tailhead::unique(
+                        r1.seq, r1.qual, rc2_seq, rc2_qual,
+                        best_ov, opts.min_ov, overlap_is_low_complexity);
+#ifdef FQDUP_NATIVE_REASONS
+                    tailhead_reason("posterior", posterior_pass);
+#endif
+                    if (!posterior_pass) best_ov = -1;
+                }
                 if (best_ov >= opts.min_ov && near_boundary_conflict) {
                     emit_unmerged(r1, r2, out, false, paired_boundary);
                     continue;
@@ -2630,6 +2678,17 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                         emit_unmerged(r1, r2, out, false, paired_boundary);
                         continue;
                     }
+                    if (opts.pair_supported_boundaries &&
+                        tail_head_word_repeats(r1.seq.data(), L1, rc2_seq.data(), L2, best_ov)) {
+#ifdef FQDUP_NATIVE_REASONS
+                        tailhead_reason("phase2_repeat_copy");
+#endif
+                        emit_unmerged(r1, r2, out, false, paired_boundary);
+                        continue;
+                    }
+#ifdef FQDUP_NATIVE_REASONS
+                    tailhead_reason("accepted");
+#endif
                     if (do_profile)
                         taph::FrameSelector::update_sample_profile_paired(local_prof, r1.seq, r2.seq);
                     // Phase 2 overlap is at R1[L1-best_ov:] vs RC(R2)[0:best_ov] — interior
@@ -2724,8 +2783,47 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
                     }
                 }
                 if (!sequence_supported) {
-                    // Rejected geometry supplies no valid shared clipping boundary.
+                    // A rejected body cannot establish geometry from one approximate
+                    // anchor. Confirm a unique visible adapter prefix on each raw mate
+                    // at the same insert coordinate, at or after the anchored boundary.
+                    // Compare the full visible prefix (at least 11 bases); mismatches
+                    // are permitted only below Q20, never for N. Uncertain pairs retain
+                    // the normal downstream repair path. Merge decisions are unchanged.
+                    auto visible_adapter_start = [&](const std::string& read,
+                                                     const std::string& qual,
+                                                     const std::string& adapter) {
+                        if (adapter.empty() || qual.size() != read.size()) return -1;
+                        int result = -1;
+                        for (int p = std::max(0, best_ov); p < static_cast<int>(read.size()); ++p) {
+                            const int n = std::min(static_cast<int>(adapter.size()),
+                                                   static_cast<int>(read.size()) - p);
+                            if (n < 11) continue;
+                            bool matches = true;
+                            for (int j = 0; j < n; ++j) {
+                                if (read[p + j] == adapter[j]) continue;
+                                if (read[p + j] == 'N' ||
+                                    static_cast<unsigned char>(qual[p + j]) - 33 >= 20) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            if (matches) {
+                                if (result >= 0) return -1;
+                                result = p;
+                            }
+                        }
+                        return result;
+                    };
+                    const int clip1 = visible_adapter_start(r1.seq, r1.qual, opts.adapter1);
+                    const int clip2 = visible_adapter_start(r2.seq, r2.qual, opts.adapter2);
+                    const int clip = clip1 >= 0 && clip1 == clip2 ? clip1 : -1;
+                    // Preserve native QC and all downstream parent repair decisions.
+                    // Intersect retained raw spans only at final pipeline emission.
+                    const auto before = out.records.size();
                     emit_unmerged(r1, r2, out, false, -1);
+                    if(out.records.size() == before + 1){
+                        out.records.back().pending_adapter_clip = clip;
+                    }
                     continue;
                 }
             }
@@ -2787,6 +2885,45 @@ static void merge_worker(PairQueue& in_q, MergeOutQueue& out_q,
 #include "memory_status.hpp"
 #include "ordered_chunks.hpp"
 namespace fqdup::r8qkeep {
+bool place_family_member(const FamilyPair& pair,int length,const NativeSettings& settings,NativeRecord& placed) {
+    using namespace ::fqdup_native_xc_internal;
+    FastqRecord r1,r2;
+    r1.header=pair.r[0].h;r1.seq=pair.r[0].s;r1.qual=pair.r[0].q;r1.plus="+";
+    r2.header=pair.r[1].h;r2.seq=pair.r[1].s;r2.qual=pair.r[1].q;r2.plus="+";
+    const int l1=r1.seq.size(),l2=r2.seq.size();
+    const bool anchored=length<=std::min(l1,l2);
+    if(length<=0||length<settings.min_length||(!anchored&&length<std::max(l1,l2)))return false;
+    const int ov=anchored?length:l1+l2-length;
+    if(ov<settings.min_overlap||(!anchored&&ov<20))return false;
+    std::string rc2,qual2;rc_record(r2,rc2,qual2);
+    const int start1=anchored?0:l1-ov,start2=anchored?l2-length:0;
+    if(anchored) {
+        const auto supported=[&](const FastqRecord& r,const std::string& adapter){
+            const int visible=std::min({33,int(adapter.size()),int(r.seq.size())-length});
+            for(int j=0;j<visible;++j)if(r.seq[length+j]!=adapter[j]&&int(uint8_t(r.qual[length+j]))-33>=20)return false;
+            return true;
+        };
+        if(!supported(r1,settings.adapter1)||!supported(r2,settings.adapter2))return false;
+    }else if(ov<=30&&tail_head_word_repeats(r1.seq.data(),l1,rc2.data(),l2,ov))return false;
+    int informative=0;float weighted=0;
+    for(int j=0;j<ov;++j) {
+        const char a=r1.seq[start1+j],b=rc2[start2+j];
+        if(a=='N'||b=='N')continue;
+        ++informative;
+        if(a!=b)weighted+=std::min(int(uint8_t(r1.qual[start1+j]))-33,int(uint8_t(qual2[start2+j]))-33)/30.f;
+    }
+    if(informative<settings.min_overlap||weighted>settings.max_mismatch_rate*informative)return false;
+    FastqRecord overlap=r1,consensus;
+    overlap.seq=r1.seq.substr(start1,ov);overlap.qual=r1.qual.substr(start1,ov);
+    consensus_merge(overlap,rc2,qual2,ov,start2,consensus);
+    placed.raw=&pair;placed.outcome="merged";
+    placed.first={consensus.header,consensus.seq,consensus.qual};
+    if(!anchored) {
+        placed.first.seq=r1.seq.substr(0,start1)+consensus.seq+rc2.substr(ov);
+        placed.first.qual=r1.qual.substr(0,start1)+consensus.qual+qual2.substr(ov);
+    }
+    return int(placed.first.seq.size())==length;
+}
 NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t begin,std::size_t count,const NativeSettings& settings,bool trace,bool audit) {
     static_assert(native_batch_size==PAIR_BATCH_SZ);
     if(begin>all.size()||count>all.size()-begin||count>native_batch_size)throw std::runtime_error("native range");
@@ -2801,6 +2938,7 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
     MergeOpts opts;
     opts.adapter1 = settings.adapter1;
     opts.adapter2 = settings.adapter2;
+    opts.posterior_tailhead_rescue = settings.posterior_tailhead_rescue;
     opts.min_ov = settings.min_overlap;
     opts.min_length = settings.min_length;
     opts.max_mm_rate = settings.max_mismatch_rate;
@@ -2856,6 +2994,7 @@ NativeResult merge_native_range(const std::vector<FamilyPair>& all,std::size_t b
         if (kind != "dropped") {
             if (emitted >= batch.records.size()) throw std::runtime_error("missing native output");
             auto& record = batch.records[emitted++];
+            native.pending_adapter_clip = record.pending_adapter_clip;
             native.first={std::move(record.merged.header),std::move(record.merged.seq),std::move(record.merged.qual)};
             if(kind=="unmerged")native.second={std::move(record.unmerged2.header),std::move(record.unmerged2.seq),std::move(record.unmerged2.qual)};
         }

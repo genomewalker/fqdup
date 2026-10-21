@@ -13,6 +13,7 @@ struct NativeRecord {
     const FamilyPair* raw=nullptr;
     std::string outcome;
     StageRead first,second;
+    int pending_adapter_clip = -1;
     std::size_t size()const{return 13;}
     const std::string& operator[](std::size_t i)const{
         switch(i){
