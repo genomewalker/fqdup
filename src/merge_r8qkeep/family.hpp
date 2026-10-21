@@ -8,7 +8,7 @@ namespace fqdup::r8qkeep {
 struct FamilyRead { std::string h, id, s, q; };
 struct FamilyPair { std::string id; std::array<FamilyRead, 2> r; };
 class WorkerPool;
-struct FamilyGroup { std::vector<int> m; bool oversize=false; int diameter=0; std::size_t runtime_id=0; };
+struct FamilyGroup { std::vector<int> m; bool oversize=false; int diameter=0; };
 struct FamilyPlan {
     std::size_t pairs=0;
     bool supported=true;
@@ -18,7 +18,6 @@ struct FamilyPlan {
 struct FamilyResult {
     std::vector<FamilyPair> pairs;
     std::string edits_tsv, families_tsv, stats_json;
-    std::vector<FamilyGroup> placement_groups; // Non-disbanded families of this run.
 };
 std::vector<FamilyRead> read_family_fastq(const std::string& path);
 std::vector<FamilyKey> extract_family_keys(const std::vector<FamilyPair>& pairs);

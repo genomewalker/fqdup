@@ -494,7 +494,6 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
               for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }}        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
         FamilyResult result{std::move(P), debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str():std::string(), f.str(), stats.str()};
-        for(std::size_t k=0;k<groups.size();++k)if(!disband[k]){groups[k].runtime_id=k;result.placement_groups.push_back(std::move(groups[k]));}
         phase("serialization");return result;
 }
 #include "compact_family.inc"
