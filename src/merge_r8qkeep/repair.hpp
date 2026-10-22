@@ -29,6 +29,8 @@ class RepairPipeline {
     std::shared_ptr<Impl> impl_;
 public:
     RepairPipeline(const std::string& nominal_prior,const std::string& full_prior);
+    void set_merged_skip_cutoff(double cutoff);
+    std::vector<int64_t> floor_bounds(NativeRecords native,std::size_t& certified) const;
     std::vector<int64_t> native_clean_bounds(NativeRecords native,double cutoff) const;
     RoutingResult route_records(NativeRecords native,bool debug=false,std::size_t start=0,RepairAlignmentCache* cache=nullptr,bool shadow=false,double clean_cutoff=0,const std::vector<int64_t>* certified=nullptr) const;
     std::vector<RepairedRecord> repair_records(NativeRecords input,int mode,double cutoff,std::size_t start=0,RepairShadow* shadow=nullptr,const std::vector<bool>* excluded=nullptr,const std::vector<int64_t>* repair_bounds=nullptr,RepairAlignmentCache* cache=nullptr,const std::vector<int64_t>* clean_bounds=nullptr,const std::vector<bool>* selected=nullptr,const std::vector<NativeRecord>* replacements=nullptr,std::size_t mask_offset=0) const;

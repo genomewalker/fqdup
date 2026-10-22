@@ -2,6 +2,7 @@
 #include "content_memo.hpp"
 #include "deferred_adapter_clip.hpp"
 #include "pipeline.hpp"
+#include "cutoff_grid.hpp"
 #include "canonical_pairs.hpp"
 #include "prior_sample.hpp"
 #include "ordered_chunks.hpp"
@@ -48,7 +49,7 @@ MemoryUsage library_memory(const LibraryPipeline& lib){
 }
 void json_string(std::string& out,const std::string& s){static const char hex[]="0123456789abcdef";out+='"';for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\b':out+="\\b";break;case '\f':out+="\\f";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}}out+='"';}
 }
-LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts,bool no_family){
+LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRead> r2,const NativeSettings& settings,int threads,bool debug,bool timings,bool defer_routing,bool counts,bool no_family,bool calibration){
     auto start=std::chrono::steady_clock::now();
     const auto stage=[&](const char* name){const auto now=std::chrono::steady_clock::now();if(timings||debug)std::cerr<<"MERGE_STAGE "<<name<<" seconds="<<std::chrono::duration<double>(now-start).count()<<memory_status()<<'\n';start=now;};
     LibraryPipeline out;out.native_settings=settings;
@@ -65,7 +66,7 @@ LibraryPipeline prepare_library(std::vector<FamilyRead> r1,std::vector<FamilyRea
             out.family.pairs.push_back({r1[i].id,{std::move(r1[i]),std::move(r2[i])}});
         }
         std::vector<FamilyRead>().swap(r1);std::vector<FamilyRead>().swap(r2);
-    }else out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get());
+    }else out.family=correct_family(std::move(r1),std::move(r2),threads,debug,out.pool.get(),nullptr,calibration||debug);
     stage("family");
 
     memory_stage("family");
@@ -163,7 +164,7 @@ struct OutputChunk {
     std::vector<FinalOutput> outputs;
     std::vector<double> seconds;
     double router_seconds=0,native_seconds=0;
-    std::string routed,audit,native;
+    std::string routed,audit,native,adapter_unclipped;
     std::size_t count=0;
     std::size_t native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass;
@@ -174,19 +175,19 @@ struct FamilyPlacementEvidence {
 void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,std::function<void(OutputChunk)> consume,FamilyPlacementEvidence* evidence=nullptr,bool collect=false){
     // Native geometry differs across the declared rescue boundary. Process each
     // homogeneous cutoff group through the complete existing router and repair.
-    const bool low=std::any_of(cuts.begin(),cuts.end(),[](double c){return c<0.05;});
-    const bool high=std::any_of(cuts.begin(),cuts.end(),[](double c){return c>=0.05;});
+    const bool low=std::any_of(cuts.begin(),cuts.end(),[&](double c){return c<lib.merged_skip_cutoff;});
+    const bool high=std::any_of(cuts.begin(),cuts.end(),[&](double c){return c>=lib.merged_skip_cutoff;});
     if(low&&high){
         for(bool restricted:{false,true}){
             std::vector<double> selected;std::vector<std::size_t> slots;
-            for(std::size_t c=0;c<cuts.size();++c)if((cuts[c]<0.05)==restricted){selected.push_back(cuts[c]);slots.push_back(c);}
+            for(std::size_t c=0;c<cuts.size();++c)if((cuts[c]<lib.merged_skip_cutoff)==restricted){selected.push_back(cuts[c]);slots.push_back(c);}
             std::vector<RepairShadow> local_counters(selected.size());
             process_records(lib,selected,threads,debug,counters?local_counters.data():nullptr,[&](OutputChunk chunk){
                 OutputChunk expanded;expanded.count=restricted?0:chunk.count;
                 expanded.outputs.resize(cuts.size());expanded.seconds.resize(cuts.size());expanded.native_clean_pass.resize(cuts.size());
                 for(std::size_t j=0;j<slots.size();++j){expanded.outputs[slots[j]]=std::move(chunk.outputs[j]);expanded.seconds[slots[j]]=chunk.seconds[j];expanded.native_clean_pass[slots[j]]=chunk.native_clean_pass[j];}
                 expanded.router_seconds=chunk.router_seconds;expanded.native_seconds=chunk.native_seconds;
-                if(!restricted){expanded.native_clean=chunk.native_clean;expanded.native_direct=chunk.native_direct;expanded.routed=std::move(chunk.routed);expanded.audit=std::move(chunk.audit);expanded.native=std::move(chunk.native);}
+                if(!restricted){expanded.native_clean=chunk.native_clean;expanded.native_direct=chunk.native_direct;expanded.routed=std::move(chunk.routed);expanded.audit=std::move(chunk.audit);expanded.native=std::move(chunk.native);expanded.adapter_unclipped=std::move(chunk.adapter_unclipped);}
                 consume(std::move(expanded));
             });
             if(counters)for(std::size_t j=0;j<slots.size();++j){
@@ -242,6 +243,15 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared=nullptr,std::size_t shared_offset=0){
         const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
+        if(debug)for(const auto& record:native){
+            if(record.outcome=="merged"||record.outcome=="dropped"||record.pending_adapter_clip>=0)continue;
+            const auto count=[&](const StageRead& read,int mate){
+                const auto& raw=record.raw->r[mate-1];
+                if(read.seq.size()==raw.s.size())chunk.adapter_unclipped+=record.raw->id+'\t'+std::to_string(mate)+'\t'+std::to_string(raw.s.size())+'\t'+std::to_string(read.seq.size())+'\n';
+            };
+            count(record.first,record.outcome=="orphan_r2"?2:1);
+            if(record.outcome=="unmerged")count(record.second,2);
+        }
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
         const auto route_begin=Clock::now();const double minimum=*std::min_element(cuts.begin(),cuts.end());
         std::vector<int64_t> certified,unresolved_bounds;std::vector<std::size_t> unresolved;
@@ -418,6 +428,44 @@ void write_files(OutputFiles& files,const FinalOutput& out){
 }
 void close_files(OutputFiles& files){for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}}
 }
+CutoffFloor derive_cutoff_floor(const LibraryPipeline& lib,int threads){
+    // Frozen Task 20 grid. Independent of requested cutoffs and override.
+    const auto& grid=cutoff_grid;
+    struct Counts {std::array<std::size_t,34> above{},phred{};std::size_t merged=0,certified=0;};
+    const auto count=[&](std::size_t start,std::size_t n){
+        std::vector<FamilyPair> raw;NativeResult native;auto settings=lib.native_settings;
+        settings.posterior_tailhead_rescue=true;
+        if(lib.compact){raw.resize(n);CompactPairStore::Decoder decoder;for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,raw[i],decoder);native=merge_native_range(raw,0,n,settings,false,false);}
+        else native=merge_native_range(lib.family.pairs,start,n,settings,false,false);
+        Counts result;const auto bounds=lib.repair->floor_bounds(native.records,result.certified);
+        for(std::size_t i=0;i<native.records.size();++i){const auto& r=native.records[i];if(r.outcome!="merged")continue;++result.merged;
+            int64_t phred=0;for(unsigned char q:r.first.qual){const double risk=std::clamp(std::pow(10.,-(int(q)-33)/10.),1e-10,1.);phred+=int64_t(std::floor(risk*1000000000000LL+.5));}
+            for(std::size_t g=0;g<grid.size();++g){const auto budget=int64_t(std::floor(grid[g]*1000000000000LL+.5))*int64_t(r.first.seq.size());result.above[g]+=bounds[i]>budget;result.phred[g]+=phred>budget;}
+        }
+        return result;
+    };
+    Counts total;std::deque<std::future<Counts>> pending;std::size_t next=0;
+    const auto workers=bounded_worker_count(threads);
+    const auto launch=[&]{const auto start=next,n=std::min(native_batch_size,lib.pair_count()-next);next+=n;pending.push_back(lib.pool->submit([&,start,n]{return count(start,n);}));};
+    try {
+        while(next<lib.pair_count()&&pending.size()<std::size_t(workers))launch();
+        while(!pending.empty()){
+            const auto c=pending.front().get();pending.pop_front();
+            total.merged+=c.merged;total.certified+=c.certified;
+            for(std::size_t g=0;g<grid.size();++g){total.above[g]+=c.above[g];total.phred[g]+=c.phred[g];}
+            if(next<lib.pair_count())launch();
+        }
+    } catch(...) {
+        // Tasks reference this census stack. Drain before unwinding it.
+        for(auto& task:pending)if(task.valid())task.wait();
+        throw;
+    }
+    std::size_t first=0;while(first<grid.size()&&total.above[first])++first;
+    if(first==grid.size())throw std::runtime_error("no certified floor in cutoff grid");
+    std::ostringstream out;out<<"floor="<<grid[first]<<"\nmerged="<<total.merged<<"\ncertified="<<total.certified<<"\nfallback="<<total.merged-total.certified<<"\ncutoff\tabove_bound\tabove_phred\n";
+    for(std::size_t g=0;g<grid.size();++g)out<<grid[g]<<'\t'<<total.above[g]<<'\t'<<total.phred[g]<<'\n';
+    return {grid[first],out.str()};
+}
 FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
     FinalOutput result;std::size_t count=0;
     process_records(lib,{cutoff},1,false,nullptr,[&](OutputChunk chunk){
@@ -435,6 +483,7 @@ void write_library_outputs(const LibraryPipeline& lib,double cutoff,const std::s
 }
 void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,const std::vector<std::string>& directories,const std::vector<std::string>& labels,int threads,bool debug,bool timings,bool shadow,bool consume_records){
     if(cuts.size()!=directories.size()||cuts.size()!=labels.size())throw std::runtime_error("cutoff cardinality");
+    if(lib.calibration_enabled)lib.output_risks.resize(cuts.size());
     using Clock=std::chrono::steady_clock;
     const bool measure=timings||debug;const auto stream_begin=Clock::now();
     const auto elapsed=[](auto begin){return std::chrono::duration<double>(Clock::now()-begin).count();};
@@ -458,9 +507,10 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         count+=chunk.count;router_seconds+=chunk.router_seconds;native_seconds+=chunk.native_seconds;
         native_clean+=chunk.native_clean;native_direct+=chunk.native_direct;
         for(std::size_t c=0;c<cuts.size();++c)native_clean_pass[c]+=chunk.native_clean_pass[c];
-        if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
+        if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;lib.adapter_unclipped_tsv+=chunk.adapter_unclipped;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];auto& out=chunk.outputs[c];
+            if(lib.calibration_enabled){auto& risk=lib.output_risks[c];risk.scan(out.merged,0);risk.scan(out.r1,1);risk.scan(out.r2,1);risk.scan(out.orphan,1);}
             if(lib.outcomes_mode==OutcomesMode::summary)for(std::size_t k=0;k<5;++k)outcome_counts[c][k]+=out.outcome_counts[k];
             if(file_writers)file_writers->append({&out.merged,&out.r1,&out.r2,&out.orphan,&out.outcomes});
             else write_files(files[c],out);}

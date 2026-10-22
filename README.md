@@ -1,5 +1,21 @@
 # fqdup
 
+> Status as of 2026-10-22: `fqdup merge` now derives a per-library cutoff
+> floor from its own data instead of the fixed 0.05: the smallest grid cutoff
+> at which no merged record's certified risk exceeds the bound (never below
+> 0.05). A requested cutoff below the floor runs at the floor and is logged;
+> `--allow-sub-floor` restores the requested value. At any cutoff at or above
+> the floor, including the default 0.316, outputs are byte-identical to the
+> previous release on the development benchmark and pilot (every cutoff and
+> library checked). `--cutoff auto` is present but refuses to run until its
+> error target (epsilon) is declared: it will pick the largest cutoff whose
+> truth-free calibrated mate error stays under epsilon without raising
+> residual adapter above the 0.316 level, falling back to the floor when
+> calibration is bad. `--calibration` writes the held-out family and overlap
+> calibration diagnostics. On real libraries the derived floors are higher
+> (ds 0.316, ss 0.237) than on simulated ones (0.03–0.06); epsilon will be set
+> from real-data measurements and confirmed on a fresh held-out validation.
+
 > Status as of 2026-10-21: `fqdup merge` (native r8qkeep merge; the previous
 > pipeline remains reachable only via `--legacy-merge`) now clips confirmed
 > adapter from mates it leaves unmerged, accepts 11–19 bp tail/head overlaps

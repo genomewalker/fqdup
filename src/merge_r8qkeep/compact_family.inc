@@ -21,7 +21,7 @@ FamilyKey compact_family_key(const FamilyPair& pair) {
     return FamilyKey(std::string_view(key.data(),key.size()));
 }
 }
-FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool debug,WorkerPool* shared_pool) {
+FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool debug,WorkerPool* shared_pool,bool calibration) {
     std::unique_ptr<WorkerPool> owned;
     if(!shared_pool){owned=std::make_unique<WorkerPool>(bounded_worker_count(threads));shared_pool=owned.get();}
     auto& pool=*shared_pool;
@@ -41,10 +41,14 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
         std::vector<char> disband(groups.size());
         const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
-        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;std::vector<QualityBlocks::Edit> qualities,bases;};
+        HoldoutBins holdout;
+        std::vector<int> calibration_excluded;
+        if(calibration)for(const auto& group:groups)calibration_excluded.insert(calibration_excluded.end(),group.m.begin(),group.m.end());
+        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;std::vector<QualityBlocks::Edit> qualities,bases;HoldoutBins holdout;};
         // Groups partition P; each worker changes only its own group's reads.
         // Ordered consumption preserves ledger rows and all integer statistics.
         ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
+        HoldoutBins local_holdout;
         static thread_local std::vector<Pair> P(MAXCOMP);
         CompactPairStore::Decoder decoder;std::vector<QualityBlocks::Edit> quality_edits,base_edits;
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
@@ -59,6 +63,7 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
             std::array<const std::vector<Column>*,2> prepared{};
             disband[gi]=groups[gi].oversize||second_molecule(P,g0,&prepared);
             if(disband[gi]){++dis;continue;}
+            if(calibration)record_family_holdout(P,g0,local_holdout);
             const auto hiq=high_quality_counts(P,g0,prepared);
             std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
@@ -76,8 +81,9 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
                     else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = quality_errors[static_cast<unsigned char>(P[i].r[side].q[c])]; w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
-        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded},std::move(quality_edits),std::move(base_edits)};
+        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded},std::move(quality_edits),std::move(base_edits),std::move(local_holdout)};
         },[&](CorrectedChunk part){
+            if(calibration)holdout.add(part.holdout);
             all_qualities.insert(all_qualities.end(),part.qualities.begin(),part.qualities.end());
             all_bases.insert(all_bases.end(),part.bases.begin(),part.bases.end());
             if(debug)ledger<<part.ledger;const auto& c=part.counts;
@@ -98,5 +104,5 @@ FamilyResult correct_compact_family(CompactPairStore& store,int threads,bool deb
           for (size_t k = 0; k < groups.size(); ++k) { f << k << '\t' << groups[k].m.size() << '\t' << groups[k].diameter << '\t' << (disband[k] ? 1 : 0) << '\t';
               for(size_t x=0;x<groups[k].m.size();++x){store.id(groups[k].m[x],id,names);f<<(x?",":"")<<id;} f << '\n'; }}        stats << "{\"pairs\":" << store.size() << ",\"groups\":" << group_count << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
-        return FamilyResult{{},debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n"+ledger.str():std::string(),f.str(),stats.str(),std::move(placement_groups)};
+        return FamilyResult{{},debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n"+ledger.str():std::string(),f.str(),stats.str(),std::move(placement_groups),std::move(holdout),std::move(calibration_excluded)};
 }
