@@ -183,6 +183,18 @@ target_link_libraries(fqdup PRIVATE
     taph
 )
 target_compile_definitions(fqdup PRIVATE HAVE_BBHASH)
+# Gate-only build constants. Shipping defaults remain unset; no runtime override.
+set(FQDUP_TEST_AUTO_EPSILON "" CACHE STRING "Task 47 test-only epsilon; empty ships unset")
+option(FQDUP_TEST_CALIBRATION_BAD "Task 47 test-only bad-calibration fallback" OFF)
+if(NOT "${FQDUP_TEST_AUTO_EPSILON}" STREQUAL "")
+    if(NOT "${FQDUP_TEST_AUTO_EPSILON}" MATCHES "^(0|1|0\\.[0-9]+)$")
+        message(FATAL_ERROR "Invalid test epsilon")
+    endif()
+    set_property(SOURCE src/merge_r8qkeep/cli.cpp APPEND PROPERTY COMPILE_DEFINITIONS FQDUP_TEST_AUTO_EPSILON=${FQDUP_TEST_AUTO_EPSILON})
+endif()
+if(FQDUP_TEST_CALIBRATION_BAD)
+    set_property(SOURCE src/merge_r8qkeep/cli.cpp APPEND PROPERTY COMPILE_DEFINITIONS FQDUP_TEST_CALIBRATION_BAD=1)
+endif()
 # Build provenance for `fqdup --version`. The libtaph revision is always the enforced pin above.
 # The fqdup commit comes from -DFQDUP_GIT_COMMIT=<sha> when given (builds from a git archive have no
 # .git), else from the source tree's git HEAD at configure time, else "unknown".

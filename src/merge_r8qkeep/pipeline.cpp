@@ -2,6 +2,7 @@
 #include "content_memo.hpp"
 #include "deferred_adapter_clip.hpp"
 #include "pipeline.hpp"
+#include "cutoff_grid.hpp"
 #include "canonical_pairs.hpp"
 #include "prior_sample.hpp"
 #include "ordered_chunks.hpp"
@@ -429,7 +430,7 @@ void close_files(OutputFiles& files){for(auto& file:files){file.close();if(!file
 }
 CutoffFloor derive_cutoff_floor(const LibraryPipeline& lib,int threads){
     // Frozen Task 20 grid. Independent of requested cutoffs and override.
-    static constexpr std::array<double,34> grid{{.0001,.000133,.000178,.000237,.000316,.000422,.000562,.00075,.001,.00133,.00178,.00237,.00316,.00422,.00562,.0075,.01,.0133,.0178,.0237,.0316,.0422,.05,.0562,.075,.1,.133,.178,.237,.316,.422,.562,.75,1}};
+    const auto& grid=cutoff_grid;
     struct Counts {std::array<std::size_t,34> above{},phred{};std::size_t merged=0,certified=0;};
     const auto count=[&](std::size_t start,std::size_t n){
         std::vector<FamilyPair> raw;NativeResult native;auto settings=lib.native_settings;
