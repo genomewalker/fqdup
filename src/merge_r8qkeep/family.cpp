@@ -2,6 +2,7 @@
 // Must be byte-identical to the JS reference on R1.fastq, R2.fastq, family-edits.tsv and families.tsv.
 // Usage: famcorrect R1.fastq R2.fastq OUTDIR     (plain FASTQ; 4-line records)
 #include "family.hpp"
+#include "family_holdout.hpp"
 #include "atomic_family_union.hpp"
 #include <atomic>
 #include "compact_family.hpp"
@@ -428,7 +429,7 @@ void reorder_family_plan(FamilyPlan& plan,const std::vector<std::size_t>& order)
     }
     std::sort(plan.groups.begin(),plan.groups.end(),[](const auto& a,const auto& b){return a.m.front()<b.m.front();});
 }
-FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool,FamilyPlan* plan) {
+FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> R2, int threads,bool debug,WorkerPool* shared_pool,FamilyPlan* plan,bool calibration) {
         std::unique_ptr<WorkerPool> owned_pool;
         if(!shared_pool){owned_pool=std::make_unique<WorkerPool>(fqdup::r8qkeep::bounded_worker_count(threads));shared_pool=owned_pool.get();}
         auto& pool=*shared_pool;
@@ -454,16 +455,19 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
         std::vector<char> disband(groups.size());
         const auto quality_errors=family_quality_errors();
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
-        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;};
+        HoldoutBins holdout;
+        struct CorrectedChunk {std::string ledger;std::array<long,9> counts;HoldoutBins holdout;};
         // Groups partition P; each worker changes only its own group's reads.
         // Ordered consumption preserves ledger rows and all integer statistics.
         ordered_index_chunks(pool,groups.size(),threads,0,[&](std::size_t begin,std::size_t n){
+        HoldoutBins local_holdout;
         std::ostringstream ledger; long prot = 0, rows = 0, fam = 0, dis = 0, members = 0, corrected = 0, confirmed = 0, unresolved = 0, excluded = 0;
         for (size_t gi = begin; gi < begin+n; ++gi) {
             const auto& g0 = groups[gi].m;
             std::array<const std::vector<Column>*,2> prepared{};
             disband[gi]=groups[gi].oversize||second_molecule(P,g0,&prepared);
             if(disband[gi]){++dis;continue;}
+            if(calibration)record_family_holdout(P,g0,local_holdout);
             const auto hiq=high_quality_counts(P,g0,prepared);
             std::vector<int> g;for(size_t member=0;member<g0.size();++member)if(hiq[member]<2)g.push_back(g0[member]);
             excluded += long(g0.size() - g.size()); if (g.size() < 2) { ++dis; continue; }
@@ -481,8 +485,9 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
                     else if (col.n >= 2 && col.votes.size() > 1) { ++unresolved; std::array<double,MAXCOMP> w;w.fill(1.0); double Z = 0; for (size_t a = 0; a < col.votes.size(); ++a) { for (size_t b = 0; b < col.votes.size(); ++b) for (int i : col.votes[b].second) { double e = quality_errors[static_cast<unsigned char>(P[i].r[side].q[c])]; w[a] *= a == b ? 1 - e : e / 3; } Z += w[a]; }
                         for (size_t a = 0; a < col.votes.size(); ++a) { auto v = col.votes[a]; for (int i : v.second) { bool tr = false; for (auto w : col.votes) if (w.first != v.first && transition(v.first, w.first)) tr = true; if (damage_safe && tr && is_protected(P[i].r[side], c, side)) { ++prot; continue; } set(i, P[i].r[side].s[c], g_phred ? std::clamp(int(std::lround(-10 * std::log10(std::max(1 - w[a] / Z, 1e-4)))), 2, 40) : 2); } } } } }
         }
-        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded}};
+        return CorrectedChunk{ledger.str(),{prot,rows,fam,dis,members,corrected,confirmed,unresolved,excluded},std::move(local_holdout)};
         },[&](CorrectedChunk part){
+            if(calibration)holdout.add(part.holdout);
             if(debug)ledger<<part.ledger;const auto& c=part.counts;
             prot+=c[0];rows+=c[1];fam+=c[2];dis+=c[3];members+=c[4];
             corrected+=c[5];confirmed+=c[6];unresolved+=c[7];excluded+=c[8];
@@ -494,6 +499,8 @@ FamilyResult correct_family(std::vector<FamilyRead> R1, std::vector<FamilyRead> 
               for (size_t x = 0; x < groups[k].m.size(); ++x) f << (x ? "," : "") << P[groups[k].m[x]].id; f << '\n'; }}        stats << "{\"pairs\":" << P.size() << ",\"groups\":" << groups.size() << ",\"families\":" << fam << ",\"disbanded\":" << dis << ",\"members\":" << members
                   << ",\"corrected\":" << corrected << ",\"confirmed\":" << confirmed << ",\"unresolved\":" << unresolved << ",\"excluded\":" << excluded << (damage_safe ? ",\"protected\":" + std::to_string(prot) : std::string()) << ",\"ledger_rows\":" << rows << "}\n";
         FamilyResult result{std::move(P), debug?"pair_id\tmate\tpos\told_base\told_Q\tbase\tQ\n" + ledger.str():std::string(), f.str(), stats.str()};
+        result.holdout=std::move(holdout);
+        if(calibration)for(const auto& group:groups)result.calibration_excluded.insert(result.calibration_excluded.end(),group.m.begin(),group.m.end());
         for(std::size_t k=0;k<groups.size();++k)if(!disband[k]){groups[k].runtime_id=k;result.placement_groups.push_back(std::move(groups[k]));}
         phase("serialization");return result;
 }

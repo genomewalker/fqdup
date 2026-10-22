@@ -117,4 +117,28 @@ CensusResult census(const std::vector<FamilyPair>& pairs,const NativeResult& nat
     const NativeRecords native_rows=native.records.empty()?parsed.records:native.records;
     return census_rows({pairs,0,pairs.size()},native_rows,debug,threads,start,counts,shared_pool);
 }
+RawConcordance raw_concordance(const std::vector<FamilyPair>& pairs,const NativeResult& native){
+    if(pairs.size()!=native.records.size())throw std::runtime_error("raw concordance cardinality");
+    RawConcordance result;std::ostringstream rows;rows.precision(17);
+    rows<<"id\tfold\ti\tk\tq1_bin\tq2_bin\te1\te2\tbase1\trc_base2\tcertified\n";
+    fqalign::BandedCorrespondence banded;std::string rc;const std::string alphabet="ACGT";
+    for(std::size_t row=0;row<pairs.size();++row){
+        const auto& p=pairs[row];const auto& a=p.r[0];const auto& b=p.r[1];
+        if(native.records[row].outcome!="merged"||a.s.size()>512||b.s.size()>512)continue;
+        const auto g=fqalign::quality_independent_geometry(a.s,b.s);
+        if(!g.eligible||g.insert!=int(native.records[row].first.seq.size()))continue;
+        fqalign::reverse_complement_into(b.s,rc);const auto c=banded.align(a.s,rc,g.insert);if(!c.eligible)continue;
+        for(auto [i,j]:c.invariant){
+            const int k=int(b.s.size())-1-j;const auto base=alphabet.find(a.s[i]);if(base==std::string::npos||alphabet.find(rc[j])==std::string::npos)continue;
+            // Exactly the frozen T46 evidence probabilities, without candidate edits.
+            const int q1=std::clamp(int(static_cast<unsigned char>(a.q[i]))-33,2,40),q2=std::clamp(int(static_cast<unsigned char>(b.q[k]))-33,2,40);
+            const double e1=std::pow(10.,-q1/10.),e2=std::pow(10.,-q2/10.);
+            const int b1=bin(char(q1+33)),b2=bin(char(q2+33));auto& cell=result.bins.cells[(b1*9+b2)*4+base];
+            ++cell.n;cell.disagree+=a.s[i]!=rc[j];cell.expected+=e1+e2-4*e1*e2/3;
+            const bool certified=std::find(c.certified.begin(),c.certified.end(),std::pair<int,int>{i,j})!=c.certified.end();
+            rows<<p.id<<'\t'<<fold(p)<<'\t'<<i<<'\t'<<k<<'\t'<<b1<<'\t'<<b2<<'\t'<<e1<<'\t'<<e2<<'\t'<<a.s[i]<<'\t'<<rc[j]<<'\t'<<certified<<'\n';
+        }
+    }
+    result.nominal_tsv=rows.str();return result;
+}
 }
