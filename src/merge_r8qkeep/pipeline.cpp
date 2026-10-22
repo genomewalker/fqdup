@@ -252,14 +252,6 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
             if(record.outcome=="unmerged")count(record.second,2);
         }
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
-        // Keep ownership until every selected record has been serialized/cached.
-        // All existing learned/read-through clips have already run natively.
-        std::vector<NativeRecord> clipped_native;
-        if(std::any_of(native.begin(),native.end(),[](const NativeRecord& r){return r.pending_adapter_clip>=0&&r.outcome!="merged"&&r.outcome!="dropped";})){
-            clipped_native.assign(native.begin(),native.end());
-            for(auto& record:clipped_native)pre_guard_adapter_clip(record);
-            native=NativeRecords(clipped_native.data(),clipped_native.size());
-        }
         const auto route_begin=Clock::now();const double minimum=*std::min_element(cuts.begin(),cuts.end());
         std::vector<int64_t> certified,unresolved_bounds;std::vector<std::size_t> unresolved;
         NativeRecords work=native;std::size_t work_start=start;
