@@ -52,9 +52,23 @@ struct RepairPipeline::Impl {
     fqquality::PairMixture nominal,full;
     RepairSkipBound bound;
     NativeCleanBound native_clean;
+    double merged_skip_cutoff=0.05;
     Impl(const std::string& a,const std::string& b):nominal(model(a)),full(model(b)),bound(nominal),native_clean(nominal){}
 };
 RepairPipeline::RepairPipeline(const std::string& nominal,const std::string& full):impl_(std::make_shared<Impl>(nominal,full)){}
+void RepairPipeline::set_merged_skip_cutoff(double cutoff){impl_->merged_skip_cutoff=cutoff;}
+std::vector<int64_t> RepairPipeline::floor_bounds(NativeRecords native,std::size_t& certified) const {
+    std::vector<int64_t> bounds;bounds.reserve(native.size());certified=0;
+    for(const auto& row:native){
+        if(row[6]!="merged"){bounds.push_back(-1);continue;}
+        if(!RepairSkipBound::supported(row))throw std::runtime_error("unsupported merged floor record");
+        int64_t sum=impl_->native_clean(row,1);
+        if(sum>=0)++certified;
+        else {sum=0;for(char q:row[9])sum+=int64_t(std::floor(fqalign::phred_error(q)*RepairSkipBound::scale+.5));}
+        bounds.push_back(sum);
+    }
+    return bounds;
+}
 std::vector<int64_t> RepairPipeline::native_clean_bounds(NativeRecords native,double cutoff) const {
     std::vector<int64_t> bounds;bounds.reserve(native.size());
     for(const auto& row:native){
@@ -119,7 +133,7 @@ std::vector<RepairedRecord> RepairPipeline::repair_records(NativeRecords input,i
 
         // T35 cutoff-proof-365Lsy9S: all five files match on dev L1-L4
         // at every tested cutoff >= 0.05; stricter cutoffs need merged trimming.
-        constexpr double merged_repair_skip_cutoff = 0.05;
+        const double merged_repair_skip_cutoff = impl_->merged_skip_cutoff;
         const bool skip_merged=mode==9&&cut>=merged_repair_skip_cutoff&&v[6]=="merged";
         if(skip_merged&&!shadow){
             RepairedRecord result;result.native=&v;output.push_back(std::move(result));continue;

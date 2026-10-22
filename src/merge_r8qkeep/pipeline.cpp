@@ -174,12 +174,12 @@ struct FamilyPlacementEvidence {
 void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,int threads,bool debug,RepairShadow* counters,std::function<void(OutputChunk)> consume,FamilyPlacementEvidence* evidence=nullptr,bool collect=false){
     // Native geometry differs across the declared rescue boundary. Process each
     // homogeneous cutoff group through the complete existing router and repair.
-    const bool low=std::any_of(cuts.begin(),cuts.end(),[](double c){return c<0.05;});
-    const bool high=std::any_of(cuts.begin(),cuts.end(),[](double c){return c>=0.05;});
+    const bool low=std::any_of(cuts.begin(),cuts.end(),[&](double c){return c<lib.merged_skip_cutoff;});
+    const bool high=std::any_of(cuts.begin(),cuts.end(),[&](double c){return c>=lib.merged_skip_cutoff;});
     if(low&&high){
         for(bool restricted:{false,true}){
             std::vector<double> selected;std::vector<std::size_t> slots;
-            for(std::size_t c=0;c<cuts.size();++c)if((cuts[c]<0.05)==restricted){selected.push_back(cuts[c]);slots.push_back(c);}
+            for(std::size_t c=0;c<cuts.size();++c)if((cuts[c]<lib.merged_skip_cutoff)==restricted){selected.push_back(cuts[c]);slots.push_back(c);}
             std::vector<RepairShadow> local_counters(selected.size());
             process_records(lib,selected,threads,debug,counters?local_counters.data():nullptr,[&](OutputChunk chunk){
                 OutputChunk expanded;expanded.count=restricted?0:chunk.count;
@@ -417,6 +417,44 @@ void write_files(OutputFiles& files,const FinalOutput& out){
     files[0].append(out.merged);files[1].append(out.r1);files[2].append(out.r2);files[3].append(out.orphan);if(!out.outcomes.empty())files[4].append(out.outcomes);
 }
 void close_files(OutputFiles& files){for(auto& file:files){file.close();if(!file)throw std::runtime_error("write output");}}
+}
+CutoffFloor derive_cutoff_floor(const LibraryPipeline& lib,int threads){
+    // Frozen Task 20 grid. Independent of requested cutoffs and override.
+    static constexpr std::array<double,34> grid{{.0001,.000133,.000178,.000237,.000316,.000422,.000562,.00075,.001,.00133,.00178,.00237,.00316,.00422,.00562,.0075,.01,.0133,.0178,.0237,.0316,.0422,.05,.0562,.075,.1,.133,.178,.237,.316,.422,.562,.75,1}};
+    struct Counts {std::array<std::size_t,34> above{},phred{};std::size_t merged=0,certified=0;};
+    const auto count=[&](std::size_t start,std::size_t n){
+        std::vector<FamilyPair> raw;NativeResult native;auto settings=lib.native_settings;
+        settings.posterior_tailhead_rescue=true;
+        if(lib.compact){raw.resize(n);CompactPairStore::Decoder decoder;for(std::size_t i=0;i<n;++i)lib.compact->read(start+i,raw[i],decoder);native=merge_native_range(raw,0,n,settings,false,false);}
+        else native=merge_native_range(lib.family.pairs,start,n,settings,false,false);
+        Counts result;const auto bounds=lib.repair->floor_bounds(native.records,result.certified);
+        for(std::size_t i=0;i<native.records.size();++i){const auto& r=native.records[i];if(r.outcome!="merged")continue;++result.merged;
+            int64_t phred=0;for(unsigned char q:r.first.qual){const double risk=std::clamp(std::pow(10.,-(int(q)-33)/10.),1e-10,1.);phred+=int64_t(std::floor(risk*1000000000000LL+.5));}
+            for(std::size_t g=0;g<grid.size();++g){const auto budget=int64_t(std::floor(grid[g]*1000000000000LL+.5))*int64_t(r.first.seq.size());result.above[g]+=bounds[i]>budget;result.phred[g]+=phred>budget;}
+        }
+        return result;
+    };
+    Counts total;std::deque<std::future<Counts>> pending;std::size_t next=0;
+    const auto workers=bounded_worker_count(threads);
+    const auto launch=[&]{const auto start=next,n=std::min(native_batch_size,lib.pair_count()-next);next+=n;pending.push_back(lib.pool->submit([&,start,n]{return count(start,n);}));};
+    try {
+        while(next<lib.pair_count()&&pending.size()<std::size_t(workers))launch();
+        while(!pending.empty()){
+            const auto c=pending.front().get();pending.pop_front();
+            total.merged+=c.merged;total.certified+=c.certified;
+            for(std::size_t g=0;g<grid.size();++g){total.above[g]+=c.above[g];total.phred[g]+=c.phred[g];}
+            if(next<lib.pair_count())launch();
+        }
+    } catch(...) {
+        // Tasks reference this census stack. Drain before unwinding it.
+        for(auto& task:pending)if(task.valid())task.wait();
+        throw;
+    }
+    std::size_t first=0;while(first<grid.size()&&total.above[first])++first;
+    if(first==grid.size())throw std::runtime_error("no certified floor in cutoff grid");
+    std::ostringstream out;out<<"floor="<<grid[first]<<"\nmerged="<<total.merged<<"\ncertified="<<total.certified<<"\nfallback="<<total.merged-total.certified<<"\ncutoff\tabove_bound\tabove_phred\n";
+    for(std::size_t g=0;g<grid.size();++g)out<<grid[g]<<'\t'<<total.above[g]<<'\t'<<total.phred[g]<<'\n';
+    return {grid[first],out.str()};
 }
 FinalOutput emit_library(const LibraryPipeline& lib,double cutoff){
     FinalOutput result;std::size_t count=0;

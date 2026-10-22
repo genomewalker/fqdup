@@ -33,14 +33,15 @@ double number(const std::string& text){std::size_t n;const double x=std::stod(te
 }
 int merge_r8qkeep_main(int argc,char** argv){
     for(int i=1;i<argc;++i)if(std::string(argv[i])=="--legacy-merge"){std::vector<char*> args;for(int j=0;j<argc;++j)if(j!=i)args.push_back(argv[j]);return merge_main(args.size(),args.data());}
-    try{std::vector<std::string> r1,r2;std::string outdir;std::vector<std::string> cuts{"0.316"};int threads=1;bool debug=false,multiple=false,timings=false,shadow=false,counts=true,no_family=false;NativeSettings settings;OutcomesMode outcomes_mode=OutcomesMode::full;
+    try{std::vector<std::string> r1,r2;std::string outdir;std::vector<std::string> cuts{"0.316"};int threads=1;bool debug=false,multiple=false,timings=false,shadow=false,counts=true,no_family=false,allow_sub_floor=false;NativeSettings settings;OutcomesMode outcomes_mode=OutcomesMode::full;
         for(int i=1;i<argc;++i){const std::string a=argv[i];const auto value=[&](){if(i+1>=argc)throw std::runtime_error("missing value: "+a);return std::string(argv[++i]);};
-            if(a=="--help"||a=="-h"){std::cout<<"Usage: fqdup merge -1 R1.fq[,LANE...] -2 R2.fq[,LANE...] -o NEW_OUTPUT_DIR [--cutoff 0.316] [-p THREADS] [--debug-stages] [--repair-shadow] [--prior-fit counts|full]\nPrior fit: counts (default); full (exact reference mode).\nFamily: --no-family skips PCR-duplicate family correction and lowers accuracy on duplicated libraries.\nOutcomes: --outcomes full|summary|none (default full). Summary writes outcomes.summary.tsv with header outcome\tcount, rows merged, unmerged, orphan_r1, orphan_r2, dropped, total; none writes no outcomes file.\nOutputs: merged.fq r1.fq r2.fq orphan.fq outcomes.jsonl\nNative options: --adapter1 --adapter2 --library-type --min-length --min-overlap --max-mm-rate\nThe r8qkeep recipe enables short-tail/gapped clipping and disables poly-G/internal-panel filtering.\nUse --legacy-merge for the previous repository merge command and its options.\n";return 0;}
+            if(a=="--help"||a=="-h"){std::cout<<"Usage: fqdup merge -1 R1.fq[,LANE...] -2 R2.fq[,LANE...] -o NEW_OUTPUT_DIR [--cutoff 0.316] [--allow-sub-floor] [-p THREADS] [--debug-stages] [--repair-shadow] [--prior-fit counts|full]\nCutoff: raised to the per-library certified grid floor; repair/rescue boundary is at least 0.05. --allow-sub-floor restores requested cutoffs and the parent 0.05 boundary.\nPrior fit: counts (default); full (exact reference mode).\nFamily: --no-family skips PCR-duplicate family correction and lowers accuracy on duplicated libraries.\nOutcomes: --outcomes full|summary|none (default full). Summary writes outcomes.summary.tsv with header outcome\tcount, rows merged, unmerged, orphan_r1, orphan_r2, dropped, total; none writes no outcomes file.\nOutputs: merged.fq r1.fq r2.fq orphan.fq outcomes.jsonl\nNative options: --adapter1 --adapter2 --library-type --min-length --min-overlap --max-mm-rate\nThe r8qkeep recipe enables short-tail/gapped clipping and disables poly-G/internal-panel filtering.\nUse --legacy-merge for the previous repository merge command and its options.\n";return 0;}
             if(a=="-1"){auto p=paths(value());r1.insert(r1.end(),p.begin(),p.end());}else if(a=="-2"){auto p=paths(value());r2.insert(r2.end(),p.begin(),p.end());}else if(a=="-o")outdir=value();
             else if(a=="--cutoff"){cuts=paths(value());multiple=cuts.size()>1;}
             else if(a=="--cutoffs"){std::ifstream list(value());if(!list)throw std::runtime_error("cannot read cutoffs file");cuts.clear();std::string text;while(list>>text)cuts.push_back(text);if(list.bad())throw std::runtime_error("cutoffs read failure");multiple=true;}
             else if(a=="--prior-fit"){const auto mode=value();if(mode!="full"&&mode!="counts")throw std::runtime_error("prior-fit must be full or counts");counts=mode=="counts";}
             else if(a=="--outcomes"){const auto mode=value();if(mode=="full")outcomes_mode=OutcomesMode::full;else if(mode=="summary")outcomes_mode=OutcomesMode::summary;else if(mode=="none")outcomes_mode=OutcomesMode::none;else throw std::runtime_error("outcomes must be full, summary or none");}
+            else if(a=="--allow-sub-floor")allow_sub_floor=true;
             else if(a=="--no-family")no_family=true;
             else if(a=="--repair-shadow")shadow=true;
             else if(a=="--timings")timings=true;
@@ -58,8 +59,14 @@ int merge_r8qkeep_main(int argc,char** argv){
             <<memory_status()<<'\n';
         auto library=prepare_compact_library(std::move(store),settings,threads,debug,timings,counts,no_family);
         library.outcomes_mode=outcomes_mode;
+        const auto floor=derive_cutoff_floor(library,threads);
+        library.merged_skip_cutoff=allow_sub_floor?0.05:std::max(floor.floor,0.05);
+        library.repair->set_merged_skip_cutoff(library.merged_skip_cutoff);
+        const auto input_path=std::filesystem::path(r1.front());
+        const auto library_name=input_path.parent_path().filename().empty()?input_path.filename().string():input_path.parent_path().filename().string();
+        if(debug)write(out/"floor.txt",floor.diagnostics);
         std::vector<double> values;std::vector<std::string> directories;
-        for(const auto& cut:cuts){values.push_back(number(cut));directories.push_back((multiple?out/cut:out).string());}
+        for(const auto& cut:cuts){const double requested=number(cut),effective=allow_sub_floor?requested:std::max(requested,floor.floor);values.push_back(effective);std::cerr<<"CUTOFF_FLOOR library="<<library_name<<" floor="<<floor.floor<<" effective="<<effective<<" requested="<<cut<<'\n';directories.push_back((multiple?out/cut:out).string());}
         write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow,true);
         if(debug){std::filesystem::create_directory(out/"debug");write(out/"debug"/"family-edits.tsv",library.family.edits_tsv);write(out/"debug"/"families.tsv",library.family.families_tsv);write(out/"debug"/"stats.json",library.family.stats_json);write(out/"debug"/"native.tsv",library.native.native_tsv);write(out/"debug"/"nominal.tsv",library.observations.nominal_tsv);write(out/"debug"/"full.tsv",library.observations.full_tsv);write(out/"debug"/"proposed-edits.tsv",library.observations.proposed_edits_tsv);write(out/"debug"/"nominal.txt",library.nominal_prior);write(out/"debug"/"full.txt",library.full_prior);write(out/"debug"/"routed.tsv",library.routing.routed_tsv);write(out/"debug"/"route-audit.tsv",library.routing.audit_tsv);}
         return 0;
