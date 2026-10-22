@@ -69,6 +69,7 @@ int merge_r8qkeep_main(int argc,char** argv){
         for(const auto& cut:cuts){const double requested=number(cut),effective=allow_sub_floor?requested:std::max(requested,floor.floor);values.push_back(effective);std::cerr<<"CUTOFF_FLOOR library="<<library_name<<" floor="<<floor.floor<<" effective="<<effective<<" requested="<<cut<<'\n';directories.push_back((multiple?out/cut:out).string());}
         write_library_cutoffs(library,values,directories,cuts,threads,debug,timings,shadow,true);
         if(debug){std::filesystem::create_directory(out/"debug");write(out/"debug"/"family-edits.tsv",library.family.edits_tsv);write(out/"debug"/"families.tsv",library.family.families_tsv);write(out/"debug"/"stats.json",library.family.stats_json);write(out/"debug"/"native.tsv",library.native.native_tsv);write(out/"debug"/"nominal.tsv",library.observations.nominal_tsv);write(out/"debug"/"full.tsv",library.observations.full_tsv);write(out/"debug"/"proposed-edits.tsv",library.observations.proposed_edits_tsv);write(out/"debug"/"nominal.txt",library.nominal_prior);write(out/"debug"/"full.txt",library.full_prior);write(out/"debug"/"routed.tsv",library.routing.routed_tsv);write(out/"debug"/"route-audit.tsv",library.routing.audit_tsv);}
+        if(debug)write(out/"debug"/"adapter-unclipped.tsv",library.adapter_unclipped_tsv);
         return 0;
     }catch(const std::exception& e){std::cerr<<"fqdup merge: "<<e.what()<<'\n';return 1;}
 }

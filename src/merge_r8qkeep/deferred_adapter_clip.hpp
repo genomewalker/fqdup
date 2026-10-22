@@ -1,6 +1,17 @@
 #pragma once
 #include "content_memo.hpp"
 namespace fqdup::r8qkeep {
+// T47-B2: intersect the very same T41 boundary before the quality guard.
+// Native mates are raw prefixes; retain raw evidence for the posterior fit.
+// No boundary is inferred here and all adapter decision constants stay on main.
+inline void pre_guard_adapter_clip(NativeRecord& record){
+    if(record.outcome=="merged"||record.outcome=="dropped"||record.pending_adapter_clip<0)return;
+    const auto clip=[&](StageRead& read){
+        const auto stop=std::min(read.seq.size(),static_cast<std::size_t>(record.pending_adapter_clip));
+        read.seq.resize(stop);read.qual.resize(stop);
+    };
+    clip(record.first);if(record.outcome=="unmerged")clip(record.second);
+}
 // Called after parent routing, interval selection and repair, before caching.
 // The confirmed adapter boundary is in raw mate coordinates, like FQT s/e.
 inline RepairedRecord final_adapter_clip(const RepairedRecord& selected,int boundary){

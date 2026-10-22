@@ -19,6 +19,7 @@ struct LibraryPipeline {
     std::string nominal_prior,full_prior;
     std::unique_ptr<RepairPipeline> repair;
     RoutingResult routing;
+    std::string adapter_unclipped_tsv="id\tmate\traw_length\tnative_length\n";
     std::shared_ptr<WorkerPool> pool;
 };
 struct FinalOutput { std::string merged,r1,r2,orphan,outcomes; std::array<std::size_t,5> outcome_counts{}; };

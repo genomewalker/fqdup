@@ -163,7 +163,7 @@ struct OutputChunk {
     std::vector<FinalOutput> outputs;
     std::vector<double> seconds;
     double router_seconds=0,native_seconds=0;
-    std::string routed,audit,native;
+    std::string routed,audit,native,adapter_unclipped;
     std::size_t count=0;
     std::size_t native_clean=0,native_direct=0;
     std::vector<std::size_t> native_clean_pass;
@@ -186,7 +186,7 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
                 expanded.outputs.resize(cuts.size());expanded.seconds.resize(cuts.size());expanded.native_clean_pass.resize(cuts.size());
                 for(std::size_t j=0;j<slots.size();++j){expanded.outputs[slots[j]]=std::move(chunk.outputs[j]);expanded.seconds[slots[j]]=chunk.seconds[j];expanded.native_clean_pass[slots[j]]=chunk.native_clean_pass[j];}
                 expanded.router_seconds=chunk.router_seconds;expanded.native_seconds=chunk.native_seconds;
-                if(!restricted){expanded.native_clean=chunk.native_clean;expanded.native_direct=chunk.native_direct;expanded.routed=std::move(chunk.routed);expanded.audit=std::move(chunk.audit);expanded.native=std::move(chunk.native);}
+                if(!restricted){expanded.native_clean=chunk.native_clean;expanded.native_direct=chunk.native_direct;expanded.routed=std::move(chunk.routed);expanded.audit=std::move(chunk.audit);expanded.native=std::move(chunk.native);expanded.adapter_unclipped=std::move(chunk.adapter_unclipped);}
                 consume(std::move(expanded));
             });
             if(counters)for(std::size_t j=0;j<slots.size();++j){
@@ -242,7 +242,24 @@ void process_records(const LibraryPipeline& lib,const std::vector<double>& cuts,
     const auto process=[&](NativeRecords native,std::size_t start,double native_seconds,std::vector<MemoValue>* collected=nullptr,const std::vector<std::shared_ptr<fqdup_shared_alignment::Pair>>* shared=nullptr,std::size_t shared_offset=0){
         const std::size_t n=native.size();if(collected)collected->resize(n);
         OutputChunk chunk;chunk.count=n;chunk.native_seconds=native_seconds;chunk.outputs.resize(cuts.size());chunk.seconds.resize(cuts.size());
+        if(debug)for(const auto& record:native){
+            if(record.outcome=="merged"||record.outcome=="dropped"||record.pending_adapter_clip>=0)continue;
+            const auto count=[&](const StageRead& read,int mate){
+                const auto& raw=record.raw->r[mate-1];
+                if(read.seq.size()==raw.s.size())chunk.adapter_unclipped+=record.raw->id+'\t'+std::to_string(mate)+'\t'+std::to_string(raw.s.size())+'\t'+std::to_string(read.seq.size())+'\n';
+            };
+            count(record.first,record.outcome=="orphan_r2"?2:1);
+            if(record.outcome=="unmerged")count(record.second,2);
+        }
         if(native_debug)for(const auto& record:native)chunk.native+=native_record_tsv(record);
+        // Keep ownership until every selected record has been serialized/cached.
+        // All existing learned/read-through clips have already run natively.
+        std::vector<NativeRecord> clipped_native;
+        if(std::any_of(native.begin(),native.end(),[](const NativeRecord& r){return r.pending_adapter_clip>=0&&r.outcome!="merged"&&r.outcome!="dropped";})){
+            clipped_native.assign(native.begin(),native.end());
+            for(auto& record:clipped_native)pre_guard_adapter_clip(record);
+            native=NativeRecords(clipped_native.data(),clipped_native.size());
+        }
         const auto route_begin=Clock::now();const double minimum=*std::min_element(cuts.begin(),cuts.end());
         std::vector<int64_t> certified,unresolved_bounds;std::vector<std::size_t> unresolved;
         NativeRecords work=native;std::size_t work_start=start;
@@ -496,7 +513,7 @@ void write_library_cutoffs(LibraryPipeline& lib,const std::vector<double>& cuts,
         count+=chunk.count;router_seconds+=chunk.router_seconds;native_seconds+=chunk.native_seconds;
         native_clean+=chunk.native_clean;native_direct+=chunk.native_direct;
         for(std::size_t c=0;c<cuts.size();++c)native_clean_pass[c]+=chunk.native_clean_pass[c];
-        if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;}
+        if(debug){lib.routing.routed_tsv+=chunk.routed;lib.routing.audit_tsv+=chunk.audit;lib.native.native_tsv+=chunk.native;lib.adapter_unclipped_tsv+=chunk.adapter_unclipped;}
         const auto write_begin=measure?Clock::now():Clock::time_point{};
         for(std::size_t c=0;c<cuts.size();++c){seconds[c]+=chunk.seconds[c];auto& out=chunk.outputs[c];
             if(lib.outcomes_mode==OutcomesMode::summary)for(std::size_t k=0;k<5;++k)outcome_counts[c][k]+=out.outcome_counts[k];
