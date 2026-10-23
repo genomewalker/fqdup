@@ -1,5 +1,18 @@
 # fqdup
 
+> Status as of 2026-10-23: libtaph is pinned to
+> `c3b3a5d46e6112e61a461c3a6f10ae9fc30345dd`, the same revision as DART v2.0.0
+> (previously `f97613b`). `fqdup profile` now runs libtaph's library profiler
+> (`taph::run_library_profile`), the same code as `dart profile`. fqdup's own
+> copies of the profiler, HTML report and 8-oxoG code are removed; `--html` and
+> `--no-oxog` work through libtaph. Profile JSON changes: each length bin has
+> `pi_authentic` (provisional; tau cutoffs come from three labelled
+> libraries), `tau_discriminator.point` and `burial_fingerprint.tau_hat` are
+> null unless tau is DETECTED, `w_length` is deprecated, and preservation
+> f_coh, evidence and score drop by up to 0.074, 0.27 and 0.18 without the
+> w_length term. The bulk damage fit uses SQUAREM. The `fqdup merge` source is
+> unchanged by this re-pin.
+
 > Status as of 2026-10-22: `fqdup merge` now derives a per-library cutoff
 > floor from its own data instead of the fixed 0.05: the smallest grid cutoff
 > at which no merged record's certified risk exceeds the bound (never below
@@ -403,7 +416,8 @@ fqdup profile -i MERGED -1 R1.fq.gz -2 R2.fq.gz [options]  # combined: see below
                              --library-type is not given, adopt the library
                              type merge explicitly declared (not one it
                              auto-detected)
-  --length-bins SPEC         Length-stratified damage curves: auto | N | e1,e2,...
+  --length-bins SPEC         Length-stratified damage curves: auto | off | N | e1,e2,...
+                             (default: auto)
   --adapter-scan-reads N     Reads sampled for adapter-stub detection (default: 1000000; 0=all)
 
 Outputs:

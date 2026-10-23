@@ -14,6 +14,7 @@ bioinfo=${FQDUP_BIOINFO:-/opt/conda/envs/bioinfo}
 cxx=${FQDUP_CXX:-/opt/software/gcc/13.2.0/bin/g++}
 deps=${FQDUP_DEPS:-/path/to/tmp/fqdup-qc-terminal-anchor-20260928/build-release/_deps}
 jobs=${FQDUP_JOBS:-8}
+export LC_ALL=C.UTF-8 LANG=C.UTF-8  # the Python tests print non-ASCII
 export LD_LIBRARY_PATH="$bioinfo/lib:$(dirname "$(dirname "$cxx")")/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir -p "$build"
 cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx" -DCMAKE_PREFIX_PATH="$bioinfo" \
