@@ -1,5 +1,10 @@
 # fqdup
 
+> Status as of 2026-10-25: libtaph is re-pinned to
+> `933877cff69cd6c6cfb685af34f9ee070df63d38` (DART v2.0.1). libtaph history was
+> rewritten and `c3b3a5d` is no longer on any branch; `933877c` has the identical
+> source tree, so every number is unchanged.
+
 > Status as of 2026-10-23: libtaph is pinned to
 > `c3b3a5d46e6112e61a461c3a6f10ae9fc30345dd`, the same revision as DART v2.0.0
 > (previously `f97613b`). `fqdup profile` now runs libtaph's library profiler
