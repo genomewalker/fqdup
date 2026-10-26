@@ -89,7 +89,9 @@ endif()
 # DART reads, so it is pinned to the same SHA as DART. 2026-10-16: libtaph main was force-pushed;
 # 7540cc8 has the same tree (fb1d5e3c) as be1f750, which every fqdup gate of Tasks 25-34 ran on.
 # 2026-10-25: re-pinned c3b3a5d -> 933877c after libtaph history was rewritten again; identical
-# tree (e7a41562), numbers unchanged. Same revision as DART v2.0.1.
+# tree (e7a41562), numbers unchanged.
+# 2026-10-26: re-pinned 933877c -> 1e83aff (v2.1.2) after libtaph history was rewritten again; the
+# code differs only in comments, numbers unchanged. Same revision as DART v2.0.2.
 # A local checkout must be exactly this revision and clean; a remote fetch checks out exactly it.
 # The pin lives in LIBTAPH_PIN (one line, 40-hex SHA) so libtaph/scripts/check-stack.sh and
 # bump-libtaph.sh can read and rewrite it for fqdup and DART alike.
