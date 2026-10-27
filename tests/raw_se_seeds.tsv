@@ -1,0 +1,10 @@
+id	read	quality	adapter5	adapter3	K	clip5	clip3	note
+hard-overlap	ACGT	IIII	-	-	0	100	100	empty, no double-count
+longest5	ACACG	IIIII	ACAC	-	2	0	0	longest suffix overlap
+min-overlap	GAC	III	-	ACGT	2	0	0	equality retained boundary
+internal-partial	GACCTG	IIIIII	-	ACGT	2	0	0	partial internal mismatch: no clipping
+full-tail	GACGTGG	IIIIIII	-	ACGT	2	0	0	full match removes downstream tail
+N-literal	GANG	IIII	-	ACGT	2	0	0	N is not wildcard
+orientation5	GTAA	IIII	ACGT	-	2	0	0	adapter suffix/read prefix
+quality-equality	AAACAAA	!!!5!!!	-	-	0	0	0	Q20 equal survives
+biological-identical	CCCCCTTGACA	IIIIIIIIIII	-	TTGACA	4	0	0	cannot distinguish biological complete motif

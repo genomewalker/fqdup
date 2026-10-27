@@ -1,0 +1,4 @@
+id	input_spelling	named_regular_dash	redirected_stdin	output	result
+literal-dash	-	A:@named-dash,ACGT	B:@redirected-stdin,NNNN	B	unsupported; A/B/output/report unchanged
+stdin-device	/dev/stdin	A:@named-dash,ACGT	B:@redirected-stdin,NNNN	C:sentinel	unsupported; A/B/C/report unchanged
+ordinary-relative-dash	./-	A:@named-dash,ACGT	B:@redirected-stdin,NNNN	C:sentinel	accept; C contains A, not B; A/B unchanged

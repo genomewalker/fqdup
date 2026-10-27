@@ -7,6 +7,7 @@
 //                                                  → ordered output queue → writer thread
 
 #include "fqdup/fastq_common.hpp"
+#include "fqdup/trim_single.hpp"
 #include "taph/frame_selector_decl.hpp"
 #include "taph/library_interpretation.hpp"
 #include "taph/sample_damage_profile.hpp"
@@ -149,6 +150,7 @@ static void clip_worker(ClipQueue& in_q, OutQueue& out_q,
 static void usage() {
     std::cerr <<
         "Usage: fqdup trim -i FILE -o FILE [options]\n\n"
+        "Raw single-end mode: fqdup trim --single-end --help\n\n"
         "Detect and remove 5'/3' adapter stubs from collapsed FASTQ.\n"
         "Uses hexamer frequency analysis on the first --scan-reads reads\n"
         "to detect stubs, then trims all reads via a parallel clip pipeline.\n\n"
@@ -167,6 +169,13 @@ static void usage() {
 
 // ---- main ------------------------------------------------------------------
 int trim_main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--single-end") return trim_single_main(argc, argv);
+        if ((a == "-i" || a == "--input" || a == "-o" || a == "--output" ||
+             a == "-p" || a == "--threads" || a == "--scan-reads" ||
+             a == "--min-length" || a == "--max-length" || a == "--stub5" || a == "--stub3") && i + 1 < argc) ++i;
+    }
     std::string in_path, out_path;
     int64_t scan_reads = 1'000'000;
     int     min_length = 15;

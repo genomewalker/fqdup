@@ -152,6 +152,7 @@ add_executable(fqdup
     src/derep.cpp
     src/split.cpp
     src/trim.cpp
+    src/trim_single.cpp
     src/merge.cpp
     src/merge_r8qkeep/cli.cpp
     src/merge_r8qkeep/pipeline.cpp
@@ -246,6 +247,23 @@ endif()
 
 # Tests
 enable_testing()
+
+add_executable(test_trim_single_properties
+    tests/trim_single_properties.cpp tests/raw_se_new_counter.cpp
+    src/trim_single.cpp src/fastq_io_backend.cpp)
+target_include_directories(test_trim_single_properties PRIVATE ${XXHASH_INCLUDE_DIR})
+target_link_libraries(test_trim_single_properties PRIVATE ZLIB::ZLIB Threads::Threads ${XXHASH_LIB})
+target_compile_options(test_trim_single_properties PRIVATE -O2 -march=${FQDUP_MARCH})
+if(ISAL_INCLUDE_DIR AND ISAL_LIB)
+    target_include_directories(test_trim_single_properties PRIVATE ${ISAL_INCLUDE_DIR})
+    target_link_libraries(test_trim_single_properties PRIVATE ${ISAL_LIB})
+endif()
+set(FQDUP_RAW_SE_MUTANT "0" CACHE STRING "Raw SE native property mutant (0 ships unchanged)")
+if(NOT FQDUP_RAW_SE_MUTANT MATCHES "^([0-9]|1[0-9]|2[0-6])$")
+    message(FATAL_ERROR "FQDUP_RAW_SE_MUTANT must be an integer in 0..26")
+endif()
+target_compile_definitions(test_trim_single_properties PRIVATE RAW_SE_MUTANT=${FQDUP_RAW_SE_MUTANT})
+add_test(NAME trim_single_properties COMMAND test_trim_single_properties "${CMAKE_CURRENT_BINARY_DIR}/raw-se-truth.tsv")
 
 add_executable(gen_synthetic tests/gen_synthetic.cpp)
 target_compile_options(gen_synthetic PRIVATE -O2)

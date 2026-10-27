@@ -36,7 +36,7 @@ static void usage(const char* prog) {
               << "  profile     Profile deamination damage and library QC\n"
               << "  gen         Generate synthetic FASTQ with configurable damage patterns\n"
               << "  view        Inspect .fqcl cluster genealogy files\n"
-              << "  trim        Remove 5'/3' adapter stubs (hexamer-detected)\n"
+              << "  trim        Adapter stubs; --single-end for explicit raw-read trimming\n"
               << "  merge       Overlap-detect and merge paired-end reads (aDNA-optimised)\n"
               << "  consensus   Emit per-cluster consensus FASTQ from .fqcl\n"
               << "\nRun '" << prog << " <subcommand> --help' for subcommand options.\n"
