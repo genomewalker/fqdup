@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.1.3] - 2026-10-27
+
+Re-pins libtaph to `b9e7cd2`, which has the same source as the v2.1.2 pin. Results are unchanged.
+
 ## [2.1.0] - 2026-06-02
 
 First tagged release since v2.0.2. Includes all v2.0.3 and v2.0.4 development
