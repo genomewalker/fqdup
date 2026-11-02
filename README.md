@@ -433,6 +433,61 @@ Reports the fraction of reads clipped at each end.
 **DS libraries only.** SS libraries (CircLigase-based prep) have no P5 adapter
 at the 5′ end of reads; `fqdup trim` is a no-op on such data.
 
+#### Raw single-end mode (`--single-end`)
+
+Preprocesses raw single-end FASTQ, where there is no mate to merge. The mode is
+opt-in: without `--single-end`, `fqdup trim` behaves exactly as above.
+
+```
+fqdup trim --single-end -i INPUT -o OUTPUT --min-length N [options]
+
+Required:
+  --single-end              Select raw single-end mode
+  -i FILE                   Raw FASTQ (.gz or plain); must be a regular file
+  -o FILE                   Output FASTQ (gzip if the name ends in .gz)
+  --min-length N            Discard reads shorter than N bp after clipping
+
+Options:
+  --clip5 N / --clip3 N     Remove a fixed number of bases from the 5′ / 3′ end
+  --adapter5 DNA            5′ adapter (A/C/G/T only)
+  --adapter3 DNA            3′ adapter (A/C/G/T only)
+  --adapter-min-overlap K   Shortest adapter match clipped; required with an adapter
+  --quality-trim none|ends  Trim low-quality bases from both ends (default: none)
+  --min-phred Q             Quality threshold, 0–93; required with --quality-trim ends
+  --max-length N            Discard reads longer than N bp (0 = no limit)
+  -p N                      Worker threads, 1–64 (default: 1)
+  --report FILE             Write the report to FILE as well as stderr
+```
+
+Each read is processed in this order:
+
+1. The fixed `--clip5` and `--clip3` bases are removed.
+2. **5′ adapter:** the longest end of the adapter, at least K bases, that exactly matches the read's start is removed.
+3. **3′ adapter:** the read is cut at the first position where the rest of the read matches the start of the adapter, over at least K bases. A match can be the whole adapter inside the read, or a partial adapter at the read's 3′ end.
+4. **Quality:** with `--quality-trim ends`, bases below `--min-phred` are removed from both ends.
+5. **Length filter:** reads left empty, shorter than `--min-length` or longer than `--max-length` are dropped.
+
+Matching is exact. An `N` or other ambiguity code in a read never matches an adapter base. Output keeps input order at any thread count, and so does the report.
+
+The report is tab-separated, and its first line is `raw_single_end_v1`.
+- **Settings:** it then lists the settings used.
+- **Read counts:** `input`, `retained`, `empty`, `short_reads`, `long_reads` and `dropped`. `dropped` is `empty + short_reads + long_reads`, and `input = retained + dropped`.
+- **Clip counts:** reads and bases removed by each clipping step. A read can be counted under more than one step.
+- **Bases:** `input_bases` equals `retained_bases` plus `discarded_bases` plus all removed bases.
+
+Limits:
+- Input must be a regular, unchanging file, and stdin (`-` or `/dev/stdin`) is not accepted. The file is checked for NUL bytes before processing, which costs an extra read pass. A run fails if the file changes during processing.
+- **Rejected inputs:** reads that already carry fqdup `FQT=`/`FQC=` traces, invalid FASTQ (illegal bases or quality bytes, sequence/quality length mismatch) and input, output or report paths that name the same file.
+- On error the command exits non-zero, and the output file may be incomplete.
+- Exact matching cannot tell a true adapter from a biological sequence identical to it, so such a sequence is clipped too. Choose K accordingly.
+- This mode does not detect adapters or library types; supply the adapter and settings explicitly.
+
+Tests: `ctest -R trim_single_properties` runs the property suite in
+`tests/trim_single_properties.cpp`. It checks fixed truth cases, the clip
+order, the report counts at 1, 8 and 16 threads, and fuzzed inputs and options.
+Configuring with `-DFQDUP_RAW_SE_MUTANT=N` (N = 1–26) builds the suite against a
+deliberately broken copy of the trimmer, and each copy must fail its named check.
+
 ### `fqdup extend`
 
 ```

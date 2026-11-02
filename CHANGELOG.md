@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.2.0] - 2026-10-28
+
+### New
+
+- **`fqdup trim --single-end`**: preprocessing for raw single-end FASTQ. It
+  applies fixed 5′/3′ clips, exact 5′ and 3′ adapter clipping with a required
+  minimum overlap, and optional end-quality trimming (off by default), then
+  filters by minimum and maximum length. A tab-separated report
+  (`raw_single_end_v1`) gives read and base counts for each step. The mode is
+  opt-in, and `fqdup trim` without `--single-end` is unchanged. Input must be a
+  regular raw FASTQ file: stdin and reads already carrying fqdup traces are
+  rejected. See the README for options, processing order and limits.
+
+### Tests
+
+- `trim_single_properties` (ctest) checks the single-end trimmer against fixed
+  truth cases, report counts at 1, 8 and 16 threads, and fuzzed inputs and
+  options. `-DFQDUP_RAW_SE_MUTANT=1..26` builds deliberately broken copies, and
+  each one must fail its named check.
+
 ## [2.1.3] - 2026-10-27
 
 Re-pins libtaph to `b9e7cd2`, which has the same source as the v2.1.2 pin. Results are unchanged.
