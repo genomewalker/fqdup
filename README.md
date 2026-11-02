@@ -461,32 +461,49 @@ Options:
 
 Each read is processed in this order:
 
-1. The fixed `--clip5` and `--clip3` bases are removed.
-2. **5′ adapter:** the longest end of the adapter, at least K bases, that exactly matches the read's start is removed.
-3. **3′ adapter:** the read is cut at the first position where the rest of the read matches the start of the adapter, over at least K bases. A match can be the whole adapter inside the read, or a partial adapter at the read's 3′ end.
-4. **Quality:** with `--quality-trim ends`, bases below `--min-phred` are removed from both ends.
-5. **Length filter:** reads left empty, shorter than `--min-length` or longer than `--max-length` are dropped.
+1. Remove the fixed `--clip5` and `--clip3` bases.
+2. Remove the longest end of the 5′ adapter, at least K bases long, that
+   exactly matches the start of the read.
+3. Cut the read at the first position where the rest of the read matches the
+   start of the 3′ adapter over at least K bases. This catches a whole adapter
+   inside the read and a partial adapter at its 3′ end.
+4. With `--quality-trim ends`, remove bases below `--min-phred` from both ends.
+5. Drop reads that are empty, shorter than `--min-length` or longer than
+   `--max-length`.
 
-Matching is exact. An `N` or other ambiguity code in a read never matches an adapter base. Output keeps input order at any thread count, and so does the report.
+Matching is exact, and an `N` or other ambiguity code in a read never matches
+an adapter base. Reads are written in input order, and the output and report
+are the same at any thread count.
 
-The report is tab-separated, and its first line is `raw_single_end_v1`.
-- **Settings:** it then lists the settings used.
-- **Read counts:** `input`, `retained`, `empty`, `short_reads`, `long_reads` and `dropped`. `dropped` is `empty + short_reads + long_reads`, and `input = retained + dropped`.
-- **Clip counts:** reads and bases removed by each clipping step. A read can be counted under more than one step.
-- **Bases:** `input_bases` equals `retained_bases` plus `discarded_bases` plus all removed bases.
+The report is tab-separated. Its first line is `raw_single_end_v1`, followed by
+the settings used and then the counts. `input`, `retained`, `empty`,
+`short_reads` and `long_reads` count reads, and `dropped` is `empty +
+short_reads + long_reads`, so `input = retained + dropped`. Each clipping step
+reports the reads and bases it removed; one read can be clipped by several
+steps. `input_bases` equals `retained_bases` plus `discarded_bases` plus all
+bases removed by the clipping steps.
 
-Limits:
-- Input must be a regular, unchanging file, and stdin (`-` or `/dev/stdin`) is not accepted. The file is checked for NUL bytes before processing, which costs an extra read pass. A run fails if the file changes during processing.
-- **Rejected inputs:** reads that already carry fqdup `FQT=`/`FQC=` traces, invalid FASTQ (illegal bases or quality bytes, sequence/quality length mismatch) and input, output or report paths that name the same file.
-- On error the command exits non-zero, and the output file may be incomplete.
-- Exact matching cannot tell a true adapter from a biological sequence identical to it, so such a sequence is clipped too. Choose K accordingly.
-- This mode does not detect adapters or library types; supply the adapter and settings explicitly.
+Input must be a regular file, so stdin (`-` or `/dev/stdin`) is not accepted.
+The file is first scanned for NUL bytes, which costs one extra read pass, and
+the run fails if the file changes while it is being processed. Reads that
+already carry fqdup `FQT=` or `FQC=` traces are rejected, as is invalid FASTQ
+(illegal bases or quality bytes, or sequence and quality of different lengths).
+Input, output and report must be different files. On any error the command
+exits non-zero and the output file may be incomplete.
 
-Tests: `ctest -R trim_single_properties` runs the property suite in
-`tests/trim_single_properties.cpp`. It checks fixed truth cases, the clip
-order, the report counts at 1, 8 and 16 threads, and fuzzed inputs and options.
-Configuring with `-DFQDUP_RAW_SE_MUTANT=N` (N = 1–26) builds the suite against a
-deliberately broken copy of the trimmer, and each copy must fail its named check.
+Exact matching cannot tell an adapter from read sequence that happens to match
+it. On random sequence, a match of K or more bases at the 3′ end occurs in about
+1 read in 0.75 × 4^K: about 1 in 770 for K = 5, and 1 in 12,000 for K = 7. A
+larger K clips fewer genuine read ends but leaves shorter adapter remnants. The
+mode does not detect adapters or library type, so supply the adapter sequence
+and settings yourself.
+
+`ctest -R trim_single_properties` runs the property suite in
+`tests/trim_single_properties.cpp`. It checks fixed truth cases, 8,192 fuzzed
+reads and 8,192 fuzzed numeric option values, and that the output and report
+are the same at 1, 8 and 16 threads. Configuring with
+`-DFQDUP_RAW_SE_MUTANT=N` (N = 1–26) builds the suite against a deliberately
+broken copy of the trimmer, and each copy must fail its named check.
 
 ### `fqdup extend`
 
