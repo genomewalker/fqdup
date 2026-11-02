@@ -491,12 +491,13 @@ already carry fqdup `FQT=` or `FQC=` traces are rejected, as is invalid FASTQ
 Input, output and report must be different files. On any error the command
 exits non-zero and the output file may be incomplete.
 
-Exact matching cannot tell an adapter from read sequence that happens to match
-it. On random sequence, a match of K or more bases at the 3′ end occurs in about
-1 read in 0.75 × 4^K: about 1 in 770 for K = 5, and 1 in 12,000 for K = 7. A
-larger K clips fewer genuine read ends but leaves shorter adapter remnants. The
-mode does not detect adapters or library type, so supply the adapter sequence
-and settings yourself.
+Exact matching can also remove genuine read sequence. If bases were independent
+and A, C, G and T equally frequent, one specified K-base comparison would match
+by chance with probability 4^-K: 1 in 1,024 for K = 5 and 1 in 16,384 for
+K = 7. The per-read chance depends on the adapter, the lengths and positions
+tested, and sequence composition. Increasing K reduces chance matches but leaves
+adapter remnants shorter than K untrimmed. The mode does not detect adapters or
+library type, so supply the adapter sequence and settings yourself.
 
 `ctest -R trim_single_properties` runs the property suite in
 `tests/trim_single_properties.cpp`. It checks fixed truth cases, 8,192 fuzzed
